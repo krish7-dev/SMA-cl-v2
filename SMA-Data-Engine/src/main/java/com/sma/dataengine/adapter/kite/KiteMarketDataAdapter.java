@@ -144,8 +144,11 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
             });
 
             ticker.setTryReconnection(true);
-            ticker.setMaximumRetries(10);
-            ticker.setMaximumRetryInterval(30);
+            // setMaximumRetries / setMaximumRetryInterval declare throws KiteException
+            try { ticker.setMaximumRetries(10); }
+            catch (KiteException e) { log.warn("Could not set max retries: {}", e.getMessage()); }
+            try { ticker.setMaximumRetryInterval(30); }
+            catch (KiteException e) { log.warn("Could not set retry interval: {}", e.getMessage()); }
 
             ticker.connect();
 
