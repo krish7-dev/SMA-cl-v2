@@ -1,0 +1,189 @@
+.dashboard-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.health-summary {
+  margin-bottom: 20px;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.summary-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 64px;
+}
+
+.summary-value {
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--text-primary);
+}
+
+.summary-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.summary-bar {
+  flex: 1;
+  height: 6px;
+  background: var(--bg-primary);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.summary-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.5s ease;
+}
+
+.all-up   .summary-bar-fill { background: var(--success); }
+.all-down .summary-bar-fill { background: var(--danger); }
+.partial  .summary-bar-fill { background: var(--warning); }
+
+/* Health Grid */
+.health-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 16px;
+  margin-bottom: 32px;
+}
+
+.health-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: border-color 0.2s;
+}
+
+.health-card.card-up   { border-color: rgba(76, 175, 125, 0.3); }
+.health-card.card-down { border-color: rgba(239, 83, 80, 0.3); }
+.health-card.card-warn { border-color: rgba(255, 167, 38, 0.3); }
+
+.hc-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.hc-name {
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+.hc-port {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.hc-error {
+  font-size: 11px;
+  color: var(--danger);
+  background: var(--danger-bg);
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  word-break: break-all;
+}
+
+.hc-components {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: var(--bg-primary);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+}
+
+.hc-component {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+}
+
+.hc-comp-name { color: var(--text-muted); text-transform: capitalize; }
+.hc-comp-status { font-weight: 600; }
+.text-up   { color: var(--success); }
+.text-down { color: var(--danger); }
+
+.hc-swagger-link {
+  margin-top: auto;
+  font-size: 12px;
+  color: var(--accent);
+  transition: color 0.15s;
+}
+.hc-swagger-link:hover { color: var(--accent-hover); }
+
+/* Loading skeleton */
+.health-card.loading { gap: 12px; }
+.hc-skeleton {
+  background: var(--bg-hover);
+  border-radius: var(--radius-sm);
+  animation: shimmer 1.4s infinite;
+}
+.hc-sk-title { height: 18px; width: 60%; }
+.hc-sk-badge { height: 22px; width: 40%; }
+.hc-sk-link  { height: 14px; width: 50%; margin-top: auto; }
+
+@keyframes shimmer {
+  0%, 100% { opacity: 0.5; }
+  50%       { opacity: 1; }
+}
+
+/* Swagger section */
+.swagger-section h2 {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.swagger-section > p {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin-bottom: 16px;
+}
+
+.swagger-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
+}
+
+.swagger-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.swagger-card:hover {
+  border-color: var(--accent);
+  background: var(--bg-hover);
+}
+
+.sw-card-name {
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.sw-card-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.sw-card-port {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--accent);
+  font-weight: 600;
+}
