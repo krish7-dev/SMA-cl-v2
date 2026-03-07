@@ -1,5 +1,7 @@
-.query-card {
-  margin-bottom: 0;
+.portfolio-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
 }
 
 .tabs {

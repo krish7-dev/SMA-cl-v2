@@ -21,6 +21,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
@@ -62,8 +63,13 @@ import java.util.function.Consumer;
 @Component
 public class KiteMarketDataAdapter implements MarketDataAdapter {
 
-    private static final String PROVIDER = "kite";
-    private static final ZoneId IST      = ZoneId.of("Asia/Kolkata");
+    private static final String          PROVIDER = "kite";
+    private static final ZoneId          IST      = ZoneId.of("Asia/Kolkata");
+
+    // Kite returns "+0530" (no colon). ISO_OFFSET_DATE_TIME requires "+05:30".
+    // This formatter handles both forms via the BasicIso offset pattern.
+    private static final DateTimeFormatter KITE_DT_FMT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssZ");
 
     // ─── State ────────────────────────────────────────────────────────────────
 
@@ -232,7 +238,12 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
             // Each element in dataArrayList IS a HistoricalData — no inner class in SDK 3.1.1
             List<CandleData> candles = new ArrayList<>(response.dataArrayList.size());
             for (HistoricalData bean : response.dataArrayList) {
-                candles.add(normalizeCandle(bean, request));
+                CandleData c = normalizeCandle(bean, request);
+                if (c.getOpenTime() != null) {
+                    candles.add(c);
+                } else {
+                    log.debug("Skipping candle with unparseable timestamp: {}", bean.timeStamp);
+                }
             }
 
             log.info("Fetched {} candles for token={}", candles.size(), request.getInstrumentToken());
@@ -318,15 +329,18 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
      */
     private LocalDateTime parseTimestamp(String ts) {
         if (ts == null || ts.isBlank()) return null;
+        // Try "+0530" form first (Kite's actual format), then ISO "+05:30", then date-only
+        try {
+            return OffsetDateTime.parse(ts, KITE_DT_FMT).atZoneSameInstant(IST).toLocalDateTime();
+        } catch (Exception ignored) {}
         try {
             return OffsetDateTime.parse(ts).atZoneSameInstant(IST).toLocalDateTime();
-        } catch (Exception e1) {
-            try {
-                return LocalDate.parse(ts).atStartOfDay();
-            } catch (Exception e2) {
-                log.warn("Could not parse historical timestamp '{}' — returning null", ts);
-                return null;
-            }
+        } catch (Exception ignored) {}
+        try {
+            return LocalDate.parse(ts).atStartOfDay();
+        } catch (Exception e) {
+            log.warn("Could not parse historical timestamp '{}' — returning null", ts);
+            return null;
         }
     }
 

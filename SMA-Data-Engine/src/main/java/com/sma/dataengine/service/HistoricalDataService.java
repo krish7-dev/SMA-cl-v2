@@ -2,6 +2,7 @@ package com.sma.dataengine.service;
 
 import com.sma.dataengine.adapter.MarketDataAdapter;
 import com.sma.dataengine.adapter.MarketDataAdapterRegistry;
+import com.sma.dataengine.client.BrokerEngineClient;
 import com.sma.dataengine.entity.CandleRecord;
 import com.sma.dataengine.model.CandleData;
 import com.sma.dataengine.model.Interval;
@@ -13,16 +14,20 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.time.LocalDateTime;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Fetches and persists historical OHLCV candle data.
  *
  * Flow:
- * 1. Check candle_data table for an existing cache hit (optional optimization).
- * 2. If not found or cache is stale, delegate to the broker adapter's REST API.
- * 3. Persist fetched candles when request.isPersist() == true.
- * 4. Return normalized CandleData list — oldest first.
+ * 1. Auto-resolve apiKey + accessToken from Broker Engine when not provided.
+ * 2. Check candle_data table for an existing cache hit.
+ * 3. If not found, delegate to the broker adapter's REST API.
+ * 4. Persist fetched candles when request.isPersist() == true.
+ * 5. Return normalized CandleData list — oldest first.
  */
 @Slf4j
 @Service
@@ -31,6 +36,7 @@ public class HistoricalDataService {
 
     private final MarketDataAdapterRegistry adapterRegistry;
     private final CandleRepository          candleRepository;
+    private final BrokerEngineClient        brokerEngineClient;
 
     // ─── Public API ───────────────────────────────────────────────────────────
 
@@ -41,6 +47,23 @@ public class HistoricalDataService {
      */
     @Transactional
     public List<CandleData> getHistoricalData(HistoricalDataRequest request) {
+        // Auto-resolve credentials from Broker Engine when not provided by the caller
+        if (isMissing(request.getApiKey()) || isMissing(request.getAccessToken())) {
+            BrokerEngineClient.Credentials creds =
+                    brokerEngineClient.fetchCredentials(request.getUserId(), request.getBrokerName());
+            if (creds.isComplete()) {
+                request.setApiKey(creds.apiKey());
+                request.setAccessToken(creds.accessToken());
+                log.info("Auto-resolved credentials from Broker Engine for userId={}, broker={}",
+                        request.getUserId(), request.getBrokerName());
+            } else {
+                throw new IllegalStateException(
+                        "No apiKey/accessToken in request and Broker Engine could not supply them. " +
+                        "Activate a session in the UI or ensure the broker account is ACTIVE. " +
+                        "userId=" + request.getUserId() + ", broker=" + request.getBrokerName());
+            }
+        }
+
         // Check DB cache first
         boolean cached = candleRepository.existsInRange(
                 request.getInstrumentToken(),
@@ -95,18 +118,41 @@ public class HistoricalDataService {
 
     @Transactional
     public void persistCandles(List<CandleData> candles, String provider) {
+        if (candles.isEmpty()) return;
+
+        // Drop candles whose timestamp could not be parsed (null openTime)
         List<CandleRecord> records = candles.stream()
                 .map(c -> toRecord(c, provider))
+                .filter(r -> r.getOpenTime() != null)
                 .toList();
 
-        // saveAll with ignore-on-duplicate via DB unique constraint
-        try {
-            candleRepository.saveAll(records);
-            log.info("Persisted {} candles (provider={})", records.size(), provider);
-        } catch (Exception e) {
-            // Duplicate key on upsert is acceptable — log and continue
-            log.warn("Some candles skipped (duplicate): {}", e.getMessage());
+        if (records.isEmpty()) {
+            log.warn("No valid candles to persist after filtering null timestamps (provider={})", provider);
+            return;
         }
+
+        // Pre-filter records that already exist — avoids unique-constraint violations
+        // which would poison the active PostgreSQL transaction even if caught.
+        LocalDateTime minTime = records.stream().map(CandleRecord::getOpenTime).min(LocalDateTime::compareTo).orElse(null);
+        LocalDateTime maxTime = records.stream().map(CandleRecord::getOpenTime).max(LocalDateTime::compareTo).orElse(null);
+        Long token    = records.get(0).getInstrumentToken();
+        String interval = records.get(0).getInterval();
+
+        Set<LocalDateTime> existing = new HashSet<>(
+                candleRepository.findOpenTimesInRange(token, interval, provider, minTime, maxTime));
+
+        List<CandleRecord> newRecords = records.stream()
+                .filter(r -> !existing.contains(r.getOpenTime()))
+                .toList();
+
+        if (newRecords.isEmpty()) {
+            log.info("All {} candles already cached (provider={})", records.size(), provider);
+            return;
+        }
+
+        candleRepository.saveAll(newRecords);
+        log.info("Persisted {}/{} candles (provider={}, {} already cached)",
+                newRecords.size(), records.size(), provider, existing.size());
     }
 
     private CandleRecord toRecord(CandleData c, String provider) {
@@ -142,5 +188,9 @@ public class HistoricalDataService {
                 .openInterest(r.getOpenInterest())
                 .provider(r.getProvider())
                 .build();
+    }
+
+    private static boolean isMissing(String value) {
+        return value == null || value.isBlank();
     }
 }

@@ -69,13 +69,15 @@ public class ReplayService {
      */
     @Transactional
     public ReplayResponse start(ReplayRequest request) {
-        // Load candles from DB — replay never hits the broker API
         HistoricalDataRequest histReq = buildHistoricalRequest(request);
-        List<CandleData> candles = historicalDataService.loadFromDbForReplay(histReq);
+
+        // getHistoricalData auto-resolves credentials from Broker Engine when missing,
+        // checks DB cache first, then fetches from broker API on cache miss.
+        List<CandleData> candles = historicalDataService.getHistoricalData(histReq);
 
         if (candles.isEmpty()) {
             throw new IllegalStateException(
-                    "No candle data found for replay. Fetch historical data first. " +
+                    "No candle data returned for the requested range. " +
                     "token=" + request.getInstrumentToken() +
                     ", interval=" + request.getInterval() +
                     ", from=" + request.getFromDate() +
@@ -249,18 +251,19 @@ public class ReplayService {
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     private static HistoricalDataRequest buildHistoricalRequest(ReplayRequest r) {
+        String brokerName = r.getBrokerName() != null ? r.getBrokerName() : r.getProvider();
         HistoricalDataRequest req = new HistoricalDataRequest();
         req.setUserId(r.getUserId());
-        req.setBrokerName(r.getProvider());
-        req.setApiKey("");          // not needed for DB-only load
-        req.setAccessToken("");     // not needed for DB-only load
+        req.setBrokerName(brokerName);
+        req.setApiKey(r.getApiKey() != null ? r.getApiKey() : "");
+        req.setAccessToken(r.getAccessToken() != null ? r.getAccessToken() : "");
         req.setInstrumentToken(r.getInstrumentToken());
         req.setSymbol(r.getSymbol());
         req.setExchange(r.getExchange());
         req.setInterval(r.getInterval());
         req.setFromDate(r.getFromDate());
         req.setToDate(r.getToDate());
-        req.setPersist(false);      // loading from DB — no re-persist needed
+        req.setPersist(r.isPersist());
         return req;
     }
 

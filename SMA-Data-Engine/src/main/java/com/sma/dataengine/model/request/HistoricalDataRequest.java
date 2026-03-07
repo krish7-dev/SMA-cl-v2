@@ -22,12 +22,16 @@ public class HistoricalDataRequest {
     @NotBlank
     private String brokerName;
 
-    /** Broker API key — required for authenticated REST calls. */
-    @NotBlank
+    /**
+     * Broker API key — optional. If blank, Data Engine resolves it
+     * from SMA-Broker-Engine automatically using userId + brokerName.
+     */
     private String apiKey;
 
-    /** Live access token from SMA-Broker-Engine. */
-    @NotBlank
+    /**
+     * Live access token — optional. Auto-resolved from SMA-Broker-Engine
+     * when not provided.
+     */
     private String accessToken;
 
     /** Numeric instrument token (e.g. 738561 for RELIANCE NSE). */

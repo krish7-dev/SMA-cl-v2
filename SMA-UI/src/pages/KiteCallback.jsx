@@ -1,20 +1,20 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { loginBrokerAccount } from '../services/api';
+import { useSession } from '../context/SessionContext';
 import './KiteCallback.css';
 
 const EMPTY = { userId: '', clientId: '', apiKey: '', apiSecret: '' };
 
 /**
  * Handles the Kite Connect OAuth redirect.
- * Kite redirects here as: /callback?request_token=xxx&action=login&status=success
- *
- * The user fills in their credentials (apiKey, apiSecret, userId, clientId)
- * and the page calls the Broker Engine login API automatically.
+ * After successful login, automatically saves the session so all pages
+ * work without re-entering credentials.
  */
 export default function KiteCallback() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
+  const { saveSession } = useSession();
 
   const requestToken = searchParams.get('request_token') || '';
   const status       = searchParams.get('status') || '';
@@ -24,7 +24,6 @@ export default function KiteCallback() {
   const [error, setError]     = useState('');
   const [done, setDone]       = useState(false);
 
-  // If Kite returned an error status
   const kiteError = status && status !== 'success';
 
   function handleChange(e) {
@@ -37,14 +36,18 @@ export default function KiteCallback() {
     setError('');
     setLoading(true);
     try {
-      await loginBrokerAccount({
-        ...form,
-        brokerName: 'kite',
-        requestToken,
+      const res = await loginBrokerAccount({ ...form, brokerName: 'kite', requestToken });
+      const data = res?.data;
+      // Auto-save session — no manual credential entry needed on other pages
+      saveSession({
+        userId:      data?.userId      || form.userId,
+        clientId:    data?.clientId    || form.clientId,
+        brokerName:  data?.brokerName  || 'kite',
+        apiKey:      data?.apiKey      || form.apiKey,
+        accessToken: data?.accessToken || '',
       });
       setDone(true);
-      // Redirect to accounts page — it will reload from DB on mount
-      setTimeout(() => navigate('/accounts'), 1800);
+      setTimeout(() => navigate('/dashboard'), 1800);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -59,10 +62,7 @@ export default function KiteCallback() {
           <div className="cb-icon cb-icon-error">✕</div>
           <h2>Kite Login Failed</h2>
           <p className="cb-sub">Kite returned status: <strong>{status}</strong></p>
-          <p className="cb-hint">Go back and try the login URL again.</p>
-          <button className="btn-secondary" onClick={() => navigate('/accounts')}>
-            Back to Accounts
-          </button>
+          <button className="btn-secondary" onClick={() => navigate('/accounts')}>Back to Accounts</button>
         </div>
       </div>
     );
@@ -74,13 +74,8 @@ export default function KiteCallback() {
         <div className="callback-card card">
           <div className="cb-icon cb-icon-warn">!</div>
           <h2>No Request Token</h2>
-          <p className="cb-hint">
-            This page is the OAuth callback for Kite Connect.<br />
-            It should be reached via Kite's redirect after login.
-          </p>
-          <button className="btn-secondary" onClick={() => navigate('/accounts')}>
-            Go to Accounts
-          </button>
+          <p className="cb-hint">This page is the OAuth callback for Kite Connect. It should be reached via Kite's redirect after login.</p>
+          <button className="btn-secondary" onClick={() => navigate('/accounts')}>Go to Accounts</button>
         </div>
       </div>
     );
@@ -91,8 +86,8 @@ export default function KiteCallback() {
       <div className="callback-page">
         <div className="callback-card card">
           <div className="cb-icon cb-icon-success">✓</div>
-          <h2>Authenticated!</h2>
-          <p className="cb-hint">Token stored securely. Redirecting to Accounts…</p>
+          <h2>Session Active!</h2>
+          <p className="cb-hint">Credentials saved. All pages are ready — redirecting to Dashboard…</p>
         </div>
       </div>
     );
@@ -103,7 +98,7 @@ export default function KiteCallback() {
       <div className="callback-card card">
         <div className="cb-icon cb-icon-success">✓</div>
         <h2>Kite Login Successful</h2>
-        <p className="cb-sub">Request token received. Enter your API credentials to complete authentication.</p>
+        <p className="cb-sub">Enter your credentials once — they'll be saved for the entire session.</p>
 
         <div className="token-preview">
           <span className="token-label">Request Token</span>

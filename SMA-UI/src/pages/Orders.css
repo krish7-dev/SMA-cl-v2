@@ -29,6 +29,8 @@
   color: #fff;
 }
 
+.orders-header { display: flex; align-items: flex-start; justify-content: space-between; }
+
 .three-col {
   grid-template-columns: 1fr 1fr 1fr;
 }

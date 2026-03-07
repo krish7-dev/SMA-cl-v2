@@ -11,17 +11,23 @@ import java.time.LocalDateTime;
 
 /**
  * Request to start a historical data replay session.
- * Candles are loaded from the candle_data table and emitted as CandleDataEvents
- * at a controlled rate, simulating a live feed for strategy testing.
+ * Candles are emitted as CandleDataEvents at a controlled rate,
+ * simulating a live feed for strategy testing.
  *
- * Candles must already exist in the DB for the requested range.
- * Call the historical data endpoint first to populate them if needed.
+ * When apiKey + accessToken are provided (on-demand mode), the service fetches
+ * data from the broker API automatically (DB cache checked first).
+ * Without credentials, it falls back to reading pre-persisted candles from DB.
  */
 @Data
 public class ReplayRequest {
 
     @NotBlank
     private String userId;
+
+    /** Broker credentials — required for on-demand API fetch. */
+    private String brokerName;
+    private String apiKey;
+    private String accessToken;
 
     /** Numeric instrument token to replay. */
     @NotNull
@@ -36,11 +42,9 @@ public class ReplayRequest {
     @NotNull
     private Interval interval;
 
-    /** Replay range start — must have candle data persisted from this point. */
     @NotNull
     private LocalDateTime fromDate;
 
-    /** Replay range end. */
     @NotNull
     private LocalDateTime toDate;
 
@@ -54,6 +58,12 @@ public class ReplayRequest {
     @Max(100)
     private int speedMultiplier = 1;
 
-    /** Data provider to replay from (defaults to "kite"). */
+    /** Data provider / broker name for API fetch (defaults to "kite"). */
     private String provider = "kite";
+
+    /**
+     * Whether to persist fetched candles to DB.
+     * Ignored when loading from DB cache. Defaults to true.
+     */
+    private boolean persist = true;
 }

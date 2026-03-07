@@ -51,4 +51,25 @@ public interface CandleRepository extends JpaRepository<CandleRecord, Long> {
             LocalDateTime from,
             LocalDateTime to
     );
+
+    /**
+     * Returns the open_time values already stored for a token/interval/provider range.
+     * Used to pre-filter inserts and avoid unique-constraint violations without relying
+     * on catching DB exceptions (which poison the active transaction in PostgreSQL).
+     */
+    @Query("""
+            SELECT c.openTime FROM CandleRecord c
+            WHERE c.instrumentToken = :token
+              AND c.interval        = :interval
+              AND c.provider        = :provider
+              AND c.openTime       >= :from
+              AND c.openTime       <= :to
+            """)
+    List<LocalDateTime> findOpenTimesInRange(
+            @Param("token")    Long instrumentToken,
+            @Param("interval") String interval,
+            @Param("provider") String provider,
+            @Param("from")     LocalDateTime from,
+            @Param("to")       LocalDateTime to
+    );
 }

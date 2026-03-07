@@ -41,4 +41,18 @@ public class BrokerAuthController {
         brokerAuthService.logout(userId, brokerName);
         return ResponseEntity.ok(ApiResponse.ok(null, "Logged out successfully"));
     }
+
+    /**
+     * Returns the decrypted apiKey and accessToken for an active account.
+     * Used by the UI to restore a session without re-entering credentials.
+     *
+     * GET /api/v1/broker/auth/credentials?userId=&brokerName=
+     */
+    @GetMapping("/credentials")
+    public ResponseEntity<ApiResponse<BrokerAuthResponse>> credentials(
+            @RequestParam String userId,
+            @RequestParam String brokerName) {
+        BrokerAuthResponse response = brokerAuthService.getCredentials(userId, brokerName);
+        return ResponseEntity.ok(ApiResponse.ok(response, "Credentials resolved"));
+    }
 }
