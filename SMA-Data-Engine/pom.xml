@@ -22,31 +22,54 @@
     </properties>
 
     <dependencies>
+        <!-- Web -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
+
+        <!-- Data JPA -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-jpa</artifactId>
         </dependency>
+
+        <!-- Validation -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
+
+        <!-- Actuator -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
+
+        <!-- PostgreSQL Driver -->
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
             <scope>runtime</scope>
         </dependency>
+
+        <!-- Flyway (flyway-core covers PostgreSQL in Flyway 9.x / Spring Boot 3.2.x) -->
         <dependency>
             <groupId>org.flywaydb</groupId>
             <artifactId>flyway-core</artifactId>
         </dependency>
+
+        <!--
+            Kite Connect Java SDK — used ONLY for market data (ticks + historical candles).
+            Auth, orders, and portfolio remain in SMA-Broker-Engine.
+            Source: https://mvnrepository.com/artifact/com.zerodhatech.kiteconnect/kiteconnect
+        -->
+        <dependency>
+            <groupId>com.zerodhatech.kiteconnect</groupId>
+            <artifactId>kiteconnect</artifactId>
+            <version>3.1.1</version>
+        </dependency>
+
         <!-- Swagger / OpenAPI -->
         <dependency>
             <groupId>org.springdoc</groupId>
@@ -54,26 +77,19 @@
             <version>2.3.0</version>
         </dependency>
 
+        <!-- Lombok -->
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
             <optional>true</optional>
         </dependency>
+
+        <!-- Test -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
-
-        <!--
-            Kite Connect Java SDK — add when wiring live market data:
-            <repository><id>jitpack.io</id><url>https://jitpack.io</url></repository>
-            <dependency>
-                <groupId>com.github.zerodhatech.javakiteconnect</groupId>
-                <artifactId>kiteconnect</artifactId>
-                <version>3.3.1</version>
-            </dependency>
-        -->
     </dependencies>
 
     <build>

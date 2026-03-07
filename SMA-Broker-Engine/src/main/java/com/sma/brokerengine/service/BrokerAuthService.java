@@ -64,6 +64,8 @@ public class BrokerAuthService {
                 .status(account.getStatus().name())
                 .tokenExpiry(account.getTokenExpiry())
                 .message("Authentication successful")
+                .apiKey(request.getApiKey())
+                .accessToken(accessToken)
                 .build();
     }
 
@@ -121,6 +123,27 @@ public class BrokerAuthService {
                 .clientId(account.getClientId())
                 .status(account.getStatus().name())
                 .tokenExpiry(account.getTokenExpiry())
+                .build();
+    }
+
+    /**
+     * Returns decrypted apiKey + accessToken for the UI session restore flow.
+     */
+    public BrokerAuthResponse getCredentials(String userId, String brokerName) {
+        BrokerAccount account = brokerAccountRepository
+                .findByUserIdAndBrokerName(userId, brokerName)
+                .orElseThrow(() -> new AccountNotFoundException(
+                        "No broker account found for userId=" + userId + ", broker=" + brokerName));
+        return BrokerAuthResponse.builder()
+                .accountId(account.getId())
+                .userId(account.getUserId())
+                .brokerName(account.getBrokerName())
+                .clientId(account.getClientId())
+                .status(account.getStatus().name())
+                .tokenExpiry(account.getTokenExpiry())
+                .apiKey(encryptionService.decrypt(account.getApiKeyEncrypted()))
+                .accessToken(account.getAccessTokenEncrypted() != null
+                        ? encryptionService.decrypt(account.getAccessTokenEncrypted()) : null)
                 .build();
     }
 

@@ -3,6 +3,7 @@ package com.sma.brokerengine.config;
 import com.sma.brokerengine.adapter.BrokerAdapterRegistry;
 import com.sma.brokerengine.adapter.kite.KiteBrokerAdapter;
 import com.sma.brokerengine.model.response.ApiResponse;
+import com.sma.brokerengine.security.TokenEncryptionService;
 import com.sma.brokerengine.service.BrokerAuthService;
 import com.sma.brokerengine.service.OrderService;
 import lombok.extern.slf4j.Slf4j;
@@ -52,6 +53,13 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleKiteError(KiteBrokerAdapter.KiteAdapterException ex) {
         log.error("Kite broker error: {}", ex.getMessage());
         return ResponseEntity.status(HttpStatus.BAD_GATEWAY).body(ApiResponse.error(ex.getMessage()));
+    }
+
+    @ExceptionHandler(TokenEncryptionService.EncryptionException.class)
+    public ResponseEntity<ApiResponse<Void>> handleEncryption(TokenEncryptionService.EncryptionException ex) {
+        log.error("Credential encryption/decryption failed: {}", ex.getMessage(), ex);
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(ApiResponse.error("Credential decryption failed — the ENCRYPTION_SECRET_KEY may have changed since the account was registered. Re-authenticate the account to fix this."));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

@@ -1,11 +1,14 @@
 import { NavLink } from 'react-router-dom';
+import { useSession } from '../context/SessionContext';
 import './Sidebar.css';
 
 const NAV_ITEMS = [
-  { to: '/dashboard', label: 'Dashboard',     icon: '◈' },
-  { to: '/accounts',  label: 'Broker Accounts', icon: '⬡' },
-  { to: '/orders',    label: 'Orders',         icon: '◫' },
-  { to: '/portfolio', label: 'Portfolio',      icon: '◱' },
+  { to: '/dashboard',   label: 'Dashboard',       icon: '◈' },
+  { to: '/accounts',    label: 'Broker Accounts',  icon: '⬡' },
+  { to: '/orders',      label: 'Orders',           icon: '◫' },
+  { to: '/portfolio',   label: 'Portfolio',        icon: '◱' },
+  { to: '/data-engine', label: 'Data Engine',      icon: '◉' },
+  { to: '/session',     label: 'Session',          icon: '◎' },
 ];
 
 const SWAGGER_LINKS = [
@@ -16,6 +19,8 @@ const SWAGGER_LINKS = [
 ];
 
 export default function Sidebar() {
+  const { session, isActive } = useSession();
+
   return (
     <aside className="sidebar">
       <div className="sidebar-brand">
@@ -23,12 +28,33 @@ export default function Sidebar() {
         <span className="brand-sub">Trading Platform</span>
       </div>
 
+      {/* Session status pill */}
+      <div className="sidebar-session">
+        {isActive ? (
+          <NavLink to="/session" className="session-pill session-pill-active">
+            <span className="session-dot session-dot-active" />
+            <span className="session-info">
+              <span className="session-user">{session.userId}</span>
+              <span className="session-broker">{session.brokerName}</span>
+            </span>
+          </NavLink>
+        ) : (
+          <NavLink to="/session" className="session-pill session-pill-none">
+            <span className="session-dot" />
+            <span className="session-info">
+              <span className="session-user">No Session</span>
+              <span className="session-broker">Click to configure</span>
+            </span>
+          </NavLink>
+        )}
+      </div>
+
       <nav className="sidebar-nav">
         {NAV_ITEMS.map(({ to, label, icon }) => (
           <NavLink
             key={to}
             to={to}
-            className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
+            className={({ isActive: a }) => `nav-item ${a ? 'active' : ''}`}
           >
             <span className="nav-icon">{icon}</span>
             {label}

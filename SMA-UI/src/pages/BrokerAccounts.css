@@ -1,3 +1,5 @@
+.active-session-row td { background: rgba(76, 175, 125, 0.05); }
+
 .form-card {
   margin-bottom: 24px;
 }
