@@ -3,24 +3,26 @@ package com.sma.dataengine.adapter.kite;
 import com.sma.dataengine.adapter.MarketDataAdapter;
 import com.sma.dataengine.adapter.MarketDataAdapterException;
 import com.sma.dataengine.model.CandleData;
-import com.sma.dataengine.model.Interval;
 import com.sma.dataengine.model.SubscriptionMode;
 import com.sma.dataengine.model.TickData;
 import com.sma.dataengine.model.request.HistoricalDataRequest;
 import com.zerodhatech.kiteconnect.KiteConnect;
 import com.zerodhatech.kiteconnect.kitehttp.exceptions.KiteException;
 import com.zerodhatech.models.HistoricalData;
+import com.zerodhatech.models.Tick;
 import com.zerodhatech.ticker.KiteTicker;
+import com.zerodhatech.ticker.OnError;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Date;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -36,18 +38,24 @@ import java.util.function.Consumer;
  * - Broker auth, login, or token generation (SMA-Broker-Engine owns this)
  * - Order placement, cancellation, portfolio, or margins
  *
- * The apiKey and accessToken are passed in at connect-time by the caller
- * (supplied from SMA-Broker-Engine's authenticated session).
+ * ─── Kite SDK 3.1.1 field reference (verified from decompiled source) ─────────
+ * Tick: all fields are private — use getters:
+ *   getInstrumentToken() → long
+ *   getLastTradedPrice(), getHighPrice(), getLowPrice(), getOpenPrice(), getClosePrice() → double
+ *   getLastTradedQuantity(), getAverageTradePrice(), getVolumeTradedToday() → double
+ *   getTotalBuyQuantity(), getTotalSellQuantity(), getChange(), getOi() → double
+ *   getTickTimestamp() → Date
+ *   NOTE: OHLC are FLAT fields on Tick — there is NO nested ohlc object in SDK 3.1.1
  *
- * ─── Kite SDK field notes (SDK 3.1.1) ────────────────────────────────────────
- * HistoricalData.HistoricalDataBean fields: timeStamp (Date), open/high/low/close
- *   (double), volume (long), oi (long).
- * Tick fields: instrumentToken (long), lastTradedPrice (double),
- *   lastTradedQuantity (int), averageTradedPrice (double), volumeTradedToday (long),
- *   totalBuyQuantity (double), totalSellQuantity (double),
- *   ohlc.open/high/low/close (double), change (double), openInterest (long).
- * If compilation errors occur on Tick fields, decompile com.zerodhatech.models.Tick
- * from the SDK jar to verify exact field names for this SDK version.
+ * HistoricalData: no inner HistoricalDataBean — each candle IS a HistoricalData.
+ *   dataArrayList: List<HistoricalData>
+ *   timeStamp: String (ISO 8601, e.g. "2023-01-02T09:15:00+0530")
+ *   open, high, low, close: double  |  volume, oi: long
+ *
+ * KiteConnect.getHistoricalData(Date from, Date to, String token, String interval,
+ *                                boolean continuous, boolean oi)
+ *
+ * KiteTicker.OnError: 3-overload interface — NOT a functional interface, use anonymous class.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 @Slf4j
@@ -55,14 +63,12 @@ import java.util.function.Consumer;
 public class KiteMarketDataAdapter implements MarketDataAdapter {
 
     private static final String PROVIDER = "kite";
-    private static final DateTimeFormatter KITE_DATE_FORMAT =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-    private static final ZoneId IST = ZoneId.of("Asia/Kolkata");
+    private static final ZoneId IST      = ZoneId.of("Asia/Kolkata");
 
     // ─── State ────────────────────────────────────────────────────────────────
 
-    private KiteTicker       ticker;
-    private KiteConnect      kiteConnect;
+    private KiteTicker          ticker;
+    private KiteConnect         kiteConnect;
     private final AtomicBoolean connected = new AtomicBoolean(false);
 
     /** Registered by LiveMarketDataService before connect() is called. */
@@ -76,20 +82,24 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
     }
 
     @Override
+    public void setTickListener(Consumer<List<TickData>> listener) {
+        this.tickListener = listener;
+    }
+
+    @Override
     public void connect(String apiKey, String accessToken) {
         if (connected.get()) {
             log.debug("KiteMarketDataAdapter already connected — skipping reconnect");
             return;
         }
 
-        log.info("Connecting KiteTicker (apiKey={}…)", maskKey(apiKey));
+        log.info("Connecting KiteTicker (apiKey={})", maskKey(apiKey));
         try {
             // KiteConnect instance — used for historical REST calls
             kiteConnect = new KiteConnect(apiKey);
             kiteConnect.setAccessToken(accessToken);
 
             // KiteTicker — WebSocket for live ticks
-            // TODO: plug in real Kite ticker integration here
             ticker = new KiteTicker(accessToken, apiKey);
 
             ticker.setOnConnectedListener(() -> {
@@ -102,15 +112,29 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
                 log.warn("KiteTicker disconnected");
             });
 
-            ticker.setOnErrorListener((ex, response, code) -> {
-                log.error("KiteTicker error: code={}, response={}", code, response, ex);
+            // OnError has 3 overloads — not a @FunctionalInterface, requires anonymous class
+            ticker.setOnErrorListener(new OnError() {
+                @Override
+                public void onError(Exception e) {
+                    log.error("KiteTicker error (Exception): {}", e.getMessage(), e);
+                }
+
+                @Override
+                public void onError(KiteException e) {
+                    log.error("KiteTicker error (KiteException): [{}] {}", e.code, e.getMessage());
+                }
+
+                @Override
+                public void onError(String errorMessage) {
+                    log.error("KiteTicker error (String): {}", errorMessage);
+                }
             });
 
-            ticker.setOnTickerArrivalListener(ticks -> {
+            ticker.setOnTickerArrivalListener((ArrayList<Tick> ticks) -> {
                 if (tickListener == null || ticks == null || ticks.isEmpty()) return;
                 try {
                     List<TickData> normalized = new ArrayList<>(ticks.size());
-                    for (com.zerodhatech.models.Tick t : ticks) {
+                    for (Tick t : ticks) {
                         normalized.add(normalizeTick(t));
                     }
                     tickListener.accept(normalized);
@@ -153,11 +177,6 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
     }
 
     @Override
-    public void setTickListener(Consumer<List<TickData>> listener) {
-        this.tickListener = listener;
-    }
-
-    @Override
     public void subscribe(List<Long> instrumentTokens, SubscriptionMode mode) {
         if (!isConnected()) {
             throw new MarketDataAdapterException("Cannot subscribe — KiteTicker is not connected");
@@ -178,32 +197,38 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
 
     @Override
     public List<CandleData> getHistoricalData(HistoricalDataRequest request) {
-        // Build a fresh KiteConnect with the caller-supplied credentials.
+        // Build a fresh KiteConnect with caller-supplied credentials.
         // Data Engine does not cache or own access tokens — each call is explicit.
         KiteConnect api = new KiteConnect(request.getApiKey());
         api.setAccessToken(request.getAccessToken());
 
-        HashMap<String, Object> params = new HashMap<>();
-        params.put("instrument_token", String.valueOf(request.getInstrumentToken()));
-        params.put("from", request.getFromDate().format(KITE_DATE_FORMAT));
-        params.put("to",   request.getToDate().format(KITE_DATE_FORMAT));
-        params.put("interval", request.getInterval().getKiteValue());
-        params.put("continuous", String.valueOf(request.isContinuous()));
+        // SDK signature: getHistoricalData(Date from, Date to, String token,
+        //                                  String interval, boolean continuous, boolean oi)
+        Date fromDate = toDate(request.getFromDate());
+        Date toDate   = toDate(request.getToDate());
 
         log.info("Fetching historical data: token={}, interval={}, from={}, to={}",
                 request.getInstrumentToken(), request.getInterval().getKiteValue(),
                 request.getFromDate(), request.getToDate());
 
         try {
-            HistoricalData response = api.getHistoricalData(params, request.isContinuous());
+            HistoricalData response = api.getHistoricalData(
+                    fromDate,
+                    toDate,
+                    String.valueOf(request.getInstrumentToken()),
+                    request.getInterval().getKiteValue(),
+                    request.isContinuous(),
+                    false  // oi flag — set true if open interest is needed
+            );
 
             if (response == null || response.dataArrayList == null) {
                 log.warn("Kite returned null historical data for token={}", request.getInstrumentToken());
                 return List.of();
             }
 
+            // Each element in dataArrayList IS a HistoricalData — no inner class in SDK 3.1.1
             List<CandleData> candles = new ArrayList<>(response.dataArrayList.size());
-            for (HistoricalData.HistoricalDataBean bean : response.dataArrayList) {
+            for (HistoricalData bean : response.dataArrayList) {
                 candles.add(normalizeCandle(bean, request));
             }
 
@@ -223,49 +248,54 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
 
     /**
      * Converts a Kite SDK Tick to a normalized TickData.
-     * Field names are based on Kite Connect Java SDK 3.1.1 decompiled source.
-     * Verify against: com.zerodhatech.models.Tick in the SDK jar.
+     *
+     * SDK 3.1.1 verified:
+     * - All fields private — getters required
+     * - OHLC are FLAT fields (getOpenPrice etc.) — no nested ohlc object
+     * - getAverageTradePrice() — "Trade" not "Traded"
+     * - getOi() for open interest — not getOpenInterest()
+     * - quantity/volume fields return double; cast to long where needed
      */
-    private TickData normalizeTick(com.zerodhatech.models.Tick t) {
-        TickData.TickDataBuilder builder = TickData.builder()
+    private TickData normalizeTick(Tick t) {
+        Instant timestamp = t.getTickTimestamp() != null
+                ? t.getTickTimestamp().toInstant()
+                : Instant.now();
+
+        return TickData.builder()
                 .provider(PROVIDER)
-                .instrumentToken(t.instrumentToken)
-                .lastTradedPrice(safeDecimal(t.lastTradedPrice))
-                .lastTradedQuantity((long) t.lastTradedQuantity)
-                .averageTradedPrice(safeDecimal(t.averageTradedPrice))
-                .volumeTradedToday(t.volumeTradedToday)
-                .totalBuyQuantity(safeDecimal(t.totalBuyQuantity))
-                .totalSellQuantity(safeDecimal(t.totalSellQuantity))
-                .change(safeDecimal(t.change))
-                .openInterest(t.openInterest)
-                .timestamp(Instant.now());
-
-        // OHLC is populated in QUOTE and FULL modes
-        if (t.ohlc != null) {
-            builder.openPrice(safeDecimal(t.ohlc.open))
-                   .highPrice(safeDecimal(t.ohlc.high))
-                   .lowPrice(safeDecimal(t.ohlc.low))
-                   .closePrice(safeDecimal(t.ohlc.close));
-        }
-
-        return builder.build();
+                .instrumentToken(t.getInstrumentToken())
+                .lastTradedPrice(bd(t.getLastTradedPrice()))
+                .lastTradedQuantity((long) t.getLastTradedQuantity())
+                .averageTradedPrice(bd(t.getAverageTradePrice()))          // "Trade" not "Traded"
+                .volumeTradedToday((long) t.getVolumeTradedToday())
+                .totalBuyQuantity(bd(t.getTotalBuyQuantity()))
+                .totalSellQuantity(bd(t.getTotalSellQuantity()))
+                .change(bd(t.getChange()))
+                .openInterest((long) t.getOi())                            // getOi(), not getOpenInterest()
+                // OHLC: flat on Tick in SDK 3.1.1 — no nested object
+                .openPrice(bd(t.getOpenPrice()))
+                .highPrice(bd(t.getHighPrice()))
+                .lowPrice(bd(t.getLowPrice()))
+                .closePrice(bd(t.getClosePrice()))
+                .timestamp(timestamp)
+                .build();
     }
 
     /**
-     * Converts a Kite SDK HistoricalDataBean to a normalized CandleData.
+     * Converts a Kite SDK HistoricalData candle to a normalized CandleData.
+     *
+     * SDK 3.1.1 verified:
+     * - No inner HistoricalDataBean class — each list element IS a HistoricalData
+     * - timeStamp is a String (ISO 8601, e.g. "2023-01-02T09:15:00+0530")
+     *   Daily candles may be date-only: "2023-01-02"
      */
-    private CandleData normalizeCandle(HistoricalData.HistoricalDataBean bean,
-                                       HistoricalDataRequest request) {
-        LocalDateTime openTime = bean.timeStamp != null
-                ? bean.timeStamp.toInstant().atZone(IST).toLocalDateTime()
-                : null;
-
+    private CandleData normalizeCandle(HistoricalData bean, HistoricalDataRequest request) {
         return CandleData.builder()
                 .instrumentToken(request.getInstrumentToken())
                 .symbol(request.getSymbol())
                 .exchange(request.getExchange())
                 .interval(request.getInterval())
-                .openTime(openTime)
+                .openTime(parseTimestamp(bean.timeStamp))
                 .open(BigDecimal.valueOf(bean.open))
                 .high(BigDecimal.valueOf(bean.high))
                 .low(BigDecimal.valueOf(bean.low))
@@ -278,6 +308,29 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
+    /**
+     * Parses Kite's historical timestamp string.
+     * Standard: ISO 8601 with offset "2023-01-02T09:15:00+0530"
+     * Daily fallback: date-only "2023-01-02"
+     */
+    private LocalDateTime parseTimestamp(String ts) {
+        if (ts == null || ts.isBlank()) return null;
+        try {
+            return OffsetDateTime.parse(ts).atZoneSameInstant(IST).toLocalDateTime();
+        } catch (Exception e1) {
+            try {
+                return LocalDate.parse(ts).atStartOfDay();
+            } catch (Exception e2) {
+                log.warn("Could not parse historical timestamp '{}' — returning null", ts);
+                return null;
+            }
+        }
+    }
+
+    private Date toDate(LocalDateTime ldt) {
+        return Date.from(ldt.atZone(IST).toInstant());
+    }
+
     private static String toKiteMode(SubscriptionMode mode) {
         return switch (mode) {
             case LTP   -> KiteTicker.modeLTP;
@@ -286,7 +339,7 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
         };
     }
 
-    private static BigDecimal safeDecimal(double value) {
+    private static BigDecimal bd(double value) {
         return BigDecimal.valueOf(value);
     }
 
