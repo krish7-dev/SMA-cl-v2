@@ -13,6 +13,7 @@ spring:
     hikari:
       maximum-pool-size: 10
       minimum-idle: 2
+      connection-timeout: 30000
 
   jpa:
     hibernate:
@@ -21,6 +22,8 @@ spring:
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
+        jdbc:
+          time_zone: UTC
 
   flyway:
     enabled: true
@@ -39,9 +42,16 @@ management:
 logging:
   level:
     com.sma.dataengine: INFO
+    com.zerodhatech: WARN
 
-# Data Engine — Kite market data config (populated when Kite SDK is integrated)
-# data:
-#   kite:
-#     api-key: ${KITE_API_KEY}
-#     access-token: ${KITE_ACCESS_TOKEN}
+# ─── Data Engine — Replay Configuration ────────────────────────────────────────
+data:
+  replay:
+    # Thread pool size for concurrent replay sessions
+    scheduler-pool-size: 4
+    # Max candles to load into memory per replay session
+    max-candles-per-session: 100000
+
+  # Broker Engine base URL — used for future inter-service calls (e.g. token resolution)
+  broker-engine:
+    base-url: ${BROKER_ENGINE_URL:http://localhost:9003}
