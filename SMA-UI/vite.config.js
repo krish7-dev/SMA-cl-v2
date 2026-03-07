@@ -16,10 +16,10 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/execution/, ''),
       },
-      '/data': {
+      '/data-api': {
         target: 'http://localhost:9005',
         changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/data/, ''),
+        rewrite: (path) => path.replace(/^\/data-api/, ''),
       },
       '/strategy': {
         target: 'http://localhost:9006',

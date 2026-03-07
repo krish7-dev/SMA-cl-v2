@@ -34,6 +34,64 @@
   letter-spacing: 1px;
 }
 
+/* Session pill */
+.sidebar-session {
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.session-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  text-decoration: none;
+  transition: background 0.15s;
+  cursor: pointer;
+}
+
+.session-pill:hover { background: var(--bg-hover); }
+
+.session-pill-active { background: rgba(76, 175, 125, 0.08); }
+.session-pill-none   { background: transparent; }
+
+.session-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-muted);
+}
+
+.session-dot-active {
+  background: var(--success);
+  animation: pulse 2s infinite;
+}
+
+.session-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  overflow: hidden;
+}
+
+.session-user {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-broker {
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
 .sidebar-nav {
   padding: 12px 8px;
   display: flex;

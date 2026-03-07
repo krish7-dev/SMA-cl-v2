@@ -2,7 +2,7 @@
 // In production, set VITE_BROKER_URL etc. as env vars.
 const BROKER   = import.meta.env.VITE_BROKER_URL   || '/broker';
 const EXECUTION = import.meta.env.VITE_EXECUTION_URL || '/execution';
-const DATA      = import.meta.env.VITE_DATA_URL      || '/data';
+const DATA      = import.meta.env.VITE_DATA_URL      || '/data-api';
 const STRATEGY  = import.meta.env.VITE_STRATEGY_URL  || '/strategy';
 
 async function request(url, options = {}) {
@@ -62,6 +62,12 @@ export async function loginBrokerAccount(payload) {
   return request(`${BROKER}/api/v1/broker/auth/login`, { method: 'POST', body: payload });
 }
 
+export async function fetchBrokerCredentials(userId, brokerName) {
+  return request(
+    `${BROKER}/api/v1/broker/auth/credentials?userId=${encodeURIComponent(userId)}&brokerName=${encodeURIComponent(brokerName)}`
+  );
+}
+
 export async function logoutBrokerAccount(userId, brokerName) {
   return request(`${BROKER}/api/v1/broker/auth/logout?userId=${encodeURIComponent(userId)}&brokerName=${encodeURIComponent(brokerName)}`, {
     method: 'POST',
@@ -84,6 +90,49 @@ export async function getOrders(userId, brokerName) {
 
 export async function cancelOrder(payload) {
   return request(`${BROKER}/api/v1/broker/orders`, { method: 'DELETE', body: payload });
+}
+
+// ─── Data Engine — Historical ─────────────────────────────────────────────────
+
+export async function fetchHistoricalData(payload) {
+  return request(`${DATA}/api/v1/data/history`, { method: 'POST', body: payload });
+}
+
+// ─── Data Engine — Live ───────────────────────────────────────────────────────
+
+export async function liveSubscribe(payload) {
+  return request(`${DATA}/api/v1/data/live/subscribe`, { method: 'POST', body: payload });
+}
+
+export async function liveUnsubscribe(payload) {
+  return request(`${DATA}/api/v1/data/live/unsubscribe`, { method: 'POST', body: payload });
+}
+
+export async function liveDisconnect(userId, brokerName) {
+  return request(
+    `${DATA}/api/v1/data/live/disconnect?userId=${encodeURIComponent(userId)}&brokerName=${encodeURIComponent(brokerName)}`,
+    { method: 'DELETE' }
+  );
+}
+
+export async function liveStatus(userId, brokerName) {
+  return request(
+    `${DATA}/api/v1/data/live/status?userId=${encodeURIComponent(userId)}&brokerName=${encodeURIComponent(brokerName)}`
+  );
+}
+
+// ─── Data Engine — Replay ─────────────────────────────────────────────────────
+
+export async function startReplay(payload) {
+  return request(`${DATA}/api/v1/data/replay/start`, { method: 'POST', body: payload });
+}
+
+export async function stopReplay(sessionId) {
+  return request(`${DATA}/api/v1/data/replay/stop/${encodeURIComponent(sessionId)}`, { method: 'POST' });
+}
+
+export async function getReplayStatus(sessionId) {
+  return request(`${DATA}/api/v1/data/replay/status/${encodeURIComponent(sessionId)}`);
 }
 
 // ─── Portfolio ────────────────────────────────────────────────────────────────
