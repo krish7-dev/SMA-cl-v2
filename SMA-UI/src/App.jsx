@@ -5,6 +5,7 @@ import BrokerAccounts from './pages/BrokerAccounts';
 import Orders from './pages/Orders';
 import Portfolio from './pages/Portfolio';
 import DataEngine from './pages/DataEngine';
+import ExecutionEngine from './pages/ExecutionEngine';
 import Session from './pages/Session';
 import KiteCallback from './pages/KiteCallback';
 import './App.css';
@@ -28,6 +29,7 @@ export default function App() {
                   <Route path="/orders" element={<Orders />} />
                   <Route path="/portfolio" element={<Portfolio />} />
                   <Route path="/data-engine" element={<DataEngine />} />
+                  <Route path="/execution-engine" element={<ExecutionEngine />} />
                   <Route path="/session" element={<Session />} />
                 </Routes>
               </main>

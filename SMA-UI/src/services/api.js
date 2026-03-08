@@ -135,6 +135,31 @@ export async function getReplayStatus(sessionId) {
   return request(`${DATA}/api/v1/data/replay/status/${encodeURIComponent(sessionId)}`);
 }
 
+// ─── Execution Engine ─────────────────────────────────────────────────────────
+
+export async function submitExecution(payload) {
+  return request(`${EXECUTION}/api/v1/execution/orders`, { method: 'POST', body: payload });
+}
+
+export async function cancelExecution(intentId) {
+  return request(`${EXECUTION}/api/v1/execution/orders/${encodeURIComponent(intentId)}`, { method: 'DELETE' });
+}
+
+export async function getExecution(intentId) {
+  return request(`${EXECUTION}/api/v1/execution/orders/${encodeURIComponent(intentId)}`);
+}
+
+export async function listExecutions(userId, brokerName) {
+  const qs = brokerName
+    ? `?userId=${encodeURIComponent(userId)}&brokerName=${encodeURIComponent(brokerName)}`
+    : `?userId=${encodeURIComponent(userId)}`;
+  return request(`${EXECUTION}/api/v1/execution/orders${qs}`);
+}
+
+export async function syncExecutionStatus(intentId) {
+  return request(`${EXECUTION}/api/v1/execution/orders/${encodeURIComponent(intentId)}/sync`, { method: 'POST' });
+}
+
 // ─── Portfolio ────────────────────────────────────────────────────────────────
 
 export async function getPositions(userId, brokerName) {

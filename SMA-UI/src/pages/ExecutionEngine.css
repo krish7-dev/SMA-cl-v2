@@ -1,0 +1,29 @@
+.exec-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.exec-table-wrap {
+  overflow-x: auto;
+}
+
+.mono-sm {
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.error-cell {
+  font-size: 12px;
+  color: var(--danger, #e55);
+  max-width: 220px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.btn-sm {
+  padding: 5px 12px;
+  font-size: 12px;
+}
