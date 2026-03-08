@@ -160,6 +160,60 @@ export async function syncExecutionStatus(intentId) {
   return request(`${EXECUTION}/api/v1/execution/orders/${encodeURIComponent(intentId)}/sync`, { method: 'POST' });
 }
 
+// ─── Strategy Engine ──────────────────────────────────────────────────────────
+
+export async function createStrategyInstance(payload) {
+  return request(`${STRATEGY}/api/v1/strategy/instances`, { method: 'POST', body: payload });
+}
+
+export async function getStrategyInstance(instanceId) {
+  return request(`${STRATEGY}/api/v1/strategy/instances/${encodeURIComponent(instanceId)}`);
+}
+
+export async function listStrategyInstances(userId, status) {
+  const qs = status
+    ? `?userId=${encodeURIComponent(userId)}&status=${encodeURIComponent(status)}`
+    : `?userId=${encodeURIComponent(userId)}`;
+  return request(`${STRATEGY}/api/v1/strategy/instances${qs}`);
+}
+
+export async function updateStrategyInstance(instanceId, payload) {
+  return request(`${STRATEGY}/api/v1/strategy/instances/${encodeURIComponent(instanceId)}`, { method: 'PUT', body: payload });
+}
+
+export async function deleteStrategyInstance(instanceId) {
+  return request(`${STRATEGY}/api/v1/strategy/instances/${encodeURIComponent(instanceId)}`, { method: 'DELETE' });
+}
+
+export async function activateStrategyInstance(instanceId) {
+  return request(`${STRATEGY}/api/v1/strategy/instances/${encodeURIComponent(instanceId)}/activate`, { method: 'POST' });
+}
+
+export async function deactivateStrategyInstance(instanceId) {
+  return request(`${STRATEGY}/api/v1/strategy/instances/${encodeURIComponent(instanceId)}/deactivate`, { method: 'POST' });
+}
+
+export async function getStrategyTypes() {
+  return request(`${STRATEGY}/api/v1/strategy/types`);
+}
+
+export async function evaluateStrategy(payload) {
+  return request(`${STRATEGY}/api/v1/strategy/evaluate`, { method: 'POST', body: payload });
+}
+
+export async function getSignalsByInstance(instanceId, actionableOnly) {
+  const qs = actionableOnly
+    ? `?instanceId=${encodeURIComponent(instanceId)}&actionableOnly=true`
+    : `?instanceId=${encodeURIComponent(instanceId)}`;
+  return request(`${STRATEGY}/api/v1/strategy/signals${qs}`);
+}
+
+export async function getSignalsBySymbol(symbol, exchange) {
+  return request(
+    `${STRATEGY}/api/v1/strategy/signals?symbol=${encodeURIComponent(symbol)}&exchange=${encodeURIComponent(exchange)}`
+  );
+}
+
 // ─── Portfolio ────────────────────────────────────────────────────────────────
 
 export async function getPositions(userId, brokerName) {
