@@ -6,13 +6,14 @@ spring:
     name: sma-execution-engine
 
   datasource:
-    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:sma_execution}
-    username: ${DB_USER:postgres}
-    password: ${DB_PASSWORD:postgres}
+    url: jdbc:postgresql://ep-falling-unit-ai397war-pooler.c-4.us-east-1.aws.neon.tech/neondb?sslmode=require
+    username: neondb_owner
+    password: npg_wJPYnHeF75SU
     driver-class-name: org.postgresql.Driver
     hikari:
       maximum-pool-size: 10
       minimum-idle: 2
+      connection-timeout: 30000
 
   jpa:
     hibernate:
@@ -21,11 +22,18 @@ spring:
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
+        jdbc:
+          time_zone: UTC
 
   flyway:
     enabled: true
     locations: classpath:db/migration
+    # Fresh table name — previous attempts left flyway_schema_history_execution with a
+    # stale V1 baseline entry that caused V1 SQL to be skipped. This name is clean.
+    table: flyway_schema_history_exec
     baseline-on-migrate: true
+    baseline-version: 0
+    validate-on-migrate: false
 
 management:
   endpoints:
@@ -39,3 +47,13 @@ management:
 logging:
   level:
     com.sma.executionengine: INFO
+
+# ─── Execution Engine — Inter-service Configuration ─────────────────────────
+execution:
+  broker-engine:
+    base-url: ${BROKER_ENGINE_URL:http://localhost:9003}
+  risk:
+    # Default maximum notional value per order (0 = disabled)
+    max-notional-per-order: ${RISK_MAX_NOTIONAL:0}
+    # Default maximum quantity per order (0 = disabled)
+    max-quantity-per-order: ${RISK_MAX_QTY:0}

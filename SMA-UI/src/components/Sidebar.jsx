@@ -7,8 +7,9 @@ const NAV_ITEMS = [
   { to: '/accounts',    label: 'Broker Accounts',  icon: '⬡' },
   { to: '/orders',      label: 'Orders',           icon: '◫' },
   { to: '/portfolio',   label: 'Portfolio',        icon: '◱' },
-  { to: '/data-engine', label: 'Data Engine',      icon: '◉' },
-  { to: '/session',     label: 'Session',          icon: '◎' },
+  { to: '/data-engine',       label: 'Data Engine',      icon: '◉' },
+  { to: '/execution-engine', label: 'Execution Engine', icon: '◬' },
+  { to: '/session',          label: 'Session',          icon: '◎' },
 ];
 
 const SWAGGER_LINKS = [
