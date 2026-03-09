@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -40,6 +41,7 @@ public class InstrumentController {
     public ResponseEntity<?> search(
             @RequestParam(required = false, defaultValue = "") String q,
             @RequestParam(required = false, defaultValue = "NSE") String exchange,
+            @RequestParam(required = false, defaultValue = "") String type,
             @RequestParam String userId,
             @RequestParam(required = false, defaultValue = "kite") String brokerName) {
 
@@ -50,7 +52,7 @@ public class InstrumentController {
         }
 
         try {
-            List<InstrumentInfo> results = searchWithCache(creds.apiKey(), creds.accessToken(), exchange, q);
+            List<InstrumentInfo> results = searchWithCache(creds.apiKey(), creds.accessToken(), exchange, q, type);
             return ResponseEntity.ok(Map.of("data", results));
         } catch (Exception e) {
             log.error("Instrument search failed: {}", e.getMessage());
@@ -58,11 +60,35 @@ public class InstrumentController {
         }
     }
 
-    private List<InstrumentInfo> searchWithCache(String apiKey, String accessToken,
-                                                  String exchange, String query) {
-        String cacheKey = exchange.toUpperCase();
-        CacheEntry entry = cache.get(cacheKey);
+    /** Exchanges searched when exchange=ALL. NSE + NFO covers equities and F&O. */
+    private static final List<String> ALL_EXCHANGES = List.of("NSE", "NFO", "BSE", "BFO", "MCX", "CDS");
 
+    private List<InstrumentInfo> searchWithCache(String apiKey, String accessToken,
+                                                  String exchange, String query, String type) {
+        String cacheKey = exchange.toUpperCase().trim();
+
+        if (cacheKey.equals("ALL") || cacheKey.isEmpty()) {
+            // Search across all already-cached exchanges — no new fetches on ALL
+            String q = query == null ? "" : query.toLowerCase().trim();
+            String t = type  == null ? "" : type.toUpperCase().trim();
+            List<InstrumentInfo> merged = new ArrayList<>();
+            for (String ex : ALL_EXCHANGES) {
+                CacheEntry e = cache.get(ex);
+                if (e == null) continue;
+                e.instruments().stream()
+                        .filter(i -> t.isEmpty() || t.equals(i.getInstrumentType()))
+                        .filter(i -> q.isEmpty()
+                                || i.getTradingSymbol().toLowerCase().contains(q)
+                                || (i.getName() != null && i.getName().toLowerCase().contains(q)))
+                        .limit(25 - merged.size())
+                        .forEach(merged::add);
+                if (merged.size() >= 25) break;
+            }
+            return merged;
+        }
+
+        // Single-exchange path
+        CacheEntry entry = cache.get(cacheKey);
         boolean expired = entry == null ||
                 Instant.now().getEpochSecond() - entry.fetchedAt().getEpochSecond() > CACHE_TTL_SECONDS;
 
@@ -75,11 +101,12 @@ public class InstrumentController {
         }
 
         String q = query == null ? "" : query.toLowerCase().trim();
-        if (q.isEmpty()) {
-            return entry.instruments().stream().limit(25).toList();
-        }
+        String t = type  == null ? "" : type.toUpperCase().trim();
+
         return entry.instruments().stream()
-                .filter(i -> i.getTradingSymbol().toLowerCase().contains(q)
+                .filter(i -> t.isEmpty() || t.equals(i.getInstrumentType()))
+                .filter(i -> q.isEmpty()
+                        || i.getTradingSymbol().toLowerCase().contains(q)
                         || (i.getName() != null && i.getName().toLowerCase().contains(q)))
                 .limit(25)
                 .toList();

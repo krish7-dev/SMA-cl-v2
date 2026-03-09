@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -lh /g/SMA-claude-v2/SMA-Strategy-Engine/src/main/java/com/sma/strategyengine/strategy/*.java)"
+    ]
+  }
+}

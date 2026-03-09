@@ -98,8 +98,9 @@ export async function cancelOrder(payload) {
 
 // ─── Data Engine — Instruments ────────────────────────────────────────────────
 
-export async function searchInstruments(q, exchange, userId, brokerName) {
+export async function searchInstruments(q, exchange, userId, brokerName, type) {
   const params = new URLSearchParams({ q: q || '', exchange: exchange || 'NSE', userId, brokerName: brokerName || 'kite' });
+  if (type) params.set('type', type);
   return request(`${DATA}/api/v1/data/instruments/search?${params}`);
 }
 

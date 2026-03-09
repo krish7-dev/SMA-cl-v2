@@ -82,5 +82,6 @@ public class BacktestResult {
         double        pnlPct;
         BigDecimal    runningCapital;   // capital after this trade closes
         String        exitReason;       // SIGNAL | STOP_LOSS | TAKE_PROFIT | END_OF_BACKTEST
+        List<String>  entryPatterns;    // candlestick patterns detected on the entry candle (may be empty)
     }
 }

@@ -416,6 +416,11 @@
   font-family: monospace;
 }
 
+.bt-drop-type {
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
 /* ─── Risk management panel ─────────────────────────────────────────────── */
 
 .bt-risk-card {
@@ -481,4 +486,103 @@
 .bt-exit-end-of-backtest {
   background: rgba(100, 116, 139, 0.15);
   color: #94a3b8;
+}
+
+/* ─── Section status badges ────────────────────────────────────────────────── */
+
+.bt-status-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.bt-status-on {
+  background: rgba(16, 185, 129, 0.15);
+  color: #10b981;
+}
+
+.bt-status-off {
+  background: rgba(100, 116, 139, 0.12);
+  color: #94a3b8;
+}
+
+/* ─── Pattern confirmation section ─────────────────────────────────────────── */
+
+.bt-pattern-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+  margin-top: 12px;
+}
+
+.bt-pattern-group {
+  flex: 1 1 180px;
+}
+
+.bt-pattern-group-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+
+.bt-pattern-group-hint {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-muted);
+  margin-left: 4px;
+}
+
+.bt-pattern-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  color: var(--text-primary);
+  cursor: pointer;
+  padding: 3px 0;
+}
+
+.bt-pattern-check input[type='checkbox'] {
+  cursor: pointer;
+  accent-color: var(--accent);
+  width: 14px;
+  height: 14px;
+}
+
+.bt-pattern-params {
+  flex: 0 0 180px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ─── Pattern badges in trades table ───────────────────────────────────────── */
+
+.bt-patterns-cell {
+  white-space: nowrap;
+}
+
+.bt-pattern-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(132, 204, 22, 0.15);
+  color: #84cc16;
+  margin-right: 3px;
+  margin-bottom: 2px;
+  white-space: nowrap;
+}
+
+.bt-pattern-none {
+  color: var(--text-muted);
+  font-size: 12px;
 }

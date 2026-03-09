@@ -79,6 +79,13 @@ public class BacktestRequest {
     @Valid
     private RiskConfig riskConfig;
 
+    /**
+     * Optional candle pattern confirmation filter.
+     * Null or enabled=false → all strategy signals fire without pattern check.
+     */
+    @Valid
+    private PatternConfig patternConfig;
+
     // ─── Nested types ─────────────────────────────────────────────────────────
 
     @Data
@@ -126,5 +133,40 @@ public class BacktestRequest {
         /** Candles to skip after a losing trade before re-entering. 0 = no cooldown. */
         @Min(value = 0)
         private int cooldownCandles = 0;
+    }
+
+    @Data
+    public static class PatternConfig {
+
+        /** Master switch — false (default) keeps pattern filtering disabled. */
+        private boolean enabled = false;
+
+        /**
+         * Wick-to-body ratio threshold for hammer / shooting-star detection.
+         * The wick must be at least this multiple of the body size.
+         */
+        @DecimalMin(value = "0")
+        private double minWickRatio = 2.0;
+
+        /**
+         * Maximum body / range ratio for hammer, shooting-star, and star-body detection.
+         * E.g. 0.35 means body must be ≤ 35 % of the candle's high–low range.
+         */
+        @DecimalMin(value = "0") @DecimalMax(value = "1")
+        private double maxBodyPct = 0.35;
+
+        /**
+         * BUY signal is only acted on when at least one of these patterns is also
+         * detected on the same candle.  Empty list = no pattern filter for entries.
+         * Valid names: HAMMER, BULLISH_ENGULFING, MORNING_STAR, DOJI_BULLISH
+         */
+        private List<String> buyConfirmPatterns = new java.util.ArrayList<>();
+
+        /**
+         * SELL signal is only acted on when at least one of these patterns is also
+         * detected on the same candle.  Empty list = no pattern filter for exits.
+         * Valid names: SHOOTING_STAR, BEARISH_ENGULFING, EVENING_STAR, DOJI_BEARISH
+         */
+        private List<String> sellConfirmPatterns = new java.util.ArrayList<>();
     }
 }

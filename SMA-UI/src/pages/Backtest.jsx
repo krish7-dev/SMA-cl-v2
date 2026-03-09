@@ -439,6 +439,143 @@ class LocalLiquiditySweepEvaluator {
   get candlesSeen()  { return this.window.length; }
 }
 
+// ─── Candle pattern definitions ─────────────────────────────────────────────────
+
+const BUY_PATTERNS = [
+  { id: 'HAMMER',           label: 'Hammer'              },
+  { id: 'BULLISH_ENGULFING',label: 'Bullish Engulfing'   },
+  { id: 'MORNING_STAR',     label: 'Morning Star'        },
+  { id: 'DOJI_BULLISH',     label: 'Doji (after bearish)'},
+];
+const SELL_PATTERNS = [
+  { id: 'SHOOTING_STAR',    label: 'Shooting Star'       },
+  { id: 'BEARISH_ENGULFING',label: 'Bearish Engulfing'   },
+  { id: 'EVENING_STAR',     label: 'Evening Star'        },
+  { id: 'DOJI_BEARISH',     label: 'Doji (after bullish)'},
+];
+
+const EMPTY_PATTERN = {
+  enabled: false, minWickRatio: '2', maxBodyPct: '0.35',
+  buyConfirmPatterns: [], sellConfirmPatterns: [],
+};
+
+const PATTERN_LABELS = {
+  HAMMER: 'Hammer', SHOOTING_STAR: 'Shooting Star',
+  BULLISH_ENGULFING: 'Bullish Engulf', BEARISH_ENGULFING: 'Bearish Engulf',
+  MORNING_STAR: 'Morning Star', EVENING_STAR: 'Evening Star',
+  DOJI: 'Doji', DOJI_BULLISH: 'Doji↑', DOJI_BEARISH: 'Doji↓',
+};
+
+class LocalCandlePatternEvaluator {
+  constructor(pattern, minWickRatio, maxBodyPct) {
+    this.pattern      = (pattern      || 'HAMMER').toUpperCase().trim();
+    this.minWickRatio = parseFloat(minWickRatio) || 2.0;
+    this.maxBodyPct   = parseFloat(maxBodyPct)   || 0.35;
+    this.window       = []; // [{open, high, low, close}]
+  }
+
+  // Replay passes (close, high, low, volume, open); Live passes only (ltp)
+  next(close, high, low, _volume, open) {
+    const c = parseFloat(close), h = parseFloat(high), l = parseFloat(low), o = parseFloat(open);
+    if (isNaN(c) || isNaN(h) || isNaN(l) || isNaN(o)) {
+      return 'HOLD'; // Live tab (LTP only) — candle patterns need OHLC
+    }
+    const win = this.window;
+    let signal = 'HOLD';
+    switch (this.pattern) {
+      case 'HAMMER':            signal = this._hammer(o, h, l, c);                           break;
+      case 'SHOOTING_STAR':     signal = this._shootingStar(o, h, l, c);                     break;
+      case 'BULLISH_ENGULFING': if (win.length >= 1) signal = this._bullishEngulfing(win[win.length-1], o, c); break;
+      case 'BEARISH_ENGULFING': if (win.length >= 1) signal = this._bearishEngulfing(win[win.length-1], o, c); break;
+      case 'DOJI_REVERSAL':     if (win.length >= 1) signal = this._dojiReversal(win[win.length-1], o, h, l, c); break;
+      case 'MORNING_STAR':      if (win.length >= 2) signal = this._morningStar(win[win.length-2], win[win.length-1], o, c); break;
+      case 'EVENING_STAR':      if (win.length >= 2) signal = this._eveningStar(win[win.length-2], win[win.length-1], o, c); break;
+    }
+    this.window.push({ open: o, high: h, low: l, close: c });
+    if (this.window.length > 3) this.window.shift();
+    return signal;
+  }
+
+  _hammer(open, high, low, close) {
+    const range = high - low;
+    if (range < 1e-9) return 'HOLD';
+    const body      = Math.abs(close - open);
+    const lowerWick = Math.min(open, close) - low;
+    const upperWick = high - Math.max(open, close);
+    if (body / range <= this.maxBodyPct &&
+        (body < 1e-9 ? lowerWick > 0 : lowerWick >= this.minWickRatio * body) &&
+        upperWick <= lowerWick * 0.5 + 1e-9) return 'BUY';
+    return 'HOLD';
+  }
+
+  _shootingStar(open, high, low, close) {
+    const range = high - low;
+    if (range < 1e-9) return 'HOLD';
+    const body      = Math.abs(close - open);
+    const upperWick = high - Math.max(open, close);
+    const lowerWick = Math.min(open, close) - low;
+    if (body / range <= this.maxBodyPct &&
+        (body < 1e-9 ? upperWick > 0 : upperWick >= this.minWickRatio * body) &&
+        lowerWick <= upperWick * 0.5 + 1e-9) return 'SELL';
+    return 'HOLD';
+  }
+
+  _bullishEngulfing(prev, open, close) {
+    const prevBearish = prev.close < prev.open;
+    const currBullish = close > open;
+    const engulfs     = open <= prev.close && close >= prev.open;
+    return (prevBearish && currBullish && engulfs) ? 'BUY' : 'HOLD';
+  }
+
+  _bearishEngulfing(prev, open, close) {
+    const prevBullish = prev.close > prev.open;
+    const currBearish = close < open;
+    const engulfs     = open >= prev.close && close <= prev.open;
+    return (prevBullish && currBearish && engulfs) ? 'SELL' : 'HOLD';
+  }
+
+  _dojiReversal(prev, open, high, low, close) {
+    const range = high - low;
+    if (range < 1e-9) return 'HOLD';
+    const body = Math.abs(close - open);
+    if (body / range > 0.05) return 'HOLD';
+    if (prev.close < prev.open) return 'BUY';
+    if (prev.close > prev.open) return 'SELL';
+    return 'HOLD';
+  }
+
+  _morningStar(c0, c1, open, close) {
+    if (!c0 || !c1) return 'HOLD';
+    const c0Bearish = c0.close < c0.open;
+    const c1Range   = c1.high - c1.low;
+    const c1Body    = Math.abs(c1.close - c1.open);
+    const c1Small   = c1Range < 1e-9 || c1Body / c1Range <= this.maxBodyPct;
+    const c2Bullish = close > open;
+    const midpoint  = (c0.open + c0.close) / 2;
+    return (c0Bearish && c1Small && c2Bullish && close > midpoint) ? 'BUY' : 'HOLD';
+  }
+
+  _eveningStar(c0, c1, open, close) {
+    if (!c0 || !c1) return 'HOLD';
+    const c0Bullish = c0.close > c0.open;
+    const c1Range   = c1.high - c1.low;
+    const c1Body    = Math.abs(c1.close - c1.open);
+    const c1Small   = c1Range < 1e-9 || c1Body / c1Range <= this.maxBodyPct;
+    const c2Bearish = close < open;
+    const midpoint  = (c0.open + c0.close) / 2;
+    return (c0Bullish && c1Small && c2Bearish && close < midpoint) ? 'SELL' : 'HOLD';
+  }
+
+  reset() { this.window = []; }
+  get warmupNeeded() {
+    const p = this.pattern;
+    if (p === 'MORNING_STAR' || p === 'EVENING_STAR')                             return 3;
+    if (p === 'BULLISH_ENGULFING' || p === 'BEARISH_ENGULFING' || p === 'DOJI_REVERSAL') return 2;
+    return 1;
+  }
+  get candlesSeen() { return this.window.length; }
+}
+
 function buildLocalEvaluator(strategyType, params = {}) {
   switch (strategyType) {
     case 'EMA_CROSSOVER':
@@ -507,7 +644,8 @@ function HistoricalBacktest() {
 
   const [strategies, setStrategies] = useState(defaultStrategies);
   const [dataCtx, setDataCtx]       = useState({ ...EMPTY_DATA_CTX });
-  const [riskConfig, setRiskConfig] = useState({ ...EMPTY_RISK });
+  const [riskConfig, setRiskConfig]       = useState({ ...EMPTY_RISK });
+  const [patternConfig, setPatternConfig] = useState({ ...EMPTY_PATTERN });
   const [loading, setLoading]       = useState(false);
   const [error, setError]           = useState('');
   const [result, setResult]         = useState(null);
@@ -530,6 +668,22 @@ function HistoricalBacktest() {
 
   function updateRisk(key, value) {
     setRiskConfig(p => ({ ...p, [key]: value }));
+  }
+
+  function updatePattern(key, value) {
+    setPatternConfig(p => ({ ...p, [key]: value }));
+  }
+
+  function togglePatternConfirm(listKey, patternId) {
+    setPatternConfig(p => {
+      const cur = p[listKey] || [];
+      return {
+        ...p,
+        [listKey]: cur.includes(patternId)
+          ? cur.filter(x => x !== patternId)
+          : [...cur, patternId],
+      };
+    });
   }
 
   function applyPreset(days) {
@@ -571,6 +725,13 @@ function HistoricalBacktest() {
           maxRiskPerTradePct: parseFloat(riskConfig.maxRiskPerTradePct) || null,
           dailyLossCapPct:    parseFloat(riskConfig.dailyLossCapPct)    || null,
           cooldownCandles:    parseInt(riskConfig.cooldownCandles, 10)  || 0,
+        } : null,
+        patternConfig: patternConfig.enabled ? {
+          enabled:             true,
+          minWickRatio:        parseFloat(patternConfig.minWickRatio) || 2,
+          maxBodyPct:          parseFloat(patternConfig.maxBodyPct)   || 0.35,
+          buyConfirmPatterns:  patternConfig.buyConfirmPatterns,
+          sellConfirmPatterns: patternConfig.sellConfirmPatterns,
         } : null,
       };
       const res = await runBacktest(payload);
@@ -691,6 +852,88 @@ function HistoricalBacktest() {
         )}
       </div>
 
+      {/* Pattern Confirmation */}
+      <div className="bt-section-label" style={{ marginTop: 28 }}>
+        <span className="bt-section-title">Candle Pattern Confirmation</span>
+        <span className="bt-section-sub">
+          {patternConfig.enabled
+            ? `ON — BUY needs: ${patternConfig.buyConfirmPatterns.length ? patternConfig.buyConfirmPatterns.map(p => PATTERN_LABELS[p] || p).join(', ') : 'any'} · SELL needs: ${patternConfig.sellConfirmPatterns.length ? patternConfig.sellConfirmPatterns.map(p => PATTERN_LABELS[p] || p).join(', ') : 'any'}`
+            : 'OFF — patterns detected and shown in trades, no signal filter'}
+        </span>
+      </div>
+      <div className="card bt-risk-card">
+        <div className="bt-risk-toggle-row">
+          <span className="bt-risk-label">
+            Pattern Confirmation
+            <span className={patternConfig.enabled ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+              {patternConfig.enabled ? 'enabled' : 'disabled'}
+            </span>
+          </span>
+          <button type="button"
+            className={patternConfig.enabled ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+            onClick={() => updatePattern('enabled', !patternConfig.enabled)}>
+            {patternConfig.enabled ? 'ON' : 'OFF'}
+          </button>
+          {!patternConfig.enabled && (
+            <span className="bt-risk-hint">Patterns are always detected and shown in trades. Enable to require a pattern before entering or exiting.</span>
+          )}
+        </div>
+        <div className="bt-pattern-groups">
+          <div className="bt-pattern-group">
+            <div className="bt-pattern-group-title">
+              BUY confirmation
+              <span className="bt-pattern-group-hint">{patternConfig.enabled ? '— at least one required to enter' : '— informational'}</span>
+            </div>
+            {BUY_PATTERNS.map(p => {
+              const on = patternConfig.buyConfirmPatterns.includes(p.id);
+              return (
+                <label key={p.id} className="bt-pattern-check">
+                  <input type="checkbox" checked={on}
+                    onChange={() => togglePatternConfirm('buyConfirmPatterns', p.id)} />
+                  {p.label}
+                  <span className={on ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+                    {on ? 'enabled' : 'disabled'}
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+          <div className="bt-pattern-group">
+            <div className="bt-pattern-group-title">
+              SELL confirmation
+              <span className="bt-pattern-group-hint">{patternConfig.enabled ? '— at least one required to exit' : '— informational'}</span>
+            </div>
+            {SELL_PATTERNS.map(p => {
+              const on = patternConfig.sellConfirmPatterns.includes(p.id);
+              return (
+                <label key={p.id} className="bt-pattern-check">
+                  <input type="checkbox" checked={on}
+                    onChange={() => togglePatternConfirm('sellConfirmPatterns', p.id)} />
+                  {p.label}
+                  <span className={on ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+                    {on ? 'enabled' : 'disabled'}
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+          {patternConfig.enabled && (
+            <div className="bt-pattern-group bt-pattern-params">
+              <div className="form-group">
+                <label>Min Wick Ratio <span className="form-hint">wick ÷ body</span></label>
+                <input type="number" min="0.5" step="0.1" value={patternConfig.minWickRatio}
+                  onChange={e => updatePattern('minWickRatio', e.target.value)} />
+              </div>
+              <div className="form-group">
+                <label>Max Body % <span className="form-hint">body ÷ range</span></label>
+                <input type="number" min="0.01" max="1" step="0.01" value={patternConfig.maxBodyPct}
+                  onChange={e => updatePattern('maxBodyPct', e.target.value)} />
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
       {/* Data Context */}
       <div className="bt-section-label" style={{ marginTop: 28 }}>
         <span className="bt-section-title">Instrument & Date Range</span>
@@ -766,7 +1009,7 @@ function HistoricalBacktest() {
         <button type="submit" className="btn-primary" disabled={loading || !isActive || enabledCount === 0}>
           {loading ? `Running ${enabledCount} strateg${enabledCount !== 1 ? 'ies' : 'y'}…` : `Run Backtest — ${enabledCount} strateg${enabledCount !== 1 ? 'ies' : 'y'}`}
         </button>
-        <button type="button" className="btn-secondary" onClick={() => { setStrategies(defaultStrategies()); setDataCtx({ ...EMPTY_DATA_CTX }); setRiskConfig({ ...EMPTY_RISK }); setResult(null); setError(''); }} disabled={loading}>
+        <button type="button" className="btn-secondary" onClick={() => { setStrategies(defaultStrategies()); setDataCtx({ ...EMPTY_DATA_CTX }); setRiskConfig({ ...EMPTY_RISK }); setPatternConfig({ ...EMPTY_PATTERN }); setResult(null); setError(''); }} disabled={loading}>
           Reset
         </button>
       </div>
@@ -779,8 +1022,18 @@ function HistoricalBacktest() {
 // ─── Instrument Picker ────────────────────────────────────────────────────────
 // Shared component used in all 3 tabs: search box + recent instruments list
 
+const FO_EXCHANGES = ['NFO', 'BFO', 'MCX', 'CDS'];
+const INSTRUMENT_TYPES = [
+  { value: '',    label: 'All Types' },
+  { value: 'EQ',  label: 'Equity (EQ)' },
+  { value: 'FUT', label: 'Futures (FUT)' },
+  { value: 'CE',  label: 'Call Option (CE)' },
+  { value: 'PE',  label: 'Put Option (PE)' },
+];
+
 function InstrumentPicker({ session, symbol, exchange, instrumentToken, onSelect, onChange, disabled }) {
   const [query, setQuery]       = useState('');
+  const [instType, setInstType] = useState('');
   const [results, setResults]   = useState([]);
   const [searching, setSearching] = useState(false);
   const [showDrop, setShowDrop] = useState(false);
@@ -795,9 +1048,16 @@ function InstrumentPicker({ session, symbol, exchange, instrumentToken, onSelect
     return () => document.removeEventListener('mousedown', onClickOut);
   }, []);
 
-  function handleQueryChange(e) {
-    const q = e.target.value;
-    setQuery(q);
+  // Auto-detect F&O exchange from query pattern
+  function resolveSearchExchange(q) {
+    const u = q.toUpperCase();
+    if (/CE$|PE$/.test(u) || /\dFUT/.test(u) || /NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY/.test(u)) {
+      return 'NFO';
+    }
+    return exchange;
+  }
+
+  function doSearch(q, type) {
     if (!q.trim()) { setResults([]); setShowDrop(false); return; }
     setShowDrop(true);
     clearTimeout(debounceRef.current);
@@ -805,11 +1065,24 @@ function InstrumentPicker({ session, symbol, exchange, instrumentToken, onSelect
       if (!session?.userId) return;
       setSearching(true);
       try {
-        const res = await searchInstruments(q, exchange, session.userId, session.brokerName || 'kite');
+        const searchEx = resolveSearchExchange(q);
+        const res = await searchInstruments(q, searchEx, session.userId, session.brokerName || 'kite', type || undefined);
         setResults(res?.data || []);
       } catch { setResults([]); }
       finally { setSearching(false); }
     }, 300);
+  }
+
+  function handleQueryChange(e) {
+    const q = e.target.value;
+    setQuery(q);
+    doSearch(q, instType);
+  }
+
+  function handleTypeChange(e) {
+    const t = e.target.value;
+    setInstType(t);
+    if (query.trim()) doSearch(query, t);
   }
 
   function pickResult(inst) {
@@ -842,18 +1115,34 @@ function InstrumentPicker({ session, symbol, exchange, instrumentToken, onSelect
         </div>
       )}
 
-      {/* Search box */}
+      {/* Search box + type filter */}
       <div ref={wrapRef} style={{ position: 'relative', marginBottom: 10 }}>
         <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 4 }}>
           Search Instrument
         </label>
-        <input
-          value={query}
-          onChange={handleQueryChange}
-          onFocus={() => query.trim() && setShowDrop(true)}
-          placeholder={session?.userId ? 'Type symbol or company name (e.g. RELIANCE)' : 'Activate a session to search instruments'}
-          disabled={disabled || !session?.userId}
-        />
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input
+            style={{ flex: 1 }}
+            value={query}
+            onChange={handleQueryChange}
+            onFocus={() => query.trim() && setShowDrop(true)}
+            placeholder={session?.userId ? 'Type symbol or name  (e.g. RELIANCE, NIFTY24DEC24450CE)' : 'Activate a session to search instruments'}
+            disabled={disabled || !session?.userId}
+          />
+          <select
+            style={{ width: 160, flexShrink: 0 }}
+            value={instType}
+            onChange={handleTypeChange}
+            disabled={disabled || !session?.userId}
+          >
+            {INSTRUMENT_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+          </select>
+        </div>
+        {query.trim() && resolveSearchExchange(query) !== exchange && (
+          <div style={{ fontSize: 11, color: '#f59e0b', marginTop: 4 }}>
+            Searching on <strong>{resolveSearchExchange(query)}</strong> (auto-detected from symbol)
+          </div>
+        )}
         {showDrop && (
           <div className="bt-instrument-drop">
             {searching && <div className="bt-drop-hint">Searching…</div>}
@@ -862,7 +1151,12 @@ function InstrumentPicker({ session, symbol, exchange, instrumentToken, onSelect
               <button key={i} type="button" className="bt-drop-item" onClick={() => pickResult(r)}>
                 <span className="bt-drop-symbol">{r.tradingSymbol}</span>
                 <span className="bt-drop-name">{r.name}</span>
-                <span className="bt-drop-meta">{r.exchange} · {r.instrumentType} · {r.instrumentToken}</span>
+                <span className="bt-drop-meta">
+                  {r.exchange} · <span className="bt-drop-type">{r.instrumentType}</span>
+                  {r.expiry ? ` · exp ${r.expiry}` : ''}
+                  {r.strike > 0 ? ` · ₹${r.strike}` : ''}
+                  {` · lot ${r.lotSize}`}
+                </span>
               </button>
             ))}
           </div>
@@ -878,7 +1172,7 @@ function InstrumentPicker({ session, symbol, exchange, instrumentToken, onSelect
         <div className="form-group">
           <label>Exchange *</label>
           <select value={exchange} onChange={e => onChange({ exchange: e.target.value })} disabled={disabled}>
-            {['NSE','BSE','NFO','MCX','CDS'].map(x => <option key={x} value={x}>{x}</option>)}
+            {['NSE','BSE','NFO','BFO','MCX','CDS'].map(x => <option key={x} value={x}>{x}</option>)}
           </select>
         </div>
         <div className="form-group">
@@ -970,7 +1264,7 @@ function ReplayTest() {
       sse.addEventListener('candle', (ev) => {
         try {
           const candle = JSON.parse(ev.data);
-          const signal = evaluatorRef.current.next(parseFloat(candle.close), parseFloat(candle.high), parseFloat(candle.low), parseFloat(candle.volume));
+          const signal = evaluatorRef.current.next(parseFloat(candle.close), parseFloat(candle.high), parseFloat(candle.low), parseFloat(candle.volume), parseFloat(candle.open));
           const entry = { ...candle, signal, ts: new Date().toLocaleTimeString() };
           setCurrentCandle(entry);
           feedRef.current = [entry, ...feedRef.current].slice(0, 500);
@@ -1576,7 +1870,7 @@ function BacktestResultPanel({ result }) {
                 <tr>
                   <th>#</th><th>Entry Time</th><th>Exit Time</th>
                   <th>Entry Price</th><th>Exit Price</th><th>Qty</th>
-                  <th>PnL</th><th>Return %</th><th>Exit</th><th>Capital After</th>
+                  <th>PnL</th><th>Return %</th><th>Exit</th><th>Patterns</th><th>Capital After</th>
                 </tr>
               </thead>
               <tbody>
@@ -1591,6 +1885,13 @@ function BacktestResultPanel({ result }) {
                     <td className={t.pnl >= 0 ? 'text-success' : 'text-danger'} style={{ fontWeight: 600 }}>{fmtRs(t.pnl)}</td>
                     <td className={t.pnlPct >= 0 ? 'text-success' : 'text-danger'}>{fmt(t.pnlPct)}%</td>
                     <td><span className={`bt-exit-badge bt-exit-${(t.exitReason || 'SIGNAL').toLowerCase().replace('_', '-')}`}>{t.exitReason || 'SIGNAL'}</span></td>
+                    <td className="bt-patterns-cell">
+                      {t.entryPatterns && t.entryPatterns.length > 0
+                        ? t.entryPatterns.map(p => (
+                            <span key={p} className="bt-pattern-badge">{PATTERN_LABELS[p] || p}</span>
+                          ))
+                        : <span className="bt-pattern-none">—</span>}
+                    </td>
                     <td>{fmtRs(t.runningCapital)}</td>
                   </tr>
                 ))}
