@@ -3,8 +3,9 @@ import {
   getStrategyTypes, runBacktest,
   startReplay, stopReplay, getReplayStatus,
   liveSubscribe, liveDisconnect, liveStatus,
-  searchInstruments,
+  searchInstruments, fetchHistoricalData,
 } from '../services/api';
+import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { useSession } from '../context/SessionContext';
 import './StrategyEngine.css';
 import './Backtest.css';
@@ -1014,7 +1015,7 @@ function HistoricalBacktest() {
         </button>
       </div>
 
-      {result && <BacktestResultPanel result={result} />}
+      {result && <BacktestResultPanel result={result} session={session} instrumentToken={dataCtx.instrumentToken} />}
     </form>
   );
 }
@@ -1745,9 +1746,307 @@ function signalBadge(signal) {
 
 // ─── Backtest Result Panel ────────────────────────────────────────────────────
 
-function BacktestResultPanel({ result }) {
-  const [selectedIdx, setSelectedIdx] = useState(0);
+// Convert "YYYY-MM-DDTHH:mm:ss" (IST LocalDateTime) → Unix seconds for lightweight-charts
+function toUtcSec(localDT) {
+  if (!localDT) return 0;
+  // Treat as IST (UTC+5:30)
+  return Math.floor(new Date(localDT + '+05:30').getTime() / 1000);
+}
+
+// ─── Equity Curve (portfolio overview) ───────────────────────────────────────
+
+function EquityCurve({ trades, selectedTradeIdx, onSelectTrade }) {
+  const W = 720, H = 180, PAD = { top: 14, right: 16, bottom: 28, left: 72 };
+  const iW = W - PAD.left - PAD.right;
+  const iH = H - PAD.top  - PAD.bottom;
+
+  if (!trades || trades.length === 0) return null;
+
+  const initCap = trades[0].runningCapital - trades[0].pnl;
+  const points = [{ cap: initCap, trade: null },
+    ...trades.map((t, i) => ({ cap: t.runningCapital, trade: t, idx: i }))];
+
+  const caps = points.map(p => p.cap);
+  const minC = Math.min(...caps), maxC = Math.max(...caps);
+  const range = maxC - minC || 1;
+
+  const xOf = i => PAD.left + (i / (points.length - 1)) * iW;
+  const yOf = c => PAD.top  + iH - ((c - minC) / range) * iH;
+
+  const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${xOf(i).toFixed(1)},${yOf(p.cap).toFixed(1)}`).join(' ');
+  const fillPath = `${path} L${xOf(points.length - 1).toFixed(1)},${(PAD.top + iH).toFixed(1)} L${PAD.left.toFixed(1)},${(PAD.top + iH).toFixed(1)} Z`;
+
+  const yTicks = 3;
+  const fmtCap = v => '₹' + (v >= 1e5 ? (v / 1e5).toFixed(1) + 'L' : v.toFixed(0));
+
+  return (
+    <div className="bt-equity-wrap">
+      <svg width="100%" viewBox={`0 0 ${W} ${H}`} className="bt-equity-svg">
+        <defs>
+          <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.18" />
+            <stop offset="100%" stopColor="var(--accent)" stopOpacity="0.01" />
+          </linearGradient>
+        </defs>
+        <path d={fillPath} fill="url(#eqGrad)" />
+        <line x1={PAD.left} y1={yOf(initCap).toFixed(1)} x2={PAD.left + iW} y2={yOf(initCap).toFixed(1)}
+          stroke="#444" strokeWidth="1" strokeDasharray="4 3" />
+        {Array.from({ length: yTicks + 1 }, (_, k) => {
+          const val = minC + (range * k / yTicks);
+          const y = yOf(val);
+          return (
+            <g key={k}>
+              <line x1={PAD.left - 4} y1={y} x2={PAD.left} y2={y} stroke="#555" strokeWidth="1" />
+              <text x={PAD.left - 6} y={y + 4} textAnchor="end" fontSize="10" fill="#888">{fmtCap(val)}</text>
+            </g>
+          );
+        })}
+        <path d={path} fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinejoin="round" />
+        {/* Selected highlight */}
+        {selectedTradeIdx != null && (() => {
+          const pi = selectedTradeIdx + 1;
+          const x = xOf(pi);
+          const t = trades[selectedTradeIdx];
+          return (
+            <g>
+              <line x1={x} y1={PAD.top} x2={x} y2={PAD.top + iH}
+                stroke="#fff" strokeWidth="1" strokeDasharray="3 3" strokeOpacity="0.4" />
+              <circle cx={x} cy={yOf(t.runningCapital)} r={7}
+                fill={t.pnl >= 0 ? 'var(--success)' : 'var(--danger)'} stroke="#fff" strokeWidth="2" />
+            </g>
+          );
+        })()}
+        {/* Trade dots */}
+        {points.slice(1).map((p, i) => {
+          const sel = selectedTradeIdx === i;
+          return (
+            <circle key={i} cx={xOf(i + 1)} cy={yOf(p.cap)} r={sel ? 0 : 3.5}
+              fill={p.trade.pnl >= 0 ? 'var(--success)' : 'var(--danger)'}
+              stroke="#1a1a2e" strokeWidth="1" style={{ cursor: 'pointer' }}
+              onClick={() => onSelectTrade(i)} />
+          );
+        })}
+        <text x={PAD.left + iW / 2} y={H - 4} textAnchor="middle" fontSize="10" fill="#555">← click a dot to view trade chart →</text>
+      </svg>
+    </div>
+  );
+}
+
+// ─── OHLC Candlestick Chart (TradingView lightweight-charts) ─────────────────
+
+function TradeChart({ candles, trades, selectedTradeIdx }) {
+  const containerRef  = useRef(null);
+  const chartRef      = useRef(null);
+  const seriesRef     = useRef(null);
+  const markersRef    = useRef(null);
+  const priceLineSeriesRef = useRef([]);
+
+  // Build markers array from all trades
+  function buildMarkers(trds, selIdx) {
+    const markers = [];
+    trds.forEach((t, i) => {
+      const sel  = i === selIdx;
+      const win  = t.pnl >= 0;
+      // Win trade: green markers — Loss trade: red markers
+      const baseColor = win ? '#22c55e' : '#ef4444';
+      const selColor  = win ? '#86efac' : '#fca5a5';
+      const color = sel ? selColor : baseColor;
+      const label = win ? (sel ? `W #${i + 1}` : 'W') : (sel ? `L #${i + 1}` : 'L');
+      if (t.entryTime) {
+        markers.push({
+          time:     toUtcSec(t.entryTime),
+          position: 'belowBar',
+          color,
+          shape:    'arrowUp',
+          text:     label,
+          size:     sel ? 2 : 1,
+        });
+      }
+      if (t.exitTime) {
+        markers.push({
+          time:     toUtcSec(t.exitTime),
+          position: 'aboveBar',
+          color,
+          shape:    'arrowDown',
+          text:     label,
+          size:     sel ? 2 : 1,
+        });
+      }
+    });
+    return markers.sort((a, b) => a.time - b.time);
+  }
+
+  // Create chart on mount
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const chart = createChart(containerRef.current, {
+      height: 480,
+      layout: {
+        background: { color: '#0d0d1a' },
+        textColor:  '#9ca3af',
+      },
+      grid: {
+        vertLines: { color: '#1a1a2e' },
+        horzLines: { color: '#1a1a2e' },
+      },
+      crosshair: { mode: CrosshairMode.Normal },
+      rightPriceScale: { borderColor: '#2d2d4e' },
+      timeScale: {
+        borderColor:    '#2d2d4e',
+        timeVisible:    true,
+        secondsVisible: false,
+      },
+    });
+
+    const series = chart.addSeries(CandlestickSeries, {
+      upColor:        '#22c55e',
+      downColor:      '#ef4444',
+      borderUpColor:  '#22c55e',
+      borderDownColor:'#ef4444',
+      wickUpColor:    '#22c55e',
+      wickDownColor:  '#ef4444',
+    });
+
+    chartRef.current  = chart;
+    seriesRef.current = series;
+
+    const onResize = () => {
+      if (containerRef.current)
+        chart.applyOptions({ width: containerRef.current.clientWidth });
+    };
+    window.addEventListener('resize', onResize);
+    return () => { window.removeEventListener('resize', onResize); chart.remove(); };
+  }, []);
+
+  // Load candle data
+  useEffect(() => {
+    if (!seriesRef.current || !candles?.length) return;
+    const data = candles
+      .map(c => ({
+        time:  toUtcSec(c.openTime),
+        open:  parseFloat(c.open),
+        high:  parseFloat(c.high),
+        low:   parseFloat(c.low),
+        close: parseFloat(c.close),
+      }))
+      .sort((a, b) => a.time - b.time);
+    seriesRef.current.setData(data);
+    chartRef.current?.timeScale().fitContent();
+  }, [candles]);
+
+  // Update markers + price lines + scroll when trades or selection changes
+  useEffect(() => {
+    if (!seriesRef.current || !trades?.length) return;
+
+    // Remove old markers
+    if (markersRef.current) {
+      markersRef.current.setMarkers([]);
+      markersRef.current = null;
+    }
+
+    // Remove old price line series
+    priceLineSeriesRef.current.forEach(s => chartRef.current?.removeSeries(s));
+    priceLineSeriesRef.current = [];
+
+    const markers = buildMarkers(trades, selectedTradeIdx);
+    markersRef.current = createSeriesMarkers(seriesRef.current, markers);
+
+    // Add short horizontal price line segments for selected trade
+    if (selectedTradeIdx != null) {
+      const t   = trades[selectedTradeIdx];
+      const win = t.pnl >= 0;
+      const color = win ? '#22c55e' : '#ef4444';
+
+      const ivSec = candles?.length >= 2
+        ? toUtcSec(candles[1].openTime) - toUtcSec(candles[0].openTime)
+        : 300;
+      const halfSpan = ivSec * 6; // line spans ±6 candles around the point
+
+      function addShortLine(price, time, style, label) {
+        if (price == null || time == null) return;
+        const t0 = time - halfSpan;
+        const t1 = time + halfSpan;
+        const s = chartRef.current.addSeries(LineSeries, {
+          color,
+          lineWidth:              1,
+          lineStyle:              style,
+          priceLineVisible:       false,
+          lastValueVisible:       false,
+          crosshairMarkerVisible: false,
+        });
+        s.setData([
+          { time: t0, value: parseFloat(price) },
+          { time: t1, value: parseFloat(price) },
+        ]);
+        // Attach a price label via a price line on the segment series
+        s.createPriceLine({
+          price:            parseFloat(price),
+          color,
+          lineWidth:        0,
+          lineStyle:        LineStyle.Solid,
+          axisLabelVisible: true,
+          title:            label,
+        });
+        priceLineSeriesRef.current.push(s);
+      }
+
+      addShortLine(t.entryPrice, toUtcSec(t.entryTime), LineStyle.Dashed,
+        `Entry ₹${Number(t.entryPrice).toFixed(2)}`);
+      addShortLine(t.exitPrice,  toUtcSec(t.exitTime),  LineStyle.Dotted,
+        `Exit  ₹${Number(t.exitPrice).toFixed(2)}`);
+
+      // Scroll to trade window
+      if (t.entryTime) {
+        const from = toUtcSec(t.entryTime) - ivSec * 40;
+        const to   = toUtcSec(t.exitTime || t.entryTime) + ivSec * 20;
+        chartRef.current?.timeScale().setVisibleRange({ from, to });
+      }
+    }
+  }, [trades, selectedTradeIdx, candles]);
+
+  return <div ref={containerRef} className="bt-tradechart-container" />;
+}
+
+function BacktestResultPanel({ result, session, instrumentToken }) {
+  const [selectedIdx,      setSelectedIdx]      = useState(0);
+  const [selectedTradeIdx, setSelectedTradeIdx] = useState(null);
+  const [chartCandles,     setChartCandles]     = useState(null);
+  const [chartLoading,     setChartLoading]     = useState(false);
+  const [chartError,       setChartError]       = useState('');
   const selected = result.results[selectedIdx];
+
+  // Fetch the full candle dataset for the backtest period once
+  useEffect(() => {
+    if (!session?.userId || !instrumentToken) return;
+    let cancelled = false;
+    setChartCandles(null);
+    setChartError('');
+    setChartLoading(true);
+    fetchHistoricalData({
+      userId:          session.userId,
+      brokerName:      session.brokerName || 'kite',
+      instrumentToken: parseInt(instrumentToken, 10),
+      symbol:          result.symbol,
+      exchange:        result.exchange,
+      interval:        result.interval,
+      fromDate:        result.fromDate,
+      toDate:          result.toDate,
+      persist:         false,
+    })
+      .then(res => { if (!cancelled) setChartCandles(res?.data || []); })
+      .catch(e  => { if (!cancelled) setChartError(e.message); })
+      .finally(()=> { if (!cancelled) setChartLoading(false); });
+    return () => { cancelled = true; };
+  }, [result]);
+
+  function switchStrategy(i) {
+    setSelectedIdx(i);
+    setSelectedTradeIdx(null);
+  }
+
+  function selectTrade(i) {
+    setSelectedTradeIdx(prev => prev === i ? null : i);
+  }
 
   function fmt(v, digits = 2) {
     if (v == null) return '—';
@@ -1800,7 +2099,7 @@ function BacktestResultPanel({ result }) {
                 const isBest = r.label === result.bestStrategyLabel;
                 return (
                   <tr key={i} className={`bt-row ${i === selectedIdx ? 'bt-row-selected' : ''} ${isBest ? 'bt-row-best' : ''}`}
-                    onClick={() => setSelectedIdx(i)} style={{ cursor: 'pointer' }}>
+                    onClick={() => switchStrategy(i)} style={{ cursor: 'pointer' }}>
                     <td>{isBest && <span className="best-star">★</span>}</td>
                     <td style={{ fontWeight: 600 }}>{r.label}</td>
                     <td><span className="instance-type">{r.strategyType}</span></td>
@@ -1860,6 +2159,56 @@ function BacktestResultPanel({ result }) {
         </div>
       )}
 
+      {/* OHLC Chart */}
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div className="bt-chart-header">
+          <h3 className="section-title" style={{ margin: 0 }}>
+            Price Chart — {result.symbol} / {result.exchange}
+            <span className="instance-type" style={{ marginLeft: 8 }}>{result.interval}</span>
+          </h3>
+          {selectedTradeIdx != null && selected?.trades?.[selectedTradeIdx] && (() => {
+            const t = selected.trades[selectedTradeIdx];
+            const win = t.pnl >= 0;
+            return (
+              <div className="bt-chart-trade-badge">
+                <span>Trade #{selectedTradeIdx + 1}</span>
+                <span className={win ? 'text-success' : 'text-danger'} style={{ fontWeight: 700 }}>
+                  {win ? '+' : ''}₹{Number(t.pnl).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                </span>
+                <span>Entry ₹{Number(t.entryPrice).toFixed(2)} → Exit ₹{Number(t.exitPrice).toFixed(2)}</span>
+                <span className="bt-chart-hint">Scroll/pinch to zoom · drag to pan</span>
+                <button className="bt-chart-reset-btn" onClick={() => setSelectedTradeIdx(null)}>Show all</button>
+              </div>
+            );
+          })()}
+          {selectedTradeIdx == null && (
+            <span className="bt-chart-hint">Click a trade row below to zoom in</span>
+          )}
+        </div>
+
+        {chartLoading && <div className="field-hint" style={{ padding: '24px 0', textAlign: 'center' }}>Fetching candle data…</div>}
+        {chartError   && <div className="error-msg" style={{ margin: '12px 0' }}>{chartError}</div>}
+        {!chartLoading && !chartError && chartCandles && (
+          <TradeChart
+            candles={chartCandles}
+            trades={selected?.trades || []}
+            selectedTradeIdx={selectedTradeIdx}
+          />
+        )}
+
+        {/* Equity curve below chart */}
+        {selected?.trades?.length > 0 && (
+          <div style={{ marginTop: 12, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+            <div className="field-hint" style={{ marginBottom: 4 }}>Equity curve — click a dot to highlight trade on chart</div>
+            <EquityCurve
+              trades={selected.trades}
+              selectedTradeIdx={selectedTradeIdx}
+              onSelectTrade={selectTrade}
+            />
+          </div>
+        )}
+      </div>
+
       {/* Trade list */}
       {selected?.trades?.length > 0 && (
         <div className="card">
@@ -1875,7 +2224,10 @@ function BacktestResultPanel({ result }) {
               </thead>
               <tbody>
                 {selected.trades.map((t, i) => (
-                  <tr key={i} className={t.pnl >= 0 ? 'trade-win' : 'trade-loss'}>
+                  <tr key={i}
+                    className={`${t.pnl >= 0 ? 'trade-win' : 'trade-loss'} ${selectedTradeIdx === i ? 'bt-trade-row-selected' : ''}`}
+                    style={{ cursor: 'pointer' }}
+                    onClick={() => selectTrade(i)}>
                     <td className="mono-sm">{i + 1}</td>
                     <td className="mono-sm">{t.entryTime ? new Date(t.entryTime).toLocaleString() : '—'}</td>
                     <td className="mono-sm">{t.exitTime  ? new Date(t.exitTime).toLocaleString()  : '—'}</td>
