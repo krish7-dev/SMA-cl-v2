@@ -62,6 +62,10 @@ public class BacktestResult {
         BigDecimal worstTrade;
         double     sharpeRatio;       // simplified trade-level Sharpe
         int        warmupCandles;     // candles consumed before first signal possible
+        // Risk management exit counters (0 when risk is OFF)
+        int        stopLossExits;
+        int        takeProfitExits;
+        int        dailyCapHalts;     // entry attempts blocked by daily loss cap
     }
 
     // ─── Individual trade ─────────────────────────────────────────────────────
@@ -77,5 +81,6 @@ public class BacktestResult {
         BigDecimal    pnl;
         double        pnlPct;
         BigDecimal    runningCapital;   // capital after this trade closes
+        String        exitReason;       // SIGNAL | STOP_LOSS | TAKE_PROFIT | END_OF_BACKTEST
     }
 }

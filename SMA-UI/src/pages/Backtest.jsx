@@ -135,6 +135,15 @@ const EMPTY_DATA_CTX = {
 
 const EMPTY_INST = { symbol: '', exchange: 'NSE', instrumentToken: '' };
 
+const EMPTY_RISK = {
+  enabled: false,
+  stopLossPct: '2',
+  takeProfitPct: '4',
+  maxRiskPerTradePct: '1',
+  dailyLossCapPct: '5',
+  cooldownCandles: '3',
+};
+
 // ─── Local strategy evaluators (mirror Java strategy implementations) ───────────
 
 class LocalSmaEvaluator {
@@ -498,6 +507,7 @@ function HistoricalBacktest() {
 
   const [strategies, setStrategies] = useState(defaultStrategies);
   const [dataCtx, setDataCtx]       = useState({ ...EMPTY_DATA_CTX });
+  const [riskConfig, setRiskConfig] = useState({ ...EMPTY_RISK });
   const [loading, setLoading]       = useState(false);
   const [error, setError]           = useState('');
   const [result, setResult]         = useState(null);
@@ -516,6 +526,10 @@ function HistoricalBacktest() {
 
   function updateLabel(idx, value) {
     setStrategies(prev => prev.map((s, i) => i === idx ? { ...s, label: value } : s));
+  }
+
+  function updateRisk(key, value) {
+    setRiskConfig(p => ({ ...p, [key]: value }));
   }
 
   function applyPreset(days) {
@@ -550,6 +564,14 @@ function HistoricalBacktest() {
           label:        s.label || undefined,
           parameters:   s.parameters,
         })),
+        riskConfig: riskConfig.enabled ? {
+          enabled:            true,
+          stopLossPct:        parseFloat(riskConfig.stopLossPct)        || null,
+          takeProfitPct:      parseFloat(riskConfig.takeProfitPct)      || null,
+          maxRiskPerTradePct: parseFloat(riskConfig.maxRiskPerTradePct) || null,
+          dailyLossCapPct:    parseFloat(riskConfig.dailyLossCapPct)    || null,
+          cooldownCandles:    parseInt(riskConfig.cooldownCandles, 10)  || 0,
+        } : null,
       };
       const res = await runBacktest(payload);
       setResult(res?.data);
@@ -610,6 +632,63 @@ function HistoricalBacktest() {
             </div>
           );
         })}
+      </div>
+
+      {/* Risk Management */}
+      <div className="bt-section-label" style={{ marginTop: 28 }}>
+        <span className="bt-section-title">Risk Management</span>
+        <span className="bt-section-sub">
+          {riskConfig.enabled
+            ? `ON — SL ${riskConfig.stopLossPct}%, TP ${riskConfig.takeProfitPct}%, risk ${riskConfig.maxRiskPerTradePct}%/trade`
+            : 'OFF — signal-only mode, all trades taken'}
+        </span>
+      </div>
+      <div className="card bt-risk-card">
+        <div className="bt-risk-toggle-row">
+          <span className="bt-risk-label">Risk Management</span>
+          <button type="button"
+            className={riskConfig.enabled ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+            onClick={() => updateRisk('enabled', !riskConfig.enabled)}>
+            {riskConfig.enabled ? 'ON' : 'OFF'}
+          </button>
+          {!riskConfig.enabled && (
+            <span className="bt-risk-hint">Enable to apply stop-loss, take-profit, position sizing, and daily loss limits</span>
+          )}
+        </div>
+        {riskConfig.enabled && (
+          <div className="bt-risk-fields">
+            <div className="form-group">
+              <label>Stop-Loss % <span className="form-hint">(0 = off)</span></label>
+              <input type="number" min="0" max="100" step="0.1" value={riskConfig.stopLossPct}
+                onChange={e => updateRisk('stopLossPct', e.target.value)} />
+              <small className="bt-risk-hint">Exit when candle low drops this % below entry</small>
+            </div>
+            <div className="form-group">
+              <label>Take-Profit % <span className="form-hint">(0 = off)</span></label>
+              <input type="number" min="0" step="0.1" value={riskConfig.takeProfitPct}
+                onChange={e => updateRisk('takeProfitPct', e.target.value)} />
+              <small className="bt-risk-hint">Exit when candle high rises this % above entry</small>
+            </div>
+            <div className="form-group">
+              <label>Max Risk / Trade % <span className="form-hint">(0 = use qty)</span></label>
+              <input type="number" min="0" max="100" step="0.1" value={riskConfig.maxRiskPerTradePct}
+                onChange={e => updateRisk('maxRiskPerTradePct', e.target.value)} />
+              <small className="bt-risk-hint">% of capital to risk per trade — sizes position via SL</small>
+            </div>
+            <div className="form-group">
+              <label>Daily Loss Cap % <span className="form-hint">(0 = off)</span></label>
+              <input type="number" min="0" max="100" step="0.1" value={riskConfig.dailyLossCapPct}
+                onChange={e => updateRisk('dailyLossCapPct', e.target.value)} />
+              <small className="bt-risk-hint">Halt new entries when day's loss exceeds this % of capital</small>
+            </div>
+            <div className="form-group">
+              <label>Cooldown After Loss <span className="form-hint">(candles)</span></label>
+              <input type="number" min="0" step="1" value={riskConfig.cooldownCandles}
+                onChange={e => updateRisk('cooldownCandles', e.target.value)} />
+              <small className="bt-risk-hint">Skip this many candles after a losing trade</small>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Data Context */}
@@ -687,7 +766,7 @@ function HistoricalBacktest() {
         <button type="submit" className="btn-primary" disabled={loading || !isActive || enabledCount === 0}>
           {loading ? `Running ${enabledCount} strateg${enabledCount !== 1 ? 'ies' : 'y'}…` : `Run Backtest — ${enabledCount} strateg${enabledCount !== 1 ? 'ies' : 'y'}`}
         </button>
-        <button type="button" className="btn-secondary" onClick={() => { setStrategies(defaultStrategies()); setDataCtx({ ...EMPTY_DATA_CTX }); setResult(null); setError(''); }} disabled={loading}>
+        <button type="button" className="btn-secondary" onClick={() => { setStrategies(defaultStrategies()); setDataCtx({ ...EMPTY_DATA_CTX }); setRiskConfig({ ...EMPTY_RISK }); setResult(null); setError(''); }} disabled={loading}>
           Reset
         </button>
       </div>
@@ -1472,6 +1551,11 @@ function BacktestResultPanel({ result }) {
               ['Worst Trade',     fmtRs(selected.metrics.worstTrade)],
               ['Sharpe Ratio',    fmt(selected.metrics.sharpeRatio)],
               ['Warmup Candles',  selected.metrics.warmupCandles],
+              ...(selected.metrics.stopLossExits > 0 || selected.metrics.takeProfitExits > 0 ? [
+                ['SL Exits',       selected.metrics.stopLossExits],
+                ['TP Exits',       selected.metrics.takeProfitExits],
+                ['Daily Cap Halts',selected.metrics.dailyCapHalts],
+              ] : []),
             ].map(([label, val]) => (
               <div key={label} className="bt-metric-cell">
                 <span className="bt-metric-label">{label}</span>
@@ -1492,7 +1576,7 @@ function BacktestResultPanel({ result }) {
                 <tr>
                   <th>#</th><th>Entry Time</th><th>Exit Time</th>
                   <th>Entry Price</th><th>Exit Price</th><th>Qty</th>
-                  <th>PnL</th><th>Return %</th><th>Capital After</th>
+                  <th>PnL</th><th>Return %</th><th>Exit</th><th>Capital After</th>
                 </tr>
               </thead>
               <tbody>
@@ -1506,6 +1590,7 @@ function BacktestResultPanel({ result }) {
                     <td>{t.quantity}</td>
                     <td className={t.pnl >= 0 ? 'text-success' : 'text-danger'} style={{ fontWeight: 600 }}>{fmtRs(t.pnl)}</td>
                     <td className={t.pnlPct >= 0 ? 'text-success' : 'text-danger'}>{fmt(t.pnlPct)}%</td>
+                    <td><span className={`bt-exit-badge bt-exit-${(t.exitReason || 'SIGNAL').toLowerCase().replace('_', '-')}`}>{t.exitReason || 'SIGNAL'}</span></td>
                     <td>{fmtRs(t.runningCapital)}</td>
                   </tr>
                 ))}
