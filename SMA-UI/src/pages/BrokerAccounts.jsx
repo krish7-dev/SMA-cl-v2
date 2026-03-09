@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { listBrokerAccounts, loginBrokerAccount, logoutBrokerAccount, fetchBrokerCredentials } from '../services/api';
 import { useSession } from '../context/SessionContext';
 import './BrokerAccounts.css';
@@ -7,6 +7,10 @@ const EMPTY_FORM = {
   userId: '', clientId: '', brokerName: 'kite',
   apiKey: '', apiSecret: '', requestToken: '',
 };
+
+function isExpired(account) {
+  return account.tokenExpiry && new Date(account.tokenExpiry) < new Date();
+}
 
 export default function BrokerAccounts() {
   const { session, saveSession, clearSession, isActive } = useSession();
@@ -21,12 +25,14 @@ export default function BrokerAccounts() {
   const [accountsLoading, setAccountsLoading] = useState(true);
   const [accountsError, setAccountsError]     = useState('');
 
-  const [activating, setActivating] = useState(null); // accountId being activated
+  const [activating, setActivating] = useState(null);
 
   const [kiteApiKey, setKiteApiKey] = useState('');
   const kiteLoginUrl = kiteApiKey
     ? `https://kite.trade/connect/login?api_key=${kiteApiKey}&v=3`
     : '';
+
+  const step1Ref = useRef(null);
 
   const loadAccounts = useCallback(async () => {
     setAccountsLoading(true);
@@ -43,9 +49,57 @@ export default function BrokerAccounts() {
 
   useEffect(() => { loadAccounts(); }, [loadAccounts]);
 
+  // Pre-fill the Kite login URL field from the active session's stored API key
+  useEffect(() => {
+    if (session.apiKey) setKiteApiKey(session.apiKey);
+  }, [session.apiKey]);
+
   function handleChange(e) {
     setForm(prev => ({ ...prev, [e.target.name]: e.target.value }));
     setError(''); setSuccess('');
+  }
+
+  function openManualForm() {
+    // Pre-fill known fields from the active session so the user only needs to paste requestToken
+    setForm({
+      ...EMPTY_FORM,
+      userId:     session.userId     || '',
+      clientId:   session.clientId   || '',
+      brokerName: session.brokerName || 'kite',
+      apiKey:     session.apiKey     || '',
+    });
+    setShowForm(true);
+  }
+
+  async function handleRelogin(account) {
+    setError(''); setSuccess('');
+    try {
+      const res  = await fetchBrokerCredentials(account.userId, account.brokerName);
+      const data = res?.data;
+      const apiKey = data?.apiKey || '';
+
+      // Pre-fill Step 1 login URL and open Kite login directly
+      if (apiKey) {
+        setKiteApiKey(apiKey);
+        const loginUrl = `https://kite.trade/connect/login?api_key=${apiKey}&v=3`;
+        window.open(loginUrl, '_blank', 'noopener,noreferrer');
+      }
+
+      // Pre-fill Step 2 manual form so user just pastes the request token
+      setForm({
+        ...EMPTY_FORM,
+        userId:     account.userId,
+        clientId:   account.clientId || '',
+        brokerName: account.brokerName,
+        apiKey,
+      });
+      setShowForm(true);
+
+      // Scroll to Step 2 (manual form) so user can paste the request token
+      step1Ref.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (err) {
+      setError('Could not load stored credentials: ' + err.message);
+    }
   }
 
   async function handleLogin(e) {
@@ -107,9 +161,12 @@ export default function BrokerAccounts() {
     }
   }
 
-  function statusBadge(status) {
-    const map = { ACTIVE: 'badge-success', INACTIVE: 'badge-muted', TOKEN_EXPIRED: 'badge-warning', SUSPENDED: 'badge-danger' };
-    return <span className={`badge ${map[status] || 'badge-muted'}`}>{status}</span>;
+  function statusBadge(account) {
+    if (account.status === 'ACTIVE' && isExpired(account)) {
+      return <span className="badge badge-warning">TOKEN EXPIRED</span>;
+    }
+    const map = { ACTIVE: 'badge-success', INACTIVE: 'badge-muted', SUSPENDED: 'badge-danger' };
+    return <span className={`badge ${map[account.status] || 'badge-muted'}`}>{account.status}</span>;
   }
 
   return (
@@ -117,16 +174,11 @@ export default function BrokerAccounts() {
       <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div>
           <h1>Broker Accounts</h1>
-          <p>Authenticate once — activate a session to use across all pages without re-entering credentials.</p>
+          <p>Activate a session from your stored accounts — or add a new account below.</p>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn-secondary" onClick={loadAccounts} disabled={accountsLoading}>
-            {accountsLoading ? 'Loading…' : 'Refresh'}
-          </button>
-          <button className="btn-primary" onClick={() => { setShowForm(v => !v); setError(''); setSuccess(''); }}>
-            {showForm ? 'Cancel' : '+ Add Account'}
-          </button>
-        </div>
+        <button className="btn-secondary" onClick={loadAccounts} disabled={accountsLoading}>
+          {accountsLoading ? 'Loading…' : 'Refresh'}
+        </button>
       </div>
 
       {/* Active Session Banner */}
@@ -140,8 +192,77 @@ export default function BrokerAccounts() {
       {success && <div className="success-msg">{success}</div>}
       {error   && <div className="error-msg">{error}</div>}
 
+      {/* Accounts Table — top so daily re-login is one click */}
+      <div className="card">
+        <h3 className="section-title">Stored Accounts</h3>
+        <p className="section-hint">
+          Click <strong>Activate</strong> to use an account as the current session.
+          Click <strong>Re-login ↗</strong> on an expired token — it opens Kite login in a new tab and pre-fills the form below.
+        </p>
+
+        {accountsError && <div className="error-msg">{accountsError}</div>}
+
+        {accountsLoading ? (
+          <div className="empty-state"><p>Loading accounts…</p></div>
+        ) : accounts.length === 0 ? (
+          <div className="empty-state"><p>No accounts yet. Use the form below to authenticate.</p></div>
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>User ID</th>
+                <th>Client ID</th>
+                <th>Broker</th>
+                <th>Status</th>
+                <th>Token Expiry</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {accounts.map(a => {
+                const isCurrentSession = session.userId === a.userId && session.brokerName === a.brokerName;
+                return (
+                  <tr key={a.accountId} className={isCurrentSession ? 'active-session-row' : ''}>
+                    <td style={{ color: 'var(--text-primary)', fontWeight: 600 }}>
+                      {a.userId}
+                      {isCurrentSession && <span className="badge badge-success" style={{ marginLeft: 8 }}>Active</span>}
+                    </td>
+                    <td>{a.clientId}</td>
+                    <td><span className="badge badge-info">{a.brokerName}</span></td>
+                    <td>{statusBadge(a)}</td>
+                    <td style={{ fontFamily: 'monospace', fontSize: 12 }}>
+                      {a.tokenExpiry ? new Date(a.tokenExpiry).toLocaleString() : '—'}
+                    </td>
+                    <td>
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        {a.status === 'ACTIVE' && isExpired(a) ? (
+                          <button className="btn-warning btn-sm" onClick={() => handleRelogin(a)}>
+                            Re-login ↗
+                          </button>
+                        ) : a.status === 'ACTIVE' && (
+                          <button
+                            className="btn-primary btn-sm"
+                            disabled={activating === a.accountId}
+                            onClick={() => handleActivate(a)}
+                          >
+                            {activating === a.accountId ? '…' : isCurrentSession ? 'Re-activate' : 'Activate'}
+                          </button>
+                        )}
+                        <button className="btn-danger btn-sm" onClick={() => handleLogout(a)}>
+                          Logout
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
       {/* Step 1 — Kite Login URL */}
-      <div className="card kite-helper">
+      <div className="card kite-helper" style={{ marginTop: 24 }}>
         <div className="kite-helper-title">
           <span className="badge badge-warning">Step 1</span>
           <span>Generate Kite Request Token</span>
@@ -170,16 +291,17 @@ export default function BrokerAccounts() {
       </div>
 
       {/* Step 2 — Manual Login */}
-      <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card" ref={step1Ref} style={{ marginBottom: 16 }}>
         <div className="kite-helper-title">
           <span className="badge badge-info">Step 2</span>
-          <span>Complete Authentication (manual fallback)</span>
+          <span>Complete Authentication</span>
         </div>
         <p className="section-hint" style={{ marginBottom: 0 }}>
-          After Kite login you'll land on <code>/callback</code> automatically. Use this only if the redirect didn't work.
+          After Kite login you'll land on <code>/callback</code> automatically. Use this form if the redirect didn't work,
+          or to paste the <code>request_token</code> manually.
         </p>
         {!showForm && (
-          <button className="btn-secondary" style={{ marginTop: 12 }} onClick={() => setShowForm(true)}>
+          <button className="btn-secondary" style={{ marginTop: 12 }} onClick={openManualForm}>
             Enter credentials manually
           </button>
         )}
@@ -228,68 +350,6 @@ export default function BrokerAccounts() {
               </div>
             </form>
           </>
-        )}
-      </div>
-
-      {/* Accounts Table */}
-      <div className="card">
-        <h3 className="section-title">Stored Accounts</h3>
-        <p className="section-hint">Click <strong>Activate</strong> on an ACTIVE account to use it as the current session — no credential re-entry needed.</p>
-
-        {accountsError && <div className="error-msg">{accountsError}</div>}
-
-        {accountsLoading ? (
-          <div className="empty-state"><p>Loading accounts…</p></div>
-        ) : accounts.length === 0 ? (
-          <div className="empty-state"><p>No accounts found. Follow Steps 1 and 2 above to authenticate.</p></div>
-        ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>User ID</th>
-                <th>Client ID</th>
-                <th>Broker</th>
-                <th>Status</th>
-                <th>Token Expiry</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {accounts.map(a => {
-                const isCurrentSession = session.userId === a.userId && session.brokerName === a.brokerName;
-                return (
-                  <tr key={a.accountId} className={isCurrentSession ? 'active-session-row' : ''}>
-                    <td style={{ color: 'var(--text-primary)', fontWeight: 600 }}>
-                      {a.userId}
-                      {isCurrentSession && <span className="badge badge-success" style={{ marginLeft: 8 }}>Active</span>}
-                    </td>
-                    <td>{a.clientId}</td>
-                    <td><span className="badge badge-info">{a.brokerName}</span></td>
-                    <td>{statusBadge(a.status)}</td>
-                    <td style={{ fontFamily: 'monospace', fontSize: 12 }}>
-                      {a.tokenExpiry ? new Date(a.tokenExpiry).toLocaleString() : '—'}
-                    </td>
-                    <td>
-                      <div style={{ display: 'flex', gap: 6 }}>
-                        {a.status === 'ACTIVE' && (
-                          <button
-                            className="btn-primary btn-sm"
-                            disabled={activating === a.accountId}
-                            onClick={() => handleActivate(a)}
-                          >
-                            {activating === a.accountId ? '…' : isCurrentSession ? 'Re-activate' : 'Activate'}
-                          </button>
-                        )}
-                        <button className="btn-danger btn-sm" onClick={() => handleLogout(a)}>
-                          Logout
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
         )}
       </div>
     </div>

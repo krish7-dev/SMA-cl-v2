@@ -18,9 +18,10 @@ public class BrokerAuthResponse {
     private String message;
 
     /**
-     * Returned only on successful login — null in list/status responses.
+     * Returned only on successful login and credential-fetch — null in list/status responses.
      * Allows the UI to save a session without re-entering credentials.
      */
     private String apiKey;
+    private String apiSecret;
     private String accessToken;
 }

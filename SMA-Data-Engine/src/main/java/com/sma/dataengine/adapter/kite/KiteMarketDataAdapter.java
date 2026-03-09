@@ -3,9 +3,12 @@ package com.sma.dataengine.adapter.kite;
 import com.sma.dataengine.adapter.MarketDataAdapter;
 import com.sma.dataengine.adapter.MarketDataAdapterException;
 import com.sma.dataengine.model.CandleData;
+import com.sma.dataengine.model.InstrumentInfo;
+import com.sma.dataengine.model.Interval;
 import com.sma.dataengine.model.SubscriptionMode;
 import com.sma.dataengine.model.TickData;
 import com.sma.dataengine.model.request.HistoricalDataRequest;
+import com.zerodhatech.models.Instrument;
 import com.zerodhatech.kiteconnect.KiteConnect;
 import com.zerodhatech.kiteconnect.kitehttp.exceptions.KiteException;
 import com.zerodhatech.models.HistoricalData;
@@ -15,6 +18,7 @@ import com.zerodhatech.ticker.OnError;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.io.IOException;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -204,6 +208,23 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
         }
     }
 
+    /**
+     * Kite API maximum days per request per interval.
+     * Requests spanning more than this are automatically chunked.
+     */
+    private static int kiteMaxDays(Interval interval) {
+        return switch (interval) {
+            case MINUTE_1  -> 60;
+            case MINUTE_3  -> 60;
+            case MINUTE_5  -> 60;
+            case MINUTE_10 -> 60;
+            case MINUTE_15 -> 60;
+            case MINUTE_30 -> 60;
+            case MINUTE_60 -> 400;
+            case DAY, WEEK, MONTH -> 2000;
+        };
+    }
+
     @Override
     public List<CandleData> getHistoricalData(HistoricalDataRequest request) {
         // Build a fresh KiteConnect with caller-supplied credentials.
@@ -211,60 +232,70 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
         KiteConnect api = new KiteConnect(request.getApiKey());
         api.setAccessToken(request.getAccessToken());
 
-        // SDK signature: getHistoricalData(Date from, Date to, String token,
-        //                                  String interval, boolean continuous, boolean oi)
-        Date fromDate = toDate(request.getFromDate());
-        Date toDate   = toDate(request.getToDate());
+        Interval interval   = request.getInterval();
+        int      chunkDays  = kiteMaxDays(interval);
+        String   kiteInterval = interval.getKiteValue();
+        String   token        = String.valueOf(request.getInstrumentToken());
 
-        log.info("Fetching historical data: token={}, interval={}, from={}, to={}",
-                request.getInstrumentToken(), request.getInterval().getKiteValue(),
-                request.getFromDate(), request.getToDate());
+        // Split the full date range into chunks that fit within Kite's per-request limit
+        List<CandleData> allCandles = new ArrayList<>();
+        LocalDateTime chunkStart = request.getFromDate();
+        LocalDateTime rangeEnd   = request.getToDate();
+        int chunkIndex = 0;
 
-        try {
-            HistoricalData response = api.getHistoricalData(
-                    fromDate,
-                    toDate,
-                    String.valueOf(request.getInstrumentToken()),
-                    request.getInterval().getKiteValue(),
-                    request.isContinuous(),
-                    false  // oi flag — set true if open interest is needed
-            );
+        while (!chunkStart.isAfter(rangeEnd)) {
+            LocalDateTime chunkEnd = chunkStart.plusDays(chunkDays).minusSeconds(1);
+            if (chunkEnd.isAfter(rangeEnd)) chunkEnd = rangeEnd;
 
-            if (response == null || response.dataArrayList == null) {
-                log.warn("Kite returned null historical data for token={}", request.getInstrumentToken());
-                return List.of();
-            }
+            log.info("Fetching historical data chunk {}: token={}, interval={}, from={}, to={}",
+                    ++chunkIndex, token, kiteInterval, chunkStart, chunkEnd);
 
-            // Each element in dataArrayList IS a HistoricalData — no inner class in SDK 3.1.1
-            List<CandleData> candles = new ArrayList<>(response.dataArrayList.size());
-            for (HistoricalData bean : response.dataArrayList) {
-                CandleData c = normalizeCandle(bean, request);
-                if (c.getOpenTime() != null) {
-                    candles.add(c);
+            try {
+                HistoricalData response = api.getHistoricalData(
+                        toDate(chunkStart),
+                        toDate(chunkEnd),
+                        token,
+                        kiteInterval,
+                        request.isContinuous(),
+                        false  // oi flag — set true if open interest is needed
+                );
+
+                if (response != null && response.dataArrayList != null) {
+                    for (HistoricalData bean : response.dataArrayList) {
+                        CandleData c = normalizeCandle(bean, request);
+                        if (c.getOpenTime() != null) {
+                            allCandles.add(c);
+                        } else {
+                            log.debug("Skipping candle with unparseable timestamp: {}", bean.timeStamp);
+                        }
+                    }
+                    log.info("Chunk {} returned {} candles (running total: {})",
+                            chunkIndex, response.dataArrayList.size(), allCandles.size());
                 } else {
-                    log.debug("Skipping candle with unparseable timestamp: {}", bean.timeStamp);
+                    log.warn("Kite returned null for chunk {}: token={}, from={}, to={}",
+                            chunkIndex, token, chunkStart, chunkEnd);
                 }
-            }
 
-            log.info("Fetched {} candles for token={}", candles.size(), request.getInstrumentToken());
-            return candles;
-
-        } catch (KiteException e) {
-            // KiteException stores the error in the public `message` field — not via super(message).
-            // e.getMessage() returns null; use e.message to surface the actual Kite error text.
-            String kiteMsg = e.message != null ? e.message : ("code=" + e.code);
-            // Kite returns 400 "invalid token" when the access token is expired (tokens expire at midnight IST).
-            if (kiteMsg.toLowerCase().contains("invalid token")) {
+            } catch (KiteException e) {
+                String kiteMsg = e.message != null ? e.message : ("code=" + e.code);
+                if (kiteMsg.toLowerCase().contains("invalid token")) {
+                    throw new MarketDataAdapterException(
+                            "Kite access token is expired or invalid. " +
+                            "Please re-authenticate: go to the Session page and log in to your Kite account again.", e);
+                }
                 throw new MarketDataAdapterException(
-                        "Kite access token is expired or invalid. " +
-                        "Please re-authenticate: go to the Session page and log in to your Kite account again.", e);
+                        "Kite API error fetching historical data (chunk " + chunkIndex + "): [" + e.code + "] " + kiteMsg, e);
+            } catch (Exception e) {
+                throw new MarketDataAdapterException(
+                        "Unexpected error fetching historical data from Kite (chunk " + chunkIndex + "): " + e.getMessage(), e);
             }
-            throw new MarketDataAdapterException(
-                    "Kite API error fetching historical data: [" + e.code + "] " + kiteMsg, e);
-        } catch (Exception e) {
-            throw new MarketDataAdapterException(
-                    "Unexpected error fetching historical data from Kite: " + e.getMessage(), e);
+
+            chunkStart = chunkEnd.plusSeconds(1);
         }
+
+        log.info("Fetched {} total candles for token={} across {} chunk(s)",
+                allCandles.size(), token, chunkIndex);
+        return allCandles;
     }
 
     // ─── Normalization ────────────────────────────────────────────────────────
@@ -367,6 +398,38 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
 
     private static BigDecimal bd(double value) {
         return BigDecimal.valueOf(value);
+    }
+
+    /**
+     * Fetches ALL instruments for a given exchange from Kite REST API.
+     * Creates a one-off KiteConnect instance — does not affect the live WebSocket connection.
+     * Returns the full list (unfiltered, no limit) for caller-side caching and search.
+     */
+    public List<InstrumentInfo> fetchAllInstruments(String apiKey, String accessToken, String exchange) {
+        try {
+            KiteConnect kc = new KiteConnect(apiKey);
+            kc.setAccessToken(accessToken);
+            List<Instrument> all = (exchange != null && !exchange.isBlank())
+                    ? kc.getInstruments(exchange.toUpperCase())
+                    : kc.getInstruments();
+
+            return all.stream()
+                    .map(i -> InstrumentInfo.builder()
+                            .instrumentToken(i.instrument_token)
+                            .tradingSymbol(i.tradingsymbol)
+                            .name(i.name)
+                            .exchange(i.exchange)
+                            .instrumentType(i.instrument_type)
+                            .segment(i.segment)
+                            .lotSize(i.lot_size)
+                            .build())
+                    .toList();
+        } catch (KiteException e) {
+            String msg = e.message != null ? e.message : "code=" + e.code;
+            throw new MarketDataAdapterException("Kite instrument fetch failed: " + msg, e);
+        } catch (IOException e) {
+            throw new MarketDataAdapterException("Network error during instrument fetch", e);
+        }
     }
 
     private static String maskKey(String key) {

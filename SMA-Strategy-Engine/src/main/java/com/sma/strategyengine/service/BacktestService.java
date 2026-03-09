@@ -59,10 +59,23 @@ public class BacktestService {
         log.info("Backtest: {} candles for {}/{}, {} strategy configuration(s)",
                 candles.size(), req.getSymbol(), req.getExchange(), req.getStrategies().size());
 
-        // 2. Run each strategy config
+        // 2. Resolve quantity — 0 means "auto: max units from capital"
+        int resolvedQty = req.getQuantity();
+        if (resolvedQty <= 0) {
+            BigDecimal firstClose = candles.get(0).close();
+            if (firstClose != null && firstClose.compareTo(BigDecimal.ZERO) > 0) {
+                resolvedQty = req.getInitialCapital().divide(firstClose, 0, RoundingMode.FLOOR).intValue();
+            }
+            resolvedQty = Math.max(1, resolvedQty);
+            log.info("Backtest: auto quantity = {} (capital={} / firstClose={})",
+                    resolvedQty, req.getInitialCapital(), candles.get(0).close());
+        }
+
+        // 3. Run each strategy config
+        final int qty = resolvedQty;
         List<StrategyRunResult> results = new ArrayList<>();
         for (StrategyConfig cfg : req.getStrategies()) {
-            results.add(runOneStrategy(req, cfg, candles));
+            results.add(runOneStrategy(req, cfg, candles, qty));
         }
 
         // 3. Find best by totalPnl
@@ -78,6 +91,7 @@ public class BacktestService {
                 .fromDate(req.getFromDate())
                 .toDate(req.getToDate())
                 .totalCandles(candles.size())
+                .resolvedQuantity(qty)
                 .bestStrategyLabel(bestLabel)
                 .results(results)
                 .build();
@@ -85,7 +99,7 @@ public class BacktestService {
 
     // ─── Per-strategy simulation ───────────────────────────────────────────────
 
-    private StrategyRunResult runOneStrategy(BacktestRequest req, StrategyConfig cfg, List<CandleDto> candles) {
+    private StrategyRunResult runOneStrategy(BacktestRequest req, StrategyConfig cfg, List<CandleDto> candles, int resolvedQty) {
         String instanceId = "BT-" + UUID.randomUUID().toString().replace("-", "").substring(0, 12).toUpperCase();
         String label = resolveLabel(cfg);
         Map<String, String> params = cfg.getParameters() != null ? cfg.getParameters() : Map.of();
@@ -96,6 +110,7 @@ public class BacktestService {
         BigDecimal runningCapital = req.getInitialCapital();
         BigDecimal peak = runningCapital;
         double maxDrawdown = 0.0;
+        int quantity = resolvedQty;
 
         // Position state
         boolean      inPosition  = false;
@@ -112,7 +127,7 @@ public class BacktestService {
                         .symbol(req.getSymbol().toUpperCase())
                         .exchange(req.getExchange().toUpperCase())
                         .product(req.getProduct())
-                        .quantity(req.getQuantity())
+                        .quantity(quantity)
                         .orderType("MARKET")
                         .candleOpenTime(candle.openTime() != null ? candle.openTime().toInstant(ZoneOffset.UTC) : null)
                         .candleOpen(candle.open())
@@ -134,7 +149,7 @@ public class BacktestService {
                 } else if (inPosition && result.isSell()) {
                     // Exit long
                     BigDecimal exitPrice = candle.close();
-                    TradeEntry trade = buildTrade(entryCandle, candle, entryPrice, exitPrice, req.getQuantity(), runningCapital);
+                    TradeEntry trade = buildTrade(entryCandle, candle, entryPrice, exitPrice, quantity, runningCapital);
                     trades.add(trade);
                     runningCapital = trade.getRunningCapital();
 
@@ -154,7 +169,7 @@ public class BacktestService {
             // Force-close open position at last candle
             if (inPosition && !candles.isEmpty()) {
                 CandleDto last = candles.get(candles.size() - 1);
-                TradeEntry trade = buildTrade(entryCandle, last, entryPrice, last.close(), req.getQuantity(), runningCapital);
+                TradeEntry trade = buildTrade(entryCandle, last, entryPrice, last.close(), quantity, runningCapital);
                 trades.add(trade);
                 runningCapital = trade.getRunningCapital();
                 peak = peak.max(runningCapital);
@@ -317,7 +332,7 @@ public class BacktestService {
                 req.getInterval(),
                 req.getFromDate(),
                 effectiveTo,
-                true   // persist fetched candles in Data Engine cache
+                false  // backtest: skip DB persistence — fetch from Kite and return directly
         );
         log.info("Fetching historical candles: token={}, interval={}, from={}, to={}",
                 req.getInstrumentToken(), req.getInterval(), req.getFromDate(), effectiveTo);
