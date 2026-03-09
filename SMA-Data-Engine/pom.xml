@@ -84,6 +84,14 @@
             <optional>true</optional>
         </dependency>
 
+        <!-- DevTools — auto-restart on classpath changes (dev only, excluded from fat jar) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-devtools</artifactId>
+            <scope>runtime</scope>
+            <optional>true</optional>
+        </dependency>
+
         <!-- Test -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

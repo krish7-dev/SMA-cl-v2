@@ -328,3 +328,138 @@
   padding-top: 12px;
   border-top: 1px solid var(--border);
 }
+
+/* ─── Backtest tab ───────────────────────────────────────────────────────── */
+
+.bt-strategies-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.bt-strategy-config {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 10px;
+}
+
+.bt-config-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.bt-config-index {
+  font-weight: 700;
+  color: var(--accent);
+  font-size: 13px;
+}
+
+/* ─── Result banner ──────────────────────────────────────────────────────── */
+
+.bt-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+  padding: 14px 20px;
+}
+
+.bt-banner-symbol {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-right: 12px;
+}
+
+.bt-banner-detail {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.bt-best-badge {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+.bt-best-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.bt-best-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+/* ─── Comparison table ───────────────────────────────────────────────────── */
+
+.bt-compare-wrap {
+  overflow-x: auto;
+}
+
+.bt-row { transition: background 0.1s; }
+.bt-row:hover { background: var(--bg-hover); }
+.bt-row-selected { background: var(--bg-hover) !important; }
+.bt-row-best td:first-child { position: relative; }
+
+.best-star {
+  color: #f59e0b;
+  font-size: 14px;
+}
+
+.text-success { color: #22c55e; }
+.text-danger  { color: #ef4444; }
+
+/* ─── Metrics grid ───────────────────────────────────────────────────────── */
+
+.bt-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.bt-metric-cell {
+  background: var(--bg-primary);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.bt-metric-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.bt-metric-val {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+/* ─── Trade list ─────────────────────────────────────────────────────────── */
+
+.bt-trades-wrap {
+  overflow-x: auto;
+  max-height: 480px;
+  overflow-y: auto;
+}
+
+.trade-win { background: rgba(34, 197, 94, 0.04); }
+.trade-loss { background: rgba(239, 68, 68, 0.04); }

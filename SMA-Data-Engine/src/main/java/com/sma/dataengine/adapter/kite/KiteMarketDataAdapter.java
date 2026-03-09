@@ -127,7 +127,7 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
 
                 @Override
                 public void onError(KiteException e) {
-                    log.error("KiteTicker error (KiteException): [{}] {}", e.code, e.getMessage());
+                    log.error("KiteTicker error (KiteException): [{}] {}", e.code, e.message != null ? e.message : e.getMessage());
                 }
 
                 @Override
@@ -250,8 +250,17 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
             return candles;
 
         } catch (KiteException e) {
+            // KiteException stores the error in the public `message` field — not via super(message).
+            // e.getMessage() returns null; use e.message to surface the actual Kite error text.
+            String kiteMsg = e.message != null ? e.message : ("code=" + e.code);
+            // Kite returns 400 "invalid token" when the access token is expired (tokens expire at midnight IST).
+            if (kiteMsg.toLowerCase().contains("invalid token")) {
+                throw new MarketDataAdapterException(
+                        "Kite access token is expired or invalid. " +
+                        "Please re-authenticate: go to the Session page and log in to your Kite account again.", e);
+            }
             throw new MarketDataAdapterException(
-                    "Kite API error fetching historical data: [" + e.code + "] " + e.getMessage(), e);
+                    "Kite API error fetching historical data: [" + e.code + "] " + kiteMsg, e);
         } catch (Exception e) {
             throw new MarketDataAdapterException(
                     "Unexpected error fetching historical data from Kite: " + e.getMessage(), e);

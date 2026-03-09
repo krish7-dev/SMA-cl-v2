@@ -20,11 +20,17 @@ export default defineConfig({
         target: 'http://localhost:9005',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/data-api/, ''),
+        // No timeout for SSE long-lived connections
+        timeout: 0,
+        proxyTimeout: 0,
       },
       '/strategy': {
         target: 'http://localhost:9006',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/strategy/, ''),
+        // Backtest on sub-15min intervals can take several minutes to fetch + persist candles
+        timeout: 0,
+        proxyTimeout: 0,
       },
     },
   },

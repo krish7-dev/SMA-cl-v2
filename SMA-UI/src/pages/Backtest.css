@@ -1,0 +1,287 @@
+/* ─── Section headers ─────────────────────────────────────────────────────── */
+
+.bt-section-label {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.bt-section-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.bt-section-sub {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* ─── Variant cards grid ──────────────────────────────────────────────────── */
+
+.bt-variants-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+
+.bt-variant-card {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-top: 3px solid var(--variant-color, var(--accent));
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+
+.bt-variant-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.bt-variant-index {
+  font-size: 11px;
+  font-weight: 700;
+  color: #fff;
+  border-radius: 4px;
+  padding: 2px 8px;
+  letter-spacing: 0.04em;
+}
+
+.bt-variant-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* ─── Parameter block inside variant card ─────────────────────────────────── */
+
+.bt-params-block {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  margin-top: 4px;
+}
+
+.bt-params-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 8px;
+}
+
+.bt-param-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.bt-param-row:last-child {
+  margin-bottom: 0;
+}
+
+.bt-param-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  min-width: 88px;
+  flex-shrink: 0;
+}
+
+.bt-param-input {
+  width: 72px;
+  flex-shrink: 0;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+
+.bt-param-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* ─── Add variant card ────────────────────────────────────────────────────── */
+
+.bt-add-variant {
+  background: none;
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 24px 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+  transition: border-color 0.15s, color 0.15s;
+  min-height: 100px;
+}
+
+.bt-add-variant:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.bt-add-icon {
+  font-size: 24px;
+  line-height: 1;
+}
+
+/* ─── Data context card ───────────────────────────────────────────────────── */
+
+.bt-data-ctx {
+  margin-bottom: 0;
+}
+
+/* ─── Optional field label ────────────────────────────────────────────────── */
+
+.field-optional {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: 400;
+  margin-left: 2px;
+}
+
+/* ─── Replay / Live two-column layout ────────────────────────────────────── */
+
+.bt-replay-layout {
+  display: grid;
+  grid-template-columns: 300px 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .bt-replay-layout { grid-template-columns: 1fr; }
+}
+
+.bt-replay-config {
+  position: sticky;
+  top: 16px;
+}
+
+.bt-replay-feed {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* ─── Feed status bar ─────────────────────────────────────────────────────── */
+
+.bt-feed-status {
+  padding: 12px 16px;
+}
+
+.bt-feed-status-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.bt-status-pill {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  border-radius: 4px;
+  padding: 2px 8px;
+}
+
+.bt-status-idle, .bt-status-stopped, .bt-status-disconnected {
+  background: var(--bg-secondary); color: var(--text-muted); border: 1px solid var(--border);
+}
+.bt-status-starting, .bt-status-connecting {
+  background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3);
+}
+.bt-status-running, .bt-status-connected {
+  background: rgba(34, 197, 94, 0.15); color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.3);
+}
+.bt-status-completed {
+  background: rgba(99, 102, 241, 0.15); color: #6366f1; border: 1px solid rgba(99, 102, 241, 0.3);
+}
+.bt-status-failed {
+  background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+/* ─── Progress bar ────────────────────────────────────────────────────────── */
+
+.bt-progress-bar {
+  height: 4px;
+  background: var(--bg-secondary);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.bt-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+/* ─── Current candle / OHLC row ──────────────────────────────────────────── */
+
+.bt-current-candle {
+  padding: 12px 16px;
+}
+
+.bt-ohlc-row {
+  display: flex;
+  gap: 16px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 6px;
+}
+
+/* ─── Live ticker ─────────────────────────────────────────────────────────── */
+
+.bt-live-ticker {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+/* ─── Signal log ──────────────────────────────────────────────────────────── */
+
+.bt-feed-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.bt-signal-log {
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.bt-signal-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.bt-signal-row:last-child {
+  border-bottom: none;
+}
+
+.bt-signal-actionable {
+  background: rgba(99, 102, 241, 0.04);
+}
