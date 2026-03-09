@@ -22,6 +22,7 @@ public class BacktestResult {
     LocalDateTime fromDate;
     LocalDateTime toDate;
     int           totalCandles;
+    int           resolvedQuantity;   // actual qty used (auto-computed if request was 0)
 
     /** Label of the strategy with the highest total PnL. */
     String bestStrategyLabel;

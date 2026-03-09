@@ -17,7 +17,11 @@ async function request(url, options = {}) {
     try {
       const err = await res.json();
       errorMsg = err.message || err.error || errorMsg;
-    } catch (_) { /* ignore */ }
+    } catch (_) {
+      // Non-JSON response — service is likely starting up, restarting, or crashed
+      if (res.status === 500) errorMsg = 'Service error (non-JSON response) — check that the backend service is running';
+      else if (res.status === 502 || res.status === 503) errorMsg = 'Service unavailable — the backend service may be starting up, try again in a moment';
+    }
     throw new Error(errorMsg);
   }
 
@@ -90,6 +94,13 @@ export async function getOrders(userId, brokerName) {
 
 export async function cancelOrder(payload) {
   return request(`${BROKER}/api/v1/broker/orders`, { method: 'DELETE', body: payload });
+}
+
+// ─── Data Engine — Instruments ────────────────────────────────────────────────
+
+export async function searchInstruments(q, exchange, userId, brokerName) {
+  const params = new URLSearchParams({ q: q || '', exchange: exchange || 'NSE', userId, brokerName: brokerName || 'kite' });
+  return request(`${DATA}/api/v1/data/instruments/search?${params}`);
 }
 
 // ─── Data Engine — Historical ─────────────────────────────────────────────────

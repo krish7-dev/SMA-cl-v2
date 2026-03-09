@@ -4,9 +4,9 @@
   --bg-card: #1e2130;
   --bg-hover: #252840;
   --border: #2e3250;
-  --text-primary: #e8eaf6;
-  --text-secondary: #8c91b5;
-  --text-muted: #565c80;
+  --text-primary: #eceef8;
+  --text-secondary: #b0b6d6;
+  --text-muted: #7880a8;
   --accent: #5c6bc0;
   --accent-hover: #7986cb;
   --accent-light: rgba(92, 107, 192, 0.15);
@@ -123,6 +123,13 @@ tr:hover td { background: var(--bg-hover); }
 }
 .btn-danger:hover:not(:disabled) { background: rgba(239, 83, 80, 0.22); }
 
+.btn-warning {
+  background: var(--warning-bg);
+  color: var(--warning);
+  font-weight: 600;
+}
+.btn-warning:hover:not(:disabled) { background: rgba(255, 167, 38, 0.22); }
+
 .btn-secondary {
   background: var(--bg-hover);
   color: var(--text-secondary);
@@ -163,6 +170,7 @@ tr:hover td { background: var(--bg-hover); }
 }
 
 .form-group { margin-bottom: 16px; }
+.form-hint { font-size: 11px; color: var(--text-muted); font-weight: 400; margin-left: 6px; }
 
 .form-actions {
   display: flex;

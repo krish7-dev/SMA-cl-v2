@@ -64,32 +64,23 @@ public class HistoricalDataService {
             }
         }
 
-        // Check DB cache first
-        boolean cached = candleRepository.existsInRange(
-                request.getInstrumentToken(),
-                request.getInterval().getKiteValue(),
-                request.getBrokerName(),
-                request.getFromDate(),
-                request.getToDate()
-        );
-
-        if (cached) {
-            log.info("Serving historical data from DB cache: token={}, interval={}, from={}, to={}",
-                    request.getInstrumentToken(), request.getInterval(), request.getFromDate(), request.getToDate());
-            return loadFromDb(request);
-        }
-
-        // Cache miss — fetch from broker adapter
-        log.info("Cache miss — fetching from broker adapter: token={}, provider={}",
-                request.getInstrumentToken(), request.getBrokerName());
+        // Always fetch from broker adapter to ensure the full requested range is covered.
+        // The adapter chunks requests internally (e.g. Kite limits intraday to 60 days per call).
+        log.info("Fetching historical data: token={}, interval={}, from={}, to={}, persist={}",
+                request.getInstrumentToken(), request.getInterval(),
+                request.getFromDate(), request.getToDate(), request.isPersist());
 
         MarketDataAdapter adapter = adapterRegistry.resolve(request.getBrokerName());
         List<CandleData> candles = adapter.getHistoricalData(request);
 
         if (request.isPersist() && !candles.isEmpty()) {
+            // Merge new candles into DB (dedup prevents duplicate inserts).
+            // Load from DB afterwards to include any previously cached candles.
             persistCandles(candles, request.getBrokerName());
+            return loadFromDb(request);
         }
 
+        // persist=false (e.g. backtest): return fetched candles directly, skip DB round-trip
         return candles;
     }
 

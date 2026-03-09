@@ -55,9 +55,12 @@ public class BacktestRequest {
     /** Product type forwarded to order intent: MIS / CNC / NRML. */
     private String product = "MIS";
 
-    /** Number of units per trade signal. */
-    @Min(value = 1, message = "quantity must be at least 1")
-    private int quantity = 1;
+    /**
+     * Number of units per trade signal.
+     * 0 = auto-compute: floor(initialCapital / firstCandleClose) — max units the capital can buy.
+     */
+    @Min(value = 0, message = "quantity must be 0 (auto) or a positive integer")
+    private int quantity = 0;
 
     /** Starting capital for PnL and drawdown calculations. */
     @NotNull

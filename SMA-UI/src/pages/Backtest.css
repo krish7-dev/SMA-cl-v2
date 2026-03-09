@@ -285,3 +285,133 @@
 .bt-signal-actionable {
   background: rgba(99, 102, 241, 0.04);
 }
+
+/* ─── Disabled strategy card ──────────────────────────────────────────────── */
+
+.bt-variant-disabled {
+  opacity: 0.45;
+  filter: grayscale(0.4);
+}
+
+/* ─── Date preset buttons ─────────────────────────────────────────────────── */
+
+.bt-preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.bt-preset-btn {
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.bt-preset-btn:hover {
+  background: var(--accent-light);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ─── Instrument Picker ───────────────────────────────────────────────────── */
+
+.bt-recent-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.bt-recent-chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.bt-recent-chip:hover {
+  background: var(--accent-light);
+  border-color: var(--accent);
+}
+
+.bt-recent-symbol {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.bt-recent-exchange {
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--bg-secondary);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+/* ─── Instrument search dropdown ──────────────────────────────────────────── */
+
+.bt-instrument-drop {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  z-index: 100;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.bt-drop-hint {
+  padding: 12px 14px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.bt-drop-item {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.bt-drop-item:last-child { border-bottom: none; }
+
+.bt-drop-item:hover { background: var(--bg-hover); }
+
+.bt-drop-symbol {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.bt-drop-name {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 1px;
+}
+
+.bt-drop-meta {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 1px;
+  font-family: monospace;
+}

@@ -3,6 +3,7 @@ import {
   getStrategyTypes, runBacktest,
   startReplay, stopReplay, getReplayStatus,
   liveSubscribe, liveDisconnect, liveStatus,
+  searchInstruments,
 } from '../services/api';
 import { useSession } from '../context/SessionContext';
 import './StrategyEngine.css';
@@ -29,6 +30,24 @@ const PARAM_DEFS = {
     { key: 'slowPeriod',   label: 'Slow Period',   placeholder: '26', hint: 'Slow EMA'   },
     { key: 'signalPeriod', label: 'Signal Period', placeholder: '9',  hint: 'Signal EMA' },
   ],
+  RSI_REVERSAL: [
+    { key: 'period',     label: 'Period',     placeholder: '14', hint: 'RSI lookback' },
+    { key: 'oversold',   label: 'Oversold',   placeholder: '30', hint: 'Buy zone'     },
+    { key: 'overbought', label: 'Overbought', placeholder: '70', hint: 'Sell zone'    },
+  ],
+  BREAKOUT: [
+    { key: 'lookback', label: 'Lookback', placeholder: '20', hint: 'Channel window' },
+  ],
+  VWAP_PULLBACK: [
+    { key: 'lookback', label: 'Lookback', placeholder: '20', hint: 'Rolling VWAP window' },
+  ],
+  BOLLINGER_REVERSION: [
+    { key: 'period',     label: 'Period',     placeholder: '20', hint: 'SMA / std dev window'  },
+    { key: 'multiplier', label: 'Multiplier', placeholder: '2',  hint: 'Band width (std devs)' },
+  ],
+  LIQUIDITY_SWEEP: [
+    { key: 'lookback', label: 'Lookback', placeholder: '10', hint: 'Prior candles for liquidity pool' },
+  ],
 };
 
 const INTERVALS = [
@@ -44,10 +63,50 @@ const INTERVALS = [
   { value: 'MONTH',     label: 'Month'  },
 ];
 
-const STRATEGY_COLORS = [
-  '#6366f1', '#0ea5e9', '#10b981', '#f59e0b', '#ef4444',
-  '#8b5cf6', '#06b6d4', '#84cc16', '#f97316', '#ec4899',
+const STRATEGY_COLORS = {
+  SMA_CROSSOVER:       '#6366f1',
+  EMA_CROSSOVER:       '#0ea5e9',
+  RSI:                 '#10b981',
+  MACD:                '#f59e0b',
+  RSI_REVERSAL:        '#8b5cf6',
+  BREAKOUT:            '#ef4444',
+  VWAP_PULLBACK:       '#06b6d4',
+  BOLLINGER_REVERSION: '#ec4899',
+  LIQUIDITY_SWEEP:     '#f97316',
+};
+
+const ALL_STRATEGY_TYPES = Object.keys(PARAM_DEFS);
+
+const DATE_PRESETS = [
+  { label: '7 Days',  days: 7   },
+  { label: '1 Month', days: 30  },
+  { label: '3 Months',days: 90  },
+  { label: '6 Months',days: 180 },
+  { label: '1 Year',  days: 365 },
 ];
+
+const RECENT_KEY = 'sma_recent_instruments';
+const MAX_RECENT = 6;
+
+function loadRecentInstruments() {
+  try { return JSON.parse(localStorage.getItem(RECENT_KEY) || '[]'); } catch { return []; }
+}
+function saveRecentInstrument(inst) {
+  const list = loadRecentInstruments().filter(
+    i => !(i.instrumentToken === inst.instrumentToken && i.exchange === inst.exchange)
+  );
+  localStorage.setItem(RECENT_KEY, JSON.stringify([inst, ...list].slice(0, MAX_RECENT)));
+}
+
+function toISODate(d) {
+  return d.toISOString().split('T')[0];
+}
+function datePreset(days) {
+  const to   = new Date();
+  const from = new Date();
+  from.setDate(from.getDate() - days);
+  return { fromDate: toISODate(from), toDate: toISODate(to) };
+}
 
 function defaultParams(type) {
   const defs = PARAM_DEFS[type] || [];
@@ -58,10 +117,20 @@ function emptyVariant(type) {
   return { strategyType: type || 'SMA_CROSSOVER', label: '', parameters: defaultParams(type || 'SMA_CROSSOVER') };
 }
 
+// Fixed strategy entries — all strategies always shown, each with an enabled toggle
+function defaultStrategies() {
+  return ALL_STRATEGY_TYPES.map(type => ({
+    strategyType: type,
+    enabled: true,
+    label: '',
+    parameters: defaultParams(type),
+  }));
+}
+
 const EMPTY_DATA_CTX = {
   symbol: '', exchange: 'NSE', instrumentToken: '',
   interval: 'DAY', fromDate: '', toDate: '',
-  initialCapital: '100000', quantity: '1', product: 'CNC',
+  initialCapital: '100000', quantity: '0', product: 'CNC',
 };
 
 const EMPTY_INST = { symbol: '', exchange: 'NSE', instrumentToken: '' };
@@ -224,6 +293,143 @@ class LocalMacdEvaluator {
   get candlesSeen()  { return this.count; }
 }
 
+class LocalRsiReversalEvaluator {
+  constructor(period, oversold, overbought) {
+    this.period = Math.max(2, parseInt(period) || 14);
+    this.oversold = parseFloat(oversold) || 30;
+    this.overbought = parseFloat(overbought) || 70;
+    this.count = 0; this.prevClose = NaN;
+    this.avgGain = 0; this.avgLoss = 0;
+    this.prevRsi = NaN; this.warmupChanges = [];
+  }
+  next(close) {
+    const price = parseFloat(close); if (isNaN(price)) return 'HOLD';
+    this.count++;
+    if (this.count === 1) { this.prevClose = price; return 'HOLD'; }
+    const change = price - this.prevClose;
+    const gain = Math.max(change, 0), loss = Math.max(-change, 0);
+    this.prevClose = price;
+    if (this.count <= this.period) { this.warmupChanges.push(change); return 'HOLD'; }
+    if (this.count === this.period + 1) {
+      let sg = gain, sl = loss;
+      for (const c of this.warmupChanges) { if (c > 0) sg += c; else sl += -c; }
+      this.avgGain = sg / this.period; this.avgLoss = sl / this.period; this.warmupChanges = null;
+    } else {
+      this.avgGain = (this.avgGain * (this.period - 1) + gain) / this.period;
+      this.avgLoss = (this.avgLoss * (this.period - 1) + loss) / this.period;
+    }
+    const rsi = this.avgLoss === 0 ? 100 : 100 - (100 / (1 + this.avgGain / this.avgLoss));
+    const prev = this.prevRsi; this.prevRsi = rsi;
+    if (isNaN(prev)) return 'HOLD';
+    if (rsi < this.oversold   && rsi > prev) return 'BUY';
+    if (rsi > this.overbought && rsi < prev) return 'SELL';
+    return 'HOLD';
+  }
+  reset() { this.count = 0; this.prevClose = NaN; this.avgGain = 0; this.avgLoss = 0; this.prevRsi = NaN; this.warmupChanges = []; }
+  get warmupNeeded() { return this.period + 2; }
+  get candlesSeen()  { return this.count; }
+}
+
+class LocalBreakoutEvaluator {
+  constructor(lookback) {
+    this.lookback = Math.max(2, parseInt(lookback) || 20);
+    this.window = []; // [{high, low}]
+  }
+  next(close, high, low) {
+    const c = parseFloat(close), h = parseFloat(high) || c, l = parseFloat(low) || c;
+    let result = 'HOLD';
+    if (this.window.length >= this.lookback) {
+      const channelHigh = Math.max(...this.window.map(e => e.high));
+      const channelLow  = Math.min(...this.window.map(e => e.low));
+      if (c > channelHigh) result = 'BUY';
+      else if (c < channelLow) result = 'SELL';
+    }
+    this.window.push({ high: h, low: l });
+    if (this.window.length > this.lookback) this.window.shift();
+    return result;
+  }
+  reset() { this.window = []; }
+  get warmupNeeded() { return this.lookback; }
+  get candlesSeen()  { return this.window.length; }
+}
+
+class LocalVwapPullbackEvaluator {
+  constructor(lookback) {
+    this.lookback = Math.max(2, parseInt(lookback) || 20);
+    this.window = []; // [{tpv, vol}]
+    this.prevClose = NaN; this.prevVwap = NaN;
+  }
+  next(close, high, low, volume) {
+    const c = parseFloat(close), h = parseFloat(high) || c, l = parseFloat(low) || c;
+    const vol = parseFloat(volume) || 0;
+    const typical = (h + l + c) / 3;
+    this.window.push({ tpv: typical * vol, vol });
+    if (this.window.length > this.lookback) this.window.shift();
+    const sumTpv = this.window.reduce((a, e) => a + e.tpv, 0);
+    const sumVol = this.window.reduce((a, e) => a + e.vol, 0);
+    const vwap   = sumVol > 0 ? sumTpv / sumVol : c;
+    if (this.window.length < this.lookback || isNaN(this.prevClose)) {
+      this.prevClose = c; this.prevVwap = vwap; return 'HOLD';
+    }
+    let result = 'HOLD';
+    if (this.prevClose < this.prevVwap && c > vwap) result = 'BUY';
+    else if (this.prevClose > this.prevVwap && c < vwap) result = 'SELL';
+    this.prevClose = c; this.prevVwap = vwap;
+    return result;
+  }
+  reset() { this.window = []; this.prevClose = NaN; this.prevVwap = NaN; }
+  get warmupNeeded() { return this.lookback; }
+  get candlesSeen()  { return this.window.length; }
+}
+
+class LocalBollingerEvaluator {
+  constructor(period, multiplier) {
+    this.period = Math.max(2, parseInt(period) || 20);
+    this.mult   = parseFloat(multiplier) || 2.0;
+    this.window = [];
+  }
+  next(close) {
+    const c = parseFloat(close); if (isNaN(c)) return 'HOLD';
+    this.window.push(c);
+    if (this.window.length > this.period) this.window.shift();
+    if (this.window.length < this.period) return 'HOLD';
+    const mean   = this.window.reduce((a, b) => a + b, 0) / this.period;
+    const stdDev = Math.sqrt(this.window.reduce((a, v) => a + (v - mean) ** 2, 0) / this.period);
+    const upper  = mean + this.mult * stdDev;
+    const lower  = mean - this.mult * stdDev;
+    if (c < lower) return 'BUY';
+    if (c > upper) return 'SELL';
+    return 'HOLD';
+  }
+  reset() { this.window = []; }
+  get warmupNeeded() { return this.period; }
+  get candlesSeen()  { return this.window.length; }
+}
+
+class LocalLiquiditySweepEvaluator {
+  constructor(lookback) {
+    this.lookback = Math.max(2, parseInt(lookback) || 10);
+    this.window   = []; // { high, low }
+  }
+  next(close, high, low) {
+    const c = parseFloat(close), h = parseFloat(high), l = parseFloat(low);
+    if (isNaN(c) || isNaN(h) || isNaN(l)) return 'HOLD';
+    let result = 'HOLD';
+    if (this.window.length >= this.lookback) {
+      const poolHigh = Math.max(...this.window.map(e => e.high));
+      const poolLow  = Math.min(...this.window.map(e => e.low));
+      if (l < poolLow  && c > poolLow)  result = 'BUY';
+      else if (h > poolHigh && c < poolHigh) result = 'SELL';
+    }
+    this.window.push({ high: h, low: l });
+    if (this.window.length > this.lookback) this.window.shift();
+    return result;
+  }
+  reset() { this.window = []; }
+  get warmupNeeded() { return this.lookback; }
+  get candlesSeen()  { return this.window.length; }
+}
+
 function buildLocalEvaluator(strategyType, params = {}) {
   switch (strategyType) {
     case 'EMA_CROSSOVER':
@@ -232,6 +438,16 @@ function buildLocalEvaluator(strategyType, params = {}) {
       return new LocalRsiEvaluator(params.period, params.oversold, params.overbought);
     case 'MACD':
       return new LocalMacdEvaluator(params.fastPeriod, params.slowPeriod, params.signalPeriod);
+    case 'RSI_REVERSAL':
+      return new LocalRsiReversalEvaluator(params.period, params.oversold, params.overbought);
+    case 'BREAKOUT':
+      return new LocalBreakoutEvaluator(params.lookback);
+    case 'VWAP_PULLBACK':
+      return new LocalVwapPullbackEvaluator(params.lookback);
+    case 'BOLLINGER_REVERSION':
+      return new LocalBollingerEvaluator(params.period, params.multiplier);
+    case 'LIQUIDITY_SWEEP':
+      return new LocalLiquiditySweepEvaluator(params.lookback);
     case 'SMA_CROSSOVER':
     default:
       return new LocalSmaEvaluator(params.shortPeriod, params.longPeriod);
@@ -280,52 +496,41 @@ export default function Backtest() {
 function HistoricalBacktest() {
   const { session, isActive } = useSession();
 
-  const [knownTypes, setKnownTypes] = useState(['SMA_CROSSOVER']);
-  const [variants, setVariants]     = useState([emptyVariant('SMA_CROSSOVER')]);
+  const [strategies, setStrategies] = useState(defaultStrategies);
   const [dataCtx, setDataCtx]       = useState({ ...EMPTY_DATA_CTX });
   const [loading, setLoading]       = useState(false);
   const [error, setError]           = useState('');
   const [result, setResult]         = useState(null);
 
-  useEffect(() => {
-    getStrategyTypes()
-      .then(r => { if (r?.data) setKnownTypes([...r.data].sort()); })
-      .catch(() => {});
-  }, []);
+  const enabledCount = strategies.filter(s => s.enabled).length;
 
-  function addVariant() {
-    setVariants(prev => [...prev, emptyVariant(knownTypes[0] || 'SMA_CROSSOVER')]);
-  }
-
-  function removeVariant(idx) {
-    setVariants(prev => prev.filter((_, i) => i !== idx));
-  }
-
-  function updateVariant(idx, field, value) {
-    setVariants(prev => prev.map((v, i) => {
-      if (i !== idx) return v;
-      if (field === 'strategyType') return { ...v, strategyType: value, parameters: defaultParams(value) };
-      return { ...v, [field]: value };
-    }));
+  function toggleStrategy(idx) {
+    setStrategies(prev => prev.map((s, i) => i === idx ? { ...s, enabled: !s.enabled } : s));
   }
 
   function updateParam(idx, key, value) {
-    setVariants(prev => prev.map((v, i) =>
-      i !== idx ? v : { ...v, parameters: { ...v.parameters, [key]: value } }
+    setStrategies(prev => prev.map((s, i) =>
+      i === idx ? { ...s, parameters: { ...s.parameters, [key]: value } } : s
     ));
   }
 
-  function duplicateVariant(idx) {
-    setVariants(prev => {
-      const copy = { ...prev[idx], label: prev[idx].label ? prev[idx].label + ' (copy)' : '', parameters: { ...prev[idx].parameters } };
-      const next = [...prev];
-      next.splice(idx + 1, 0, copy);
-      return next;
-    });
+  function updateLabel(idx, value) {
+    setStrategies(prev => prev.map((s, i) => i === idx ? { ...s, label: value } : s));
+  }
+
+  function applyPreset(days) {
+    const { fromDate, toDate } = datePreset(days);
+    setDataCtx(p => ({ ...p, fromDate, toDate }));
+  }
+
+  function handleInstrumentSelect(inst) {
+    setDataCtx(p => ({ ...p, symbol: inst.tradingSymbol, exchange: inst.exchange, instrumentToken: String(inst.instrumentToken) }));
+    saveRecentInstrument(inst);
   }
 
   async function handleRun(e) {
     e.preventDefault();
+    if (enabledCount === 0) { setError('Enable at least one strategy.'); return; }
     setError(''); setResult(null); setLoading(true);
     try {
       const payload = {
@@ -338,12 +543,12 @@ function HistoricalBacktest() {
         fromDate:        dataCtx.fromDate + 'T09:15:00',
         toDate:          dataCtx.toDate   + 'T15:30:00',
         product:         dataCtx.product,
-        quantity:        parseInt(dataCtx.quantity, 10),
+        quantity:        parseInt(dataCtx.quantity, 10) || 0,
         initialCapital:  parseFloat(dataCtx.initialCapital),
-        strategies: variants.map(v => ({
-          strategyType: v.strategyType,
-          label:        v.label || undefined,
-          parameters:   v.parameters,
+        strategies: strategies.filter(s => s.enabled).map(s => ({
+          strategyType: s.strategyType,
+          label:        s.label || undefined,
+          parameters:   s.parameters,
         })),
       };
       const res = await runBacktest(payload);
@@ -357,50 +562,45 @@ function HistoricalBacktest() {
 
   return (
     <form onSubmit={handleRun}>
-      {/* Strategy Variants */}
+      {/* Strategy Cards — all always visible */}
       <div className="bt-section-label">
-        <span className="bt-section-title">Strategy Configurations</span>
-        <span className="bt-section-sub">Define one or more strategies to compare head-to-head</span>
+        <span className="bt-section-title">Strategies</span>
+        <span className="bt-section-sub">{enabledCount} of {strategies.length} enabled — all run on the same instrument and date range</span>
       </div>
 
       <div className="bt-variants-grid">
-        {variants.map((v, idx) => {
-          const color = STRATEGY_COLORS[idx % STRATEGY_COLORS.length];
-          const paramDefs = PARAM_DEFS[v.strategyType] || [];
+        {strategies.map((s, idx) => {
+          const color    = STRATEGY_COLORS[s.strategyType] || '#6366f1';
+          const paramDefs = PARAM_DEFS[s.strategyType] || [];
           return (
-            <div key={idx} className="bt-variant-card" style={{ '--variant-color': color }}>
+            <div key={s.strategyType} className={`bt-variant-card ${!s.enabled ? 'bt-variant-disabled' : ''}`} style={{ '--variant-color': color }}>
               <div className="bt-variant-header">
-                <span className="bt-variant-index" style={{ background: color }}>#{idx + 1}</span>
-                <div className="bt-variant-actions">
-                  <button type="button" className="btn-secondary btn-sm" onClick={() => duplicateVariant(idx)} title="Duplicate">⧉</button>
-                  {variants.length > 1 && (
-                    <button type="button" className="btn-danger btn-sm" onClick={() => removeVariant(idx)}>×</button>
-                  )}
-                </div>
+                <span className="bt-variant-index" style={{ background: color }}>{s.strategyType.replace('_', ' ')}</span>
+                <button
+                  type="button"
+                  className={s.enabled ? 'btn-danger btn-sm' : 'btn-secondary btn-sm'}
+                  onClick={() => toggleStrategy(idx)}
+                >
+                  {s.enabled ? 'Disable' : 'Enable'}
+                </button>
               </div>
 
-              <div className="form-group" style={{ marginBottom: 10 }}>
-                <label>Strategy Type</label>
-                <select value={v.strategyType} onChange={e => updateVariant(idx, 'strategyType', e.target.value)}>
-                  {knownTypes.map(t => <option key={t} value={t}>{t}</option>)}
-                </select>
-              </div>
-
-              <div className="form-group" style={{ marginBottom: 10 }}>
+              <div className="form-group" style={{ marginBottom: 10, opacity: s.enabled ? 1 : 0.5 }}>
                 <label>Label <span className="field-optional">(optional)</span></label>
-                <input value={v.label} onChange={e => updateVariant(idx, 'label', e.target.value)} placeholder={`${v.strategyType} #${idx + 1}`} />
+                <input value={s.label} onChange={e => updateLabel(idx, e.target.value)} placeholder={s.strategyType} disabled={!s.enabled} />
               </div>
 
               {paramDefs.length > 0 && (
-                <div className="bt-params-block">
+                <div className="bt-params-block" style={{ opacity: s.enabled ? 1 : 0.5 }}>
                   <div className="bt-params-label">Parameters</div>
                   {paramDefs.map(def => (
                     <div className="bt-param-row" key={def.key}>
                       <label className="bt-param-label">{def.label}</label>
                       <input type="number" min="1" className="bt-param-input"
-                        value={v.parameters?.[def.key] || ''}
+                        value={s.parameters?.[def.key] || ''}
                         onChange={e => updateParam(idx, def.key, e.target.value)}
                         placeholder={def.placeholder}
+                        disabled={!s.enabled}
                       />
                       <span className="bt-param-hint">{def.hint}</span>
                     </div>
@@ -410,39 +610,40 @@ function HistoricalBacktest() {
             </div>
           );
         })}
-
-        <button type="button" className="bt-add-variant" onClick={addVariant}>
-          <span className="bt-add-icon">+</span>
-          <span>Add Variant</span>
-        </button>
       </div>
 
       {/* Data Context */}
       <div className="bt-section-label" style={{ marginTop: 28 }}>
-        <span className="bt-section-title">Data Context</span>
-        <span className="bt-section-sub">Instrument and time range to run all strategies against</span>
+        <span className="bt-section-title">Instrument & Date Range</span>
+        <span className="bt-section-sub">All enabled strategies run on this data</span>
       </div>
 
       <div className="card bt-data-ctx">
-        <div className="form-row">
-          <div className="form-group">
-            <label>Symbol *</label>
-            <input value={dataCtx.symbol} onChange={e => setDataCtx(p => ({ ...p, symbol: e.target.value }))} placeholder="e.g. RELIANCE" required />
-          </div>
-          <div className="form-group">
-            <label>Exchange *</label>
-            <select value={dataCtx.exchange} onChange={e => setDataCtx(p => ({ ...p, exchange: e.target.value }))}>
-              {['NSE','BSE','NFO','MCX','CDS'].map(x => <option key={x} value={x}>{x}</option>)}
-            </select>
-          </div>
-          <div className="form-group">
-            <label>Instrument Token *</label>
-            <input type="number" value={dataCtx.instrumentToken} onChange={e => setDataCtx(p => ({ ...p, instrumentToken: e.target.value }))} placeholder="e.g. 738561" required />
-            <div className="field-hint">Kite numeric token — find via Data Engine.</div>
+        {/* Instrument picker */}
+        <InstrumentPicker
+          session={session}
+          symbol={dataCtx.symbol}
+          exchange={dataCtx.exchange}
+          instrumentToken={dataCtx.instrumentToken}
+          onSelect={handleInstrumentSelect}
+          onChange={patch => setDataCtx(p => ({ ...p, ...patch }))}
+        />
+
+        {/* Date range */}
+        <div style={{ marginTop: 12 }}>
+          <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 6 }}>
+            Date Range — Quick Select
+          </label>
+          <div className="bt-preset-row">
+            {DATE_PRESETS.map(p => (
+              <button key={p.days} type="button" className="bt-preset-btn" onClick={() => applyPreset(p.days)}>
+                {p.label}
+              </button>
+            ))}
           </div>
         </div>
 
-        <div className="form-row">
+        <div className="form-row" style={{ marginTop: 8 }}>
           <div className="form-group">
             <label>Interval *</label>
             <select value={dataCtx.interval} onChange={e => setDataCtx(p => ({ ...p, interval: e.target.value }))}>
@@ -465,8 +666,8 @@ function HistoricalBacktest() {
             <input type="number" value={dataCtx.initialCapital} onChange={e => setDataCtx(p => ({ ...p, initialCapital: e.target.value }))} required />
           </div>
           <div className="form-group">
-            <label>Quantity *</label>
-            <input type="number" min="1" value={dataCtx.quantity} onChange={e => setDataCtx(p => ({ ...p, quantity: e.target.value }))} required />
+            <label>Quantity <span className="form-hint">(0 = auto: max units from capital)</span></label>
+            <input type="number" min="0" placeholder="0 = auto" value={dataCtx.quantity} onChange={e => setDataCtx(p => ({ ...p, quantity: e.target.value }))} />
           </div>
           <div className="form-group">
             <label>Product</label>
@@ -483,16 +684,130 @@ function HistoricalBacktest() {
       {!isActive && <div className="error-msg" style={{ marginBottom: 16 }}>No active session — activate one in Broker Accounts first.</div>}
 
       <div className="form-actions">
-        <button type="submit" className="btn-primary" disabled={loading || !isActive}>
-          {loading ? `Running ${variants.length} variant${variants.length > 1 ? 's' : ''}…` : `Run Backtest — ${variants.length} variant${variants.length > 1 ? 's' : ''}`}
+        <button type="submit" className="btn-primary" disabled={loading || !isActive || enabledCount === 0}>
+          {loading ? `Running ${enabledCount} strateg${enabledCount !== 1 ? 'ies' : 'y'}…` : `Run Backtest — ${enabledCount} strateg${enabledCount !== 1 ? 'ies' : 'y'}`}
         </button>
-        <button type="button" className="btn-secondary" onClick={() => { setVariants([emptyVariant('SMA_CROSSOVER')]); setDataCtx({ ...EMPTY_DATA_CTX }); setResult(null); setError(''); }} disabled={loading}>
+        <button type="button" className="btn-secondary" onClick={() => { setStrategies(defaultStrategies()); setDataCtx({ ...EMPTY_DATA_CTX }); setResult(null); setError(''); }} disabled={loading}>
           Reset
         </button>
       </div>
 
       {result && <BacktestResultPanel result={result} />}
     </form>
+  );
+}
+
+// ─── Instrument Picker ────────────────────────────────────────────────────────
+// Shared component used in all 3 tabs: search box + recent instruments list
+
+function InstrumentPicker({ session, symbol, exchange, instrumentToken, onSelect, onChange, disabled }) {
+  const [query, setQuery]       = useState('');
+  const [results, setResults]   = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [showDrop, setShowDrop] = useState(false);
+  const [recent, setRecent]     = useState(loadRecentInstruments);
+  const debounceRef             = useRef(null);
+  const wrapRef                 = useRef(null);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    function onClickOut(e) { if (wrapRef.current && !wrapRef.current.contains(e.target)) setShowDrop(false); }
+    document.addEventListener('mousedown', onClickOut);
+    return () => document.removeEventListener('mousedown', onClickOut);
+  }, []);
+
+  function handleQueryChange(e) {
+    const q = e.target.value;
+    setQuery(q);
+    if (!q.trim()) { setResults([]); setShowDrop(false); return; }
+    setShowDrop(true);
+    clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(async () => {
+      if (!session?.userId) return;
+      setSearching(true);
+      try {
+        const res = await searchInstruments(q, exchange, session.userId, session.brokerName || 'kite');
+        setResults(res?.data || []);
+      } catch { setResults([]); }
+      finally { setSearching(false); }
+    }, 300);
+  }
+
+  function pickResult(inst) {
+    onSelect(inst);
+    setQuery('');
+    setResults([]);
+    setShowDrop(false);
+    setRecent(loadRecentInstruments());
+  }
+
+  function pickRecent(inst) {
+    onSelect(inst);
+    setRecent(loadRecentInstruments());
+  }
+
+  return (
+    <div>
+      {/* Recent instruments */}
+      {recent.length > 0 && (
+        <div style={{ marginBottom: 10 }}>
+          <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 6 }}>Recent Instruments</label>
+          <div className="bt-recent-row">
+            {recent.map((r, i) => (
+              <button key={i} type="button" className="bt-recent-chip" onClick={() => pickRecent(r)} disabled={disabled}>
+                <span className="bt-recent-symbol">{r.tradingSymbol}</span>
+                <span className="bt-recent-exchange">{r.exchange}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Search box */}
+      <div ref={wrapRef} style={{ position: 'relative', marginBottom: 10 }}>
+        <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 4 }}>
+          Search Instrument
+        </label>
+        <input
+          value={query}
+          onChange={handleQueryChange}
+          onFocus={() => query.trim() && setShowDrop(true)}
+          placeholder={session?.userId ? 'Type symbol or company name (e.g. RELIANCE)' : 'Activate a session to search instruments'}
+          disabled={disabled || !session?.userId}
+        />
+        {showDrop && (
+          <div className="bt-instrument-drop">
+            {searching && <div className="bt-drop-hint">Searching…</div>}
+            {!searching && results.length === 0 && <div className="bt-drop-hint">No matches found</div>}
+            {results.map((r, i) => (
+              <button key={i} type="button" className="bt-drop-item" onClick={() => pickResult(r)}>
+                <span className="bt-drop-symbol">{r.tradingSymbol}</span>
+                <span className="bt-drop-name">{r.name}</span>
+                <span className="bt-drop-meta">{r.exchange} · {r.instrumentType} · {r.instrumentToken}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Manual fields — auto-filled by search or recent, still editable */}
+      <div className="form-row">
+        <div className="form-group">
+          <label>Symbol *</label>
+          <input value={symbol} onChange={e => onChange({ symbol: e.target.value })} placeholder="e.g. RELIANCE" required disabled={disabled} />
+        </div>
+        <div className="form-group">
+          <label>Exchange *</label>
+          <select value={exchange} onChange={e => onChange({ exchange: e.target.value })} disabled={disabled}>
+            {['NSE','BSE','NFO','MCX','CDS'].map(x => <option key={x} value={x}>{x}</option>)}
+          </select>
+        </div>
+        <div className="form-group">
+          <label>Instrument Token *</label>
+          <input type="number" value={instrumentToken} onChange={e => onChange({ instrumentToken: e.target.value })} placeholder="e.g. 738561" required disabled={disabled} />
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -576,7 +891,7 @@ function ReplayTest() {
       sse.addEventListener('candle', (ev) => {
         try {
           const candle = JSON.parse(ev.data);
-          const signal = evaluatorRef.current.next(parseFloat(candle.close));
+          const signal = evaluatorRef.current.next(parseFloat(candle.close), parseFloat(candle.high), parseFloat(candle.low), parseFloat(candle.volume));
           const entry = { ...candle, signal, ts: new Date().toLocaleTimeString() };
           setCurrentCandle(entry);
           feedRef.current = [entry, ...feedRef.current].slice(0, 500);
@@ -657,22 +972,29 @@ function ReplayTest() {
             <h3 className="section-title" style={{ marginTop: 16 }}>Data</h3>
 
             <form onSubmit={handleStart}>
-              <div className="form-row">
-                <div className="form-group">
-                  <label>Symbol *</label>
-                  <input value={inst.symbol} onChange={e => setInst(p => ({ ...p, symbol: e.target.value }))} placeholder="e.g. RELIANCE" required disabled={isRunning} />
-                </div>
-                <div className="form-group">
-                  <label>Exchange *</label>
-                  <select value={inst.exchange} onChange={e => setInst(p => ({ ...p, exchange: e.target.value }))} disabled={isRunning}>
-                    {['NSE','BSE','NFO','MCX','CDS'].map(x => <option key={x} value={x}>{x}</option>)}
-                  </select>
+              <InstrumentPicker
+                session={session}
+                symbol={inst.symbol}
+                exchange={inst.exchange}
+                instrumentToken={inst.instrumentToken}
+                onSelect={r => { setInst({ symbol: r.tradingSymbol, exchange: r.exchange, instrumentToken: String(r.instrumentToken) }); saveRecentInstrument(r); }}
+                onChange={patch => setInst(p => ({ ...p, ...patch }))}
+                disabled={isRunning}
+              />
+
+              {/* Date preset buttons */}
+              <div style={{ marginBottom: 8 }}>
+                <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 6 }}>Date Range</label>
+                <div className="bt-preset-row">
+                  {DATE_PRESETS.map(p => (
+                    <button key={p.days} type="button" className="bt-preset-btn" disabled={isRunning}
+                      onClick={() => { const d = datePreset(p.days); setFromDate(d.fromDate); setToDate(d.toDate); }}>
+                      {p.label}
+                    </button>
+                  ))}
                 </div>
               </div>
-              <div className="form-group">
-                <label>Instrument Token *</label>
-                <input type="number" value={inst.instrumentToken} onChange={e => setInst(p => ({ ...p, instrumentToken: e.target.value }))} placeholder="e.g. 738561" required disabled={isRunning} />
-              </div>
+
               <div className="form-row">
                 <div className="form-group">
                   <label>Interval *</label>
@@ -928,22 +1250,15 @@ function LiveTest() {
           <h3 className="section-title" style={{ marginTop: 16 }}>Instrument</h3>
 
           <form onSubmit={handleConnect}>
-            <div className="form-row">
-              <div className="form-group">
-                <label>Symbol *</label>
-                <input value={inst.symbol} onChange={e => setInst(p => ({ ...p, symbol: e.target.value }))} placeholder="e.g. RELIANCE" required disabled={connected} />
-              </div>
-              <div className="form-group">
-                <label>Exchange *</label>
-                <select value={inst.exchange} onChange={e => setInst(p => ({ ...p, exchange: e.target.value }))} disabled={connected}>
-                  {['NSE','BSE','NFO','MCX','CDS'].map(x => <option key={x} value={x}>{x}</option>)}
-                </select>
-              </div>
-            </div>
-            <div className="form-group">
-              <label>Instrument Token *</label>
-              <input type="number" value={inst.instrumentToken} onChange={e => setInst(p => ({ ...p, instrumentToken: e.target.value }))} placeholder="e.g. 738561" required disabled={connected} />
-            </div>
+            <InstrumentPicker
+              session={session}
+              symbol={inst.symbol}
+              exchange={inst.exchange}
+              instrumentToken={inst.instrumentToken}
+              onSelect={r => { setInst({ symbol: r.tradingSymbol, exchange: r.exchange, instrumentToken: String(r.instrumentToken) }); saveRecentInstrument(r); }}
+              onChange={patch => setInst(p => ({ ...p, ...patch }))}
+              disabled={connected}
+            />
             <div className="form-group">
               <label>Subscription Mode</label>
               <select value={mode} onChange={e => setMode(e.target.value)} disabled={connected}>
@@ -1076,7 +1391,7 @@ function BacktestResultPanel({ result }) {
         <div>
           <span className="bt-banner-symbol">{result.symbol} / {result.exchange}</span>
           <span className="bt-banner-detail">
-            {result.interval} · {result.totalCandles} candles · {result.fromDate?.split('T')[0]} → {result.toDate?.split('T')[0]}
+            {result.interval} · {result.totalCandles} candles · qty {result.resolvedQuantity} · {result.fromDate?.split('T')[0]} → {result.toDate?.split('T')[0]}
           </span>
         </div>
         {result.bestStrategyLabel && (

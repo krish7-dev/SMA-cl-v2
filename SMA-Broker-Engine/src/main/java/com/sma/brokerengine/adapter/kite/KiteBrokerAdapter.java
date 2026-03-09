@@ -52,6 +52,12 @@ public class KiteBrokerAdapter implements BrokerAdapter {
             log.info("Kite session generated successfully for user={}", user.userName);
             return user.accessToken;
         } catch (KiteException e) {
+            String msg = e.message != null ? e.message.toLowerCase() : "";
+            if (msg.contains("checksum") || msg.contains("invalid token") || msg.contains("token is invalid")) {
+                throw new KiteAdapterException(
+                    "Request token is invalid or already used. Kite request tokens are one-time — " +
+                    "please go to Broker Accounts and click Re-login to get a fresh token.", e);
+            }
             throw new KiteAdapterException("Kite session generation failed: " + e.message, e);
         } catch (IOException e) {
             throw new KiteAdapterException("Network error during Kite session generation", e);

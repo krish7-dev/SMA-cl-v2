@@ -142,6 +142,7 @@ public class BrokerAuthService {
                 .status(account.getStatus().name())
                 .tokenExpiry(account.getTokenExpiry())
                 .apiKey(encryptionService.decrypt(account.getApiKeyEncrypted()))
+                .apiSecret(encryptionService.decrypt(account.getApiSecretEncrypted()))
                 .accessToken(account.getAccessTokenEncrypted() != null
                         ? encryptionService.decrypt(account.getAccessTokenEncrypted()) : null)
                 .build();
