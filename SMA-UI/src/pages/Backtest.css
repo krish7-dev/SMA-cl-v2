@@ -415,3 +415,70 @@
   margin-top: 1px;
   font-family: monospace;
 }
+
+/* ─── Risk management panel ─────────────────────────────────────────────── */
+
+.bt-risk-card {
+  padding: 16px 20px;
+}
+
+.bt-risk-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.bt-risk-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  min-width: 130px;
+}
+
+.bt-risk-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.bt-risk-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 14px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+/* ─── Exit reason badges ─────────────────────────────────────────────────── */
+
+.bt-exit-badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.bt-exit-signal {
+  background: rgba(99, 102, 241, 0.15);
+  color: #818cf8;
+}
+
+.bt-exit-stop-loss {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+}
+
+.bt-exit-take-profit {
+  background: rgba(34, 197, 94, 0.15);
+  color: #4ade80;
+}
+
+.bt-exit-end-of-backtest {
+  background: rgba(100, 116, 139, 0.15);
+  color: #94a3b8;
+}

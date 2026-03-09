@@ -72,6 +72,13 @@ public class BacktestRequest {
     @Valid
     private List<StrategyConfig> strategies;
 
+    /**
+     * Optional risk management overlay applied during simulation.
+     * Null or enabled=false → vanilla signal-only backtest (original behaviour).
+     */
+    @Valid
+    private RiskConfig riskConfig;
+
     // ─── Nested types ─────────────────────────────────────────────────────────
 
     @Data
@@ -85,5 +92,39 @@ public class BacktestRequest {
 
         /** Strategy-specific parameters (e.g. {"shortPeriod":"5","longPeriod":"20"}). */
         private Map<String, String> parameters;
+    }
+
+    @Data
+    public static class RiskConfig {
+
+        /** Master switch — false (default) keeps all rules disabled. */
+        private boolean enabled = false;
+
+        /** Exit long when candle LOW drops this % below entry price. 0/null = SL off. */
+        @DecimalMin(value = "0") @DecimalMax(value = "100")
+        private BigDecimal stopLossPct;
+
+        /** Exit long when candle HIGH rises this % above entry price. 0/null = TP off. */
+        @DecimalMin(value = "0")
+        private BigDecimal takeProfitPct;
+
+        /**
+         * Risk at most this % of running capital per trade.
+         * Drives position sizing: qty = floor(capital × riskPct / (entry × slPct)).
+         * Requires stopLossPct > 0; otherwise resolvedQty is used unchanged.
+         */
+        @DecimalMin(value = "0") @DecimalMax(value = "100")
+        private BigDecimal maxRiskPerTradePct;
+
+        /**
+         * Halt new entries for the rest of a calendar day once cumulative daily
+         * loss reaches this % of the day's starting capital. 0/null = cap off.
+         */
+        @DecimalMin(value = "0") @DecimalMax(value = "100")
+        private BigDecimal dailyLossCapPct;
+
+        /** Candles to skip after a losing trade before re-entering. 0 = no cooldown. */
+        @Min(value = 0)
+        private int cooldownCandles = 0;
     }
 }
