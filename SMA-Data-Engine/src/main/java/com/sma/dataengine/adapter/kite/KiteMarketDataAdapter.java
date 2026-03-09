@@ -414,15 +414,7 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
                     : kc.getInstruments();
 
             return all.stream()
-                    .map(i -> InstrumentInfo.builder()
-                            .instrumentToken(i.instrument_token)
-                            .tradingSymbol(i.tradingsymbol)
-                            .name(i.name)
-                            .exchange(i.exchange)
-                            .instrumentType(i.instrument_type)
-                            .segment(i.segment)
-                            .lotSize(i.lot_size)
-                            .build())
+                    .map(this::toInstrumentInfo)
                     .toList();
         } catch (KiteException e) {
             String msg = e.message != null ? e.message : "code=" + e.code;
@@ -430,6 +422,30 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
         } catch (IOException e) {
             throw new MarketDataAdapterException("Network error during instrument fetch", e);
         }
+    }
+
+    private InstrumentInfo toInstrumentInfo(Instrument i) {
+        String expiry = null;
+        if (i.expiry != null) {
+            expiry = new java.text.SimpleDateFormat("yyyy-MM-dd").format(i.expiry);
+        }
+        return InstrumentInfo.builder()
+                .instrumentToken(i.instrument_token)
+                .tradingSymbol(i.tradingsymbol)
+                .name(i.name)
+                .exchange(i.exchange)
+                .instrumentType(i.instrument_type)
+                .segment(i.segment)
+                .lotSize(i.lot_size)
+                .expiry(expiry)
+                .strike(parseStrike(i.strike))
+                .build();
+    }
+
+    private static double parseStrike(Object strike) {
+        if (strike == null) return 0.0;
+        try { return Double.parseDouble(strike.toString().trim()); }
+        catch (NumberFormatException e) { return 0.0; }
     }
 
     private static String maskKey(String key) {

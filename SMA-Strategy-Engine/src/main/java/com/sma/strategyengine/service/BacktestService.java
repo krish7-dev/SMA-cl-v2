@@ -4,6 +4,7 @@ import com.sma.strategyengine.client.DataEngineClient;
 import com.sma.strategyengine.client.DataEngineClient.CandleDto;
 import com.sma.strategyengine.client.DataEngineClient.HistoryRequest;
 import com.sma.strategyengine.model.request.BacktestRequest;
+import com.sma.strategyengine.model.request.BacktestRequest.PatternConfig;
 import com.sma.strategyengine.model.request.BacktestRequest.RiskConfig;
 import com.sma.strategyengine.model.request.BacktestRequest.StrategyConfig;
 import com.sma.strategyengine.model.response.BacktestResult;
@@ -108,6 +109,20 @@ public class BacktestService {
 
         StrategyLogic logic = strategyRegistry.resolve(cfg.getStrategyType());
 
+        // ── Pattern confirmation config ───────────────────────────────────────
+        PatternConfig pc           = req.getPatternConfig();
+        boolean       patternOn    = pc != null && pc.isEnabled();
+        double        pMinWick     = patternOn ? pc.getMinWickRatio() : 2.0;
+        double        pMaxBody     = patternOn ? pc.getMaxBodyPct()   : 0.35;
+        Set<String>   buyConfirm   = patternOn && pc.getBuyConfirmPatterns()  != null
+                ? new HashSet<>(pc.getBuyConfirmPatterns())  : Set.of();
+        Set<String>   sellConfirm  = patternOn && pc.getSellConfirmPatterns() != null
+                ? new HashSet<>(pc.getSellConfirmPatterns()) : Set.of();
+
+        // Rolling window for pattern detection: [prev2, prev1] (oldest first)
+        double[] patPrev2 = null;
+        double[] patPrev1 = null;
+
         // ── Risk config ──────────────────────────────────────────────────────
         RiskConfig rc    = req.getRiskConfig();
         boolean    riskOn = rc != null && rc.isEnabled();
@@ -125,12 +140,13 @@ public class BacktestService {
         double           maxDrawdown    = 0.0;
 
         // ── Position state ───────────────────────────────────────────────────
-        boolean    inPosition  = false;
-        BigDecimal entryPrice  = null;
-        CandleDto  entryCandle = null;
-        BigDecimal slPrice     = null;   // null when risk off or SL disabled
-        BigDecimal tpPrice     = null;
-        int        tradeQty    = resolvedQty;
+        boolean      inPosition     = false;
+        BigDecimal   entryPrice     = null;
+        CandleDto    entryCandle    = null;
+        List<String> entryPatterns  = List.of();  // patterns detected on entry candle
+        BigDecimal   slPrice        = null;        // null when risk off or SL disabled
+        BigDecimal   tpPrice        = null;
+        int          tradeQty       = resolvedQty;
 
         // ── Risk state ───────────────────────────────────────────────────────
         int        cooldownRemaining = 0;
@@ -172,6 +188,27 @@ public class BacktestService {
 
                 StrategyResult result = logic.evaluate(ctx);
 
+                // ── Detect candle patterns ───────────────────────────────────
+                List<String> detectedPatterns = List.of();
+                if (candle.open() != null && candle.high() != null
+                        && candle.low() != null && candle.close() != null) {
+                    double cO = candle.open() .doubleValue();
+                    double cH = candle.high() .doubleValue();
+                    double cL = candle.low()  .doubleValue();
+                    double cC = candle.close().doubleValue();
+                    detectedPatterns = CandlePatternDetector.detect(
+                            patPrev2, patPrev1, cO, cH, cL, cC, pMinWick, pMaxBody);
+                    // Advance pattern rolling window
+                    patPrev2 = patPrev1;
+                    patPrev1 = new double[]{ candle.open().doubleValue(), candle.high().doubleValue(),
+                                             candle.low().doubleValue(),  candle.close().doubleValue() };
+                }
+
+                // Pattern confirmation gates (empty confirm set = no restriction)
+                final List<String> fp = detectedPatterns;
+                boolean patOkBuy  = buyConfirm.isEmpty()  || fp.stream().anyMatch(buyConfirm::contains);
+                boolean patOkSell = sellConfirm.isEmpty() || fp.stream().anyMatch(sellConfirm::contains);
+
                 // ── 3. In-position checks ────────────────────────────────────
                 if (inPosition) {
                     BigDecimal exitPrice = null;
@@ -195,14 +232,14 @@ public class BacktestService {
                     }
 
                     // Strategy SELL signal (only if not already exited via SL/TP)
-                    if (exitPrice == null && result.isSell()) {
+                    if (exitPrice == null && result.isSell() && patOkSell) {
                         exitPrice  = candle.close();
                         exitReason = "SIGNAL";
                     }
 
                     if (exitPrice != null) {
                         TradeEntry trade = buildTrade(entryCandle, candle, entryPrice, exitPrice,
-                                                      tradeQty, runningCapital, exitReason);
+                                                      tradeQty, runningCapital, exitReason, entryPatterns);
                         trades.add(trade);
                         runningCapital = trade.getRunningCapital();
 
@@ -220,11 +257,12 @@ public class BacktestService {
                             cooldownRemaining = rc.getCooldownCandles();
                         }
 
-                        inPosition  = false;
-                        entryPrice  = null;
-                        entryCandle = null;
-                        slPrice     = null;
-                        tpPrice     = null;
+                        inPosition    = false;
+                        entryPrice    = null;
+                        entryCandle   = null;
+                        entryPatterns = List.of();
+                        slPrice       = null;
+                        tpPrice       = null;
                     }
 
                 // ── 4. Flat — entry check ────────────────────────────────────
@@ -244,7 +282,7 @@ public class BacktestService {
                                 dailyCapHalts++;
                             }
                         }
-                        if (!dailyCapHit && result.isBuy() && candle.close() != null
+                        if (!dailyCapHit && result.isBuy() && patOkBuy && candle.close() != null
                                 && candle.close().compareTo(BigDecimal.ZERO) > 0) {
                             // Position sizing via risk-per-trade
                             tradeQty = resolvedQty;
@@ -256,9 +294,10 @@ public class BacktestService {
                                     tradeQty = Math.max(1, Math.min(sized, resolvedQty));
                                 }
                             }
-                            inPosition  = true;
-                            entryPrice  = candle.close();
-                            entryCandle = candle;
+                            inPosition    = true;
+                            entryPrice    = candle.close();
+                            entryCandle   = candle;
+                            entryPatterns = detectedPatterns;
                             slPrice = slFrac != null
                                     ? entryPrice.multiply(BigDecimal.ONE.subtract(slFrac)).setScale(2, RoundingMode.HALF_UP)
                                     : null;
@@ -268,11 +307,12 @@ public class BacktestService {
                         }
                     } else {
                         // Risk OFF — original signal-only logic
-                        if (result.isBuy()) {
-                            inPosition  = true;
-                            entryPrice  = candle.close();
-                            entryCandle = candle;
-                            tradeQty    = resolvedQty;
+                        if (result.isBuy() && patOkBuy) {
+                            inPosition    = true;
+                            entryPrice    = candle.close();
+                            entryCandle   = candle;
+                            entryPatterns = detectedPatterns;
+                            tradeQty      = resolvedQty;
                         }
                     }
                 }
@@ -282,7 +322,7 @@ public class BacktestService {
             if (inPosition && !candles.isEmpty()) {
                 CandleDto last = candles.get(candles.size() - 1);
                 TradeEntry trade = buildTrade(entryCandle, last, entryPrice, last.close(),
-                                             tradeQty, runningCapital, "END_OF_BACKTEST");
+                                             tradeQty, runningCapital, "END_OF_BACKTEST", entryPatterns);
                 trades.add(trade);
                 runningCapital = trade.getRunningCapital();
                 peak = peak.max(runningCapital);
@@ -324,7 +364,8 @@ public class BacktestService {
 
     private TradeEntry buildTrade(CandleDto entry, CandleDto exit,
                                   BigDecimal entryPrice, BigDecimal exitPrice,
-                                  int qty, BigDecimal capitalBefore, String exitReason) {
+                                  int qty, BigDecimal capitalBefore, String exitReason,
+                                  List<String> entryPatterns) {
         BigDecimal pnl = exitPrice.subtract(entryPrice)
                 .multiply(BigDecimal.valueOf(qty))
                 .setScale(2, RoundingMode.HALF_UP);
@@ -343,6 +384,7 @@ public class BacktestService {
                 .pnlPct(Math.round(pnlPct * 100.0) / 100.0)
                 .runningCapital(runningCapital)
                 .exitReason(exitReason)
+                .entryPatterns(entryPatterns != null ? entryPatterns : List.of())
                 .build();
     }
 
@@ -438,6 +480,17 @@ public class BacktestService {
                 try { longPeriod = Integer.parseInt(params.get("longPeriod")); } catch (Exception ignored) {}
             }
             return longPeriod + 1;
+        }
+        if ("CANDLE_PATTERN".equals(strategyType)) {
+            String pattern = params != null
+                    ? params.getOrDefault("pattern", "HAMMER").toUpperCase().trim()
+                    : "HAMMER";
+            return switch (pattern) {
+                case "MORNING_STAR", "EVENING_STAR"                    -> 3;
+                case "BULLISH_ENGULFING", "BEARISH_ENGULFING",
+                     "DOJI_REVERSAL"                                    -> 2;
+                default                                                 -> 1;
+            };
         }
         return 0;
     }

@@ -13,7 +13,9 @@ public class InstrumentInfo {
     private String tradingSymbol;
     private String name;
     private String exchange;
-    private String instrumentType;
+    private String instrumentType;  // EQ, FUT, CE, PE
     private String segment;
     private double lotSize;
+    private String expiry;          // yyyy-MM-dd, null for equities
+    private double strike;          // 0.0 for non-options
 }
