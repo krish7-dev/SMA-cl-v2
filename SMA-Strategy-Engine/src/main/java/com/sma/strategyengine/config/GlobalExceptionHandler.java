@@ -1,5 +1,6 @@
 package com.sma.strategyengine.config;
 
+import com.sma.strategyengine.client.DataEngineClient.DataEngineException;
 import com.sma.strategyengine.model.response.ApiResponse;
 import jakarta.validation.ConstraintViolationException;
 import lombok.extern.slf4j.Slf4j;
@@ -36,6 +37,13 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(IllegalStateException.class)
     public ResponseEntity<ApiResponse<Void>> handleIllegalState(IllegalStateException ex) {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResponse.error(ex.getMessage()));
+    }
+
+    @ExceptionHandler(DataEngineException.class)
+    public ResponseEntity<ApiResponse<Void>> handleDataEngine(DataEngineException ex) {
+        log.error("Data Engine error: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                .body(ApiResponse.error(ex.getMessage()));
     }
 
     @ExceptionHandler(Exception.class)

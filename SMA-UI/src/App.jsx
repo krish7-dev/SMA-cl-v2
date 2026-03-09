@@ -7,6 +7,7 @@ import Portfolio from './pages/Portfolio';
 import DataEngine from './pages/DataEngine';
 import ExecutionEngine from './pages/ExecutionEngine';
 import StrategyEngine from './pages/StrategyEngine';
+import Backtest from './pages/Backtest';
 import Session from './pages/Session';
 import KiteCallback from './pages/KiteCallback';
 import './App.css';
@@ -32,6 +33,7 @@ export default function App() {
                   <Route path="/data-engine" element={<DataEngine />} />
                   <Route path="/execution-engine" element={<ExecutionEngine />} />
                   <Route path="/strategy-engine" element={<StrategyEngine />} />
+                  <Route path="/backtest" element={<Backtest />} />
                   <Route path="/session" element={<Session />} />
                 </Routes>
               </main>

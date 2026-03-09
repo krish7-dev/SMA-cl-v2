@@ -214,6 +214,10 @@ export async function getSignalsBySymbol(symbol, exchange) {
   );
 }
 
+export async function runBacktest(payload) {
+  return request(`${STRATEGY}/api/v1/strategy/backtest`, { method: 'POST', body: payload });
+}
+
 // ─── Portfolio ────────────────────────────────────────────────────────────────
 
 export async function getPositions(userId, brokerName) {

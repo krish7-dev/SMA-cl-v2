@@ -66,6 +66,7 @@ const STRATEGY_CATALOG = {
   },
 };
 
+
 const EMPTY_FORM = {
   name: '', strategyType: 'SMA_CROSSOVER',
   symbol: '', exchange: 'NSE',
@@ -735,3 +736,4 @@ function MetaTooltip({ meta, reason }) {
     </span>
   );
 }
+

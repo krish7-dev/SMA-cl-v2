@@ -10,6 +10,7 @@ const NAV_ITEMS = [
   { to: '/data-engine',       label: 'Data Engine',      icon: '◉' },
   { to: '/execution-engine',  label: 'Execution Engine',  icon: '◬' },
   { to: '/strategy-engine',   label: 'Strategy Engine',   icon: '◇' },
+  { to: '/backtest',          label: 'Backtest Lab',      icon: '◑' },
   { to: '/session',           label: 'Session',           icon: '◎' },
 ];
 
