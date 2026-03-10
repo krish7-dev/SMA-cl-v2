@@ -467,6 +467,35 @@ const PATTERN_LABELS = {
   DOJI: 'Doji', DOJI_BULLISH: 'Doji↑', DOJI_BEARISH: 'Doji↓',
 };
 
+const REGIMES = ['TRENDING', 'RANGING', 'VOLATILE', 'COMPRESSION'];
+const REGIME_COLORS = {
+  TRENDING:    { bg: 'rgba(99,102,241,0.15)', text: '#818cf8', border: '#4f46e5' },
+  RANGING:     { bg: 'rgba(245,158,11,0.15)', text: '#fbbf24', border: '#d97706' },
+  VOLATILE:    { bg: 'rgba(239,68,68,0.15)',  text: '#f87171', border: '#dc2626' },
+  COMPRESSION: { bg: 'rgba(34,197,94,0.15)',  text: '#4ade80', border: '#16a34a' },
+};
+// Default regime suitability — auto-assigned when Market Regime Detection is ON
+const STRATEGY_REGIME_MAP = {
+  SMA_CROSSOVER:       ['TRENDING'],
+  EMA_CROSSOVER:       ['TRENDING'],
+  MACD:                ['TRENDING', 'VOLATILE'],
+  RSI:                 ['RANGING'],
+  RSI_REVERSAL:        ['RANGING', 'VOLATILE'],
+  BREAKOUT:            ['VOLATILE', 'COMPRESSION'],
+  VWAP_PULLBACK:       ['TRENDING'],
+  BOLLINGER_REVERSION: ['RANGING', 'COMPRESSION'],
+  LIQUIDITY_SWEEP:     ['VOLATILE'],
+  CANDLE_PATTERN:      ['RANGING', 'VOLATILE'],
+};
+const EMPTY_REGIME_CONFIG = {
+  enabled: false,
+  adxPeriod: 14,
+  atrPeriod: 14,
+  adxTrendThreshold: 25,
+  atrVolatilePct: 2.0,
+  atrCompressionPct: 0.5,
+};
+
 class LocalCandlePatternEvaluator {
   constructor(pattern, minWickRatio, maxBodyPct) {
     this.pattern      = (pattern      || 'HAMMER').toUpperCase().trim();
@@ -645,8 +674,9 @@ function HistoricalBacktest() {
 
   const [strategies, setStrategies] = useState(defaultStrategies);
   const [dataCtx, setDataCtx]       = useState({ ...EMPTY_DATA_CTX });
-  const [riskConfig, setRiskConfig]       = useState({ ...EMPTY_RISK });
-  const [patternConfig, setPatternConfig] = useState({ ...EMPTY_PATTERN });
+  const [riskConfig, setRiskConfig]         = useState({ ...EMPTY_RISK });
+  const [patternConfig, setPatternConfig]   = useState({ ...EMPTY_PATTERN });
+  const [regimeConfig, setRegimeConfig]     = useState({ ...EMPTY_REGIME_CONFIG });
   const [loading, setLoading]       = useState(false);
   const [error, setError]           = useState('');
   const [result, setResult]         = useState(null);
@@ -687,6 +717,11 @@ function HistoricalBacktest() {
     });
   }
 
+  function updateRegime(key, value) {
+    setRegimeConfig(p => ({ ...p, [key]: value }));
+  }
+
+
   function applyPreset(days) {
     const { fromDate, toDate } = datePreset(days);
     setDataCtx(p => ({ ...p, fromDate, toDate }));
@@ -718,6 +753,9 @@ function HistoricalBacktest() {
           strategyType: s.strategyType,
           label:        s.label || undefined,
           parameters:   s.parameters,
+          activeRegimes: regimeConfig.enabled
+            ? (STRATEGY_REGIME_MAP[s.strategyType] || [])
+            : undefined,
         })),
         riskConfig: riskConfig.enabled ? {
           enabled:            true,
@@ -734,6 +772,14 @@ function HistoricalBacktest() {
           buyConfirmPatterns:  patternConfig.buyConfirmPatterns,
           sellConfirmPatterns: patternConfig.sellConfirmPatterns,
         } : null,
+        regimeConfig: regimeConfig.enabled ? {
+          enabled:            true,
+          adxPeriod:          parseInt(regimeConfig.adxPeriod, 10)          || 14,
+          atrPeriod:          parseInt(regimeConfig.atrPeriod, 10)          || 14,
+          adxTrendThreshold:  parseFloat(regimeConfig.adxTrendThreshold)    || 25,
+          atrVolatilePct:     parseFloat(regimeConfig.atrVolatilePct)       || 2.0,
+          atrCompressionPct:  parseFloat(regimeConfig.atrCompressionPct)    || 0.5,
+        } : undefined,
       };
       const res = await runBacktest(payload);
       setResult(res?.data);
@@ -789,6 +835,24 @@ function HistoricalBacktest() {
                       <span className="bt-param-hint">{def.hint}</span>
                     </div>
                   ))}
+                </div>
+              )}
+
+              {/* Auto-assigned regimes (shown when regime detection is enabled) */}
+              {regimeConfig.enabled && (
+                <div className="bt-params-block" style={{ marginTop: 8, opacity: s.enabled ? 1 : 0.5 }}>
+                  <div className="bt-params-label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    Active Regimes
+                    <span className="bt-regime-auto-tag">auto</span>
+                  </div>
+                  <div className="bt-regime-regimes">
+                    {(STRATEGY_REGIME_MAP[s.strategyType] || []).length > 0
+                      ? (STRATEGY_REGIME_MAP[s.strategyType] || []).map(r => (
+                          <span key={r} className={`bt-regime-badge bt-regime-${r}`}>{r}</span>
+                        ))
+                      : <span className="field-hint">All regimes (no mapping defined)</span>
+                    }
+                  </div>
                 </div>
               )}
             </div>
@@ -935,6 +999,87 @@ function HistoricalBacktest() {
         </div>
       </div>
 
+      {/* Market Regime Detection */}
+      <div className="bt-section-label" style={{ marginTop: 28 }}>
+        <span className="bt-section-title">Market Regime Detection</span>
+        <span className="bt-section-sub">
+          {regimeConfig.enabled
+            ? `ON — ADX(${regimeConfig.adxPeriod}) trend>${regimeConfig.adxTrendThreshold} · ATR(${regimeConfig.atrPeriod}) volatile>${regimeConfig.atrVolatilePct}% compress<${regimeConfig.atrCompressionPct}%`
+            : 'OFF — no regime filtering applied'}
+        </span>
+      </div>
+      <div className="card bt-risk-card">
+        <div className="bt-risk-toggle-row">
+          <span className="bt-risk-label">
+            Regime Detection
+            <span className={regimeConfig.enabled ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+              {regimeConfig.enabled ? 'enabled' : 'disabled'}
+            </span>
+          </span>
+          <button type="button"
+            className={regimeConfig.enabled ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+            onClick={() => updateRegime('enabled', !regimeConfig.enabled)}>
+            {regimeConfig.enabled ? 'ON' : 'OFF'}
+          </button>
+          {!regimeConfig.enabled && (
+            <span className="bt-risk-hint">Enable to classify each candle as TRENDING / RANGING / VOLATILE / COMPRESSION and filter strategy entries by regime.</span>
+          )}
+        </div>
+        {regimeConfig.enabled && (
+          <>
+            <div className="bt-risk-fields">
+              <div className="form-group">
+                <label>ADX Period</label>
+                <input type="number" min="2" value={regimeConfig.adxPeriod}
+                  onChange={e => updateRegime('adxPeriod', e.target.value)} />
+                <small className="bt-risk-hint">Lookback for ADX indicator</small>
+              </div>
+              <div className="form-group">
+                <label>ATR Period</label>
+                <input type="number" min="2" value={regimeConfig.atrPeriod}
+                  onChange={e => updateRegime('atrPeriod', e.target.value)} />
+                <small className="bt-risk-hint">Lookback for ATR indicator</small>
+              </div>
+              <div className="form-group">
+                <label>ADX Trend Threshold</label>
+                <input type="number" min="1" max="100" step="0.5" value={regimeConfig.adxTrendThreshold}
+                  onChange={e => updateRegime('adxTrendThreshold', e.target.value)} />
+                <small className="bt-risk-hint">ADX above this = TRENDING</small>
+              </div>
+              <div className="form-group">
+                <label>ATR Volatile % <span className="form-hint">(of price)</span></label>
+                <input type="number" min="0" step="0.1" value={regimeConfig.atrVolatilePct}
+                  onChange={e => updateRegime('atrVolatilePct', e.target.value)} />
+                <small className="bt-risk-hint">ATR/close% above this = VOLATILE</small>
+              </div>
+              <div className="form-group">
+                <label>ATR Compression % <span className="form-hint">(of price)</span></label>
+                <input type="number" min="0" step="0.05" value={regimeConfig.atrCompressionPct}
+                  onChange={e => updateRegime('atrCompressionPct', e.target.value)} />
+                <small className="bt-risk-hint">ATR/close% below this = COMPRESSION</small>
+              </div>
+            </div>
+            <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
+              <div className="bt-params-label" style={{ marginBottom: 6 }}>Regime Descriptions</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+                {REGIMES.map(r => (
+                  <span key={r} className={`bt-regime-badge bt-regime-${r}`}>{r}</span>
+                ))}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 8, lineHeight: 1.6 }}>
+                <strong style={{ color: 'var(--text-secondary)' }}>TRENDING</strong> — strong directional move (ADX high) &nbsp;·&nbsp;
+                <strong style={{ color: 'var(--text-secondary)' }}>VOLATILE</strong> — large swings with no clear direction (ATR% high) &nbsp;·&nbsp;
+                <strong style={{ color: 'var(--text-secondary)' }}>COMPRESSION</strong> — tight range / low-volatility squeeze (ATR% low) &nbsp;·&nbsp;
+                <strong style={{ color: 'var(--text-secondary)' }}>RANGING</strong> — everything else
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6 }}>
+                Per-strategy &quot;Active Regimes&quot; appear in each strategy card above. Empty selection = trades in all regimes.
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+
       {/* Data Context */}
       <div className="bt-section-label" style={{ marginTop: 28 }}>
         <span className="bt-section-title">Instrument & Date Range</span>
@@ -1010,7 +1155,7 @@ function HistoricalBacktest() {
         <button type="submit" className="btn-primary" disabled={loading || !isActive || enabledCount === 0}>
           {loading ? `Running ${enabledCount} strateg${enabledCount !== 1 ? 'ies' : 'y'}…` : `Run Backtest — ${enabledCount} strateg${enabledCount !== 1 ? 'ies' : 'y'}`}
         </button>
-        <button type="button" className="btn-secondary" onClick={() => { setStrategies(defaultStrategies()); setDataCtx({ ...EMPTY_DATA_CTX }); setRiskConfig({ ...EMPTY_RISK }); setPatternConfig({ ...EMPTY_PATTERN }); setResult(null); setError(''); }} disabled={loading}>
+        <button type="button" className="btn-secondary" onClick={() => { setStrategies(defaultStrategies()); setDataCtx({ ...EMPTY_DATA_CTX }); setRiskConfig({ ...EMPTY_RISK }); setPatternConfig({ ...EMPTY_PATTERN }); setRegimeConfig({ ...EMPTY_REGIME_CONFIG }); setResult(null); setError(''); }} disabled={loading}>
           Reset
         </button>
       </div>
@@ -1746,11 +1891,12 @@ function signalBadge(signal) {
 
 // ─── Backtest Result Panel ────────────────────────────────────────────────────
 
-// Convert "YYYY-MM-DDTHH:mm:ss" (IST LocalDateTime) → Unix seconds for lightweight-charts
+// Convert "YYYY-MM-DDTHH:mm:ss" (IST LocalDateTime) → Unix seconds for lightweight-charts.
+// lightweight-charts displays timestamps as UTC, so we parse the IST string as-if UTC
+// so the chart axis shows the correct IST clock time (e.g. 09:15, not 03:45).
 function toUtcSec(localDT) {
   if (!localDT) return 0;
-  // Treat as IST (UTC+5:30)
-  return Math.floor(new Date(localDT + '+05:30').getTime() / 1000);
+  return Math.floor(new Date(localDT + 'Z').getTime() / 1000);
 }
 
 // ─── Equity Curve (portfolio overview) ───────────────────────────────────────
@@ -2097,12 +2243,16 @@ function BacktestResultPanel({ result, session, instrumentToken }) {
               {result.results.map((r, i) => {
                 const m = r.metrics;
                 const isBest = r.label === result.bestStrategyLabel;
+                const isRegimeSwitched = r.strategyType === 'REGIME_SWITCHED';
                 return (
-                  <tr key={i} className={`bt-row ${i === selectedIdx ? 'bt-row-selected' : ''} ${isBest ? 'bt-row-best' : ''}`}
+                  <tr key={i} className={`bt-row ${i === selectedIdx ? 'bt-row-selected' : ''} ${isBest ? 'bt-row-best' : ''} ${isRegimeSwitched ? 'bt-row-regime-switched' : ''}`}
                     onClick={() => switchStrategy(i)} style={{ cursor: 'pointer' }}>
-                    <td>{isBest && <span className="best-star">★</span>}</td>
+                    <td>{isBest && <span className="best-star">★</span>}{isRegimeSwitched && <span className="bt-regime-combined-star">⚡</span>}</td>
                     <td style={{ fontWeight: 600 }}>{r.label}</td>
-                    <td><span className="instance-type">{r.strategyType}</span></td>
+                    <td>{isRegimeSwitched
+                      ? <span className="bt-regime-combined-badge">Combined</span>
+                      : <span className="instance-type">{r.strategyType}</span>
+                    }</td>
                     <td>{m.totalTrades}</td>
                     <td className={m.winRate >= 50 ? 'text-success' : 'text-danger'}>{fmt(m.winRate)}%</td>
                     <td className={m.totalPnl >= 0 ? 'text-success' : 'text-danger'} style={{ fontWeight: 600 }}>{fmtRs(m.totalPnl)}</td>
@@ -2117,6 +2267,12 @@ function BacktestResultPanel({ result, session, instrumentToken }) {
           </table>
         </div>
         <div className="field-hint" style={{ marginTop: 8 }}>Click a row to drill into metrics and trades.</div>
+        {result.results.some(r => r.strategyType === 'REGIME_SWITCHED') && (
+          <div className="bt-regime-combined-hint">
+            <span className="bt-regime-combined-badge" style={{ marginRight: 6 }}>⚡ Combined</span>
+            The highlighted row uses a single capital pool that switches strategies based on the detected market regime.
+          </div>
+        )}
       </div>
 
       {/* Detailed metrics */}
@@ -2149,6 +2305,12 @@ function BacktestResultPanel({ result, session, instrumentToken }) {
                 ['TP Exits',       selected.metrics.takeProfitExits],
                 ['Daily Cap Halts',selected.metrics.dailyCapHalts],
               ] : []),
+              ...(selected.trades?.some(t => t.regime) ? (() => {
+                const counts = {};
+                REGIMES.forEach(r => { counts[r] = 0; });
+                selected.trades.forEach(t => { if (t.regime) counts[t.regime] = (counts[t.regime] || 0) + 1; });
+                return REGIMES.filter(r => counts[r] > 0).map(r => [`Trades (${r})`, counts[r]]);
+              })() : []),
             ].map(([label, val]) => (
               <div key={label} className="bt-metric-cell">
                 <span className="bt-metric-label">{label}</span>
@@ -2219,7 +2381,7 @@ function BacktestResultPanel({ result, session, instrumentToken }) {
                 <tr>
                   <th>#</th><th>Entry Time</th><th>Exit Time</th>
                   <th>Entry Price</th><th>Exit Price</th><th>Qty</th>
-                  <th>PnL</th><th>Return %</th><th>Exit</th><th>Patterns</th><th>Capital After</th>
+                  <th>PnL</th><th>Return %</th><th>Exit</th><th>Regime</th><th>Patterns</th><th>Capital After</th>
                 </tr>
               </thead>
               <tbody>
@@ -2237,6 +2399,11 @@ function BacktestResultPanel({ result, session, instrumentToken }) {
                     <td className={t.pnl >= 0 ? 'text-success' : 'text-danger'} style={{ fontWeight: 600 }}>{fmtRs(t.pnl)}</td>
                     <td className={t.pnlPct >= 0 ? 'text-success' : 'text-danger'}>{fmt(t.pnlPct)}%</td>
                     <td><span className={`bt-exit-badge bt-exit-${(t.exitReason || 'SIGNAL').toLowerCase().replace('_', '-')}`}>{t.exitReason || 'SIGNAL'}</span></td>
+                    <td>
+                      {t.regime
+                        ? <span className={`bt-regime-badge bt-regime-${t.regime}`}>{t.regime}</span>
+                        : <span className="bt-pattern-none">—</span>}
+                    </td>
                     <td className="bt-patterns-cell">
                       {t.entryPatterns && t.entryPatterns.length > 0
                         ? t.entryPatterns.map(p => (

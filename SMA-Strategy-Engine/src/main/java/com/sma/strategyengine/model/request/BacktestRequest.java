@@ -86,6 +86,13 @@ public class BacktestRequest {
     @Valid
     private PatternConfig patternConfig;
 
+    /**
+     * Optional market regime detection configuration.
+     * Null or enabled=false → no regime filtering.
+     */
+    @Valid
+    private RegimeConfig regimeConfig;
+
     // ─── Nested types ─────────────────────────────────────────────────────────
 
     @Data
@@ -99,6 +106,13 @@ public class BacktestRequest {
 
         /** Strategy-specific parameters (e.g. {"shortPeriod":"5","longPeriod":"20"}). */
         private Map<String, String> parameters;
+
+        /**
+         * Regimes in which this strategy is allowed to open new positions.
+         * Empty = active in all regimes (default behaviour).
+         * Valid values: TRENDING, RANGING, VOLATILE, COMPRESSION
+         */
+        private List<String> activeRegimes = new java.util.ArrayList<>();
     }
 
     @Data
@@ -133,6 +147,34 @@ public class BacktestRequest {
         /** Candles to skip after a losing trade before re-entering. 0 = no cooldown. */
         @Min(value = 0)
         private int cooldownCandles = 0;
+    }
+
+    @Data
+    public static class RegimeConfig {
+
+        /** Master switch. */
+        private boolean enabled = false;
+
+        /** ADX calculation period (default 14). */
+        @Min(2) private int adxPeriod = 14;
+
+        /** ATR calculation period (default 14). */
+        @Min(2) private int atrPeriod = 14;
+
+        /** ADX value above which market is classified TRENDING (default 25). */
+        @DecimalMin("1") private double adxTrendThreshold = 25.0;
+
+        /**
+         * ATR as % of close price above which market is classified VOLATILE (default 2.0%).
+         * E.g. 2.0 means ATR > 2% of current price.
+         */
+        @DecimalMin("0") private double atrVolatilePct = 2.0;
+
+        /**
+         * ATR as % of close price below which market is classified COMPRESSION (default 0.5%).
+         * E.g. 0.5 means ATR < 0.5% of current price.
+         */
+        @DecimalMin("0") private double atrCompressionPct = 0.5;
     }
 
     @Data

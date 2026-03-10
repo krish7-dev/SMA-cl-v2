@@ -83,5 +83,6 @@ public class BacktestResult {
         BigDecimal    runningCapital;   // capital after this trade closes
         String        exitReason;       // SIGNAL | STOP_LOSS | TAKE_PROFIT | END_OF_BACKTEST
         List<String>  entryPatterns;    // candlestick patterns detected on the entry candle (may be empty)
+        String        regime;           // TRENDING | RANGING | VOLATILE | COMPRESSION — null when regime detection off
     }
 }

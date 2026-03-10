@@ -5,6 +5,7 @@ import com.sma.strategyengine.client.DataEngineClient.CandleDto;
 import com.sma.strategyengine.client.DataEngineClient.HistoryRequest;
 import com.sma.strategyengine.model.request.BacktestRequest;
 import com.sma.strategyengine.model.request.BacktestRequest.PatternConfig;
+import com.sma.strategyengine.model.request.BacktestRequest.RegimeConfig;
 import com.sma.strategyengine.model.request.BacktestRequest.RiskConfig;
 import com.sma.strategyengine.model.request.BacktestRequest.StrategyConfig;
 import com.sma.strategyengine.model.response.BacktestResult;
@@ -74,14 +75,48 @@ public class BacktestService {
                     resolvedQty, req.getInitialCapital(), candles.get(0).close());
         }
 
-        // 3. Run each strategy config
-        final int qty = resolvedQty;
-        List<StrategyRunResult> results = new ArrayList<>();
-        for (StrategyConfig cfg : req.getStrategies()) {
-            results.add(runOneStrategy(req, cfg, candles, qty));
+        // 3. Pre-compute market regimes if enabled
+        RegimeConfig regimeCfg = req.getRegimeConfig();
+        boolean regimeOn = regimeCfg != null && regimeCfg.isEnabled();
+        MarketRegimeDetector.Regime[] regimes = null;
+        if (regimeOn && !candles.isEmpty()) {
+            int sz = candles.size();
+            double[] H = new double[sz], L = new double[sz], C = new double[sz];
+            for (int i = 0; i < sz; i++) {
+                CandleDto cd = candles.get(i);
+                H[i] = cd.high()  != null ? cd.high() .doubleValue() : 0;
+                L[i] = cd.low()   != null ? cd.low()  .doubleValue() : 0;
+                C[i] = cd.close() != null ? cd.close().doubleValue() : 0;
+            }
+            regimes = MarketRegimeDetector.computeAll(H, L, C,
+                    regimeCfg.getAdxPeriod(), regimeCfg.getAtrPeriod(),
+                    regimeCfg.getAdxTrendThreshold(),
+                    regimeCfg.getAtrVolatilePct(), regimeCfg.getAtrCompressionPct());
+            log.info("Backtest: regime detection ON (adxPeriod={}, atrPeriod={}, trendThreshold={})",
+                    regimeCfg.getAdxPeriod(), regimeCfg.getAtrPeriod(), regimeCfg.getAdxTrendThreshold());
         }
 
-        // 3. Find best by totalPnl
+        // 4. Run each strategy config
+        final int qty = resolvedQty;
+        final MarketRegimeDetector.Regime[] finalRegimes = regimes;
+        List<StrategyRunResult> results = new ArrayList<>();
+
+        // When regime detection is ON and at least one strategy has activeRegimes configured,
+        // prepend a combined regime-switched result (one capital pool, one P&L).
+        if (regimeOn && finalRegimes != null) {
+            List<StrategyConfig> cfgsWithRegimes = req.getStrategies().stream()
+                    .filter(cfg -> cfg.getActiveRegimes() != null && !cfg.getActiveRegimes().isEmpty())
+                    .collect(java.util.stream.Collectors.toList());
+            if (!cfgsWithRegimes.isEmpty()) {
+                results.add(runRegimeSwitched(req, cfgsWithRegimes, candles, qty, finalRegimes));
+            }
+        }
+
+        for (StrategyConfig cfg : req.getStrategies()) {
+            results.add(runOneStrategy(req, cfg, candles, qty, finalRegimes));
+        }
+
+        // 5. Find best by totalPnl
         String bestLabel = results.stream()
                 .max(Comparator.comparing(r -> r.getMetrics().getTotalPnl()))
                 .map(StrategyRunResult::getLabel)
@@ -102,7 +137,9 @@ public class BacktestService {
 
     // ─── Per-strategy simulation ───────────────────────────────────────────────
 
-    private StrategyRunResult runOneStrategy(BacktestRequest req, StrategyConfig cfg, List<CandleDto> candles, int resolvedQty) {
+    private StrategyRunResult runOneStrategy(BacktestRequest req, StrategyConfig cfg,
+                                             List<CandleDto> candles, int resolvedQty,
+                                             MarketRegimeDetector.Regime[] regimes) {
         String instanceId = "BT-" + UUID.randomUUID().toString().replace("-", "").substring(0, 12).toUpperCase();
         String label = resolveLabel(cfg);
         Map<String, String> params = cfg.getParameters() != null ? cfg.getParameters() : Map.of();
@@ -122,6 +159,11 @@ public class BacktestService {
         // Rolling window for pattern detection: [prev2, prev1] (oldest first)
         double[] patPrev2 = null;
         double[] patPrev1 = null;
+
+        // ── Regime filter config ─────────────────────────────────────────────────
+        Set<String> activeRegimeSet = (cfg.getActiveRegimes() != null && !cfg.getActiveRegimes().isEmpty())
+                ? new HashSet<>(cfg.getActiveRegimes()) : Set.of();
+        boolean regimeFilterOn = regimes != null && !activeRegimeSet.isEmpty();
 
         // ── Risk config ──────────────────────────────────────────────────────
         RiskConfig rc    = req.getRiskConfig();
@@ -144,6 +186,7 @@ public class BacktestService {
         BigDecimal   entryPrice     = null;
         CandleDto    entryCandle    = null;
         List<String> entryPatterns  = List.of();  // patterns detected on entry candle
+        String       entryRegime    = null;        // regime at entry time
         BigDecimal   slPrice        = null;        // null when risk off or SL disabled
         BigDecimal   tpPrice        = null;
         int          tradeQty       = resolvedQty;
@@ -155,7 +198,11 @@ public class BacktestService {
         int        slExits = 0, tpExits = 0, dailyCapHalts = 0;
 
         try {
-            for (CandleDto candle : candles) {
+            for (int candleIdx = 0; candleIdx < candles.size(); candleIdx++) {
+                CandleDto candle = candles.get(candleIdx);
+                MarketRegimeDetector.Regime currentRegime = regimes != null ? regimes[candleIdx] : null;
+                boolean regimeAllowed = !regimeFilterOn || (currentRegime != null && activeRegimeSet.contains(currentRegime.name()));
+                String regimeName = currentRegime != null ? currentRegime.name() : null;
 
                 // ── 1. Day boundary reset ────────────────────────────────────
                 if (riskOn && candle.openTime() != null) {
@@ -239,7 +286,7 @@ public class BacktestService {
 
                     if (exitPrice != null) {
                         TradeEntry trade = buildTrade(entryCandle, candle, entryPrice, exitPrice,
-                                                      tradeQty, runningCapital, exitReason, entryPatterns);
+                                                      tradeQty, runningCapital, exitReason, entryPatterns, entryRegime);
                         trades.add(trade);
                         runningCapital = trade.getRunningCapital();
 
@@ -261,6 +308,7 @@ public class BacktestService {
                         entryPrice    = null;
                         entryCandle   = null;
                         entryPatterns = List.of();
+                        entryRegime   = null;
                         slPrice       = null;
                         tpPrice       = null;
                     }
@@ -282,7 +330,7 @@ public class BacktestService {
                                 dailyCapHalts++;
                             }
                         }
-                        if (!dailyCapHit && result.isBuy() && patOkBuy && candle.close() != null
+                        if (!dailyCapHit && result.isBuy() && patOkBuy && regimeAllowed && candle.close() != null
                                 && candle.close().compareTo(BigDecimal.ZERO) > 0) {
                             // Position sizing via risk-per-trade
                             tradeQty = resolvedQty;
@@ -298,6 +346,7 @@ public class BacktestService {
                             entryPrice    = candle.close();
                             entryCandle   = candle;
                             entryPatterns = detectedPatterns;
+                            entryRegime   = regimeName;
                             slPrice = slFrac != null
                                     ? entryPrice.multiply(BigDecimal.ONE.subtract(slFrac)).setScale(2, RoundingMode.HALF_UP)
                                     : null;
@@ -307,11 +356,12 @@ public class BacktestService {
                         }
                     } else {
                         // Risk OFF — original signal-only logic
-                        if (result.isBuy() && patOkBuy) {
+                        if (result.isBuy() && patOkBuy && regimeAllowed) {
                             inPosition    = true;
                             entryPrice    = candle.close();
                             entryCandle   = candle;
                             entryPatterns = detectedPatterns;
+                            entryRegime   = regimeName;
                             tradeQty      = resolvedQty;
                         }
                     }
@@ -322,7 +372,7 @@ public class BacktestService {
             if (inPosition && !candles.isEmpty()) {
                 CandleDto last = candles.get(candles.size() - 1);
                 TradeEntry trade = buildTrade(entryCandle, last, entryPrice, last.close(),
-                                             tradeQty, runningCapital, "END_OF_BACKTEST", entryPatterns);
+                                             tradeQty, runningCapital, "END_OF_BACKTEST", entryPatterns, entryRegime);
                 trades.add(trade);
                 runningCapital = trade.getRunningCapital();
                 peak = peak.max(runningCapital);
@@ -354,6 +404,229 @@ public class BacktestService {
                 .build();
     }
 
+    // ─── Regime-Switched combined simulation ──────────────────────────────────
+    //
+    // Runs all strategy logics per candle simultaneously (each maintaining its own
+    // warmup/state), but only acts on the signal from the strategy assigned to the
+    // current regime. One capital pool → one combined P&L.
+
+    private StrategyRunResult runRegimeSwitched(BacktestRequest req, List<StrategyConfig> cfgs,
+                                                List<CandleDto> candles, int resolvedQty,
+                                                MarketRegimeDetector.Regime[] regimes) {
+        // Regime → first matching config (order in list wins)
+        Map<String, StrategyConfig> regimeMap = new LinkedHashMap<>();
+        for (StrategyConfig cfg : cfgs) {
+            if (cfg.getActiveRegimes() != null) {
+                for (String r : cfg.getActiveRegimes()) {
+                    regimeMap.putIfAbsent(r.toUpperCase(), cfg);
+                }
+            }
+        }
+
+        // One StrategyLogic instance per config object (IdentityHashMap preserves separation)
+        Map<StrategyConfig, StrategyLogic>        cfgLogic    = new java.util.IdentityHashMap<>();
+        Map<StrategyConfig, String>               cfgInstance = new java.util.IdentityHashMap<>();
+        Map<StrategyConfig, Map<String, String>>  cfgParams   = new java.util.IdentityHashMap<>();
+        for (StrategyConfig cfg : cfgs) {
+            if (!cfgLogic.containsKey(cfg)) {
+                cfgLogic.put(cfg, strategyRegistry.resolve(cfg.getStrategyType()));
+                cfgInstance.put(cfg, "BT-RS-" + UUID.randomUUID().toString().replace("-", "").substring(0, 10).toUpperCase());
+                cfgParams.put(cfg, cfg.getParameters() != null ? cfg.getParameters() : Map.of());
+            }
+        }
+
+        // Pattern config
+        PatternConfig pc         = req.getPatternConfig();
+        boolean       patternOn  = pc != null && pc.isEnabled();
+        double        pMinWick   = patternOn ? pc.getMinWickRatio() : 2.0;
+        double        pMaxBody   = patternOn ? pc.getMaxBodyPct()   : 0.35;
+        Set<String>   buyConfirm = patternOn && pc.getBuyConfirmPatterns()  != null
+                ? new HashSet<>(pc.getBuyConfirmPatterns())  : Set.of();
+        Set<String>   sellConfirm = patternOn && pc.getSellConfirmPatterns() != null
+                ? new HashSet<>(pc.getSellConfirmPatterns()) : Set.of();
+        double[] patPrev2 = null, patPrev1 = null;
+
+        // Risk config
+        RiskConfig rc     = req.getRiskConfig();
+        boolean    riskOn = rc != null && rc.isEnabled();
+        BigDecimal slFrac   = fracOrNull(rc == null ? null : rc.getStopLossPct());
+        BigDecimal tpFrac   = fracOrNull(rc == null ? null : rc.getTakeProfitPct());
+        BigDecimal riskFrac = (riskOn && slFrac != null) ? fracOrNull(rc.getMaxRiskPerTradePct()) : null;
+        BigDecimal capFrac  = fracOrNull(rc == null ? null : rc.getDailyLossCapPct());
+
+        // Capital / drawdown / position state
+        List<TradeEntry> trades         = new ArrayList<>();
+        BigDecimal       runningCapital = req.getInitialCapital();
+        BigDecimal       peak           = runningCapital;
+        double           maxDrawdown    = 0.0;
+        boolean          inPosition     = false;
+        BigDecimal       entryPrice     = null;
+        CandleDto        entryCandle    = null;
+        List<String>     entryPatterns  = List.of();
+        String           entryRegime    = null;
+        BigDecimal       slPrice        = null;
+        BigDecimal       tpPrice        = null;
+        int              tradeQty       = resolvedQty;
+        int              cooldownRemaining = 0;
+        LocalDate        currentDay        = null;
+        BigDecimal       dailyLossStart    = runningCapital;
+        int              slExits = 0, tpExits = 0, dailyCapHalts = 0;
+
+        try {
+            for (int ci = 0; ci < candles.size(); ci++) {
+                CandleDto candle       = candles.get(ci);
+                String    regimeName   = regimes[ci].name();
+                StrategyConfig active  = regimeMap.get(regimeName);  // null = no strategy for this regime
+
+                // Day boundary reset
+                if (riskOn && candle.openTime() != null) {
+                    LocalDate day = candle.openTime().toLocalDate();
+                    if (!day.equals(currentDay)) { currentDay = day; dailyLossStart = runningCapital; }
+                }
+
+                // ── Evaluate ALL strategy logics (maintains each one's warmup state) ─
+                Map<StrategyConfig, StrategyResult> allResults = new java.util.IdentityHashMap<>();
+                for (StrategyConfig cfg : cfgs) {
+                    StrategyContext ctx = StrategyContext.builder()
+                            .instanceId(cfgInstance.get(cfg))
+                            .strategyType(cfg.getStrategyType())
+                            .userId(req.getUserId()).brokerName(req.getBrokerName())
+                            .symbol(req.getSymbol().toUpperCase()).exchange(req.getExchange().toUpperCase())
+                            .product(req.getProduct()).quantity(tradeQty).orderType("MARKET")
+                            .candleOpenTime(candle.openTime() != null ? candle.openTime().toInstant(ZoneOffset.UTC) : null)
+                            .candleOpen(candle.open()).candleHigh(candle.high())
+                            .candleLow(candle.low()).candleClose(candle.close())
+                            .candleVolume(candle.volume() != null ? candle.volume() : 0L)
+                            .params(cfgParams.get(cfg))
+                            .build();
+                    allResults.put(cfg, cfgLogic.get(cfg).evaluate(ctx));
+                }
+
+                StrategyResult activeResult = active != null ? allResults.get(active) : null;
+
+                // Candle patterns
+                List<String> detectedPatterns = List.of();
+                if (candle.open() != null && candle.high() != null && candle.low() != null && candle.close() != null) {
+                    double cO = candle.open().doubleValue(), cH = candle.high().doubleValue();
+                    double cL = candle.low().doubleValue(),  cC = candle.close().doubleValue();
+                    detectedPatterns = CandlePatternDetector.detect(patPrev2, patPrev1, cO, cH, cL, cC, pMinWick, pMaxBody);
+                    patPrev2 = patPrev1;
+                    patPrev1 = new double[]{ cO, cH, cL, cC };
+                }
+                final List<String> fp = detectedPatterns;
+                boolean patOkBuy  = buyConfirm.isEmpty()  || fp.stream().anyMatch(buyConfirm::contains);
+                boolean patOkSell = sellConfirm.isEmpty() || fp.stream().anyMatch(sellConfirm::contains);
+
+                // ── In-position exit checks ───────────────────────────────────────
+                if (inPosition) {
+                    BigDecimal exitPrice = null;
+                    String     exitReason = null;
+                    if (riskOn) {
+                        if (slPrice != null && candle.low() != null && candle.low().compareTo(slPrice) <= 0) {
+                            exitPrice = slPrice; exitReason = "STOP_LOSS"; slExits++;
+                        } else if (tpPrice != null && candle.high() != null && candle.high().compareTo(tpPrice) >= 0) {
+                            exitPrice = tpPrice; exitReason = "TAKE_PROFIT"; tpExits++;
+                        }
+                    }
+                    if (exitPrice == null && activeResult != null && activeResult.isSell() && patOkSell) {
+                        exitPrice = candle.close(); exitReason = "SIGNAL";
+                    }
+                    // Regime changed to one with no assigned strategy → force exit
+                    if (exitPrice == null && active == null) {
+                        exitPrice = candle.close(); exitReason = "REGIME_CHANGE";
+                    }
+                    if (exitPrice != null) {
+                        TradeEntry trade = buildTrade(entryCandle, candle, entryPrice, exitPrice,
+                                tradeQty, runningCapital, exitReason, entryPatterns, entryRegime);
+                        trades.add(trade);
+                        runningCapital = trade.getRunningCapital();
+                        peak = peak.max(runningCapital);
+                        if (peak.compareTo(BigDecimal.ZERO) > 0) {
+                            double dd = peak.subtract(runningCapital).divide(peak, 6, RoundingMode.HALF_UP).doubleValue() * 100.0;
+                            maxDrawdown = Math.max(maxDrawdown, dd);
+                        }
+                        if (riskOn && rc.getCooldownCandles() > 0 && trade.getPnl().compareTo(BigDecimal.ZERO) <= 0) {
+                            cooldownRemaining = rc.getCooldownCandles();
+                        }
+                        inPosition = false; entryPrice = null; entryCandle = null;
+                        entryPatterns = List.of(); entryRegime = null; slPrice = null; tpPrice = null;
+                    }
+
+                // ── Entry check ───────────────────────────────────────────────────
+                } else if (activeResult != null) {
+                    if (riskOn) {
+                        if (cooldownRemaining > 0) { cooldownRemaining--; continue; }
+                        boolean dailyCapHit = false;
+                        if (capFrac != null && dailyLossStart.compareTo(BigDecimal.ZERO) > 0) {
+                            BigDecimal lost = dailyLossStart.subtract(runningCapital).divide(dailyLossStart, 8, RoundingMode.HALF_UP);
+                            if (lost.compareTo(capFrac) >= 0) { dailyCapHit = true; dailyCapHalts++; }
+                        }
+                        if (!dailyCapHit && activeResult.isBuy() && patOkBuy
+                                && candle.close() != null && candle.close().compareTo(BigDecimal.ZERO) > 0) {
+                            tradeQty = resolvedQty;
+                            if (riskFrac != null && slFrac != null) {
+                                BigDecimal ra = runningCapital.multiply(riskFrac);
+                                BigDecimal ru = candle.close().multiply(slFrac);
+                                if (ru.compareTo(BigDecimal.ZERO) > 0) {
+                                    int sized = ra.divide(ru, 0, RoundingMode.FLOOR).intValue();
+                                    tradeQty = Math.max(1, Math.min(sized, resolvedQty));
+                                }
+                            }
+                            inPosition = true; entryPrice = candle.close(); entryCandle = candle;
+                            entryPatterns = detectedPatterns; entryRegime = regimeName;
+                            slPrice = slFrac != null ? entryPrice.multiply(BigDecimal.ONE.subtract(slFrac)).setScale(2, RoundingMode.HALF_UP) : null;
+                            tpPrice = tpFrac != null ? entryPrice.multiply(BigDecimal.ONE.add(tpFrac)).setScale(2, RoundingMode.HALF_UP) : null;
+                        }
+                    } else {
+                        if (activeResult.isBuy() && patOkBuy) {
+                            inPosition = true; entryPrice = candle.close(); entryCandle = candle;
+                            entryPatterns = detectedPatterns; entryRegime = regimeName; tradeQty = resolvedQty;
+                        }
+                    }
+                }
+            }
+
+            // Force-close open position at last candle
+            if (inPosition && !candles.isEmpty()) {
+                CandleDto last = candles.get(candles.size() - 1);
+                TradeEntry trade = buildTrade(entryCandle, last, entryPrice, last.close(),
+                        tradeQty, runningCapital, "END_OF_BACKTEST", entryPatterns, entryRegime);
+                trades.add(trade);
+                runningCapital = trade.getRunningCapital();
+                peak = peak.max(runningCapital);
+                if (peak.compareTo(BigDecimal.ZERO) > 0) {
+                    double dd = peak.subtract(runningCapital).divide(peak, 6, RoundingMode.HALF_UP).doubleValue() * 100.0;
+                    maxDrawdown = Math.max(maxDrawdown, dd);
+                }
+            }
+
+        } finally {
+            cfgs.forEach(cfg -> {
+                StrategyLogic l = cfgLogic.get(cfg);
+                if (l != null) l.onInstanceRemoved(cfgInstance.get(cfg));
+            });
+        }
+
+        // Build a readable label: "Regime-Switched [T:SMA V:RSI ...]"
+        StringBuilder labelB = new StringBuilder("Regime-Switched [");
+        regimeMap.forEach((r, cfg) -> labelB.append(r.charAt(0)).append(':').append(resolveLabel(cfg)).append(' '));
+        String label = labelB.toString().trim() + "]";
+
+        Metrics metrics = computeMetrics(trades, req.getInitialCapital(), runningCapital,
+                maxDrawdown, Map.of(), "REGIME_SWITCHED", slExits, tpExits, dailyCapHalts);
+
+        log.info("Backtest [{}]: {} trades, winRate={}%, totalPnl={}", label,
+                metrics.getTotalTrades(), metrics.getWinRate(), metrics.getTotalPnl());
+
+        return StrategyRunResult.builder()
+                .strategyType("REGIME_SWITCHED")
+                .label(label)
+                .parameters(Map.of())
+                .metrics(metrics)
+                .trades(trades)
+                .build();
+    }
+
     /** Converts a percentage BigDecimal (e.g. 2.0) to a fraction (0.02). Returns null if 0 or null. */
     private static BigDecimal fracOrNull(BigDecimal pct) {
         if (pct == null || pct.compareTo(BigDecimal.ZERO) <= 0) return null;
@@ -365,7 +638,7 @@ public class BacktestService {
     private TradeEntry buildTrade(CandleDto entry, CandleDto exit,
                                   BigDecimal entryPrice, BigDecimal exitPrice,
                                   int qty, BigDecimal capitalBefore, String exitReason,
-                                  List<String> entryPatterns) {
+                                  List<String> entryPatterns, String regime) {
         BigDecimal pnl = exitPrice.subtract(entryPrice)
                 .multiply(BigDecimal.valueOf(qty))
                 .setScale(2, RoundingMode.HALF_UP);
@@ -385,6 +658,7 @@ public class BacktestService {
                 .runningCapital(runningCapital)
                 .exitReason(exitReason)
                 .entryPatterns(entryPatterns != null ? entryPatterns : List.of())
+                .regime(regime)
                 .build();
     }
 
