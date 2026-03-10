@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   getStrategyTypes, runBacktest,
   startReplay, stopReplay, getReplayStatus,
-  liveSubscribe, liveDisconnect, liveStatus,
+  liveSubscribe, liveUnsubscribe, liveStatus,
   searchInstruments, fetchHistoricalData,
 } from '../services/api';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers, CrosshairMode, LineStyle } from 'lightweight-charts';
@@ -1634,6 +1634,8 @@ function LiveTest() {
   const [variant, setVariant]         = useState(emptyVariant('SMA_CROSSOVER'));
   const [inst, setInst]               = useState({ ...EMPTY_INST });
   const [mode, setMode]               = useState('QUOTE');
+  const [preload, setPreload]         = useState({ enabled: true, daysBack: 5, interval: 'MINUTE_5' });
+  const [preloadState, setPreloadState] = useState(null); // null | { status, count, error }
 
   const [connected, setConnected]     = useState(false);
   const [status, setStatus]           = useState('idle');
@@ -1668,10 +1670,44 @@ function LiveTest() {
   async function handleConnect(e) {
     e.preventDefault();
     setError(''); setTicks([]); ticksRef.current = []; setSignals([]); signalsRef.current = [];
-    setLatestTick(null);
+    setLatestTick(null); setPreloadState(null);
     evaluatorRef.current = buildLocalEvaluator(variant.strategyType, variant.parameters || {});
 
     try {
+      // ── Step 1: warmup evaluator with historical candles ──────────────────
+      if (preload.enabled && inst.instrumentToken) {
+        setStatus('warming up');
+        setPreloadState({ status: 'loading', count: 0, error: null });
+        try {
+          const now  = new Date();
+          const from = new Date(now.getTime() - parseInt(preload.daysBack, 10) * 24 * 60 * 60 * 1000);
+          from.setHours(9, 15, 0, 0);
+          const pad = n => String(n).padStart(2, '0');
+          const fmt  = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+
+          const res = await fetchHistoricalData({
+            userId:          session.userId,
+            brokerName:      session.brokerName,
+            apiKey:          session.apiKey,
+            accessToken:     session.accessToken,
+            instrumentToken: parseInt(inst.instrumentToken, 10),
+            symbol:          inst.symbol.toUpperCase(),
+            exchange:        inst.exchange.toUpperCase(),
+            interval:        preload.interval,
+            fromDate:        fmt(from),
+            toDate:          fmt(now),
+            persist:         true,
+          });
+          const candles = res?.data || [];
+          candles.forEach(c => evaluatorRef.current.next(parseFloat(c.close)));
+          setPreloadState({ status: 'done', count: candles.length, error: null });
+        } catch (err) {
+          setPreloadState({ status: 'error', count: 0, error: err.message });
+          // non-fatal — continue to live connection with cold evaluator
+        }
+      }
+
+      // ── Step 2: subscribe to live feed ────────────────────────────────────
       setStatus('connecting');
       await liveSubscribe({
         userId:      session.userId,
@@ -1724,7 +1760,11 @@ function LiveTest() {
 
   async function handleDisconnect() {
     try {
-      await liveDisconnect(session.userId, session.brokerName);
+      await liveUnsubscribe({
+        userId:           session.userId,
+        brokerName:       session.brokerName,
+        instrumentTokens: [parseInt(inst.instrumentToken, 10)],
+      });
     } catch {}
     cleanup();
     setConnected(false);
@@ -1787,16 +1827,52 @@ function LiveTest() {
               </select>
             </div>
 
+            {/* Preload historical candles for warmup */}
+            <div className="de-preload-block" style={{ marginBottom: 14 }}>
+              <div className="de-preload-header">
+                <label className="checkbox-label" style={{ margin: 0, fontWeight: 600 }}>
+                  <input type="checkbox" checked={preload.enabled} disabled={connected}
+                    onChange={e => setPreload(p => ({ ...p, enabled: e.target.checked }))} />
+                  Preload past candles
+                </label>
+                <span className="de-preload-hint">Warms up the strategy evaluator before going live</span>
+              </div>
+              {preload.enabled && (
+                <div className="de-preload-fields">
+                  <div className="form-group">
+                    <label>Days back</label>
+                    <input type="number" min="1" max="60" value={preload.daysBack} disabled={connected}
+                      onChange={e => setPreload(p => ({ ...p, daysBack: e.target.value }))}
+                      style={{ width: 80 }} />
+                  </div>
+                  <div className="form-group">
+                    <label>Candle interval</label>
+                    <select value={preload.interval} disabled={connected}
+                      onChange={e => setPreload(p => ({ ...p, interval: e.target.value }))}>
+                      {INTERVALS.map(iv => <option key={iv.value} value={iv.value}>{iv.label}</option>)}
+                    </select>
+                  </div>
+                </div>
+              )}
+              {preloadState && (
+                <div className="de-preload-results">
+                  {preloadState.status === 'loading' && <span className="de-preload-loading">Fetching historical candles…</span>}
+                  {preloadState.status === 'done'    && <span className="de-preload-result-item de-preload-ok">{preloadState.count} candles fed into evaluator</span>}
+                  {preloadState.status === 'error'   && <span className="de-preload-result-item de-preload-error">Preload failed: {preloadState.error} — continuing cold</span>}
+                </div>
+              )}
+            </div>
+
             {error && <div className="error-msg" style={{ marginBottom: 12 }}>{error}</div>}
             {!isActive && <div className="error-msg" style={{ marginBottom: 12 }}>No active session.</div>}
 
             <div style={{ display: 'flex', gap: 8 }}>
               {!connected ? (
-                <button type="submit" className="btn-primary" disabled={!isActive || status === 'connecting'}>
-                  {status === 'connecting' ? 'Connecting…' : '⬤ Connect Live'}
+                <button type="submit" className="btn-primary" disabled={!isActive || status === 'connecting' || status === 'warming up'}>
+                  {status === 'warming up' ? 'Warming up…' : status === 'connecting' ? 'Connecting…' : '⬤ Connect Live'}
                 </button>
               ) : (
-                <button type="button" className="btn-danger" onClick={handleDisconnect}>✕ Disconnect</button>
+                <button type="button" className="btn-danger" onClick={handleDisconnect}>✕ Unsubscribe</button>
               )}
             </div>
           </form>
