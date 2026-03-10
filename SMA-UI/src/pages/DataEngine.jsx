@@ -269,12 +269,22 @@ function HistoricalTab({ session }) {
 
 const EMPTY_INSTRUMENT = { instrumentToken: '', symbol: '', exchange: 'NSE' };
 
+/** Format a JS Date as "YYYY-MM-DDTHH:mm:ss" in browser local time (IST on Indian machines). */
+function fmtLocalDT(date) {
+  const pad = n => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}` +
+         `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
 function LiveTab({ session }) {
   const [mode, setMode]             = useState('FULL');
   const [instruments, setInstruments] = useState([{ ...EMPTY_INSTRUMENT }]);
   const [subLoading, setSubLoading] = useState(false);
   const [subError, setSubError]     = useState('');
   const [subResult, setSubResult]   = useState(null);
+
+  const [preload, setPreload]           = useState({ enabled: true, daysBack: 5, interval: 'MINUTE_5' });
+  const [preloadStatus, setPreloadStatus] = useState(null); // null | { loading, results, error }
 
   const [unsubTokens, setUnsubTokens]     = useState('');
   const [unsubLoading, setUnsubLoading]   = useState(false);
@@ -310,7 +320,43 @@ function LiveTab({ session }) {
   async function handleSubscribe(e) {
     e.preventDefault();
     setSubError(''); setSubResult(null); setSubLoading(true);
+    setPreloadStatus(null);
     try {
+      // ── Step 1: preload historical candles (strategy warmup) ──────────────
+      if (preload.enabled) {
+        setPreloadStatus({ loading: true, results: [], error: '' });
+        const now  = new Date();
+        const from = new Date(now.getTime() - parseInt(preload.daysBack, 10) * 24 * 60 * 60 * 1000);
+        from.setHours(9, 15, 0, 0); // NSE opens 09:15
+        const fromStr = fmtLocalDT(from);
+        const toStr   = fmtLocalDT(now);
+
+        const results = [];
+        for (const inst of instruments) {
+          if (!inst.instrumentToken) continue;
+          try {
+            const res = await fetchHistoricalData({
+              userId:          session.userId,
+              brokerName:      session.brokerName,
+              apiKey:          session.apiKey,
+              accessToken:     session.accessToken,
+              instrumentToken: parseInt(inst.instrumentToken, 10),
+              symbol:          inst.symbol,
+              exchange:        inst.exchange,
+              interval:        preload.interval,
+              fromDate:        fromStr,
+              toDate:          toStr,
+              persist:         true,
+            });
+            results.push({ symbol: inst.symbol || inst.instrumentToken, count: res?.data?.length ?? 0, error: null });
+          } catch (err) {
+            results.push({ symbol: inst.symbol || inst.instrumentToken, count: 0, error: err.message });
+          }
+        }
+        setPreloadStatus({ loading: false, results, error: '' });
+      }
+
+      // ── Step 2: subscribe to live feed ────────────────────────────────────
       const res = await liveSubscribe({
         userId:      session.userId,
         brokerName:  session.brokerName,
@@ -383,8 +429,55 @@ function LiveTab({ session }) {
               {instruments.length > 1 && <button type="button" className="btn-danger btn-sm" onClick={() => removeInstrument(idx)}>✕</button>}
             </div>
           ))}
+          {/* Preload historical candles */}
+          <div className="de-preload-block">
+            <div className="de-preload-header">
+              <label className="checkbox-label" style={{ margin: 0, fontWeight: 600 }}>
+                <input type="checkbox" checked={preload.enabled}
+                  onChange={e => setPreload(p => ({ ...p, enabled: e.target.checked }))} />
+                Preload historical candles
+              </label>
+              <span className="de-preload-hint">
+                Fetches past candles before subscribing so strategy indicators have warmup data
+              </span>
+            </div>
+            {preload.enabled && (
+              <div className="de-preload-fields">
+                <div className="form-group">
+                  <label>Days back</label>
+                  <input type="number" min="1" max="60" value={preload.daysBack}
+                    onChange={e => setPreload(p => ({ ...p, daysBack: e.target.value }))}
+                    style={{ width: 80 }} />
+                </div>
+                <div className="form-group">
+                  <label>Candle interval</label>
+                  <select value={preload.interval}
+                    onChange={e => setPreload(p => ({ ...p, interval: e.target.value }))}>
+                    {INTERVALS.map(i => <option key={i.value} value={i.value}>{i.label}</option>)}
+                  </select>
+                </div>
+              </div>
+            )}
+            {preloadStatus && (
+              <div className="de-preload-results">
+                {preloadStatus.loading
+                  ? <span className="de-preload-loading">Loading historical candles…</span>
+                  : preloadStatus.results.map((r, i) => (
+                      <span key={i} className={`de-preload-result-item ${r.error ? 'de-preload-error' : 'de-preload-ok'}`}>
+                        {r.symbol}: {r.error ? `Error — ${r.error}` : `${r.count} candles loaded`}
+                      </span>
+                    ))
+                }
+              </div>
+            )}
+          </div>
+
           <div className="form-actions" style={{ marginTop: 16 }}>
-            <button type="submit" className="btn-primary" disabled={subLoading}>{subLoading ? 'Subscribing…' : 'Subscribe'}</button>
+            <button type="submit" className="btn-primary" disabled={subLoading}>
+              {subLoading
+                ? (preload.enabled && !preloadStatus ? 'Loading candles…' : 'Subscribing…')
+                : 'Subscribe'}
+            </button>
           </div>
         </form>
       </div>
