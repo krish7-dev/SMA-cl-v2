@@ -630,6 +630,65 @@ function buildLocalEvaluator(strategyType, params = {}) {
   }
 }
 
+// ─── Candle interval → milliseconds ──────────────────────────────────────────
+const INTERVAL_MS = {
+  MINUTE_1: 60_000, MINUTE_3: 180_000, MINUTE_5: 300_000,
+  MINUTE_10: 600_000, MINUTE_15: 900_000, MINUTE_30: 1_800_000,
+  MINUTE_60: 3_600_000, DAY: 86_400_000,
+};
+
+// ─── Local regime detector (mirrors Java MarketRegimeDetector) ────────────────
+class LocalRegimeDetector {
+  constructor(adxPeriod=14, atrPeriod=14, adxTrendThreshold=25, atrVolatilePct=2, atrCompressionPct=0.5) {
+    this.adxPeriod = adxPeriod; this.atrPeriod = atrPeriod;
+    this.adxTrendThreshold = adxTrendThreshold;
+    this.atrVolatilePct = atrVolatilePct; this.atrCompressionPct = atrCompressionPct;
+    this.H = []; this.L = []; this.C = [];
+  }
+  addCandle(high, low, close) {
+    this.H.push(high); this.L.push(low); this.C.push(close);
+    const keep = this.adxPeriod * 4;
+    if (this.H.length > keep) { this.H.shift(); this.L.shift(); this.C.shift(); }
+    return this._detect();
+  }
+  reset() { this.H = []; this.L = []; this.C = []; }
+  _smooth(arr, p) {
+    if (arr.length < p) return arr.map(() => 0);
+    const r = new Array(arr.length).fill(0);
+    let s = 0; for (let i = 0; i < p; i++) s += arr[i]; r[p-1] = s/p;
+    for (let i = p; i < arr.length; i++) r[i] = (r[i-1]*(p-1)+arr[i])/p;
+    return r;
+  }
+  _detect() {
+    const { H, L, C, adxPeriod: p, atrPeriod: ap } = this;
+    const n = C.length;
+    if (n < p * 2) return 'RANGING';
+    const trs = [], pdms = [], mdms = [];
+    for (let i = 1; i < n; i++) {
+      trs.push(Math.max(H[i]-L[i], Math.abs(H[i]-C[i-1]), Math.abs(L[i]-C[i-1])));
+      const up = H[i]-H[i-1], dn = L[i-1]-L[i];
+      pdms.push(up > dn && up > 0 ? up : 0);
+      mdms.push(dn > up && dn > 0 ? dn : 0);
+    }
+    const sTR  = this._smooth(trs, p);
+    const sPDM = this._smooth(pdms, p);
+    const sMDM = this._smooth(mdms, p);
+    const dxs  = sTR.map((tr, i) => {
+      if (tr === 0) return 0;
+      const pdi = sPDM[i]/tr*100, mdi = sMDM[i]/tr*100, sum = pdi+mdi;
+      return sum === 0 ? 0 : Math.abs(pdi-mdi)/sum*100;
+    });
+    const adx = this._smooth(dxs, p);
+    const lastAdx = adx[adx.length-1];
+    const atrArr  = this._smooth(trs.slice(-Math.max(ap*3, trs.length)), ap);
+    const atrPct  = (atrArr[atrArr.length-1] / C[C.length-1]) * 100;
+    if (atrPct > this.atrVolatilePct)    return 'VOLATILE';
+    if (atrPct < this.atrCompressionPct) return 'COMPRESSION';
+    if (lastAdx >= this.adxTrendThreshold) return 'TRENDING';
+    return 'RANGING';
+  }
+}
+
 // ─── Page ───────────────────────────────────────────────────────────────────────
 
 export default function Backtest() {
@@ -1335,25 +1394,42 @@ function InstrumentPicker({ session, symbol, exchange, instrumentToken, onSelect
 function ReplayTest() {
   const { session, isActive } = useSession();
 
-  const [knownTypes, setKnownTypes]   = useState(['SMA_CROSSOVER']);
-  const [variant, setVariant]         = useState(emptyVariant('SMA_CROSSOVER'));
-  const [inst, setInst]               = useState({ ...EMPTY_INST });
-  const [interval, setInterval]       = useState('DAY');
-  const [fromDate, setFromDate]       = useState('');
-  const [toDate, setToDate]           = useState('');
-  const [speed, setSpeed]             = useState(1);
+  const [knownTypes, setKnownTypes]     = useState(['SMA_CROSSOVER']);
+  const [strategies, setStrategies]     = useState(defaultStrategies);
+  const [inst, setInst]                 = useState({ ...EMPTY_INST });
+  const [replayInterval, setReplayInterval] = useState('DAY');
+  const [fromDate, setFromDate]         = useState('');
+  const [toDate, setToDate]             = useState('');
+  const [speed, setSpeed]               = useState(1);
+  const [initialCapital, setInitialCapital] = useState('100000');
+  const [quantity, setQuantity]         = useState('0');
 
-  const [sessionId, setSessionId]     = useState(null);
-  const [status, setStatus]           = useState('idle');   // idle|starting|running|completed|stopped|failed
-  const [progress, setProgress]       = useState({ emitted: 0, total: 0 });
-  const [error, setError]             = useState('');
-  const [feed, setFeed]               = useState([]);       // { time, symbol, open, high, low, close, signal }
+  const [riskConfig, setRiskConfig]       = useState({ ...EMPTY_RISK });
+  const [patternConfig, setPatternConfig] = useState({ ...EMPTY_PATTERN });
+  const [regimeConfig, setRegimeConfig]   = useState({ ...EMPTY_REGIME_CONFIG });
+  const [currentRegime, setCurrentRegime] = useState(null);
+
+  const [sessionId, setSessionId]       = useState(null);
+  const [status, setStatus]             = useState('idle');
+  const [progress, setProgress]         = useState({ emitted: 0, total: 0 });
+  const [error, setError]               = useState('');
+  const [feed, setFeed]                 = useState([]);
   const [currentCandle, setCurrentCandle] = useState(null);
+  const [stratStates, setStratStates]   = useState({});
+  const [rightTab, setRightTab]         = useState('feed');
 
-  const evaluatorRef  = useRef(null);
-  const sseRef        = useRef(null);
-  const pollRef       = useRef(null);
-  const feedRef       = useRef([]);
+  const evaluatorsRef     = useRef({});
+  const sseRef            = useRef(null);
+  const pollRef           = useRef(null);
+  const feedRef           = useRef([]);
+  const capitalMap        = useRef({});
+  const openPositionMap   = useRef({});
+  const closedTradesMap   = useRef({});
+  const equityMap         = useRef({});
+  const regimeDetectorRef = useRef(null);
+  const patternEvalRef    = useRef(null);
+  const cooldownRef       = useRef({});
+  const dailyCapMap       = useRef({});
 
   useEffect(() => {
     getStrategyTypes().then(r => { if (r?.data) setKnownTypes([...r.data].sort()); }).catch(() => {});
@@ -1365,13 +1441,160 @@ function ReplayTest() {
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
   }
 
-  function updateVariantField(field, value) {
-    if (field === 'strategyType') setVariant(v => ({ ...v, strategyType: value, parameters: defaultParams(value) }));
-    else setVariant(v => ({ ...v, [field]: value }));
+  function addStrategy() {
+    setStrategies(p => [...p, { strategyType: 'SMA_CROSSOVER', enabled: true, label: '', parameters: defaultParams('SMA_CROSSOVER') }]);
+  }
+  function removeStrategy(idx) { setStrategies(p => p.filter((_, i) => i !== idx)); }
+  function updateStrategy(idx, field, value) {
+    setStrategies(p => p.map((s, i) => {
+      if (i !== idx) return s;
+      if (field === 'strategyType') return { ...s, strategyType: value, parameters: defaultParams(value) };
+      return { ...s, [field]: value };
+    }));
+  }
+  function updateStrategyParam(idx, key, value) {
+    setStrategies(p => p.map((s, i) => i !== idx ? s : { ...s, parameters: { ...s.parameters, [key]: value } }));
+  }
+  function updateRisk(f, v)    { setRiskConfig(p => ({ ...p, [f]: v })); }
+  function updatePattern(f, v) { setPatternConfig(p => ({ ...p, [f]: v })); }
+  function togglePatternList(f, v) {
+    setPatternConfig(p => ({ ...p, [f]: p[f].includes(v) ? p[f].filter(x => x !== v) : [...p[f], v] }));
+  }
+  function updateRegime(f, v)  { setRegimeConfig(p => ({ ...p, [f]: v })); }
+
+  function flushStrat(label) {
+    setStratStates(prev => ({
+      ...prev,
+      [label]: {
+        capital:      capitalMap.current[label],
+        openPosition: openPositionMap.current[label] || null,
+        closedTrades: [...(closedTradesMap.current[label] || [])],
+        equityHistory:[...(equityMap.current[label]     || [])],
+      },
+    }));
   }
 
-  function updateVariantParam(key, value) {
-    setVariant(v => ({ ...v, parameters: { ...v.parameters, [key]: value } }));
+  function computeQty(label, entryPrice) {
+    const cap = capitalMap.current[label] || 0;
+    const baseQty = parseInt(quantity, 10);
+    if (baseQty > 0) return baseQty;
+    if (riskConfig.enabled && parseFloat(riskConfig.maxRiskPerTradePct) > 0 && parseFloat(riskConfig.stopLossPct) > 0) {
+      const riskAmt = cap * parseFloat(riskConfig.maxRiskPerTradePct) / 100;
+      const riskPS  = entryPrice * parseFloat(riskConfig.stopLossPct) / 100;
+      return Math.max(1, Math.floor(riskAmt / riskPS));
+    }
+    return Math.max(1, Math.floor(cap / entryPrice));
+  }
+
+  function openLong(label, price, candleTime, regime) {
+    if (openPositionMap.current[label]) return;
+    const qty = computeQty(label, price);
+    if (price * qty > (capitalMap.current[label] || 0)) return;
+    const sl = riskConfig.enabled && parseFloat(riskConfig.stopLossPct)   > 0 ? price * (1 - parseFloat(riskConfig.stopLossPct)/100)   : null;
+    const tp = riskConfig.enabled && parseFloat(riskConfig.takeProfitPct) > 0 ? price * (1 + parseFloat(riskConfig.takeProfitPct)/100) : null;
+    openPositionMap.current[label] = { entryPrice: price, qty, entryTime: candleTime, type: 'LONG', slPrice: sl, tpPrice: tp, regime };
+    flushStrat(label);
+    const sig = { signal: 'BUY', price, symbol: inst.symbol, ts: candleTime, strategyLabel: label };
+    feedRef.current = [{ ...sig, close: price }, ...feedRef.current].slice(0, 500);
+    setFeed([...feedRef.current]);
+  }
+
+  function closeLong(label, exitPrice, candleTime, exitReason) {
+    const pos = openPositionMap.current[label];
+    if (!pos) return;
+    const pnl    = (exitPrice - pos.entryPrice) * pos.qty;
+    const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
+    const newCap = (capitalMap.current[label] || 0) + pnl;
+    capitalMap.current[label] = newCap;
+    const trade = { ...pos, exitPrice, exitTime: candleTime, pnl, pnlPct, exitReason, capitalAfter: newCap };
+    closedTradesMap.current[label] = [trade, ...(closedTradesMap.current[label] || [])];
+    equityMap.current[label] = [...(equityMap.current[label] || []), { time: candleTime, capital: newCap }];
+    openPositionMap.current[label] = null;
+    flushStrat(label);
+    if (pnl < 0 && riskConfig.enabled && parseInt(riskConfig.cooldownCandles, 10) > 0) {
+      cooldownRef.current[label] = parseInt(riskConfig.cooldownCandles, 10);
+    }
+    const sig = { signal: 'SELL', price: exitPrice, symbol: inst.symbol, ts: candleTime, strategyLabel: label, reason: exitReason };
+    feedRef.current = [{ ...sig, close: exitPrice }, ...feedRef.current].slice(0, 500);
+    setFeed([...feedRef.current]);
+  }
+
+  function onCandleEvent(candle) {
+    const candleTime = candle.openTime?.substring(0, 16) || new Date().toLocaleTimeString();
+    const close = parseFloat(candle.close);
+    const high  = parseFloat(candle.high);
+    const low   = parseFloat(candle.low);
+    const vol   = parseFloat(candle.volume || 0);
+    const open  = parseFloat(candle.open);
+
+    // Tick down cooldowns
+    Object.keys(cooldownRef.current).forEach(k => { if (cooldownRef.current[k] > 0) cooldownRef.current[k]--; });
+
+    // Regime detection
+    let regime = null;
+    if (regimeConfig.enabled && regimeDetectorRef.current) {
+      regime = regimeDetectorRef.current.addCandle(high, low, close);
+      setCurrentRegime(regime);
+    }
+
+    // SL/TP check against candle's high/low before evaluating signals
+    for (const strat of strategies.filter(s => s.enabled)) {
+      const label = strat.label || strat.strategyType;
+      const pos = openPositionMap.current[label];
+      if (!pos || !riskConfig.enabled) continue;
+      if (pos.slPrice && low <= pos.slPrice) { closeLong(label, pos.slPrice, candleTime, 'STOP_LOSS'); continue; }
+      if (pos.tpPrice && high >= pos.tpPrice) { closeLong(label, pos.tpPrice, candleTime, 'TAKE_PROFIT'); continue; }
+    }
+
+    const today = candleTime.substring(0, 10);
+    let latestSignals = {};
+    for (const strat of strategies.filter(s => s.enabled)) {
+      const label = strat.label || strat.strategyType;
+      const ev = evaluatorsRef.current[label];
+      if (!ev) continue;
+      if ((cooldownRef.current[label] || 0) > 0) continue;
+
+      // Daily loss cap
+      if (riskConfig.enabled && riskConfig.dailyLossCapPct) {
+        const dc = dailyCapMap.current[label];
+        if (dc) {
+          if (dc.date !== today) {
+            dailyCapMap.current[label] = { date: today, startCapital: capitalMap.current[label], halted: false };
+          } else {
+            const dayLoss = (capitalMap.current[label] - dc.startCapital) / dc.startCapital * 100;
+            if (dayLoss <= -parseFloat(riskConfig.dailyLossCapPct)) dailyCapMap.current[label].halted = true;
+            if (dailyCapMap.current[label].halted) continue;
+          }
+        }
+      }
+
+      // Regime filter
+      if (regimeConfig.enabled && regime) {
+        const allowed = STRATEGY_REGIME_MAP[strat.strategyType] || [];
+        if (allowed.length > 0 && !allowed.includes(regime)) continue;
+      }
+
+      const signal = ev.next(close, high, low, vol, open);
+      latestSignals[label] = signal;
+
+      // Pattern confirmation
+      if (patternConfig.enabled && patternEvalRef.current && signal !== 'HOLD') {
+        const patSig = patternEvalRef.current.next(close, high, low, vol, open);
+        if (signal === 'BUY'  && patternConfig.buyConfirmPatterns.length  > 0 && !patternConfig.buyConfirmPatterns.includes(patSig))  continue;
+        if (signal === 'SELL' && patternConfig.sellConfirmPatterns.length > 0 && !patternConfig.sellConfirmPatterns.includes(patSig)) continue;
+      }
+
+      const hasLong = !!openPositionMap.current[label];
+      if (signal === 'BUY' && !hasLong) {
+        openLong(label, close, candleTime, regime);
+      } else if (signal === 'SELL' && hasLong) {
+        closeLong(label, close, candleTime, 'SIGNAL');
+      }
+    }
+
+    const entry = { ...candle, signals: latestSignals, ts: candleTime };
+    setCurrentCandle(entry);
+    setProgress(prev => ({ ...prev, emitted: prev.emitted + 1 }));
   }
 
   async function handleStart(e) {
@@ -1380,9 +1603,35 @@ function ReplayTest() {
     setError(''); setFeed([]); feedRef.current = [];
     setProgress({ emitted: 0, total: 0 });
     setStatus('starting'); setSessionId(null); setCurrentCandle(null);
+    setStratStates({});
 
-    // Build evaluator matching the selected strategy type
-    evaluatorRef.current = buildLocalEvaluator(variant.strategyType, variant.parameters || {});
+    const initCap = parseFloat(initialCapital) || 100000;
+    evaluatorsRef.current = {};
+    capitalMap.current = {};
+    openPositionMap.current = {};
+    closedTradesMap.current = {};
+    equityMap.current = {};
+    cooldownRef.current = {};
+    dailyCapMap.current = {};
+    setCurrentRegime(null);
+    for (const strat of strategies.filter(s => s.enabled)) {
+      const label = strat.label || strat.strategyType;
+      evaluatorsRef.current[label] = buildLocalEvaluator(strat.strategyType, strat.parameters || {});
+      capitalMap.current[label] = initCap;
+      openPositionMap.current[label] = null;
+      closedTradesMap.current[label] = [];
+      equityMap.current[label] = [{ time: 'start', capital: initCap }];
+      dailyCapMap.current[label] = { date: '', startCapital: initCap, halted: false };
+    }
+    patternEvalRef.current = patternConfig.enabled
+      ? new LocalCandlePatternEvaluator(patternConfig.buyConfirmPatterns[0] || 'HAMMER', patternConfig.minWickRatio, patternConfig.maxBodyPct)
+      : null;
+    regimeDetectorRef.current = regimeConfig.enabled
+      ? new LocalRegimeDetector(
+          parseInt(regimeConfig.adxPeriod,10)||14, parseInt(regimeConfig.atrPeriod,10)||14,
+          parseFloat(regimeConfig.adxTrendThreshold)||25, parseFloat(regimeConfig.atrVolatilePct)||2,
+          parseFloat(regimeConfig.atrCompressionPct)||0.5)
+      : null;
 
     try {
       const res = await startReplay({
@@ -1391,7 +1640,7 @@ function ReplayTest() {
         instrumentToken: parseInt(inst.instrumentToken, 10),
         symbol:          inst.symbol.toUpperCase(),
         exchange:        inst.exchange.toUpperCase(),
-        interval,
+        interval:        replayInterval,
         fromDate:        fromDate + 'T09:15:00',
         toDate:          toDate   + 'T15:30:00',
         speedMultiplier: speed,
@@ -1403,20 +1652,11 @@ function ReplayTest() {
       setProgress({ emitted: 0, total: res?.data?.totalCandles || 0 });
       setStatus('running');
 
-      // Connect SSE
       const sse = new EventSource(`/data-api/api/v1/data/stream/candles?sessionId=${encodeURIComponent(sid)}`);
       sseRef.current = sse;
 
       sse.addEventListener('candle', (ev) => {
-        try {
-          const candle = JSON.parse(ev.data);
-          const signal = evaluatorRef.current.next(parseFloat(candle.close), parseFloat(candle.high), parseFloat(candle.low), parseFloat(candle.volume), parseFloat(candle.open));
-          const entry = { ...candle, signal, ts: new Date().toLocaleTimeString() };
-          setCurrentCandle(entry);
-          feedRef.current = [entry, ...feedRef.current].slice(0, 500);
-          setFeed([...feedRef.current]);
-          setProgress(prev => ({ ...prev, emitted: prev.emitted + 1 }));
-        } catch {}
+        try { onCandleEvent(JSON.parse(ev.data)); } catch {}
       });
 
       sse.onerror = () => {
@@ -1424,7 +1664,6 @@ function ReplayTest() {
         cleanup();
       };
 
-      // Poll for completion
       pollRef.current = setInterval(async () => {
         try {
           const statusRes = await getReplayStatus(sid);
@@ -1445,63 +1684,50 @@ function ReplayTest() {
 
   async function handleStop() {
     if (!sessionId) return;
-    try {
-      await stopReplay(sessionId);
-      setStatus('stopped');
-    } catch {}
+    try { await stopReplay(sessionId); setStatus('stopped'); } catch {}
     cleanup();
   }
 
-  const isRunning = status === 'running' || status === 'starting';
-  const paramDefs = PARAM_DEFS[variant.strategyType] || [];
+  function handleReset() {
+    cleanup();
+    setFeed([]); feedRef.current = [];
+    setStatus('idle'); setSessionId(null);
+    setProgress({ emitted: 0, total: 0 });
+    setCurrentCandle(null); setError('');
+    setStratStates({}); setCurrentRegime(null);
+    capitalMap.current = {}; openPositionMap.current = {};
+    closedTradesMap.current = {}; equityMap.current = {};
+    cooldownRef.current = {}; dailyCapMap.current = {};
+    regimeDetectorRef.current = null; patternEvalRef.current = null;
+  }
+
+  const isRunning      = status === 'running' || status === 'starting';
+  const initCap        = parseFloat(initialCapital) || 100000;
+  const allLabels      = Object.keys(stratStates);
+  const totalDeployed  = initCap * (allLabels.length || 1);
+  const totalCapital   = allLabels.reduce((s, l) => s + (stratStates[l]?.capital ?? initCap), 0);
+  const totalPnl       = allLabels.reduce((s, l) => s + ((stratStates[l]?.capital ?? initCap) - initCap), 0);
+  const totalPnlPct    = totalDeployed > 0 ? (totalPnl / totalDeployed) * 100 : 0;
+  const allTrades      = allLabels.flatMap(l => stratStates[l]?.closedTrades || []);
+  const fmtRs          = v => `₹${Number(v).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
 
   return (
-    <div>
-      {/* Config */}
+    <div className="bt-replay-outer">
+
+      {/* ── Top: config left + feed right ─────────────────────────────── */}
       <div className="bt-replay-layout">
         <div className="bt-replay-config">
           <div className="card">
-            <h3 className="section-title">Strategy</h3>
-
-            <div className="form-group">
-              <label>Strategy Type</label>
-              <select value={variant.strategyType} onChange={e => updateVariantField('strategyType', e.target.value)} disabled={isRunning}>
-                {knownTypes.map(t => <option key={t} value={t}>{t}</option>)}
-              </select>
-            </div>
-
-            {paramDefs.length > 0 && (
-              <div className="bt-params-block" style={{ marginTop: 8 }}>
-                <div className="bt-params-label">Parameters</div>
-                {paramDefs.map(def => (
-                  <div className="bt-param-row" key={def.key}>
-                    <label className="bt-param-label">{def.label}</label>
-                    <input type="number" min="1" className="bt-param-input"
-                      value={variant.parameters?.[def.key] || ''}
-                      onChange={e => updateVariantParam(def.key, e.target.value)}
-                      placeholder={def.placeholder}
-                      disabled={isRunning}
-                    />
-                    <span className="bt-param-hint">{def.hint}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            <h3 className="section-title" style={{ marginTop: 16 }}>Data</h3>
-
+            <h3 className="section-title">Data & Settings</h3>
             <form onSubmit={handleStart}>
               <InstrumentPicker
                 session={session}
-                symbol={inst.symbol}
-                exchange={inst.exchange}
-                instrumentToken={inst.instrumentToken}
+                symbol={inst.symbol} exchange={inst.exchange} instrumentToken={inst.instrumentToken}
                 onSelect={r => { setInst({ symbol: r.tradingSymbol, exchange: r.exchange, instrumentToken: String(r.instrumentToken) }); saveRecentInstrument(r); }}
                 onChange={patch => setInst(p => ({ ...p, ...patch }))}
                 disabled={isRunning}
               />
 
-              {/* Date preset buttons */}
               <div style={{ marginBottom: 8 }}>
                 <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 6 }}>Date Range</label>
                 <div className="bt-preset-row">
@@ -1517,7 +1743,7 @@ function ReplayTest() {
               <div className="form-row">
                 <div className="form-group">
                   <label>Interval *</label>
-                  <select value={interval} onChange={e => setInterval(e.target.value)} disabled={isRunning}>
+                  <select value={replayInterval} onChange={e => setReplayInterval(e.target.value)} disabled={isRunning}>
                     {INTERVALS.map(iv => <option key={iv.value} value={iv.value}>{iv.label}</option>)}
                   </select>
                 </div>
@@ -1538,37 +1764,157 @@ function ReplayTest() {
                   <input type="date" value={toDate} onChange={e => setToDate(e.target.value)} required disabled={isRunning} />
                 </div>
               </div>
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Initial Capital (₹)</label>
+                  <input type="number" min="1000" value={initialCapital} onChange={e => setInitialCapital(e.target.value)} disabled={isRunning} />
+                </div>
+                <div className="form-group">
+                  <label>Quantity <span className="form-hint">(0 = auto)</span></label>
+                  <input type="number" min="0" value={quantity} onChange={e => setQuantity(e.target.value)} disabled={isRunning} />
+                </div>
+              </div>
 
               {error && <div className="error-msg" style={{ marginBottom: 12 }}>{error}</div>}
               {!isActive && <div className="error-msg" style={{ marginBottom: 12 }}>No active session.</div>}
 
               <div style={{ display: 'flex', gap: 8 }}>
-                {!isRunning ? (
-                  <button type="submit" className="btn-primary" disabled={!isActive}>▶ Start Replay</button>
-                ) : (
-                  <button type="button" className="btn-danger" onClick={handleStop}>■ Stop</button>
-                )}
-                {!isRunning && (
-                  <button type="button" className="btn-secondary" onClick={() => { cleanup(); setFeed([]); feedRef.current = []; setStatus('idle'); setSessionId(null); setProgress({ emitted: 0, total: 0 }); setCurrentCandle(null); setError(''); }}>
-                    Reset
-                  </button>
-                )}
+                {!isRunning
+                  ? <button type="submit" className="btn-primary" disabled={!isActive}>▶ Start Replay</button>
+                  : <button type="button" className="btn-danger" onClick={handleStop}>■ Stop</button>
+                }
+                {!isRunning && <button type="button" className="btn-secondary" onClick={handleReset}>Reset</button>}
               </div>
             </form>
           </div>
+
+          {/* ── Risk Management ── */}
+          <div className="card bt-risk-card" style={{ marginTop: 12 }}>
+            <div className="bt-risk-toggle-row">
+              <span className="bt-risk-label">Risk Management
+                <span className={riskConfig.enabled ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+                  {riskConfig.enabled ? 'enabled' : 'disabled'}
+                </span>
+              </span>
+              <button type="button" disabled={isRunning}
+                className={riskConfig.enabled ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+                onClick={() => updateRisk('enabled', !riskConfig.enabled)}>
+                {riskConfig.enabled ? 'ON' : 'OFF'}
+              </button>
+            </div>
+            {riskConfig.enabled && (
+              <div className="bt-risk-fields">
+                {[
+                  ['Stop Loss %', 'stopLossPct', '0.1', '100'],
+                  ['Take Profit %', 'takeProfitPct', '0.1', null],
+                  ['Max Risk / Trade %', 'maxRiskPerTradePct', '0.1', '100'],
+                  ['Daily Loss Cap %', 'dailyLossCapPct', '0.1', '100'],
+                  ['Cooldown Candles', 'cooldownCandles', '1', null],
+                ].map(([lbl, key, step, max]) => (
+                  <div className="form-group" key={key}>
+                    <label>{lbl}</label>
+                    <input type="number" min="0" max={max||undefined} step={step} value={riskConfig[key]} disabled={isRunning}
+                      onChange={e => updateRisk(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* ── Market Regime Detection ── */}
+          <div className="card bt-risk-card" style={{ marginTop: 12 }}>
+            <div className="bt-risk-toggle-row">
+              <span className="bt-risk-label">Market Regime Detection
+                <span className={regimeConfig.enabled ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+                  {regimeConfig.enabled ? 'enabled' : 'disabled'}
+                </span>
+              </span>
+              <button type="button" disabled={isRunning}
+                className={regimeConfig.enabled ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+                onClick={() => updateRegime('enabled', !regimeConfig.enabled)}>
+                {regimeConfig.enabled ? 'ON' : 'OFF'}
+              </button>
+            </div>
+            {regimeConfig.enabled && (
+              <div className="bt-risk-fields">
+                {[['ADX Period','adxPeriod'],['ATR Period','atrPeriod'],['ADX Trend Threshold','adxTrendThreshold'],
+                  ['ATR Volatile %','atrVolatilePct'],['ATR Compression %','atrCompressionPct']].map(([lbl, key]) => (
+                  <div className="form-group" key={key}>
+                    <label>{lbl}</label>
+                    <input type="number" min="0" step="0.5" value={regimeConfig[key]} disabled={isRunning}
+                      onChange={e => updateRegime(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+            )}
+            {currentRegime && (
+              <div style={{ marginTop: 8 }}>
+                <span className="bt-params-label" style={{ marginRight: 6 }}>Current:</span>
+                <span className={`bt-regime-badge bt-regime-${currentRegime}`}>{currentRegime}</span>
+              </div>
+            )}
+          </div>
+
+          {/* ── Pattern Confirmation ── */}
+          <div className="card bt-risk-card" style={{ marginTop: 12 }}>
+            <div className="bt-risk-toggle-row">
+              <span className="bt-risk-label">Pattern Confirmation
+                <span className={patternConfig.enabled ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+                  {patternConfig.enabled ? 'enabled' : 'disabled'}
+                </span>
+              </span>
+              <button type="button" disabled={isRunning}
+                className={patternConfig.enabled ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+                onClick={() => updatePattern('enabled', !patternConfig.enabled)}>
+                {patternConfig.enabled ? 'ON' : 'OFF'}
+              </button>
+            </div>
+            {patternConfig.enabled && (
+              <>
+                <div className="bt-risk-fields">
+                  <div className="form-group"><label>Min Wick Ratio</label>
+                    <input type="number" min="0" step="0.1" value={patternConfig.minWickRatio} disabled={isRunning} onChange={e => updatePattern('minWickRatio', e.target.value)} />
+                  </div>
+                  <div className="form-group"><label>Max Body %</label>
+                    <input type="number" min="0" max="1" step="0.05" value={patternConfig.maxBodyPct} disabled={isRunning} onChange={e => updatePattern('maxBodyPct', e.target.value)} />
+                  </div>
+                </div>
+                <div className="bt-params-label" style={{ marginTop: 8 }}>BUY confirm patterns</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>
+                  {BUY_PATTERNS.map(p => (
+                    <label key={p.id} className="checkbox-label">
+                      <input type="checkbox" disabled={isRunning} checked={patternConfig.buyConfirmPatterns.includes(p.id)}
+                        onChange={() => togglePatternList('buyConfirmPatterns', p.id)} />
+                      {p.label}
+                    </label>
+                  ))}
+                </div>
+                <div className="bt-params-label" style={{ marginTop: 8 }}>SELL confirm patterns</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>
+                  {SELL_PATTERNS.map(p => (
+                    <label key={p.id} className="checkbox-label">
+                      <input type="checkbox" disabled={isRunning} checked={patternConfig.sellConfirmPatterns.includes(p.id)}
+                        onChange={() => togglePatternList('sellConfirmPatterns', p.id)} />
+                      {p.label}
+                    </label>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+
         </div>
 
-        {/* Live feed */}
+        {/* Right: tabs */}
         <div className="bt-replay-feed">
-          {/* Status bar */}
+
+          {/* Status + progress */}
           <div className="card bt-feed-status">
             <div className="bt-feed-status-row">
               <span className={`bt-status-pill bt-status-${status}`}>{status.toUpperCase()}</span>
               {sessionId && <span className="mono-sm" style={{ color: 'var(--text-muted)', fontSize: 11 }}>{sessionId.substring(0, 16)}…</span>}
               {progress.total > 0 && (
-                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                  {progress.emitted} / {progress.total} candles
-                </span>
+                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{progress.emitted} / {progress.total} candles</span>
               )}
             </div>
             {progress.total > 0 && (
@@ -1578,49 +1924,241 @@ function ReplayTest() {
             )}
           </div>
 
-          {/* Current candle */}
-          {currentCandle && (
-            <div className="card bt-current-candle">
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <div>
-                  <span style={{ fontWeight: 700, fontSize: 15 }}>{currentCandle.symbol}</span>
-                  <span style={{ marginLeft: 8, fontSize: 12, color: 'var(--text-muted)' }}>{currentCandle.openTime?.substring(0, 16)}</span>
+          {/* Tab bar */}
+          <div className="bt-live-right-tabs">
+            {[['feed','Feed'],['pnl','P&L'],['portfolio','Portfolio']].map(([k,l]) => (
+              <button key={k} className={`bt-live-tab-btn ${rightTab===k?'active':''}`} onClick={() => setRightTab(k)}>{l}</button>
+            ))}
+          </div>
+
+          {/* ── Feed tab ── */}
+          {rightTab === 'feed' && (
+            <>
+              {currentCandle && (
+                <div className="card bt-current-candle">
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
+                    <div>
+                      <span style={{ fontWeight: 700, fontSize: 15 }}>{currentCandle.symbol}</span>
+                      <span style={{ marginLeft: 8, fontSize: 12, color: 'var(--text-muted)' }}>{currentCandle.ts}</span>
+                    </div>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      {Object.entries(currentCandle.signals || {}).map(([lbl, sig]) => (
+                        <span key={lbl} style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                          {lbl}: {signalBadge(sig)}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="bt-ohlc-row">
+                    {[['O', currentCandle.open],['H', currentCandle.high],['L', currentCandle.low],['C', currentCandle.close]].map(([l, v]) => (
+                      <span key={l}><span className="meta-label">{l}</span> {Number(v).toFixed(2)}</span>
+                    ))}
+                    <span><span className="meta-label">Vol</span> {currentCandle.volume?.toLocaleString()}</span>
+                  </div>
                 </div>
-                {signalBadge(currentCandle.signal)}
+              )}
+
+              <div className="card" style={{ padding: 0 }}>
+                <div className="bt-feed-header">
+                  <span className="bt-params-label" style={{ margin: 0 }}>Trade Log</span>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                    {feed.filter(f => f.signal !== 'HOLD').length} actions / {feed.length} total
+                  </span>
+                </div>
+                <div className="bt-signal-log">
+                  {feed.length === 0
+                    ? <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>Actions will appear here when replay starts.</div>
+                    : feed.map((row, i) => (
+                      <div key={i} className={`bt-signal-row ${row.signal !== 'HOLD' ? 'bt-signal-actionable' : ''}`}>
+                        <span className="mono-sm" style={{ color: 'var(--text-muted)', minWidth: 56 }}>{row.ts}</span>
+                        {row.signal === 'SHORT'
+                          ? <span className="badge" style={{ background: 'rgba(139,92,246,0.15)', color: '#8b5cf6', border: '1px solid rgba(139,92,246,0.3)', borderRadius: 4, padding: '2px 7px', fontSize: 11, fontWeight: 700 }}>SHORT↓</span>
+                          : signalBadge(row.signal)
+                        }
+                        <span style={{ fontSize: 11, color: 'var(--text-muted)', minWidth: 90 }}>{row.strategyLabel}</span>
+                        <span style={{ flex: 1, fontSize: 12 }}>{row.symbol}</span>
+                        <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>₹{Number(row.close).toFixed(2)}</span>
+                        {row.note && <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{row.note}</span>}
+                      </div>
+                    ))
+                  }
+                </div>
               </div>
-              <div className="bt-ohlc-row">
-                {[['O', currentCandle.open],['H', currentCandle.high],['L', currentCandle.low],['C', currentCandle.close]].map(([l, v]) => (
-                  <span key={l}><span className="meta-label">{l}</span> {Number(v).toFixed(2)}</span>
+            </>
+          )}
+
+          {/* ── P&L tab ── */}
+          {rightTab === 'pnl' && (
+            <div className="card">
+              <h3 className="section-title" style={{ marginBottom: 12 }}>P&L Summary</h3>
+              <div className="bt-live-pnl-grid" style={{ marginBottom: 16 }}>
+                {[
+                  ['Total Capital', fmtRs(totalCapital), null],
+                  ['Total P&L', fmtRs(totalPnl), totalPnl >= 0 ? '#22c55e' : '#ef4444'],
+                  ['Return %', `${totalPnlPct.toFixed(2)}%`, totalPnlPct >= 0 ? '#22c55e' : '#ef4444'],
+                  ['Total Trades', String(allTrades.length), null],
+                  ['Win Rate', allTrades.length ? `${(allTrades.filter(t=>t.pnl>=0).length/allTrades.length*100).toFixed(1)}%` : '—', null],
+                ].map(([lbl, val, col]) => (
+                  <div key={lbl} className="bt-live-stat-card">
+                    <div className="bt-live-stat-label">{lbl}</div>
+                    <div className="bt-live-stat-val" style={col ? { color: col } : {}}>{val}</div>
+                  </div>
                 ))}
-                <span><span className="meta-label">Vol</span> {currentCandle.volume?.toLocaleString()}</span>
               </div>
+
+              {allLabels.length > 0 && (
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                      {['Strategy','Capital','P&L','Return %','Trades','Win%'].map(h => (
+                        <th key={h} style={{ textAlign: 'left', padding: '4px 8px', color: 'var(--text-muted)', fontWeight: 600 }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {allLabels.map(lbl => {
+                      const st = stratStates[lbl];
+                      const cap = st?.capital ?? initCap;
+                      const pnl = cap - initCap;
+                      const pct = (pnl / initCap) * 100;
+                      const trades = st?.closedTrades || [];
+                      const wins = trades.filter(t => t.pnl >= 0).length;
+                      return (
+                        <tr key={lbl} style={{ borderBottom: '1px solid var(--border)' }}>
+                          <td style={{ padding: '6px 8px', fontWeight: 600 }}>{lbl}</td>
+                          <td style={{ padding: '6px 8px' }}>{fmtRs(cap)}</td>
+                          <td style={{ padding: '6px 8px', color: pnl >= 0 ? '#22c55e' : '#ef4444' }}>{fmtRs(pnl)}</td>
+                          <td style={{ padding: '6px 8px', color: pct >= 0 ? '#22c55e' : '#ef4444' }}>{pct.toFixed(2)}%</td>
+                          <td style={{ padding: '6px 8px' }}>{trades.length}</td>
+                          <td style={{ padding: '6px 8px' }}>{trades.length ? `${(wins/trades.length*100).toFixed(1)}%` : '—'}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+              {allLabels.length === 0 && (
+                <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 24 }}>P&L data will appear after replay starts.</div>
+              )}
             </div>
           )}
 
-          {/* Signal log */}
-          <div className="card" style={{ padding: 0 }}>
-            <div className="bt-feed-header">
-              <span className="bt-params-label" style={{ margin: 0 }}>Signal Log</span>
-              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                {feed.filter(f => f.signal !== 'HOLD').length} actionable / {feed.length} total
-              </span>
-            </div>
-            <div className="bt-signal-log">
-              {feed.length === 0
-                ? <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>Signals will appear here when replay starts.</div>
-                : feed.map((row, i) => (
-                  <div key={i} className={`bt-signal-row ${row.signal !== 'HOLD' ? 'bt-signal-actionable' : ''}`}>
-                    <span className="mono-sm" style={{ color: 'var(--text-muted)', minWidth: 56 }}>{row.ts}</span>
-                    {signalBadge(row.signal)}
-                    <span style={{ flex: 1, fontSize: 12 }}>{row.symbol}</span>
-                    <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>C: {Number(row.close).toFixed(2)}</span>
-                  </div>
-                ))
+          {/* ── Portfolio tab ── */}
+          {rightTab === 'portfolio' && (
+            <div className="card">
+              <h3 className="section-title" style={{ marginBottom: 12 }}>Open Positions</h3>
+              {allLabels.filter(l => stratStates[l]?.openPosition).length > 0
+                ? allLabels.filter(l => stratStates[l]?.openPosition).map(lbl => {
+                    const pos = stratStates[lbl].openPosition;
+                    return (
+                      <div key={lbl} style={{ display: 'flex', gap: 12, flexWrap: 'wrap', padding: '8px 0', borderBottom: '1px solid var(--border)', fontSize: 13 }}>
+                        <span style={{ fontWeight: 600, minWidth: 120 }}>{lbl}</span>
+                        <span className="badge badge-success">LONG</span>
+                        <span>Entry: <strong>₹{Number(pos.entryPrice).toFixed(2)}</strong></span>
+                        <span>Qty: {pos.qty}</span>
+                        <span style={{ color: 'var(--text-muted)' }}>{pos.entryTime}</span>
+                      </div>
+                    );
+                  })
+                : <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 24 }}>No open positions.</div>
               }
+
+              {allLabels.some(l => (stratStates[l]?.closedTrades || []).length > 0) && (
+                <>
+                  <h3 className="section-title" style={{ margin: '16px 0 10px' }}>Trade History</h3>
+                  {allLabels.map(lbl => {
+                    const trades = stratStates[lbl]?.closedTrades || [];
+                    if (!trades.length) return null;
+                    return (
+                      <div key={lbl} style={{ marginBottom: 16 }}>
+                        <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 6 }}>{lbl}</div>
+                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+                          <thead>
+                            <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                              {['Entry','Exit','Qty','Entry ₹','Exit ₹','P&L','Reason'].map(h => (
+                                <th key={h} style={{ textAlign: 'left', padding: '3px 6px', color: 'var(--text-muted)' }}>{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {trades.map((t, i) => (
+                              <tr key={i} style={{ borderBottom: '1px solid var(--border)' }}>
+                                <td style={{ padding: '4px 6px' }}>{t.entryTime}</td>
+                                <td style={{ padding: '4px 6px' }}>{t.exitTime}</td>
+                                <td style={{ padding: '4px 6px' }}>{t.qty}</td>
+                                <td style={{ padding: '4px 6px' }}>₹{Number(t.entryPrice).toFixed(2)}</td>
+                                <td style={{ padding: '4px 6px' }}>₹{Number(t.exitPrice).toFixed(2)}</td>
+                                <td style={{ padding: '4px 6px', color: t.pnl >= 0 ? '#22c55e' : '#ef4444' }}>
+                                  {t.pnl >= 0 ? '+' : ''}{fmtRs(t.pnl)} ({t.pnlPct?.toFixed(2)}%)
+                                </td>
+                                <td style={{ padding: '4px 6px', color: 'var(--text-muted)' }}>{t.exitReason}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    );
+                  })}
+                </>
+              )}
             </div>
-          </div>
+          )}
+
         </div>
       </div>
+
+      {/* ── Bottom: Strategies full-width ──────────────────────────────── */}
+      <div className="card bt-live-strategies-row" style={{ marginTop: 16 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+          <h3 className="section-title" style={{ margin: 0 }}>Strategies</h3>
+          {!isRunning && <button type="button" className="btn-secondary btn-sm" onClick={addStrategy}>+ Add</button>}
+        </div>
+        <div className="bt-live-strategies-grid">
+          {strategies.map((s, idx) => {
+            const pdefs = PARAM_DEFS[s.strategyType] || [];
+            return (
+              <div key={idx} className={`bt-strategy-card ${s.enabled ? '' : 'bt-strategy-disabled'}`}>
+                <div className="bt-strategy-header">
+                  <label className="checkbox-label" style={{ margin: 0, fontWeight: 600 }}>
+                    <input type="checkbox" checked={s.enabled} disabled={isRunning}
+                      onChange={e => updateStrategy(idx, 'enabled', e.target.checked)} />
+                    <select value={s.strategyType} disabled={isRunning} onChange={e => updateStrategy(idx, 'strategyType', e.target.value)}
+                      className="bt-strategy-type-sel">
+                      {knownTypes.map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                  </label>
+                  {strategies.length > 1 && !isRunning &&
+                    <button type="button" className="btn-danger btn-xs" onClick={() => removeStrategy(idx)}>✕</button>}
+                </div>
+                {pdefs.length > 0 && s.enabled && (
+                  <div className="bt-params-block" style={{ marginTop: 6 }}>
+                    {pdefs.map(def => (
+                      <div className="bt-param-row" key={def.key}>
+                        <label className="bt-param-label">{def.label}</label>
+                        <input type="number" min="1" className="bt-param-input"
+                          value={s.parameters?.[def.key] || ''} disabled={isRunning}
+                          onChange={e => updateStrategyParam(idx, def.key, e.target.value)}
+                          placeholder={def.placeholder} />
+                        <span className="bt-param-hint">{def.hint}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {regimeConfig.enabled && s.enabled && (
+                  <div style={{ marginTop: 6, display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <span className="bt-params-label" style={{ marginRight: 4 }}>Regimes</span>
+                    <span className="bt-regime-auto-tag">auto</span>
+                    {(STRATEGY_REGIME_MAP[s.strategyType] || []).map(r => (
+                      <span key={r} className={`bt-regime-badge bt-regime-${r}`}>{r}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
     </div>
   );
 }
@@ -1630,24 +2168,58 @@ function ReplayTest() {
 function LiveTest() {
   const { session, isActive } = useSession();
 
-  const [knownTypes, setKnownTypes]   = useState(['SMA_CROSSOVER']);
-  const [variant, setVariant]         = useState(emptyVariant('SMA_CROSSOVER'));
-  const [inst, setInst]               = useState({ ...EMPTY_INST });
-  const [mode, setMode]               = useState('QUOTE');
-  const [preload, setPreload]         = useState({ enabled: true, daysBack: 5, interval: 'MINUTE_5' });
-  const [preloadState, setPreloadState] = useState(null); // null | { status, count, error }
+  // ── Config (mirrors HistoricalBacktest) ──────────────────────────────────
+  const [knownTypes, setKnownTypes]         = useState(['SMA_CROSSOVER']);
+  const [strategies, setStrategies]         = useState(defaultStrategies);
+  const [riskConfig, setRiskConfig]         = useState({ ...EMPTY_RISK });
+  const [patternConfig, setPatternConfig]   = useState({ ...EMPTY_PATTERN });
+  const [regimeConfig, setRegimeConfig]     = useState({ ...EMPTY_REGIME_CONFIG });
+  const [initialCapital, setInitialCapital] = useState('100000');
+  const [quantity, setQuantity]             = useState('0');
+  const [inst, setInst]                     = useState({ ...EMPTY_INST });
+  const [candleInterval, setCandleInterval] = useState('MINUTE_5');
+  const [mode, setMode]                     = useState('QUOTE');
+  const [preload, setPreload]             = useState({ enabled: true, daysBack: 5, interval: 'MINUTE_5' });
+  const [preloadState, setPreloadState]   = useState(null);
 
-  const [connected, setConnected]     = useState(false);
-  const [status, setStatus]           = useState('idle');
-  const [error, setError]             = useState('');
-  const [ticks, setTicks]             = useState([]);
-  const [signals, setSignals]         = useState([]);
-  const [latestTick, setLatestTick]   = useState(null);
+  // ── Connection ────────────────────────────────────────────────────────────
+  const [connected, setConnected]   = useState(false);
+  const [status, setStatus]         = useState('idle');
+  const [error, setError]           = useState('');
 
-  const evaluatorRef = useRef(null);
-  const sseRef       = useRef(null);
-  const ticksRef     = useRef([]);
-  const signalsRef   = useRef([]);
+  // ── Live data ─────────────────────────────────────────────────────────────
+  const [latestTick, setLatestTick]     = useState(null);
+  const [ticks, setTicks]               = useState([]);
+  const [signals, setSignals]           = useState([]);
+  const [liveCandles, setLiveCandles]   = useState([]);
+  const [currentCandle, setCurrentCandle] = useState(null);
+  const [currentRegime, setCurrentRegime] = useState(null);
+
+  // ── Paper trading — PER-STRATEGY state ───────────────────────────────────
+  // stratStates: { [label]: { capital, openPosition, closedTrades, equityHistory } }
+  const [stratStates, setStratStates]   = useState({});
+  const [selectedLabel, setSelectedLabel] = useState(null);
+
+  // ── UI ────────────────────────────────────────────────────────────────────
+  const [rightTab, setRightTab] = useState('feed'); // 'feed' | 'pnl' | 'portfolio'
+
+  // ── Refs (mutable, no re-render) ──────────────────────────────────────────
+  const evaluatorsRef     = useRef({});
+  const patternEvalRef    = useRef(null);
+  const regimeDetectorRef = useRef(null);
+  const sseRef            = useRef(null);
+  const ticksRef          = useRef([]);
+  const signalsRef        = useRef([]);
+  // Per-strategy maps (label → value)
+  const capitalMap        = useRef({});   // label → number
+  const openPositionMap   = useRef({});   // label → position | null
+  const closedTradesMap   = useRef({});   // label → []
+  const equityMap         = useRef({});   // label → []
+  const currentCandleRef  = useRef(null);
+  const liveCandlesRef    = useRef([]);
+  const cooldownRef       = useRef({});   // label → candles remaining
+  const dailyCapMap       = useRef({});   // label → { date, startCapital, halted }
+  const latestTickRef     = useRef(null);
 
   useEffect(() => {
     getStrategyTypes().then(r => { if (r?.data) setKnownTypes([...r.data].sort()); }).catch(() => {});
@@ -1658,176 +2230,360 @@ function LiveTest() {
     if (sseRef.current) { sseRef.current.close(); sseRef.current = null; }
   }
 
-  function updateVariantField(field, value) {
-    if (field === 'strategyType') setVariant(v => ({ ...v, strategyType: value, parameters: defaultParams(value) }));
-    else setVariant(v => ({ ...v, [field]: value }));
+  // ── Strategy config helpers ───────────────────────────────────────────────
+  function addStrategy() {
+    setStrategies(p => [...p, { strategyType: 'SMA_CROSSOVER', enabled: true, label: '', parameters: defaultParams('SMA_CROSSOVER') }]);
+  }
+  function removeStrategy(idx) { setStrategies(p => p.filter((_, i) => i !== idx)); }
+  function updateStrategy(idx, field, value) {
+    setStrategies(p => p.map((s, i) => {
+      if (i !== idx) return s;
+      if (field === 'strategyType') return { ...s, strategyType: value, parameters: defaultParams(value) };
+      return { ...s, [field]: value };
+    }));
+  }
+  function updateStrategyParam(idx, key, value) {
+    setStrategies(p => p.map((s, i) => i !== idx ? s : { ...s, parameters: { ...s.parameters, [key]: value } }));
+  }
+  function updateRisk(f, v)    { setRiskConfig(p => ({ ...p, [f]: v })); }
+  function updatePattern(f, v) { setPatternConfig(p => ({ ...p, [f]: v })); }
+  function togglePatternList(f, v) {
+    setPatternConfig(p => ({ ...p, [f]: p[f].includes(v) ? p[f].filter(x => x !== v) : [...p[f], v] }));
+  }
+  function updateRegime(f, v)  { setRegimeConfig(p => ({ ...p, [f]: v })); }
+
+  // ── Per-strategy state flush (refs → React state) ────────────────────────
+  function flushStrat(label) {
+    setStratStates(prev => ({
+      ...prev,
+      [label]: {
+        capital:      capitalMap.current[label],
+        openPosition: openPositionMap.current[label] || null,
+        closedTrades: [...(closedTradesMap.current[label] || [])],
+        equityHistory:[...(equityMap.current[label]     || [])],
+      },
+    }));
   }
 
-  function updateVariantParam(key, value) {
-    setVariant(v => ({ ...v, parameters: { ...v.parameters, [key]: value } }));
+  // ── Paper trading helpers (all per-strategy) ──────────────────────────────
+  function computeQty(label, entryPrice) {
+    const cap = capitalMap.current[label] || 0;
+    const baseQty = parseInt(quantity, 10);
+    if (baseQty > 0) return baseQty;
+    if (riskConfig.enabled && parseFloat(riskConfig.maxRiskPerTradePct) > 0 && parseFloat(riskConfig.stopLossPct) > 0) {
+      const riskAmt = cap * parseFloat(riskConfig.maxRiskPerTradePct) / 100;
+      const riskPS  = entryPrice * parseFloat(riskConfig.stopLossPct) / 100;
+      return Math.max(1, Math.floor(riskAmt / riskPS));
+    }
+    return Math.max(1, Math.floor(cap / entryPrice));
   }
 
+  function openPaperPosition(label, price, regime) {
+    if (openPositionMap.current[label]) return;                          // already in a position
+    const qty = computeQty(label, price);
+    if (price * qty > (capitalMap.current[label] || 0)) return;          // not enough capital
+    const sl = riskConfig.enabled && parseFloat(riskConfig.stopLossPct)   > 0 ? price * (1 - parseFloat(riskConfig.stopLossPct)/100)   : null;
+    const tp = riskConfig.enabled && parseFloat(riskConfig.takeProfitPct) > 0 ? price * (1 + parseFloat(riskConfig.takeProfitPct)/100) : null;
+    const pos = { strategyLabel: label, entryPrice: price, qty, entryTime: new Date().toLocaleTimeString(), slPrice: sl, tpPrice: tp, regime };
+    openPositionMap.current[label] = pos;
+    flushStrat(label);
+    const sig = { signal: 'BUY', price, symbol: inst.symbol, ts: pos.entryTime, strategyLabel: label };
+    signalsRef.current = [sig, ...signalsRef.current].slice(0, 100);
+    setSignals([...signalsRef.current]);
+  }
+
+  function closePaperPosition(label, exitPrice, exitReason) {
+    const pos = openPositionMap.current[label];
+    if (!pos) return;
+    const pnl    = (exitPrice - pos.entryPrice) * pos.qty;
+    const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
+    const newCap = (capitalMap.current[label] || 0) + pnl;
+    capitalMap.current[label] = newCap;
+    const exitTime = new Date().toLocaleTimeString();
+    const trade = { ...pos, exitPrice, exitTime, pnl, pnlPct, exitReason, capitalAfter: newCap };
+    closedTradesMap.current[label] = [trade, ...(closedTradesMap.current[label] || [])];
+    equityMap.current[label] = [...(equityMap.current[label] || []), { time: exitTime, capital: newCap }];
+    openPositionMap.current[label] = null;
+    flushStrat(label);
+    if (pnl < 0 && riskConfig.enabled && parseInt(riskConfig.cooldownCandles, 10) > 0) {
+      cooldownRef.current[label] = parseInt(riskConfig.cooldownCandles, 10);
+    }
+    const sig = { signal: 'SELL', price: exitPrice, symbol: inst.symbol, ts: exitTime, strategyLabel: label, reason: exitReason };
+    signalsRef.current = [sig, ...signalsRef.current].slice(0, 100);
+    setSignals([...signalsRef.current]);
+  }
+
+  // ── Candle close handler ──────────────────────────────────────────────────
+  function onCandleClose(candle) {
+    liveCandlesRef.current = [...liveCandlesRef.current, candle].slice(-500);
+    setLiveCandles([...liveCandlesRef.current]);
+
+    // Tick down cooldowns
+    Object.keys(cooldownRef.current).forEach(k => { if (cooldownRef.current[k] > 0) cooldownRef.current[k]--; });
+
+    // Regime detection
+    let regime = null;
+    if (regimeConfig.enabled && regimeDetectorRef.current) {
+      regime = regimeDetectorRef.current.addCandle(candle.high, candle.low, candle.close);
+      setCurrentRegime(regime);
+    }
+
+    const today = new Date().toDateString();
+
+    // Evaluate each enabled strategy independently
+    for (const strat of strategies.filter(s => s.enabled)) {
+      const label = strat.label || strat.strategyType;
+      const ev = evaluatorsRef.current[label];
+      if (!ev) continue;
+      if ((cooldownRef.current[label] || 0) > 0) continue;
+
+      // Per-strategy daily loss cap check
+      if (riskConfig.enabled && riskConfig.dailyLossCapPct) {
+        const dc = dailyCapMap.current[label];
+        if (dc) {
+          if (dc.date !== today) {
+            dailyCapMap.current[label] = { date: today, startCapital: capitalMap.current[label], halted: false };
+          } else {
+            const dayLoss = (capitalMap.current[label] - dc.startCapital) / dc.startCapital * 100;
+            if (dayLoss <= -parseFloat(riskConfig.dailyLossCapPct)) dailyCapMap.current[label].halted = true;
+            if (dailyCapMap.current[label].halted) continue;
+          }
+        }
+      }
+
+      // Regime filter (auto-assigned)
+      if (regimeConfig.enabled && regime) {
+        const allowed = STRATEGY_REGIME_MAP[strat.strategyType] || [];
+        if (allowed.length > 0 && !allowed.includes(regime)) continue;
+      }
+
+      const signal = ev.next(candle.close);
+
+      // Pattern confirmation
+      if (patternConfig.enabled && patternEvalRef.current && signal !== 'HOLD') {
+        const patSig = patternEvalRef.current.next(candle.close, candle.high, candle.low, candle.volume||0, candle.open);
+        if (signal === 'BUY'  && patternConfig.buyConfirmPatterns.length  > 0 && !patternConfig.buyConfirmPatterns.includes(patSig))  continue;
+        if (signal === 'SELL' && patternConfig.sellConfirmPatterns.length > 0 && !patternConfig.sellConfirmPatterns.includes(patSig)) continue;
+      }
+
+      const pos = openPositionMap.current[label];
+      if (signal === 'BUY' && !pos) {
+        openPaperPosition(label, candle.close, regime);
+      } else if (signal === 'SELL' && pos) {
+        closePaperPosition(label, candle.close, 'SIGNAL');
+      }
+    }
+  }
+
+  // ── Connect handler ───────────────────────────────────────────────────────
   async function handleConnect(e) {
     e.preventDefault();
-    setError(''); setTicks([]); ticksRef.current = []; setSignals([]); signalsRef.current = [];
-    setLatestTick(null); setPreloadState(null);
-    evaluatorRef.current = buildLocalEvaluator(variant.strategyType, variant.parameters || {});
+    setError(''); setTicks([]); ticksRef.current = [];
+    setSignals([]); signalsRef.current = [];
+    setLatestTick(null); latestTickRef.current = null;
+    setPreloadState(null);
+    setLiveCandles([]); liveCandlesRef.current = [];
+    setCurrentCandle(null); currentCandleRef.current = null;
+    setCurrentRegime(null);
+    cooldownRef.current = {};
+
+    const initCap = parseFloat(initialCapital) || 100000;
+    const todayStr = new Date().toDateString();
+    const allLabels = strategies.filter(s => s.enabled).map(s => s.label || s.strategyType);
+    capitalMap.current       = {};
+    openPositionMap.current  = {};
+    closedTradesMap.current  = {};
+    equityMap.current        = {};
+    dailyCapMap.current      = {};
+    allLabels.forEach(lbl => {
+      capitalMap.current[lbl]      = initCap;
+      openPositionMap.current[lbl] = null;
+      closedTradesMap.current[lbl] = [];
+      equityMap.current[lbl]       = [];
+      dailyCapMap.current[lbl]     = { date: todayStr, startCapital: initCap, halted: false };
+    });
+    setStratStates({});
+    setSelectedLabel(allLabels[0] || null);
+
+    // Build evaluators for each enabled strategy
+    const evals = {};
+    strategies.filter(s => s.enabled).forEach(s => {
+      evals[s.label || s.strategyType] = buildLocalEvaluator(s.strategyType, s.parameters || {});
+    });
+    evaluatorsRef.current = evals;
+
+    patternEvalRef.current = patternConfig.enabled
+      ? new LocalCandlePatternEvaluator(patternConfig.buyConfirmPatterns[0] || 'HAMMER', patternConfig.minWickRatio, patternConfig.maxBodyPct)
+      : null;
+
+    regimeDetectorRef.current = regimeConfig.enabled
+      ? new LocalRegimeDetector(
+          parseInt(regimeConfig.adxPeriod,10)||14, parseInt(regimeConfig.atrPeriod,10)||14,
+          parseFloat(regimeConfig.adxTrendThreshold)||25, parseFloat(regimeConfig.atrVolatilePct)||2,
+          parseFloat(regimeConfig.atrCompressionPct)||0.5)
+      : null;
 
     try {
-      // ── Step 1: warmup evaluator with historical candles ──────────────────
+      // ── Preload warmup ──────────────────────────────────────────────────
       if (preload.enabled && inst.instrumentToken) {
         setStatus('warming up');
         setPreloadState({ status: 'loading', count: 0, error: null });
         try {
-          const now  = new Date();
-          const from = new Date(now.getTime() - parseInt(preload.daysBack, 10) * 24 * 60 * 60 * 1000);
+          const now = new Date();
+          const from = new Date(now.getTime() - parseInt(preload.daysBack,10)*24*60*60*1000);
           from.setHours(9, 15, 0, 0);
-          const pad = n => String(n).padStart(2, '0');
-          const fmt  = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-
+          const pad = n => String(n).padStart(2,'0');
+          const fmt = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
           const res = await fetchHistoricalData({
-            userId:          session.userId,
-            brokerName:      session.brokerName,
-            apiKey:          session.apiKey,
-            accessToken:     session.accessToken,
-            instrumentToken: parseInt(inst.instrumentToken, 10),
-            symbol:          inst.symbol.toUpperCase(),
-            exchange:        inst.exchange.toUpperCase(),
-            interval:        preload.interval,
-            fromDate:        fmt(from),
-            toDate:          fmt(now),
-            persist:         true,
+            userId: session.userId, brokerName: session.brokerName,
+            apiKey: session.apiKey, accessToken: session.accessToken,
+            instrumentToken: parseInt(inst.instrumentToken,10),
+            symbol: inst.symbol.toUpperCase(), exchange: inst.exchange.toUpperCase(),
+            interval: preload.interval, fromDate: fmt(from), toDate: fmt(now), persist: true,
           });
           const candles = res?.data || [];
-          candles.forEach(c => evaluatorRef.current.next(parseFloat(c.close)));
+          candles.forEach(c => {
+            Object.values(evaluatorsRef.current).forEach(ev => ev.next(parseFloat(c.close)));
+            if (regimeDetectorRef.current) regimeDetectorRef.current.addCandle(parseFloat(c.high), parseFloat(c.low), parseFloat(c.close));
+            if (patternEvalRef.current) patternEvalRef.current.next(parseFloat(c.close), parseFloat(c.high), parseFloat(c.low), parseFloat(c.volume||0), parseFloat(c.open));
+          });
           setPreloadState({ status: 'done', count: candles.length, error: null });
         } catch (err) {
           setPreloadState({ status: 'error', count: 0, error: err.message });
-          // non-fatal — continue to live connection with cold evaluator
         }
       }
 
-      // ── Step 2: subscribe to live feed ────────────────────────────────────
+      // ── Subscribe live ──────────────────────────────────────────────────
       setStatus('connecting');
       await liveSubscribe({
-        userId:      session.userId,
-        brokerName:  session.brokerName,
-        apiKey:      session.apiKey,
-        accessToken: session.accessToken,
-        mode,
-        instruments: [{
-          instrumentToken: parseInt(inst.instrumentToken, 10),
-          symbol:          inst.symbol.toUpperCase(),
-          exchange:        inst.exchange.toUpperCase(),
-        }],
+        userId: session.userId, brokerName: session.brokerName,
+        apiKey: session.apiKey, accessToken: session.accessToken, mode,
+        instruments: [{ instrumentToken: parseInt(inst.instrumentToken,10), symbol: inst.symbol.toUpperCase(), exchange: inst.exchange.toUpperCase() }],
       });
 
-      // Connect to SSE tick stream
       const sse = new EventSource('/data-api/api/v1/data/stream/ticks');
       sseRef.current = sse;
 
       sse.addEventListener('tick', (ev) => {
         try {
           const tick = JSON.parse(ev.data);
+          const ltp = parseFloat(tick.ltp);
+          const tsMs = Date.now();
+          latestTickRef.current = tick;
           setLatestTick(tick);
           ticksRef.current = [{ ...tick, ts: new Date().toLocaleTimeString() }, ...ticksRef.current].slice(0, 200);
           setTicks([...ticksRef.current]);
 
-          // Evaluate using LTP as surrogate close
-          const signal = evaluatorRef.current.next(parseFloat(tick.ltp));
-          if (signal !== 'HOLD') {
-            const entry = { signal, price: tick.ltp, symbol: tick.symbol, ts: new Date().toLocaleTimeString() };
-            signalsRef.current = [entry, ...signalsRef.current].slice(0, 100);
-            setSignals([...signalsRef.current]);
+          // SL / TP check on every tick — per strategy
+          if (riskConfig.enabled) {
+            for (const lbl of Object.keys(openPositionMap.current)) {
+              const pos = openPositionMap.current[lbl];
+              if (!pos) continue;
+              if (pos.slPrice && ltp <= pos.slPrice) closePaperPosition(lbl, ltp, 'STOP_LOSS');
+              else if (pos.tpPrice && ltp >= pos.tpPrice) closePaperPosition(lbl, ltp, 'TAKE_PROFIT');
+            }
           }
+
+          // Candle formation
+          const ivMs = INTERVAL_MS[candleInterval] || 300_000;
+          const bucketStart = Math.floor(tsMs / ivMs) * ivMs;
+          const cur = currentCandleRef.current;
+          if (!cur) {
+            currentCandleRef.current = { open: ltp, high: ltp, low: ltp, close: ltp, volume: tick.volume||0, startTime: bucketStart };
+          } else if (bucketStart > cur.startTime) {
+            onCandleClose({ ...cur });
+            currentCandleRef.current = { open: ltp, high: ltp, low: ltp, close: ltp, volume: tick.volume||0, startTime: bucketStart };
+          } else {
+            cur.high = Math.max(cur.high, ltp); cur.low = Math.min(cur.low, ltp);
+            cur.close = ltp; cur.volume += (tick.volume||0);
+          }
+          setCurrentCandle(currentCandleRef.current ? { ...currentCandleRef.current } : null);
         } catch {}
       });
 
+      let sseErrorCount = 0;
       sse.onerror = () => {
-        setConnected(false);
-        setStatus('disconnected');
-        cleanup();
+        sseErrorCount++;
+        // EventSource fires onerror on transient drops and auto-reconnects;
+        // only tear down after repeated consecutive failures (not recoverable).
+        if (sse.readyState === EventSource.CLOSED) {
+          setConnected(false); setStatus('disconnected'); cleanup();
+        } else {
+          // Transient error — SSE is auto-reconnecting, just update status briefly
+          setStatus('reconnecting');
+          setTimeout(() => {
+            if (sse.readyState === EventSource.OPEN) setStatus('connected');
+          }, 3000);
+        }
       };
-
-      setConnected(true);
-      setStatus('connected');
-    } catch (err) {
-      setError(err.message);
-      setStatus('idle');
-      cleanup();
-    }
+      setConnected(true); setStatus('connected');
+    } catch (err) { setError(err.message); setStatus('idle'); cleanup(); }
   }
 
   async function handleDisconnect() {
     try {
-      await liveUnsubscribe({
-        userId:           session.userId,
-        brokerName:       session.brokerName,
-        instrumentTokens: [parseInt(inst.instrumentToken, 10)],
-      });
+      await liveUnsubscribe({ userId: session.userId, brokerName: session.brokerName, instrumentTokens: [parseInt(inst.instrumentToken,10)] });
     } catch {}
-    cleanup();
-    setConnected(false);
-    setStatus('idle');
+    cleanup(); setConnected(false); setStatus('idle');
   }
 
-  const paramDefs = PARAM_DEFS[variant.strategyType] || [];
-  const changeColor = latestTick?.change >= 0 ? 'var(--text-success, #22c55e)' : '#ef4444';
+  // ── Derived values (per-strategy aggregates) ─────────────────────────────
+  const initCap         = parseFloat(initialCapital) || 100000;
+  const allStratLabels  = Object.keys(stratStates);
+  const numActive       = allStratLabels.length || 1;
+  const totalDeployed   = initCap * numActive;
+  const totalCapital    = allStratLabels.reduce((s, lbl) => s + (stratStates[lbl]?.capital ?? initCap), 0);
+  const totalPnl        = allStratLabels.reduce((s, lbl) => s + ((stratStates[lbl]?.capital ?? initCap) - initCap), 0);
+  const totalPnlPct     = totalDeployed > 0 ? (totalPnl / totalDeployed) * 100 : 0;
+  const allClosedTrades = allStratLabels.flatMap(lbl => stratStates[lbl]?.closedTrades || []);
+  const changeColor     = (latestTick?.change ?? 0) >= 0 ? '#22c55e' : '#ef4444';
+  const fmtRs = v => `₹${Number(v).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
 
   return (
-    <div className="bt-replay-layout">
-      {/* Config */}
-      <div className="bt-replay-config">
-        <div className="card">
-          <h3 className="section-title">Strategy</h3>
+    <div className="bt-live-layout">
 
-          <div className="form-group">
-            <label>Strategy Type</label>
-            <select value={variant.strategyType} onChange={e => updateVariantField('strategyType', e.target.value)} disabled={connected}>
-              {knownTypes.map(t => <option key={t} value={t}>{t}</option>)}
-            </select>
-          </div>
+      {/* ── Top row ─────────────────────────────────────────────────────── */}
+      <div className="bt-live-top-row">
 
-          {paramDefs.length > 0 && (
-            <div className="bt-params-block" style={{ marginTop: 8 }}>
-              <div className="bt-params-label">Parameters</div>
-              {paramDefs.map(def => (
-                <div className="bt-param-row" key={def.key}>
-                  <label className="bt-param-label">{def.label}</label>
-                  <input type="number" min="1" className="bt-param-input"
-                    value={variant.parameters?.[def.key] || ''}
-                    onChange={e => updateVariantParam(def.key, e.target.value)}
-                    placeholder={def.placeholder}
-                    disabled={connected}
-                  />
-                  <span className="bt-param-hint">{def.hint}</span>
-                </div>
-              ))}
-            </div>
-          )}
-
-          <h3 className="section-title" style={{ marginTop: 16 }}>Instrument</h3>
-
+        {/* Instrument + connection */}
+        <div className="card bt-live-conn-card">
+          <h3 className="section-title">Instrument & Connection</h3>
           <form onSubmit={handleConnect}>
             <InstrumentPicker
               session={session}
-              symbol={inst.symbol}
-              exchange={inst.exchange}
-              instrumentToken={inst.instrumentToken}
+              symbol={inst.symbol} exchange={inst.exchange} instrumentToken={inst.instrumentToken}
               onSelect={r => { setInst({ symbol: r.tradingSymbol, exchange: r.exchange, instrumentToken: String(r.instrumentToken) }); saveRecentInstrument(r); }}
               onChange={patch => setInst(p => ({ ...p, ...patch }))}
               disabled={connected}
             />
-            <div className="form-group">
-              <label>Subscription Mode</label>
-              <select value={mode} onChange={e => setMode(e.target.value)} disabled={connected}>
-                <option value="LTP">LTP — last price only</option>
-                <option value="QUOTE">QUOTE — market quote</option>
-                <option value="FULL">FULL — full depth</option>
-              </select>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Candle Interval</label>
+                <select value={candleInterval} onChange={e => setCandleInterval(e.target.value)} disabled={connected}>
+                  {INTERVALS.map(iv => <option key={iv.value} value={iv.value}>{iv.label}</option>)}
+                </select>
+              </div>
+              <div className="form-group">
+                <label>Mode</label>
+                <select value={mode} onChange={e => setMode(e.target.value)} disabled={connected}>
+                  <option value="LTP">LTP</option>
+                  <option value="QUOTE">QUOTE</option>
+                  <option value="FULL">FULL</option>
+                </select>
+              </div>
+            </div>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Initial Capital (₹)</label>
+                <input type="number" min="1000" value={initialCapital} onChange={e => setInitialCapital(e.target.value)} disabled={connected} />
+              </div>
+              <div className="form-group">
+                <label>Quantity <span className="form-hint">(0 = auto)</span></label>
+                <input type="number" min="0" value={quantity} onChange={e => setQuantity(e.target.value)} disabled={connected} />
+              </div>
             </div>
 
-            {/* Preload historical candles for warmup */}
+            {/* Preload */}
             <div className="de-preload-block" style={{ marginBottom: 14 }}>
               <div className="de-preload-header">
                 <label className="checkbox-label" style={{ margin: 0, fontWeight: 600 }}>
@@ -1835,20 +2591,18 @@ function LiveTest() {
                     onChange={e => setPreload(p => ({ ...p, enabled: e.target.checked }))} />
                   Preload past candles
                 </label>
-                <span className="de-preload-hint">Warms up the strategy evaluator before going live</span>
+                <span className="de-preload-hint">Warms up all evaluators before going live</span>
               </div>
               {preload.enabled && (
                 <div className="de-preload-fields">
                   <div className="form-group">
                     <label>Days back</label>
                     <input type="number" min="1" max="60" value={preload.daysBack} disabled={connected}
-                      onChange={e => setPreload(p => ({ ...p, daysBack: e.target.value }))}
-                      style={{ width: 80 }} />
+                      onChange={e => setPreload(p => ({ ...p, daysBack: e.target.value }))} style={{ width: 80 }} />
                   </div>
                   <div className="form-group">
-                    <label>Candle interval</label>
-                    <select value={preload.interval} disabled={connected}
-                      onChange={e => setPreload(p => ({ ...p, interval: e.target.value }))}>
+                    <label>Interval</label>
+                    <select value={preload.interval} disabled={connected} onChange={e => setPreload(p => ({ ...p, interval: e.target.value }))}>
                       {INTERVALS.map(iv => <option key={iv.value} value={iv.value}>{iv.label}</option>)}
                     </select>
                   </div>
@@ -1857,101 +2611,535 @@ function LiveTest() {
               {preloadState && (
                 <div className="de-preload-results">
                   {preloadState.status === 'loading' && <span className="de-preload-loading">Fetching historical candles…</span>}
-                  {preloadState.status === 'done'    && <span className="de-preload-result-item de-preload-ok">{preloadState.count} candles fed into evaluator</span>}
+                  {preloadState.status === 'done'    && <span className="de-preload-result-item de-preload-ok">{preloadState.count} candles — all evaluators warmed up</span>}
                   {preloadState.status === 'error'   && <span className="de-preload-result-item de-preload-error">Preload failed: {preloadState.error} — continuing cold</span>}
                 </div>
               )}
             </div>
 
-            {error && <div className="error-msg" style={{ marginBottom: 12 }}>{error}</div>}
+            {error    && <div className="error-msg" style={{ marginBottom: 12 }}>{error}</div>}
             {!isActive && <div className="error-msg" style={{ marginBottom: 12 }}>No active session.</div>}
 
             <div style={{ display: 'flex', gap: 8 }}>
-              {!connected ? (
-                <button type="submit" className="btn-primary" disabled={!isActive || status === 'connecting' || status === 'warming up'}>
-                  {status === 'warming up' ? 'Warming up…' : status === 'connecting' ? 'Connecting…' : '⬤ Connect Live'}
-                </button>
-              ) : (
-                <button type="button" className="btn-danger" onClick={handleDisconnect}>✕ Unsubscribe</button>
-              )}
+              {!connected
+                ? <button type="submit" className="btn-primary" disabled={!isActive || ['warming up','connecting'].includes(status)}>
+                    {status === 'warming up' ? 'Warming up…' : status === 'connecting' ? 'Connecting…' : '⬤ Connect Live'}
+                  </button>
+                : <button type="button" className="btn-danger" onClick={handleDisconnect}>✕ Unsubscribe</button>
+              }
             </div>
           </form>
         </div>
-      </div>
 
-      {/* Live feed */}
-      <div className="bt-replay-feed">
-        {/* Status + latest tick */}
-        <div className="card bt-feed-status">
-          <div className="bt-feed-status-row">
-            <span className={`bt-status-pill bt-status-${status}`}>{status.toUpperCase()}</span>
-            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-              Evaluator warming up: {evaluatorRef.current?.candlesSeen || 0} / {evaluatorRef.current?.warmupNeeded || '—'} ticks
+        {/* ── Center: Risk / Regime / Pattern ── */}
+        <div className="bt-live-center-col">
+
+        {/* Risk Config */}
+        <div className="card bt-risk-card" style={{ marginBottom: 12 }}>
+          <div className="bt-risk-toggle-row">
+            <span className="bt-risk-label">Risk Management
+              <span className={riskConfig.enabled ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+                {riskConfig.enabled ? 'enabled' : 'disabled'}
+              </span>
             </span>
+            <button type="button" disabled={connected}
+              className={riskConfig.enabled ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+              onClick={() => updateRisk('enabled', !riskConfig.enabled)}>
+              {riskConfig.enabled ? 'ON' : 'OFF'}
+            </button>
           </div>
-
-          {latestTick && (
-            <div className="bt-live-ticker">
-              <span style={{ fontWeight: 700, fontSize: 18 }}>{latestTick.symbol}</span>
-              <span style={{ fontSize: 22, fontWeight: 700, color: 'var(--accent)' }}>
-                ₹{Number(latestTick.ltp).toFixed(2)}
-              </span>
-              <span style={{ fontSize: 13, color: changeColor }}>
-                {latestTick.change >= 0 ? '+' : ''}{Number(latestTick.change).toFixed(2)}%
-              </span>
-              {latestTick.open && (
-                <div className="bt-ohlc-row" style={{ marginTop: 6 }}>
-                  {[['O', latestTick.open],['H', latestTick.high],['L', latestTick.low]].map(([l, v]) => (
-                    <span key={l}><span className="meta-label">{l}</span> {Number(v).toFixed(2)}</span>
-                  ))}
+          {riskConfig.enabled && (
+            <div className="bt-risk-fields">
+              {[
+                ['Stop Loss %', 'stopLossPct', '0.1', '100'],
+                ['Take Profit %', 'takeProfitPct', '0.1', null],
+                ['Max Risk / Trade %', 'maxRiskPerTradePct', '0.1', '100'],
+                ['Daily Loss Cap %', 'dailyLossCapPct', '0.1', '100'],
+                ['Cooldown Candles', 'cooldownCandles', '1', null, true],
+              ].map(([lbl, key, step, max]) => (
+                <div className="form-group" key={key}>
+                  <label>{lbl}</label>
+                  <input type="number" min="0" max={max||undefined} step={step} value={riskConfig[key]} disabled={connected}
+                    onChange={e => updateRisk(key, e.target.value)} />
                 </div>
-              )}
+              ))}
             </div>
           )}
         </div>
 
-        {/* Signal log */}
-        {signals.length > 0 && (
-          <div className="card" style={{ marginBottom: 12, padding: 0 }}>
-            <div className="bt-feed-header"><span className="bt-params-label" style={{ margin: 0 }}>Signals</span></div>
-            <div className="bt-signal-log">
-              {signals.map((s, i) => (
-                <div key={i} className="bt-signal-row bt-signal-actionable">
-                  <span className="mono-sm" style={{ color: 'var(--text-muted)', minWidth: 56 }}>{s.ts}</span>
-                  {signalBadge(s.signal)}
-                  <span style={{ flex: 1, fontSize: 12 }}>{s.symbol}</span>
-                  <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>₹{Number(s.price).toFixed(2)}</span>
+        {/* Regime Config */}
+        <div className="card bt-risk-card" style={{ marginBottom: 12 }}>
+          <div className="bt-risk-toggle-row">
+            <span className="bt-risk-label">Market Regime Detection
+              <span className={regimeConfig.enabled ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+                {regimeConfig.enabled ? 'enabled' : 'disabled'}
+              </span>
+            </span>
+            <button type="button" disabled={connected}
+              className={regimeConfig.enabled ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+              onClick={() => updateRegime('enabled', !regimeConfig.enabled)}>
+              {regimeConfig.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          {regimeConfig.enabled && (
+            <div className="bt-risk-fields">
+              {[['ADX Period','adxPeriod'],['ATR Period','atrPeriod'],['ADX Trend Threshold','adxTrendThreshold'],
+                ['ATR Volatile %','atrVolatilePct'],['ATR Compression %','atrCompressionPct']].map(([lbl, key]) => (
+                <div className="form-group" key={key}>
+                  <label>{lbl}</label>
+                  <input type="number" min="0" step="0.5" value={regimeConfig[key]} disabled={connected}
+                    onChange={e => updateRegime(key, e.target.value)} />
                 </div>
               ))}
             </div>
-          </div>
-        )}
+          )}
+        </div>
 
-        {/* Tick stream */}
-        <div className="card" style={{ padding: 0 }}>
-          <div className="bt-feed-header">
-            <span className="bt-params-label" style={{ margin: 0 }}>Tick Stream</span>
-            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{ticks.length} ticks received</span>
+        {/* Pattern Config */}
+        <div className="card bt-risk-card">
+          <div className="bt-risk-toggle-row">
+            <span className="bt-risk-label">Pattern Confirmation
+              <span className={patternConfig.enabled ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+                {patternConfig.enabled ? 'enabled' : 'disabled'}
+              </span>
+            </span>
+            <button type="button" disabled={connected}
+              className={patternConfig.enabled ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+              onClick={() => updatePattern('enabled', !patternConfig.enabled)}>
+              {patternConfig.enabled ? 'ON' : 'OFF'}
+            </button>
           </div>
-          <div className="bt-signal-log">
-            {ticks.length === 0
-              ? <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>Ticks will appear here when connected to live data.</div>
-              : ticks.map((t, i) => (
-                <div key={i} className="bt-signal-row">
-                  <span className="mono-sm" style={{ color: 'var(--text-muted)', minWidth: 56 }}>{t.ts}</span>
-                  <span style={{ fontWeight: 600, fontSize: 12, minWidth: 80 }}>{t.symbol}</span>
-                  <span style={{ fontSize: 13, color: 'var(--accent)', fontWeight: 700 }}>₹{Number(t.ltp).toFixed(2)}</span>
-                  {t.change !== undefined && (
-                    <span style={{ fontSize: 11, color: Number(t.change) >= 0 ? '#22c55e' : '#ef4444' }}>
-                      {Number(t.change) >= 0 ? '+' : ''}{Number(t.change).toFixed(2)}%
-                    </span>
+          {patternConfig.enabled && (
+            <>
+              <div className="bt-risk-fields">
+                <div className="form-group"><label>Min Wick Ratio</label>
+                  <input type="number" min="0" step="0.1" value={patternConfig.minWickRatio} disabled={connected} onChange={e => updatePattern('minWickRatio', e.target.value)} />
+                </div>
+                <div className="form-group"><label>Max Body %</label>
+                  <input type="number" min="0" max="1" step="0.05" value={patternConfig.maxBodyPct} disabled={connected} onChange={e => updatePattern('maxBodyPct', e.target.value)} />
+                </div>
+              </div>
+              <div className="bt-params-label" style={{ marginTop: 8 }}>BUY confirm patterns</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>
+                {BUY_PATTERNS.map(p => (
+                  <label key={p.id} className="checkbox-label">
+                    <input type="checkbox" disabled={connected} checked={patternConfig.buyConfirmPatterns.includes(p.id)}
+                      onChange={() => togglePatternList('buyConfirmPatterns', p.id)} />
+                    {p.label}
+                  </label>
+                ))}
+              </div>
+              <div className="bt-params-label" style={{ marginTop: 8 }}>SELL confirm patterns</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>
+                {SELL_PATTERNS.map(p => (
+                  <label key={p.id} className="checkbox-label">
+                    <input type="checkbox" disabled={connected} checked={patternConfig.sellConfirmPatterns.includes(p.id)}
+                      onChange={() => togglePatternList('sellConfirmPatterns', p.id)} />
+                    {p.label}
+                  </label>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+
+        </div>{/* end bt-live-center-col */}
+
+        {/* ── Feed tabs (right col) ── */}
+        <div className="bt-live-feed">
+
+        {/* Tab bar */}
+        <div className="bt-live-right-tabs">
+          {[['feed','Feed'],['pnl','P&L'],['portfolio','Portfolio']].map(([k,l]) => (
+            <button key={k} className={`bt-live-tab-btn ${rightTab===k?'active':''}`} onClick={() => setRightTab(k)}>{l}</button>
+          ))}
+          {currentRegime && (
+            <span className={`bt-regime-badge bt-regime-${currentRegime}`} style={{ marginLeft: 'auto', alignSelf: 'center' }}>
+              {currentRegime}
+            </span>
+          )}
+          <span className={`bt-status-pill bt-status-${status}`} style={{ marginLeft: currentRegime ? 8 : 'auto', alignSelf: 'center' }}>
+            {status.toUpperCase()}
+          </span>
+        </div>
+
+        {/* ── Feed tab ── */}
+        {rightTab === 'feed' && (
+          <>
+            {/* Latest tick */}
+            {latestTick && (
+              <div className="card bt-feed-status" style={{ marginBottom: 10 }}>
+                <div className="bt-live-ticker">
+                  <span style={{ fontWeight: 700, fontSize: 18 }}>{latestTick.symbol}</span>
+                  <span style={{ fontSize: 22, fontWeight: 700, color: 'var(--accent)' }}>
+                    {fmtRs(latestTick.ltp)}
+                  </span>
+                  <span style={{ fontSize: 13, color: changeColor }}>
+                    {(latestTick.change??0) >= 0 ? '+' : ''}{Number(latestTick.change||0).toFixed(2)}%
+                  </span>
+                  {currentCandle && (
+                    <div className="bt-ohlc-row" style={{ marginTop: 6 }}>
+                      {[['O',currentCandle.open],['H',currentCandle.high],['L',currentCandle.low],['C',currentCandle.close]].map(([l,v])=>(
+                        <span key={l}><span className="meta-label">{l}</span> {Number(v).toFixed(2)}</span>
+                      ))}
+                      <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>forming…</span>
+                    </div>
                   )}
                 </div>
-              ))
-            }
-          </div>
+                {/* Candles formed */}
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6 }}>
+                  {liveCandles.length} candle{liveCandles.length !== 1 ? 's' : ''} closed · {ticks.length} ticks
+                  {allStratLabels.filter(lbl => stratStates[lbl]?.openPosition).map(lbl => {
+                    const pos = stratStates[lbl].openPosition;
+                    const ltp = parseFloat(latestTick?.ltp || pos.entryPrice);
+                    const uPnl = (ltp - pos.entryPrice) * pos.qty;
+                    const uPct = (uPnl / (pos.entryPrice * pos.qty)) * 100;
+                    return (
+                      <span key={lbl} style={{ marginLeft: 12, color: uPnl >= 0 ? '#22c55e' : '#ef4444', fontWeight: 600 }}>
+                        OPEN {lbl} — {fmtRs(uPnl)} ({uPct.toFixed(2)}%)
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            {!latestTick && (
+              <div className="card bt-feed-status" style={{ marginBottom: 10 }}>
+                <span className={`bt-status-pill bt-status-${status}`}>{status.toUpperCase()}</span>
+                <span style={{ fontSize: 12, color: 'var(--text-muted)', marginLeft: 10 }}>
+                  {connected ? 'Waiting for ticks…' : 'Connect to start paper trading'}
+                </span>
+              </div>
+            )}
+
+            {/* Signal log */}
+            {signals.length > 0 && (
+              <div className="card" style={{ marginBottom: 10, padding: 0 }}>
+                <div className="bt-feed-header">
+                  <span className="bt-params-label" style={{ margin: 0 }}>Signals</span>
+                </div>
+                <div className="bt-signal-log">
+                  {signals.map((s, i) => (
+                    <div key={i} className={`bt-signal-row ${s.signal !== 'HOLD' ? 'bt-signal-actionable' : ''}`}>
+                      <span className="mono-sm" style={{ color: 'var(--text-muted)', minWidth: 56 }}>{s.ts}</span>
+                      {signalBadge(s.signal)}
+                      <span style={{ fontSize: 11, color: 'var(--text-muted)', flex: 1 }}>{s.strategyLabel}</span>
+                      <span style={{ fontSize: 12, color: 'var(--accent)' }}>{fmtRs(s.price)}</span>
+                      {s.reason && <span className={`bt-exit-badge bt-exit-${s.reason.toLowerCase().replace('_','-')}`}>{s.reason}</span>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Tick stream */}
+            <div className="card" style={{ padding: 0 }}>
+              <div className="bt-feed-header">
+                <span className="bt-params-label" style={{ margin: 0 }}>Tick Stream</span>
+                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{ticks.length} received</span>
+              </div>
+              <div className="bt-signal-log">
+                {ticks.length === 0
+                  ? <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
+                      Ticks will appear here when connected.
+                    </div>
+                  : ticks.map((t, i) => (
+                    <div key={i} className="bt-signal-row">
+                      <span className="mono-sm" style={{ color: 'var(--text-muted)', minWidth: 56 }}>{t.ts}</span>
+                      <span style={{ fontWeight: 600, fontSize: 12, minWidth: 80 }}>{t.symbol}</span>
+                      <span style={{ fontSize: 13, color: 'var(--accent)', fontWeight: 700 }}>{fmtRs(t.ltp)}</span>
+                      {t.change !== undefined && (
+                        <span style={{ fontSize: 11, color: Number(t.change) >= 0 ? '#22c55e' : '#ef4444' }}>
+                          {Number(t.change) >= 0 ? '+' : ''}{Number(t.change).toFixed(2)}%
+                        </span>
+                      )}
+                    </div>
+                  ))
+                }
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* ── P&L tab ── */}
+        {rightTab === 'pnl' && (
+          <>
+            {/* Aggregate summary */}
+            <div className="bt-live-pnl-summary" style={{ marginBottom: 10 }}>
+              {[
+                ['Total P&L', fmtRs(totalPnl), totalPnl >= 0 ? '#22c55e' : '#ef4444'],
+                ['Return', `${totalPnlPct.toFixed(2)}%`, totalPnlPct >= 0 ? '#22c55e' : '#ef4444'],
+                ['Total Trades', String(allClosedTrades.length), null],
+                ['Win Rate', allClosedTrades.length ? `${(allClosedTrades.filter(t=>t.pnl>=0).length/allClosedTrades.length*100).toFixed(1)}%` : '—', null],
+                ['Strategies', String(numActive), null],
+              ].map(([label, val, color]) => (
+                <div key={label} className="bt-metric-cell">
+                  <div className="bt-metric-label">{label}</div>
+                  <div className="bt-metric-value" style={color ? { color } : {}}>{val}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Per-strategy comparison table */}
+            {allStratLabels.length > 0 && (
+              <div className="card" style={{ marginBottom: 10, padding: 0 }}>
+                <div className="bt-feed-header">
+                  <span className="bt-params-label" style={{ margin: 0 }}>Strategy Comparison</span>
+                </div>
+                <div style={{ overflowX: 'auto' }}>
+                  <table>
+                    <thead>
+                      <tr><th>Strategy</th><th>Capital</th><th>P&L</th><th>Return %</th><th>Trades</th><th>Win Rate</th></tr>
+                    </thead>
+                    <tbody>
+                      {allStratLabels.map(lbl => {
+                        const st = stratStates[lbl];
+                        const cap = st?.capital ?? initCap;
+                        const pnl = cap - initCap;
+                        const pct = initCap > 0 ? (pnl / initCap) * 100 : 0;
+                        const trades = st?.closedTrades || [];
+                        const wins = trades.filter(t => t.pnl >= 0).length;
+                        return (
+                          <tr key={lbl}>
+                            <td style={{ fontSize: 11, fontWeight: 600 }}>{lbl}</td>
+                            <td style={{ fontSize: 11 }}>{fmtRs(cap)}</td>
+                            <td className={pnl >= 0 ? 'text-success' : 'text-danger'} style={{ fontWeight: 600, fontSize: 11 }}>{fmtRs(pnl)}</td>
+                            <td className={pct >= 0 ? 'text-success' : 'text-danger'} style={{ fontSize: 11 }}>{pct.toFixed(2)}%</td>
+                            <td style={{ fontSize: 11 }}>{trades.length}</td>
+                            <td style={{ fontSize: 11 }}>{trades.length ? `${(wins/trades.length*100).toFixed(1)}%` : '—'}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* Per-strategy detail — all shown automatically */}
+            {allStratLabels.map(lbl => {
+              const st = stratStates[lbl];
+              const trades = st?.closedTrades || [];
+              return (
+                <div key={lbl}>
+                  {trades.length > 0 && (
+                    <div className="card" style={{ marginBottom: 10 }}>
+                      <div className="bt-params-label" style={{ marginBottom: 6 }}>Equity Curve — {lbl}</div>
+                      <EquityCurve
+                        trades={[...trades].reverse().map(t => ({ runningCapital: t.capitalAfter, pnl: t.pnl }))}
+                      />
+                    </div>
+                  )}
+                  <div className="card" style={{ padding: 0, marginBottom: 10 }}>
+                    <div className="bt-feed-header">
+                      <span className="bt-params-label" style={{ margin: 0 }}>Closed Trades — {lbl}</span>
+                      <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{trades.length} trade{trades.length !== 1 ? 's' : ''}</span>
+                    </div>
+                    {trades.length === 0
+                      ? <div style={{ padding: '16px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>No closed trades yet.</div>
+                      : (
+                        <div style={{ overflowX: 'auto' }}>
+                          <table>
+                            <thead>
+                              <tr><th>#</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>Return %</th><th>Exit Reason</th><th>Capital After</th></tr>
+                            </thead>
+                            <tbody>
+                              {trades.map((t, i) => (
+                                <tr key={i}>
+                                  <td>{trades.length - i}</td>
+                                  <td><span className="mono-sm">{t.entryTime}</span><br/><span style={{ fontSize: 11 }}>{fmtRs(t.entryPrice)}</span></td>
+                                  <td><span className="mono-sm">{t.exitTime}</span><br/><span style={{ fontSize: 11 }}>{fmtRs(t.exitPrice)}</span></td>
+                                  <td>{t.qty}</td>
+                                  <td className={t.pnl >= 0 ? 'text-success' : 'text-danger'} style={{ fontWeight: 600 }}>{fmtRs(t.pnl)}</td>
+                                  <td className={t.pnlPct >= 0 ? 'text-success' : 'text-danger'}>{t.pnlPct.toFixed(2)}%</td>
+                                  <td><span className={`bt-exit-badge bt-exit-${(t.exitReason||'SIGNAL').toLowerCase().replace(/_/g,'-')}`}>{t.exitReason||'SIGNAL'}</span></td>
+                                  <td style={{ fontSize: 11 }}>{fmtRs(t.capitalAfter)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )
+                    }
+                  </div>
+                </div>
+              );
+            })}
+            {allStratLabels.length === 0 && (
+              <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
+                Connect live to start paper trading.
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ── Portfolio tab ── */}
+        {rightTab === 'portfolio' && (
+          <>
+            {/* Capital breakdown per strategy */}
+            <div className="card" style={{ marginBottom: 10, padding: 0 }}>
+              <div className="bt-feed-header">
+                <span className="bt-params-label" style={{ margin: 0 }}>Capital per Strategy</span>
+              </div>
+              {allStratLabels.length === 0
+                ? <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>Connect live to start paper trading.</div>
+                : (
+                  <div style={{ overflowX: 'auto' }}>
+                    <table>
+                      <thead>
+                        <tr><th>Strategy</th><th>Initial</th><th>Current</th><th>P&L</th><th>Return %</th><th>Status</th></tr>
+                      </thead>
+                      <tbody>
+                        {allStratLabels.map(lbl => {
+                          const cap = stratStates[lbl]?.capital ?? initCap;
+                          const pnl = cap - initCap;
+                          const pct = initCap > 0 ? (pnl / initCap) * 100 : 0;
+                          const hasOpen = !!stratStates[lbl]?.openPosition;
+                          const halted  = dailyCapMap.current[lbl]?.halted || false;
+                          return (
+                            <tr key={lbl}>
+                              <td style={{ fontSize: 11, fontWeight: 600 }}>{lbl}</td>
+                              <td style={{ fontSize: 11 }}>{fmtRs(initCap)}</td>
+                              <td style={{ fontSize: 11 }}>{fmtRs(cap)}</td>
+                              <td className={pnl >= 0 ? 'text-success' : 'text-danger'} style={{ fontWeight: 600, fontSize: 11 }}>{fmtRs(pnl)}</td>
+                              <td className={pct >= 0 ? 'text-success' : 'text-danger'} style={{ fontSize: 11 }}>{pct.toFixed(2)}%</td>
+                              <td style={{ fontSize: 11 }}>
+                                {halted  ? <span className="bt-exit-badge bt-exit-stop-loss">HALTED</span>
+                                : hasOpen ? <span className="badge badge-success">IN POSITION</span>
+                                :           <span className="badge badge-muted">IDLE</span>}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )
+              }
+            </div>
+
+            {/* Open positions — one card per strategy */}
+            {allStratLabels.filter(lbl => stratStates[lbl]?.openPosition).length > 0 && (
+              <div className="card" style={{ marginBottom: 10 }}>
+                <h3 className="section-title" style={{ marginBottom: 10 }}>Open Positions</h3>
+                {allStratLabels.filter(lbl => stratStates[lbl]?.openPosition).map(lbl => {
+                  const pos = stratStates[lbl].openPosition;
+                  const ltp = parseFloat(latestTick?.ltp || pos.entryPrice);
+                  const uPnl = (ltp - pos.entryPrice) * pos.qty;
+                  const uPct = (uPnl / (pos.entryPrice * pos.qty)) * 100;
+                  return (
+                    <div key={lbl} className="bt-live-position-card" style={{ marginBottom: 8 }}>
+                      <div className="bt-live-pos-row">
+                        <span className="bt-metric-label">Strategy</span>
+                        <span className="instance-type">{lbl}</span>
+                      </div>
+                      <div className="bt-live-pos-row">
+                        <span className="bt-metric-label">Entry</span>
+                        <span>{fmtRs(pos.entryPrice)} × {pos.qty} @ {pos.entryTime}</span>
+                      </div>
+                      <div className="bt-live-pos-row">
+                        <span className="bt-metric-label">LTP</span>
+                        <span style={{ fontWeight: 700 }}>{latestTick ? fmtRs(ltp) : '—'}</span>
+                      </div>
+                      <div className="bt-live-pos-row">
+                        <span className="bt-metric-label">Unrealised P&L</span>
+                        <span style={{ color: uPnl >= 0 ? '#22c55e' : '#ef4444', fontWeight: 700 }}>
+                          {fmtRs(uPnl)} ({uPct.toFixed(2)}%)
+                        </span>
+                      </div>
+                      {pos.slPrice && <div className="bt-live-pos-row"><span className="bt-metric-label">SL</span><span style={{ color: '#ef4444' }}>{fmtRs(pos.slPrice)}</span></div>}
+                      {pos.tpPrice && <div className="bt-live-pos-row"><span className="bt-metric-label">TP</span><span style={{ color: '#22c55e' }}>{fmtRs(pos.tpPrice)}</span></div>}
+                      {pos.regime && <div className="bt-live-pos-row"><span className="bt-metric-label">Regime</span><span className={`bt-regime-badge bt-regime-${pos.regime}`}>{pos.regime}</span></div>}
+                      <button type="button" className="btn-danger btn-sm" style={{ marginTop: 8 }}
+                        onClick={() => closePaperPosition(lbl, parseFloat(latestTickRef.current?.ltp || pos.entryPrice), 'MANUAL')}>
+                        Close {lbl}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Strategy warmup status */}
+            <div className="card">
+              <h3 className="section-title" style={{ marginBottom: 10 }}>Strategy Warmup</h3>
+              {strategies.filter(s => s.enabled).map(s => {
+                const label = s.label || s.strategyType;
+                const ev = evaluatorsRef.current[label];
+                const seen = ev?.candlesSeen || 0;
+                const need = ev?.warmupNeeded || 1;
+                const warmed = seen >= need;
+                return (
+                  <div key={label} className="bt-live-warmup-row">
+                    <span className="instance-type" style={{ minWidth: 160 }}>{label}</span>
+                    <div className="bt-live-warmup-bar-wrap">
+                      <div className="bt-live-warmup-bar" style={{ width: `${Math.min(100, (seen/need)*100)}%`, background: warmed ? '#22c55e' : 'var(--accent)' }} />
+                    </div>
+                    <span style={{ fontSize: 11, color: warmed ? '#22c55e' : 'var(--text-muted)', minWidth: 80, textAlign: 'right' }}>
+                      {warmed ? 'Ready' : `${seen}/${need}`}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        </div>{/* end bt-live-feed */}
+      </div>{/* end bt-live-top-row */}
+
+      {/* ── Bottom: Strategies (full width) ──────────────────────────── */}
+      <div className="card bt-live-strategies-row">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+          <h3 className="section-title" style={{ margin: 0 }}>Strategies</h3>
+          {!connected && <button type="button" className="btn-secondary btn-sm" onClick={addStrategy}>+ Add</button>}
+        </div>
+        <div className="bt-live-strategies-grid">
+          {strategies.map((s, idx) => {
+            const pdefs = PARAM_DEFS[s.strategyType] || [];
+            return (
+              <div key={idx} className={`bt-strategy-card ${s.enabled ? '' : 'bt-strategy-disabled'}`}>
+                <div className="bt-strategy-header">
+                  <label className="checkbox-label" style={{ margin: 0, fontWeight: 600 }}>
+                    <input type="checkbox" checked={s.enabled} disabled={connected}
+                      onChange={e => updateStrategy(idx, 'enabled', e.target.checked)} />
+                    <select value={s.strategyType} disabled={connected} onChange={e => updateStrategy(idx, 'strategyType', e.target.value)}
+                      className="bt-strategy-type-sel">
+                      {knownTypes.map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                  </label>
+                  {strategies.length > 1 && !connected &&
+                    <button type="button" className="btn-danger btn-xs" onClick={() => removeStrategy(idx)}>✕</button>}
+                </div>
+                {pdefs.length > 0 && s.enabled && (
+                  <div className="bt-params-block" style={{ marginTop: 6 }}>
+                    {pdefs.map(def => (
+                      <div className="bt-param-row" key={def.key}>
+                        <label className="bt-param-label">{def.label}</label>
+                        <input type="number" min="1" className="bt-param-input"
+                          value={s.parameters?.[def.key] || ''} disabled={connected}
+                          onChange={e => updateStrategyParam(idx, def.key, e.target.value)}
+                          placeholder={def.placeholder} />
+                        <span className="bt-param-hint">{def.hint}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {regimeConfig.enabled && s.enabled && (
+                  <div style={{ marginTop: 6, display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <span className="bt-params-label" style={{ marginRight: 4 }}>Regimes</span>
+                    <span className="bt-regime-auto-tag">auto</span>
+                    {(STRATEGY_REGIME_MAP[s.strategyType] || []).map(r => (
+                      <span key={r} className={`bt-regime-badge bt-regime-${r}`}>{r}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
+
     </div>
   );
 }
@@ -1960,8 +3148,9 @@ function LiveTest() {
 
 function signalBadge(signal) {
   const s = (signal || '').toUpperCase();
-  if (s === 'BUY')  return <span className="badge badge-success">BUY</span>;
-  if (s === 'SELL') return <span className="badge badge-danger">SELL</span>;
+  if (s === 'BUY')   return <span className="badge badge-success">BUY</span>;
+  if (s === 'SELL')  return <span className="badge badge-danger">SELL</span>;
+  if (s === 'SHORT') return <span className="badge" style={{ background: 'rgba(139,92,246,0.15)', color: '#8b5cf6', border: '1px solid rgba(139,92,246,0.3)', borderRadius: 4, padding: '2px 7px', fontSize: 11, fontWeight: 700 }}>SHORT↓</span>;
   return <span className="badge badge-muted">HOLD</span>;
 }
 
