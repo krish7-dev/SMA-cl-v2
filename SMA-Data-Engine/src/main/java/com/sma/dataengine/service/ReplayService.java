@@ -172,19 +172,24 @@ public class ReplayService {
         // Delay between emissions in milliseconds: 1000ms / speedMultiplier
         long delayMs = Math.max(1, 1000L / session.getSpeedMultiplier());
 
-        // Mutable index via array trick (lambda capture)
-        int[] index = {0};
+        // AtomicInteger ensures thread-safe increment when pool threads overlap at high speed
+        java.util.concurrent.atomic.AtomicInteger index     = new java.util.concurrent.atomic.AtomicInteger(0);
+        java.util.concurrent.atomic.AtomicBoolean completed = new java.util.concurrent.atomic.AtomicBoolean(false);
 
         ScheduledFuture<?> future = scheduler.scheduleAtFixedRate(() -> {
             try {
-                if (index[0] >= candles.size()) {
-                    // All candles emitted — mark complete and cancel
-                    completeSession(sessionId);
-                    cancelFuture(sessionId);
+                int i = index.getAndIncrement();
+                if (i >= candles.size()) {
+                    // Only the first thread to hit the end triggers completion
+                    if (completed.compareAndSet(false, true)) {
+                        completeSession(sessionId);
+                        eventPublisher.publishEvent(new com.sma.dataengine.event.ReplayCompleteEvent(this, sessionId));
+                        cancelFuture(sessionId);
+                    }
                     return;
                 }
 
-                CandleData candle = candles.get(index[0]++);
+                CandleData candle = candles.get(i);
 
                 // Emit simulated OHLC tick stream before publishing the completed candle.
                 // Sequence: open → high → low → close (standard intra-bar price path).
@@ -193,8 +198,9 @@ public class ReplayService {
                 eventPublisher.publishEvent(new CandleDataEvent(this, candle, true, sessionId));
 
                 // Periodically flush emitted count to DB every 100 candles
-                if (index[0] % 100 == 0) {
-                    updateEmittedCount(sessionId, index[0]);
+                int emitted = i + 1;
+                if (emitted % 100 == 0) {
+                    updateEmittedCount(sessionId, emitted);
                 }
 
             } catch (Exception e) {
@@ -202,7 +208,7 @@ public class ReplayService {
                 failSession(sessionId);
                 cancelFuture(sessionId);
             }
-        }, 0, delayMs, TimeUnit.MILLISECONDS);
+        }, 1000L, delayMs, TimeUnit.MILLISECONDS); // 1 s initial delay — lets browser establish SSE connection
 
         activeFutures.put(sessionId, future);
 

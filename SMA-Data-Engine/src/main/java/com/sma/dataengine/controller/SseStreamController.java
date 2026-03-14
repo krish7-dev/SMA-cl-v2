@@ -2,6 +2,7 @@ package com.sma.dataengine.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sma.dataengine.event.CandleDataEvent;
+import com.sma.dataengine.event.ReplayCompleteEvent;
 import com.sma.dataengine.event.TickDataEvent;
 import com.sma.dataengine.model.CandleData;
 import com.sma.dataengine.model.TickData;
@@ -131,6 +132,26 @@ public class SseStreamController {
         payload.put("sessionId",       t.getReplaySessionId() != null ? t.getReplaySessionId() : "");
 
         broadcastTicks(payload, t.isReplay() ? t.getReplaySessionId() : null);
+    }
+
+    /**
+     * Sends a "done" SSE event to the candle client subscribed to the completed session.
+     * This lets the browser close its EventSource only after all candle events are processed,
+     * avoiding the race where the poll-based status check closes the connection too early.
+     */
+    @EventListener
+    public void onReplayComplete(ReplayCompleteEvent event) {
+        String sessionId = event.getSessionId();
+        List<SseEntry> dead = new ArrayList<>();
+        for (SseEntry entry : candleClients) {
+            if (!sessionId.equals(entry.sessionId())) continue;
+            try {
+                entry.emitter().send(SseEmitter.event().name("done").data(sessionId));
+            } catch (Exception e) {
+                dead.add(entry);
+            }
+        }
+        candleClients.removeAll(dead);
     }
 
     // ─── Broadcast Helpers ────────────────────────────────────────────────────
