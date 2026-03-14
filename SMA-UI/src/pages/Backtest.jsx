@@ -1421,12 +1421,15 @@ function ReplayTest() {
   const [rightTab, setRightTab]         = useState('feed');
   const [ticks, setTicks]               = useState([]);
   const [latestTick, setLatestTick]     = useState(null);
+  const [candleLog, setCandleLog]       = useState([]);
+  const [combinedOnlyMode, setCombinedOnlyMode] = useState(false);
 
   const evaluatorsRef     = useRef({});
   const sseRef            = useRef(null);
   const tickSseRef        = useRef(null);
   const ticksRef          = useRef([]);
   const latestTickRef     = useRef(null);
+  const candleLogRef      = useRef([]);
   const pollRef           = useRef(null);
   const feedRef           = useRef([]);
   const capitalMap        = useRef({});
@@ -1582,17 +1585,19 @@ function ReplayTest() {
       setCurrentRegime(regime);
     }
 
-    // SL/TP check against candle's high/low before evaluating signals
-    for (const strat of strategies.filter(s => s.enabled)) {
-      const label = strat.label || strat.strategyType;
-      const pos = openPositionMap.current[label];
-      if (!pos || !riskConfig.enabled) continue;
-      if (pos.type === 'LONG') {
-        if (pos.slPrice && low <= pos.slPrice) { closeLong(label, pos.slPrice, candleTime, 'STOP_LOSS'); continue; }
-        if (pos.tpPrice && high >= pos.tpPrice) { closeLong(label, pos.tpPrice, candleTime, 'TAKE_PROFIT'); continue; }
-      } else if (pos.type === 'SHORT') {
-        if (pos.slPrice && high >= pos.slPrice) { closeShort(label, pos.slPrice, candleTime, 'STOP_LOSS'); continue; }
-        if (pos.tpPrice && low <= pos.tpPrice) { closeShort(label, pos.tpPrice, candleTime, 'TAKE_PROFIT'); continue; }
+    // SL/TP check against candle's high/low before evaluating signals (skipped in combined-only mode)
+    if (!combinedOnlyMode) {
+      for (const strat of strategies.filter(s => s.enabled)) {
+        const label = strat.label || strat.strategyType;
+        const pos = openPositionMap.current[label];
+        if (!pos || !riskConfig.enabled) continue;
+        if (pos.type === 'LONG') {
+          if (pos.slPrice && low <= pos.slPrice) { closeLong(label, pos.slPrice, candleTime, 'STOP_LOSS'); continue; }
+          if (pos.tpPrice && high >= pos.tpPrice) { closeLong(label, pos.tpPrice, candleTime, 'TAKE_PROFIT'); continue; }
+        } else if (pos.type === 'SHORT') {
+          if (pos.slPrice && high >= pos.slPrice) { closeShort(label, pos.slPrice, candleTime, 'STOP_LOSS'); continue; }
+          if (pos.tpPrice && low <= pos.tpPrice) { closeShort(label, pos.tpPrice, candleTime, 'TAKE_PROFIT'); continue; }
+        }
       }
     }
 
@@ -1619,7 +1624,9 @@ function ReplayTest() {
       }
 
       const signal = ev.next(close, high, low, vol, open);
-      latestSignals[label] = signal;
+      latestSignals[label] = signal; // always record signal for Combined pool + Details tab
+
+      if (combinedOnlyMode) continue; // don't trade individually — Combined pool handles it
 
       // Pattern confirmation
       if (patternConfig.enabled && patternEvalRef.current && signal !== 'HOLD') {
@@ -1651,16 +1658,27 @@ function ReplayTest() {
     }
 
     // ── Combined regime-switched pool ──────────────────────────────────────
+    const combinedDetails = []; // enriched context for ⚡ Combined actions this candle
     if (capitalMap.current[COMBINED_LABEL] !== undefined) {
       // SL/TP for combined position
       const cPos = openPositionMap.current[COMBINED_LABEL];
       if (cPos && riskConfig.enabled) {
         if (cPos.type === 'LONG') {
-          if (cPos.slPrice && low  <= cPos.slPrice)  closeLong(COMBINED_LABEL,  cPos.slPrice,  candleTime, 'STOP_LOSS');
-          else if (cPos.tpPrice && high >= cPos.tpPrice) closeLong(COMBINED_LABEL, cPos.tpPrice, candleTime, 'TAKE_PROFIT');
+          if (cPos.slPrice && low <= cPos.slPrice) {
+            closeLong(COMBINED_LABEL, cPos.slPrice, candleTime, 'STOP_LOSS');
+            combinedDetails.push({ action: 'Exit Long', price: cPos.slPrice, reason: 'Stop Loss hit', regime, sourceStrategy: null, trigger: 'Risk Management' });
+          } else if (cPos.tpPrice && high >= cPos.tpPrice) {
+            closeLong(COMBINED_LABEL, cPos.tpPrice, candleTime, 'TAKE_PROFIT');
+            combinedDetails.push({ action: 'Exit Long', price: cPos.tpPrice, reason: 'Take Profit hit', regime, sourceStrategy: null, trigger: 'Risk Management' });
+          }
         } else if (cPos.type === 'SHORT') {
-          if (cPos.slPrice && high >= cPos.slPrice)  closeShort(COMBINED_LABEL, cPos.slPrice,  candleTime, 'STOP_LOSS');
-          else if (cPos.tpPrice && low  <= cPos.tpPrice) closeShort(COMBINED_LABEL, cPos.tpPrice, candleTime, 'TAKE_PROFIT');
+          if (cPos.slPrice && high >= cPos.slPrice) {
+            closeShort(COMBINED_LABEL, cPos.slPrice, candleTime, 'STOP_LOSS');
+            combinedDetails.push({ action: 'Exit Short', price: cPos.slPrice, reason: 'Stop Loss hit', regime, sourceStrategy: null, trigger: 'Risk Management' });
+          } else if (cPos.tpPrice && low <= cPos.tpPrice) {
+            closeShort(COMBINED_LABEL, cPos.tpPrice, candleTime, 'TAKE_PROFIT');
+            combinedDetails.push({ action: 'Exit Short', price: cPos.tpPrice, reason: 'Take Profit hit', regime, sourceStrategy: null, trigger: 'Risk Management' });
+          }
         }
       }
 
@@ -1673,17 +1691,35 @@ function ReplayTest() {
           const signal = latestSignals[stratLabel];
           if (!signal || signal === 'HOLD') continue;
 
-          const cp       = openPositionMap.current[COMBINED_LABEL];
+          const cp        = openPositionMap.current[COMBINED_LABEL];
           const cHasLong  = cp?.type === 'LONG';
           const cHasShort = cp?.type === 'SHORT';
           const allowShort = !!strat.allowShorting;
 
           if (signal === 'BUY') {
-            if (cHasShort) { closeShort(COMBINED_LABEL, close, candleTime, 'SIGNAL'); if (allowShort) openLong(COMBINED_LABEL, close, candleTime, regime); }
-            else if (!cHasLong) openLong(COMBINED_LABEL, close, candleTime, regime);
+            if (cHasShort) {
+              closeShort(COMBINED_LABEL, close, candleTime, 'SIGNAL');
+              combinedDetails.push({ action: 'Exit Short', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger: 'Regime matched signal' });
+              if (allowShort) {
+                openLong(COMBINED_LABEL, close, candleTime, regime);
+                combinedDetails.push({ action: 'Enter Long', price: close, reason: 'Reversal SHORT→LONG', regime, sourceStrategy: stratLabel, trigger: 'Regime matched signal' });
+              }
+            } else if (!cHasLong) {
+              openLong(COMBINED_LABEL, close, candleTime, regime);
+              combinedDetails.push({ action: 'Enter Long', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger: 'Regime matched signal' });
+            }
           } else if (signal === 'SELL') {
-            if (cHasLong) { closeLong(COMBINED_LABEL, close, candleTime, 'SIGNAL'); if (allowShort) openShort(COMBINED_LABEL, close, candleTime, regime); }
-            else if (!cHasShort && allowShort) openShort(COMBINED_LABEL, close, candleTime, regime);
+            if (cHasLong) {
+              closeLong(COMBINED_LABEL, close, candleTime, 'SIGNAL');
+              combinedDetails.push({ action: 'Exit Long', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger: 'Regime matched signal' });
+              if (allowShort) {
+                openShort(COMBINED_LABEL, close, candleTime, regime);
+                combinedDetails.push({ action: 'Enter Short', price: close, reason: 'Reversal LONG→SHORT', regime, sourceStrategy: stratLabel, trigger: 'Regime matched signal' });
+              }
+            } else if (!cHasShort && allowShort) {
+              openShort(COMBINED_LABEL, close, candleTime, regime);
+              combinedDetails.push({ action: 'Enter Short', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger: 'Regime matched signal' });
+            }
           }
           break; // first matching strategy wins
         }
@@ -1693,6 +1729,14 @@ function ReplayTest() {
     const entry = { ...candle, signals: latestSignals, ts: candleTime };
     setCurrentCandle(entry);
     setProgress(prev => ({ ...prev, emitted: prev.emitted + 1 }));
+
+    // Build candle log — exclude ⚡ Combined from feed-based actions (we have richer combinedDetails)
+    const logActions = feedRef.current
+      .filter(f => f.ts === candleTime && f.strategyLabel !== COMBINED_LABEL)
+      .map(f => ({ strategy: f.strategyLabel || '', signal: f.signal, price: f.close, reason: f.reason || '' }));
+    const logEntry = { ts: candleTime, open, high, low, close, volume: vol, regime, signals: { ...latestSignals }, actions: logActions, combinedDetails };
+    candleLogRef.current = [...candleLogRef.current, logEntry];
+    setCandleLog([...candleLogRef.current]);
   }
 
   async function handleStart(e) {
@@ -1700,6 +1744,7 @@ function ReplayTest() {
     cleanup();
     setError(''); setFeed([]); feedRef.current = [];
     setTicks([]); ticksRef.current = []; setLatestTick(null); latestTickRef.current = null;
+    setCandleLog([]); candleLogRef.current = [];
     setProgress({ emitted: 0, total: 0 });
     setStatus('starting'); setSessionId(null); setCurrentCandle(null);
     setStratStates({});
@@ -1832,6 +1877,7 @@ function ReplayTest() {
     cleanup();
     setFeed([]); feedRef.current = [];
     setTicks([]); ticksRef.current = []; setLatestTick(null); latestTickRef.current = null;
+    setCandleLog([]); candleLogRef.current = [];
     setStatus('idle'); setSessionId(null);
     setProgress({ emitted: 0, total: 0 });
     setCurrentCandle(null); setError('');
@@ -2067,7 +2113,7 @@ function ReplayTest() {
 
           {/* Tab bar */}
           <div className="bt-live-right-tabs">
-            {[['feed','Feed'],['pnl','P&L'],['portfolio','Portfolio']].map(([k,l]) => (
+            {[['feed','Feed'],['pnl','P&L'],['portfolio','Portfolio'],['details','Details']].map(([k,l]) => (
               <button key={k} className={`bt-live-tab-btn ${rightTab===k?'active':''}`} onClick={() => setRightTab(k)}>{l}</button>
             ))}
           </div>
@@ -2311,6 +2357,299 @@ function ReplayTest() {
             </div>
           )}
 
+          {/* ── Details tab ── */}
+          {rightTab === 'details' && (() => {
+            const stratLabels = strategies.filter(s => s.enabled).map(s => s.label || s.strategyType);
+
+            // Human-readable action label
+            function fmtAction(a) {
+              const r = a.reason === 'STOP_LOSS'   ? 'Stop Loss hit'
+                      : a.reason === 'TAKE_PROFIT' ? 'Take Profit hit'
+                      : a.reason === 'SIGNAL'      ? 'Signal'
+                      : a.reason || '';
+              if (a.signal === 'SHORT')             return `Enter Short — ${a.strategy} @${Number(a.price).toFixed(2)}`;
+              if (a.signal === 'BUY'  && !a.reason) return `Enter Long — ${a.strategy} @${Number(a.price).toFixed(2)}`;
+              if (a.signal === 'BUY'  &&  a.reason) return `Exit Short — ${a.strategy} @${Number(a.price).toFixed(2)} [${r}]`;
+              if (a.signal === 'SELL')               return `Exit Long — ${a.strategy} @${Number(a.price).toFixed(2)} [${r}]`;
+              return `${a.signal} — ${a.strategy} @${Number(a.price).toFixed(2)}`;
+            }
+
+            function downloadCSV() {
+              const q = v => `"${String(v ?? '').replace(/"/g,'""')}"`;
+              const row = (...cols) => cols.map(q).join(',');
+              const blank = '';
+              const lines = [];
+
+              // ── Instrument Details ────────────────────────────────────
+              lines.push(row('=== Instrument Details ==='));
+              lines.push(row('Symbol','Exchange','Token','Interval','From','To','Speed'));
+              lines.push(row(inst.symbol, inst.exchange, inst.instrumentToken,
+                replayInterval, fromDate, toDate, `${speed}x`));
+              lines.push(blank);
+
+              // ── Strategies ────────────────────────────────────────────
+              lines.push(row('=== Strategies ==='));
+              lines.push(row('Name','Type','Allow Shorting'));
+              strategies.filter(s => s.enabled).forEach(s => {
+                lines.push(row(s.label || s.strategyType, s.strategyType, s.allowShorting ? 'Yes' : 'No'));
+              });
+              lines.push(blank);
+
+              // ── Risk Management ───────────────────────────────────────
+              if (riskConfig.enabled) {
+                lines.push(row('=== Risk Management ==='));
+                lines.push(row('Stop Loss %','Take Profit %','Max Risk Per Trade %','Cooldown Candles','Daily Loss Cap %'));
+                lines.push(row(
+                  riskConfig.stopLossPct   || '—',
+                  riskConfig.takeProfitPct || '—',
+                  riskConfig.maxRiskPerTradePct || '—',
+                  riskConfig.cooldownCandles    || '—',
+                  riskConfig.dailyLossCapPct    || '—',
+                ));
+                lines.push(blank);
+              }
+
+              // ── Market Regime Detection ───────────────────────────────
+              if (regimeConfig.enabled) {
+                lines.push(row('=== Market Regime Detection ==='));
+                lines.push(row('ADX Period','ATR Period','ADX Trend Threshold','ATR Volatile %','ATR Compression %'));
+                lines.push(row(
+                  regimeConfig.adxPeriod,
+                  regimeConfig.atrPeriod,
+                  regimeConfig.adxTrendThreshold,
+                  regimeConfig.atrVolatilePct,
+                  regimeConfig.atrCompressionPct,
+                ));
+                lines.push(blank);
+              }
+
+              // ── Pattern Confirmation (only if enabled) ─────────────────
+              if (patternConfig.enabled) {
+                lines.push(row('=== Pattern Confirmation ==='));
+                lines.push(row('Buy Confirm Patterns','Sell Confirm Patterns','Min Wick Ratio','Max Body %'));
+                lines.push(row(
+                  (patternConfig.buyConfirmPatterns  || []).join('; ') || 'Any',
+                  (patternConfig.sellConfirmPatterns || []).join('; ') || 'Any',
+                  patternConfig.minWickRatio,
+                  patternConfig.maxBodyPct,
+                ));
+                lines.push(blank);
+              }
+
+              // ── P&L Summary ───────────────────────────────────────────
+              lines.push(row('=== P&L Summary ==='));
+              lines.push(row('Strategy','Initial Capital','Final Capital','P&L','Return %','Total Trades','Wins','Losses','Win Rate %'));
+              const allPnlLabels = [...stratLabels, ...(stratStates[COMBINED_LABEL] ? [COMBINED_LABEL] : [])];
+              allPnlLabels.forEach(lbl => {
+                const st     = stratStates[lbl];
+                const cap    = st?.capital ?? initCap;
+                const pnl    = cap - initCap;
+                const pct    = ((pnl / initCap) * 100).toFixed(2);
+                const trades = st?.closedTrades || [];
+                const wins   = trades.filter(t => t.pnl >= 0).length;
+                const losses = trades.length - wins;
+                const wr     = trades.length ? ((wins / trades.length) * 100).toFixed(1) : '—';
+                lines.push(row(lbl, initCap.toFixed(2), cap.toFixed(2), pnl.toFixed(2), pct, trades.length, wins, losses, wr));
+              });
+              lines.push(blank);
+
+              // ── Trade History ─────────────────────────────────────────
+              lines.push(row('=== Trade History ==='));
+              lines.push(row('Strategy','Direction','Entry Time','Exit Time','Qty',
+                'Entry Price','Exit Price','P&L','P&L %','Exit Reason',
+                ...(regimeConfig.enabled ? ['Regime'] : [])));
+              allPnlLabels.forEach(lbl => {
+                const trades = stratStates[lbl]?.closedTrades || [];
+                trades.slice().reverse().forEach(t => {
+                  lines.push(row(
+                    lbl,
+                    t.type || 'LONG',
+                    t.entryTime,
+                    t.exitTime,
+                    t.qty,
+                    Number(t.entryPrice).toFixed(2),
+                    Number(t.exitPrice).toFixed(2),
+                    Number(t.pnl).toFixed(2),
+                    Number(t.pnlPct ?? 0).toFixed(2),
+                    t.exitReason === 'STOP_LOSS'   ? 'Stop Loss hit'
+                      : t.exitReason === 'TAKE_PROFIT' ? 'Take Profit hit'
+                      : t.exitReason || 'Signal',
+                    ...(regimeConfig.enabled ? [t.regime ?? ''] : []),
+                  ));
+                });
+              });
+              lines.push(blank);
+
+              // ── Candle Data ───────────────────────────────────────────
+              lines.push(row('=== Candle Data ==='));
+              const sigCols = stratLabels.map(l => `Signal_${l}`);
+              lines.push(row('Time','Open','High','Low','Close','Volume',
+                ...(regimeConfig.enabled ? ['Regime'] : []),
+                ...sigCols, 'Strategy Actions', 'Combined Actions'));
+              candleLogRef.current.forEach(r => {
+                const combinedActionsStr = (r.combinedDetails || []).map(cd =>
+                  `${cd.action} @${Number(cd.price).toFixed(2)}` +
+                  (cd.sourceStrategy ? ` via ${cd.sourceStrategy}` : '') +
+                  (cd.regime         ? ` [${cd.regime}]`           : '') +
+                  ` · ${cd.reason} · ${cd.trigger}`
+                ).join(' | ');
+                lines.push(row(
+                  r.ts,
+                  Number(r.open).toFixed(2),
+                  Number(r.high).toFixed(2),
+                  Number(r.low).toFixed(2),
+                  Number(r.close).toFixed(2),
+                  r.volume ?? '',
+                  ...(regimeConfig.enabled ? [r.regime ?? ''] : []),
+                  ...stratLabels.map(l => r.signals?.[l] ?? ''),
+                  r.actions.map(fmtAction).join(' | '),
+                  combinedActionsStr,
+                ));
+              });
+
+              const csv  = lines.join('\n');
+              const blob = new Blob([csv], { type: 'text/csv' });
+              const url  = URL.createObjectURL(blob);
+              const a    = document.createElement('a');
+              a.href = url; a.download = `replay_${inst.symbol || 'data'}_${fromDate}.csv`; a.click();
+              URL.revokeObjectURL(url);
+            }
+
+            // ── Info summary cards shown at top of tab ─────────────────
+            const infoBlocks = [
+              { label: 'Instrument', items: [
+                  `${inst.symbol || '—'} · ${inst.exchange || '—'}`,
+                  `Token: ${inst.instrumentToken || '—'}`,
+                  `${replayInterval} · ${fromDate} → ${toDate} · ${speed}x`,
+              ]},
+              ...(riskConfig.enabled ? [{ label: 'Risk Management', items: [
+                  riskConfig.stopLossPct    ? `SL: ${riskConfig.stopLossPct}%`        : null,
+                  riskConfig.takeProfitPct  ? `TP: ${riskConfig.takeProfitPct}%`      : null,
+                  riskConfig.maxRiskPerTradePct ? `Max Risk/Trade: ${riskConfig.maxRiskPerTradePct}%` : null,
+                  riskConfig.cooldownCandles    ? `Cooldown: ${riskConfig.cooldownCandles} candles`   : null,
+                  riskConfig.dailyLossCapPct    ? `Daily Cap: ${riskConfig.dailyLossCapPct}%`         : null,
+              ].filter(Boolean) }] : []),
+              ...(regimeConfig.enabled ? [{ label: 'Regime Detection', items: [
+                  `ADX ${regimeConfig.adxPeriod}p · Trend ≥ ${regimeConfig.adxTrendThreshold}`,
+                  `ATR ${regimeConfig.atrPeriod}p · Volatile ≥ ${regimeConfig.atrVolatilePct}% · Compress ≤ ${regimeConfig.atrCompressionPct}%`,
+              ] }] : []),
+              ...(patternConfig.enabled ? [{ label: 'Pattern Confirmation', items: [
+                  `Buy: ${(patternConfig.buyConfirmPatterns||[]).join(', ') || 'Any'}`,
+                  `Sell: ${(patternConfig.sellConfirmPatterns||[]).join(', ') || 'Any'}`,
+                  `Wick ≥ ${patternConfig.minWickRatio} · Body ≤ ${patternConfig.maxBodyPct}%`,
+              ] }] : []),
+            ];
+
+            return (
+              <div className="card" style={{ padding: 0 }}>
+                <div className="bt-feed-header">
+                  <span className="bt-params-label" style={{ margin: 0 }}>Candle Details</span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{candleLog.length} candles</span>
+                    {candleLog.length > 0 && (
+                      <button type="button" className="btn-secondary btn-xs" onClick={downloadCSV}>Download CSV</button>
+                    )}
+                  </div>
+                </div>
+
+                {/* ── Feature summary ── */}
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '10px 12px', borderBottom: '1px solid var(--border)' }}>
+                  {infoBlocks.map(blk => (
+                    <div key={blk.label} style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 12px', minWidth: 160, flex: '1 1 160px' }}>
+                      <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: 4 }}>{blk.label}</div>
+                      {blk.items.map((it, i) => <div key={i} style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6 }}>{it}</div>)}
+                    </div>
+                  ))}
+                </div>
+
+                {candleLog.length === 0
+                  ? <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>Candle details will appear when replay starts.</div>
+                  : (
+                    <div style={{ overflowX: 'auto', maxHeight: 480, overflowY: 'auto' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+                        <thead style={{ position: 'sticky', top: 0, background: 'var(--card-bg)', zIndex: 1 }}>
+                          <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                            {['Time','O','H','L','C','Vol',
+                              ...(regimeConfig.enabled ? ['Regime'] : []),
+                              ...stratLabels.map(l => l.length > 10 ? l.slice(0,10)+'…' : l),
+                              'Actions'].map(h => (
+                              <th key={h} style={{ padding: '5px 6px', textAlign: 'left', color: 'var(--text-muted)', fontWeight: 600, whiteSpace: 'nowrap' }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {[...candleLog].reverse().map((row, i) => (
+                            <tr key={i} style={{ borderBottom: '1px solid var(--border)', background: (row.actions.length > 0 || row.combinedDetails?.length > 0) ? 'rgba(99,102,241,0.06)' : undefined }}>
+                              <td style={{ padding: '4px 6px', whiteSpace: 'nowrap', color: 'var(--text-muted)' }}>{row.ts}</td>
+                              <td style={{ padding: '4px 6px' }}>{Number(row.open).toFixed(2)}</td>
+                              <td style={{ padding: '4px 6px', color: '#22c55e' }}>{Number(row.high).toFixed(2)}</td>
+                              <td style={{ padding: '4px 6px', color: '#ef4444' }}>{Number(row.low).toFixed(2)}</td>
+                              <td style={{ padding: '4px 6px', fontWeight: 600 }}>{Number(row.close).toFixed(2)}</td>
+                              <td style={{ padding: '4px 6px', color: 'var(--text-muted)' }}>{row.volume?.toLocaleString() ?? '—'}</td>
+                              {regimeConfig.enabled && (
+                                <td style={{ padding: '4px 6px' }}>
+                                  {row.regime
+                                    ? <span className={`bt-regime-badge bt-regime-${row.regime}`}>{row.regime}</span>
+                                    : <span style={{ color: 'var(--text-muted)' }}>—</span>}
+                                </td>
+                              )}
+                              {stratLabels.map(l => {
+                                const sig = row.signals?.[l];
+                                return (
+                                  <td key={l} style={{ padding: '4px 6px' }}>
+                                    {sig === 'BUY'  ? <span style={{ color: '#22c55e', fontWeight: 700 }}>BUY</span>
+                                    : sig === 'SELL' ? <span style={{ color: '#ef4444', fontWeight: 700 }}>SELL</span>
+                                    : sig === 'SHORT'? <span style={{ color: '#8b5cf6', fontWeight: 700 }}>SHORT</span>
+                                    : <span style={{ color: 'var(--text-muted)' }}>—</span>}
+                                  </td>
+                                );
+                              })}
+                              <td style={{ padding: '4px 6px', minWidth: 220 }}>
+                                {row.actions.length === 0 && !row.combinedDetails?.length
+                                  ? <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                  : <>
+                                    {row.actions.map((a, ai) => {
+                                      const label   = fmtAction(a);
+                                      const isEnter = !a.reason;
+                                      const color   = a.signal === 'SHORT' ? '#8b5cf6' : isEnter ? '#22c55e' : '#ef4444';
+                                      return (
+                                        <div key={ai} style={{ fontSize: 11, lineHeight: 1.6 }}>
+                                          <span style={{ fontWeight: 700, color }}>{label.split(' —')[0]}</span>
+                                          <span style={{ color: 'var(--text-muted)' }}>{' —' + label.split(' —').slice(1).join(' —')}</span>
+                                        </div>
+                                      );
+                                    })}
+                                    {(row.combinedDetails || []).map((cd, ci) => {
+                                      const isEnter = cd.action.startsWith('Enter');
+                                      const color   = cd.action.includes('Short') ? '#8b5cf6' : isEnter ? '#22c55e' : '#ef4444';
+                                      return (
+                                        <div key={'c'+ci} style={{ fontSize: 11, lineHeight: 1.6, borderTop: ci === 0 && row.actions.length > 0 ? '1px dashed var(--border)' : undefined, marginTop: ci === 0 && row.actions.length > 0 ? 3 : 0, paddingTop: ci === 0 && row.actions.length > 0 ? 3 : 0 }}>
+                                          <span style={{ fontWeight: 700, color: '#8b5cf6', fontSize: 10 }}>⚡</span>
+                                          {' '}<span style={{ fontWeight: 700, color }}>{cd.action}</span>
+                                          {' '}<span style={{ color: 'var(--text-muted)', fontSize: 10 }}>
+                                            @{Number(cd.price).toFixed(2)}
+                                            {cd.sourceStrategy ? ` · via ${cd.sourceStrategy}` : ''}
+                                            {cd.regime ? ` · ${cd.regime}` : ''}
+                                            {' · '}{cd.reason}
+                                            {' · '}<span style={{ color: cd.trigger === 'Risk Management' ? '#f59e0b' : 'var(--text-muted)' }}>{cd.trigger}</span>
+                                          </span>
+                                        </div>
+                                      );
+                                    })}
+                                  </>
+                                }
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )
+                }
+              </div>
+            );
+          })()}
+
         </div>
       </div>
 
@@ -2326,6 +2665,15 @@ function ReplayTest() {
                 color:      strategies.every(s => s.allowShorting) ? '#8b5cf6' : 'var(--text-muted)',
                 borderColor:strategies.every(s => s.allowShorting) ? 'rgba(139,92,246,0.4)' : 'var(--border)' }}>
               {strategies.every(s => s.allowShorting) ? 'Short ON' : 'Short OFF'}
+            </button>
+            <button type="button" disabled={isRunning}
+              onClick={() => setCombinedOnlyMode(m => !m)}
+              title="When ON: individual strategies only compute signals for the ⚡ Combined pool — they don't trade independently"
+              style={{ fontSize: 11, padding: '2px 10px', borderRadius: 12, border: '1px solid', cursor: 'pointer',
+                background:   combinedOnlyMode ? 'rgba(234,179,8,0.15)'  : 'transparent',
+                color:        combinedOnlyMode ? '#ca8a04'               : 'var(--text-muted)',
+                borderColor:  combinedOnlyMode ? 'rgba(234,179,8,0.4)'   : 'var(--border)' }}>
+              {combinedOnlyMode ? '⚡ Combined Only' : 'All Strategies'}
             </button>
           </div>
           {!isRunning && <button type="button" className="btn-secondary btn-sm" onClick={addStrategy}>+ Add</button>}
