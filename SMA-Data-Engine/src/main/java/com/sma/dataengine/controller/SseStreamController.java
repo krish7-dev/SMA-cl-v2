@@ -46,7 +46,7 @@ public class SseStreamController {
     private final List<SseEntry> candleClients = new CopyOnWriteArrayList<>();
 
     /** Connected browser clients waiting for tick events. */
-    private final List<SseEmitter> tickClients = new CopyOnWriteArrayList<>();
+    private final List<SseEntry> tickClients = new CopyOnWriteArrayList<>();
 
     // ─── Browser Connection Endpoints ─────────────────────────────────────────
 
@@ -70,17 +70,21 @@ public class SseStreamController {
     }
 
     /**
-     * Opens an SSE stream for live market tick events.
-     * All ticks arriving from any active live subscription are forwarded here.
+     * Opens an SSE stream for tick events (live or replay).
+     *
+     * @param sessionId optional filter — when provided, only replay ticks from that
+     *                  session are forwarded; live ticks (replay=false) are excluded.
+     *                  When omitted, live ticks are forwarded and replay ticks are excluded.
      */
     @GetMapping(value = "/ticks", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter ticks() {
+    public SseEmitter ticks(@RequestParam(required = false) String sessionId) {
         SseEmitter emitter = new SseEmitter(600_000L);
-        tickClients.add(emitter);
-        emitter.onCompletion(() -> tickClients.remove(emitter));
-        emitter.onTimeout(() -> { emitter.complete(); tickClients.remove(emitter); });
-        emitter.onError(e -> tickClients.remove(emitter));
-        log.debug("Tick SSE client connected (total={})", tickClients.size());
+        SseEntry entry = new SseEntry(emitter, sessionId);
+        tickClients.add(entry);
+        emitter.onCompletion(() -> tickClients.remove(entry));
+        emitter.onTimeout(() -> { emitter.complete(); tickClients.remove(entry); });
+        emitter.onError(e -> tickClients.remove(entry));
+        log.debug("Tick SSE client connected (sessionId={}, total={})", sessionId, tickClients.size());
         return emitter;
     }
 
@@ -107,7 +111,7 @@ public class SseStreamController {
         broadcastCandles(payload, event.getReplaySessionId());
     }
 
-    /** Receives TickDataEvents from LiveMarketDataService and broadcasts to SSE clients. */
+    /** Receives TickDataEvents from LiveMarketDataService or ReplayService and broadcasts to SSE clients. */
     @EventListener
     public void onTickEvent(TickDataEvent event) {
         if (tickClients.isEmpty()) return;
@@ -123,8 +127,10 @@ public class SseStreamController {
         payload.put("low",             t.getLowPrice()          != null ? t.getLowPrice()          : 0);
         payload.put("change",          t.getChangePercent()     != null ? t.getChangePercent()     : 0);
         payload.put("timestamp",       t.getTimestamp() != null ? t.getTimestamp().toString() : null);
+        payload.put("replay",          t.isReplay());
+        payload.put("sessionId",       t.getReplaySessionId() != null ? t.getReplaySessionId() : "");
 
-        broadcastTicks(payload);
+        broadcastTicks(payload, t.isReplay() ? t.getReplaySessionId() : null);
     }
 
     // ─── Broadcast Helpers ────────────────────────────────────────────────────
@@ -144,14 +150,32 @@ public class SseStreamController {
         candleClients.removeAll(dead);
     }
 
-    private void broadcastTicks(Map<String, Object> payload) {
-        List<SseEmitter> dead = new ArrayList<>();
-        for (SseEmitter emitter : tickClients) {
+    /**
+     * Broadcasts a tick payload to connected clients.
+     *
+     * Filtering rules:
+     * - {@code sourceSessionId} non-null → replay tick: only send to clients subscribed to that session
+     * - {@code sourceSessionId} null     → live tick:   only send to clients with no session filter
+     */
+    private void broadcastTicks(Map<String, Object> payload, String sourceSessionId) {
+        List<SseEntry> dead = new ArrayList<>();
+        for (SseEntry entry : tickClients) {
+            boolean isReplayTick = sourceSessionId != null;
+            boolean clientWantsReplay = entry.sessionId() != null;
+
+            if (isReplayTick) {
+                // Replay tick → only send to the matching replay session client
+                if (!sourceSessionId.equals(entry.sessionId())) continue;
+            } else {
+                // Live tick → only send to clients without a session filter
+                if (clientWantsReplay) continue;
+            }
+
             try {
                 String json = objectMapper.writeValueAsString(payload);
-                emitter.send(SseEmitter.event().name("tick").data(json));
+                entry.emitter().send(SseEmitter.event().name("tick").data(json));
             } catch (Exception e) {
-                dead.add(emitter);
+                dead.add(entry);
             }
         }
         tickClients.removeAll(dead);

@@ -1417,9 +1417,14 @@ function ReplayTest() {
   const [currentCandle, setCurrentCandle] = useState(null);
   const [stratStates, setStratStates]   = useState({});
   const [rightTab, setRightTab]         = useState('feed');
+  const [ticks, setTicks]               = useState([]);
+  const [latestTick, setLatestTick]     = useState(null);
 
   const evaluatorsRef     = useRef({});
   const sseRef            = useRef(null);
+  const tickSseRef        = useRef(null);
+  const ticksRef          = useRef([]);
+  const latestTickRef     = useRef(null);
   const pollRef           = useRef(null);
   const feedRef           = useRef([]);
   const capitalMap        = useRef({});
@@ -1437,8 +1442,9 @@ function ReplayTest() {
   }, []);
 
   function cleanup() {
-    if (sseRef.current)  { sseRef.current.close(); sseRef.current = null; }
-    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+    if (sseRef.current)     { sseRef.current.close(); sseRef.current = null; }
+    if (tickSseRef.current) { tickSseRef.current.close(); tickSseRef.current = null; }
+    if (pollRef.current)    { clearInterval(pollRef.current); pollRef.current = null; }
   }
 
   function addStrategy() {
@@ -1601,6 +1607,7 @@ function ReplayTest() {
     e.preventDefault();
     cleanup();
     setError(''); setFeed([]); feedRef.current = [];
+    setTicks([]); ticksRef.current = []; setLatestTick(null); latestTickRef.current = null;
     setProgress({ emitted: 0, total: 0 });
     setStatus('starting'); setSessionId(null); setCurrentCandle(null);
     setStratStates({});
@@ -1664,6 +1671,26 @@ function ReplayTest() {
         cleanup();
       };
 
+      const tickSse = new EventSource(`/data-api/api/v1/data/stream/ticks?sessionId=${encodeURIComponent(sid)}`);
+      tickSseRef.current = tickSse;
+      tickSse.addEventListener('tick', (ev) => {
+        try {
+          const t = JSON.parse(ev.data);
+          const entry = {
+            ts:     t.timestamp ? new Date(t.timestamp).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '--',
+            symbol: t.symbol || '',
+            ltp:    t.ltp ?? 0,
+            change: t.change,
+          };
+          latestTickRef.current = entry;
+          setLatestTick(entry);
+          const next = [entry, ...ticksRef.current].slice(0, 200);
+          ticksRef.current = next;
+          setTicks(next);
+        } catch {}
+      });
+      tickSse.onerror = () => { if (tickSseRef.current) { tickSseRef.current.close(); tickSseRef.current = null; } };
+
       pollRef.current = setInterval(async () => {
         try {
           const statusRes = await getReplayStatus(sid);
@@ -1691,6 +1718,7 @@ function ReplayTest() {
   function handleReset() {
     cleanup();
     setFeed([]); feedRef.current = [];
+    setTicks([]); ticksRef.current = []; setLatestTick(null); latestTickRef.current = null;
     setStatus('idle'); setSessionId(null);
     setProgress({ emitted: 0, total: 0 });
     setCurrentCandle(null); setError('');
@@ -1979,6 +2007,33 @@ function ReplayTest() {
                         <span style={{ flex: 1, fontSize: 12 }}>{row.symbol}</span>
                         <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>₹{Number(row.close).toFixed(2)}</span>
                         {row.note && <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{row.note}</span>}
+                      </div>
+                    ))
+                  }
+                </div>
+              </div>
+
+              {/* Tick Stream */}
+              <div className="card" style={{ padding: 0 }}>
+                <div className="bt-feed-header">
+                  <span className="bt-params-label" style={{ margin: 0 }}>Tick Stream</span>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{ticks.length} received</span>
+                </div>
+                <div className="bt-signal-log">
+                  {ticks.length === 0
+                    ? <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
+                        Ticks will appear here when replay starts.
+                      </div>
+                    : ticks.map((t, i) => (
+                      <div key={i} className="bt-signal-row">
+                        <span className="mono-sm" style={{ color: 'var(--text-muted)', minWidth: 56 }}>{t.ts}</span>
+                        <span style={{ fontWeight: 600, fontSize: 12, minWidth: 80 }}>{t.symbol}</span>
+                        <span style={{ fontSize: 13, color: 'var(--accent)', fontWeight: 700 }}>{fmtRs(t.ltp)}</span>
+                        {t.change !== undefined && (
+                          <span style={{ fontSize: 11, color: Number(t.change) >= 0 ? '#22c55e' : '#ef4444' }}>
+                            {Number(t.change) >= 0 ? '+' : ''}{Number(t.change).toFixed(2)}%
+                          </span>
+                        )}
                       </div>
                     ))
                   }

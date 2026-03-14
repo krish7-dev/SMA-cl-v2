@@ -40,4 +40,10 @@ public class CreateStrategyRequest {
      * For SMA_CROSSOVER: {"shortPeriod": "5", "longPeriod": "20"}
      */
     private Map<String, String> parameters;
+
+    /**
+     * Allow shorting. When true, SELL signals open short positions; BUY signals cover them.
+     * Requires product = MIS or NRML. Defaults to false (long-only).
+     */
+    private boolean allowShorting = false;
 }
