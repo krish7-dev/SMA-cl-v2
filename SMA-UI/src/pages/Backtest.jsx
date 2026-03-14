@@ -1666,6 +1666,13 @@ function ReplayTest() {
         try { onCandleEvent(JSON.parse(ev.data)); } catch {}
       });
 
+      // Backend sends "done" after the last candle — only close then, not via the poll,
+      // to avoid dropping buffered SSE events at high speed.
+      sse.addEventListener('done', () => {
+        setStatus('completed');
+        cleanup();
+      });
+
       sse.onerror = () => {
         setStatus(s => s === 'running' ? 'completed' : s);
         cleanup();
@@ -1691,13 +1698,18 @@ function ReplayTest() {
       });
       tickSse.onerror = () => { if (tickSseRef.current) { tickSseRef.current.close(); tickSseRef.current = null; } };
 
+      // Poll is a fallback for STOPPED/FAILED; COMPLETED is handled by the "done" SSE event.
       pollRef.current = setInterval(async () => {
         try {
           const statusRes = await getReplayStatus(sid);
           const st = statusRes?.data?.status;
-          if (st === 'COMPLETED' || st === 'STOPPED' || st === 'FAILED') {
+          if (st === 'STOPPED' || st === 'FAILED') {
             setStatus(st.toLowerCase());
             cleanup();
+          } else if (st === 'COMPLETED') {
+            // Update progress display but don't close SSE — wait for "done" event.
+            setStatus('completed');
+            clearInterval(pollRef.current); pollRef.current = null;
           }
         } catch {}
       }, 2000);
