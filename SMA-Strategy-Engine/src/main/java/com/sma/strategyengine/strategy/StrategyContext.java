@@ -7,6 +7,8 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.Map;
 
+import com.sma.strategyengine.strategy.PositionDirection;
+
 /**
  * Immutable snapshot passed to {@link StrategyLogic#evaluate} on each candle.
  *
@@ -34,6 +36,14 @@ public class StrategyContext {
     String  product;    // MIS / CNC / NRML
     int     quantity;
     String  orderType;  // MARKET / LIMIT
+
+    // ─── Position state ───────────────────────────────────────────────────────
+
+    /** Current directional position of this instance (FLAT / LONG / SHORT). */
+    PositionDirection currentDirection;
+
+    /** Whether this instance is allowed to open short positions. */
+    boolean allowShorting;
 
     // ─── Current candle ───────────────────────────────────────────────────────
 

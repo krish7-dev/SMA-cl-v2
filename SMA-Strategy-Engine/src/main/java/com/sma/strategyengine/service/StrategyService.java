@@ -34,6 +34,7 @@ public class StrategyService {
 
     private final StrategyInstanceRepository repository;
     private final StrategyRegistry           registry;
+    private final PositionTracker            positionTracker;
     private final ObjectMapper               objectMapper;
 
     private static final TypeReference<Map<String, String>> PARAM_TYPE = new TypeReference<>() {};
@@ -58,6 +59,7 @@ public class StrategyService {
                 .product(req.getProduct().toUpperCase())
                 .quantity(req.getQuantity())
                 .orderType(req.getOrderType() != null ? req.getOrderType().toUpperCase() : "MARKET")
+                .allowShorting(req.isAllowShorting())
                 .parameters(serializeParams(req.getParameters()))
                 .status(Status.INACTIVE)
                 .build();
@@ -90,11 +92,12 @@ public class StrategyService {
     public StrategyResponse update(String instanceId, UpdateStrategyRequest req) {
         StrategyInstance instance = findOrThrow(instanceId);
 
-        if (req.getName()       != null) instance.setName(req.getName());
-        if (req.getQuantity()   != null) instance.setQuantity(req.getQuantity());
-        if (req.getProduct()    != null) instance.setProduct(req.getProduct().toUpperCase());
-        if (req.getOrderType()  != null) instance.setOrderType(req.getOrderType().toUpperCase());
-        if (req.getParameters() != null) instance.setParameters(serializeParams(req.getParameters()));
+        if (req.getName()          != null) instance.setName(req.getName());
+        if (req.getQuantity()      != null) instance.setQuantity(req.getQuantity());
+        if (req.getProduct()       != null) instance.setProduct(req.getProduct().toUpperCase());
+        if (req.getOrderType()     != null) instance.setOrderType(req.getOrderType().toUpperCase());
+        if (req.getAllowShorting()  != null) instance.setAllowShorting(req.getAllowShorting());
+        if (req.getParameters()    != null) instance.setParameters(serializeParams(req.getParameters()));
 
         repository.save(instance);
         log.info("Strategy instance updated: instanceId={}", instanceId);
@@ -123,6 +126,7 @@ public class StrategyService {
         }
         instance.setStatus(Status.INACTIVE);
         repository.save(instance);
+        positionTracker.reset(instanceId);
         log.info("Strategy instance deactivated: instanceId={}", instanceId);
         return toResponse(instance);
     }
@@ -133,8 +137,9 @@ public class StrategyService {
     public void delete(String instanceId) {
         StrategyInstance instance = findOrThrow(instanceId);
         repository.delete(instance);
-        // Release in-memory state (e.g. price windows)
+        // Release in-memory state (price windows + position direction)
         registry.resolve(instance.getStrategyType()).onInstanceRemoved(instanceId);
+        positionTracker.reset(instanceId);
         log.info("Strategy instance deleted: instanceId={}", instanceId);
     }
 

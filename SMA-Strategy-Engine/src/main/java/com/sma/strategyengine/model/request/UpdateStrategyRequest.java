@@ -24,4 +24,7 @@ public class UpdateStrategyRequest {
     private String product;
 
     private String orderType;
+
+    /** Toggle shorting on/off. Null means leave unchanged. */
+    private Boolean allowShorting;
 }

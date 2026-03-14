@@ -68,6 +68,15 @@ public class StrategyInstance {
     @Column(columnDefinition = "TEXT")
     private String parameters;
 
+    /**
+     * When true, SELL signals open a short position (and BUY signals cover it).
+     * When false (default), only long positions are taken — SELL signals exit long only.
+     * Requires product = MIS or NRML; CNC does not support shorting.
+     */
+    @Column(name = "allow_shorting", nullable = false)
+    @Builder.Default
+    private boolean allowShorting = false;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     private Status status;

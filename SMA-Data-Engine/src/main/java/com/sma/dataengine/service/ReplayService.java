@@ -2,8 +2,10 @@ package com.sma.dataengine.service;
 
 import com.sma.dataengine.entity.ReplaySession;
 import com.sma.dataengine.event.CandleDataEvent;
+import com.sma.dataengine.event.TickDataEvent;
 import com.sma.dataengine.model.CandleData;
 import com.sma.dataengine.model.Interval;
+import com.sma.dataengine.model.TickData;
 import com.sma.dataengine.model.request.HistoricalDataRequest;
 import com.sma.dataengine.model.request.ReplayRequest;
 import com.sma.dataengine.model.response.ReplayResponse;
@@ -183,6 +185,11 @@ public class ReplayService {
                 }
 
                 CandleData candle = candles.get(index[0]++);
+
+                // Emit simulated OHLC tick stream before publishing the completed candle.
+                // Sequence: open → high → low → close (standard intra-bar price path).
+                publishReplayTicks(candle, sessionId);
+
                 eventPublisher.publishEvent(new CandleDataEvent(this, candle, true, sessionId));
 
                 // Periodically flush emitted count to DB every 100 candles
@@ -201,6 +208,49 @@ public class ReplayService {
 
         // Transition to RUNNING
         updateStatus(sessionId, ReplaySession.Status.RUNNING, Instant.now());
+    }
+
+    /**
+     * Publishes four {@link TickDataEvent}s representing the intra-candle price path:
+     * open → high → low → close.
+     *
+     * All four ticks share the candle's {@code openTime} as their exchange timestamp
+     * (precise intra-bar timestamps are not stored in OHLCV data).  The {@code replay}
+     * and {@code replaySessionId} fields let downstream consumers and SSE clients
+     * distinguish replay ticks from live market ticks.
+     */
+    private void publishReplayTicks(CandleData candle, String sessionId) {
+        java.time.Instant baseTs = candle.getOpenTime() != null
+                ? candle.getOpenTime().atZone(java.time.ZoneId.of("Asia/Kolkata")).toInstant()
+                : java.time.Instant.now();
+
+        java.math.BigDecimal[] ohlc = {
+                candle.getOpen(),
+                candle.getHigh(),
+                candle.getLow(),
+                candle.getClose()
+        };
+
+        for (java.math.BigDecimal ltp : ohlc) {
+            if (ltp == null) continue;
+            TickData tick = TickData.builder()
+                    .instrumentToken(candle.getInstrumentToken())
+                    .symbol(candle.getSymbol())
+                    .exchange(candle.getExchange())
+                    .provider(candle.getProvider())
+                    .lastTradedPrice(ltp)
+                    .openPrice(candle.getOpen())
+                    .highPrice(candle.getHigh())
+                    .lowPrice(candle.getLow())
+                    .closePrice(candle.getClose())
+                    .volumeTradedToday(candle.getVolume())
+                    .openInterest(candle.getOpenInterest())
+                    .timestamp(baseTs)
+                    .replay(true)
+                    .replaySessionId(sessionId)
+                    .build();
+            eventPublisher.publishEvent(new TickDataEvent(this, tick));
+        }
     }
 
     private void cancelFuture(String sessionId) {

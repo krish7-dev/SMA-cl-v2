@@ -56,6 +56,14 @@ public class BacktestRequest {
     private String product = "MIS";
 
     /**
+     * Allow shorting. When true, SELL signals open short positions; BUY signals cover them.
+     * Reversals (LONG→SHORT and SHORT→LONG) are simulated via a single close+reopen on the same candle close.
+     * Requires product = MIS or NRML; CNC does not support shorting in live markets.
+     * Defaults to false (long-only, original behaviour).
+     */
+    private boolean allowShorting = false;
+
+    /**
      * Number of units per trade signal.
      * 0 = auto-compute: floor(initialCapital / firstCandleClose) — max units the capital can buy.
      */

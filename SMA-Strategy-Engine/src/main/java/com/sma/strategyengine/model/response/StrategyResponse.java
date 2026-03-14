@@ -21,6 +21,7 @@ public class StrategyResponse {
     String              product;
     int                 quantity;
     String              orderType;
+    boolean             allowShorting;
     Map<String, String> parameters;
     String              status;
     Instant             createdAt;
@@ -38,6 +39,7 @@ public class StrategyResponse {
                 .product(entity.getProduct())
                 .quantity(entity.getQuantity())
                 .orderType(entity.getOrderType())
+                .allowShorting(entity.isAllowShorting())
                 .parameters(parsedParams)
                 .status(entity.getStatus().name())
                 .createdAt(entity.getCreatedAt())
