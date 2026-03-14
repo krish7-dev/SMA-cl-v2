@@ -124,6 +124,7 @@ function defaultStrategies() {
     strategyType: type,
     enabled: true,
     label: '',
+    allowShorting: true,
     parameters: defaultParams(type),
   }));
 }
@@ -487,6 +488,7 @@ const STRATEGY_REGIME_MAP = {
   LIQUIDITY_SWEEP:     ['VOLATILE'],
   CANDLE_PATTERN:      ['RANGING', 'VOLATILE'],
 };
+const COMBINED_LABEL = '⚡ Combined';
 const EMPTY_REGIME_CONFIG = {
   enabled: false,
   adxPeriod: 14,
@@ -1448,9 +1450,14 @@ function ReplayTest() {
   }
 
   function addStrategy() {
-    setStrategies(p => [...p, { strategyType: 'SMA_CROSSOVER', enabled: true, label: '', parameters: defaultParams('SMA_CROSSOVER') }]);
+    const masterShort = strategies.every(s => s.allowShorting);
+    setStrategies(p => [...p, { strategyType: 'SMA_CROSSOVER', enabled: true, label: '', allowShorting: masterShort, parameters: defaultParams('SMA_CROSSOVER') }]);
   }
   function removeStrategy(idx) { setStrategies(p => p.filter((_, i) => i !== idx)); }
+  function toggleMasterShorting() {
+    const next = !strategies.every(s => s.allowShorting);
+    setStrategies(p => p.map(s => ({ ...s, allowShorting: next })));
+  }
   function updateStrategy(idx, field, value) {
     setStrategies(p => p.map((s, i) => {
       if (i !== idx) return s;
@@ -1507,7 +1514,7 @@ function ReplayTest() {
 
   function closeLong(label, exitPrice, candleTime, exitReason) {
     const pos = openPositionMap.current[label];
-    if (!pos) return;
+    if (!pos || pos.type !== 'LONG') return;
     const pnl    = (exitPrice - pos.entryPrice) * pos.qty;
     const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
     const newCap = (capitalMap.current[label] || 0) + pnl;
@@ -1521,6 +1528,38 @@ function ReplayTest() {
       cooldownRef.current[label] = parseInt(riskConfig.cooldownCandles, 10);
     }
     const sig = { signal: 'SELL', price: exitPrice, symbol: inst.symbol, ts: candleTime, strategyLabel: label, reason: exitReason };
+    feedRef.current = [{ ...sig, close: exitPrice }, ...feedRef.current].slice(0, 500);
+    setFeed([...feedRef.current]);
+  }
+
+  function openShort(label, price, candleTime, regime) {
+    if (openPositionMap.current[label]) return;
+    const qty = computeQty(label, price);
+    const sl = riskConfig.enabled && parseFloat(riskConfig.stopLossPct)   > 0 ? price * (1 + parseFloat(riskConfig.stopLossPct)/100)   : null;
+    const tp = riskConfig.enabled && parseFloat(riskConfig.takeProfitPct) > 0 ? price * (1 - parseFloat(riskConfig.takeProfitPct)/100) : null;
+    openPositionMap.current[label] = { entryPrice: price, qty, entryTime: candleTime, type: 'SHORT', slPrice: sl, tpPrice: tp, regime };
+    flushStrat(label);
+    const sig = { signal: 'SHORT', price, symbol: inst.symbol, ts: candleTime, strategyLabel: label };
+    feedRef.current = [{ ...sig, close: price }, ...feedRef.current].slice(0, 500);
+    setFeed([...feedRef.current]);
+  }
+
+  function closeShort(label, exitPrice, candleTime, exitReason) {
+    const pos = openPositionMap.current[label];
+    if (!pos || pos.type !== 'SHORT') return;
+    const pnl    = (pos.entryPrice - exitPrice) * pos.qty;
+    const pnlPct = ((pos.entryPrice - exitPrice) / pos.entryPrice) * 100;
+    const newCap = (capitalMap.current[label] || 0) + pnl;
+    capitalMap.current[label] = newCap;
+    const trade = { ...pos, exitPrice, exitTime: candleTime, pnl, pnlPct, exitReason, capitalAfter: newCap };
+    closedTradesMap.current[label] = [trade, ...(closedTradesMap.current[label] || [])];
+    equityMap.current[label] = [...(equityMap.current[label] || []), { time: candleTime, capital: newCap }];
+    openPositionMap.current[label] = null;
+    flushStrat(label);
+    if (pnl < 0 && riskConfig.enabled && parseInt(riskConfig.cooldownCandles, 10) > 0) {
+      cooldownRef.current[label] = parseInt(riskConfig.cooldownCandles, 10);
+    }
+    const sig = { signal: 'BUY', price: exitPrice, symbol: inst.symbol, ts: candleTime, strategyLabel: label, reason: exitReason };
     feedRef.current = [{ ...sig, close: exitPrice }, ...feedRef.current].slice(0, 500);
     setFeed([...feedRef.current]);
   }
@@ -1548,8 +1587,13 @@ function ReplayTest() {
       const label = strat.label || strat.strategyType;
       const pos = openPositionMap.current[label];
       if (!pos || !riskConfig.enabled) continue;
-      if (pos.slPrice && low <= pos.slPrice) { closeLong(label, pos.slPrice, candleTime, 'STOP_LOSS'); continue; }
-      if (pos.tpPrice && high >= pos.tpPrice) { closeLong(label, pos.tpPrice, candleTime, 'TAKE_PROFIT'); continue; }
+      if (pos.type === 'LONG') {
+        if (pos.slPrice && low <= pos.slPrice) { closeLong(label, pos.slPrice, candleTime, 'STOP_LOSS'); continue; }
+        if (pos.tpPrice && high >= pos.tpPrice) { closeLong(label, pos.tpPrice, candleTime, 'TAKE_PROFIT'); continue; }
+      } else if (pos.type === 'SHORT') {
+        if (pos.slPrice && high >= pos.slPrice) { closeShort(label, pos.slPrice, candleTime, 'STOP_LOSS'); continue; }
+        if (pos.tpPrice && low <= pos.tpPrice) { closeShort(label, pos.tpPrice, candleTime, 'TAKE_PROFIT'); continue; }
+      }
     }
 
     const today = candleTime.substring(0, 10);
@@ -1574,12 +1618,6 @@ function ReplayTest() {
         }
       }
 
-      // Regime filter
-      if (regimeConfig.enabled && regime) {
-        const allowed = STRATEGY_REGIME_MAP[strat.strategyType] || [];
-        if (allowed.length > 0 && !allowed.includes(regime)) continue;
-      }
-
       const signal = ev.next(close, high, low, vol, open);
       latestSignals[label] = signal;
 
@@ -1590,11 +1628,65 @@ function ReplayTest() {
         if (signal === 'SELL' && patternConfig.sellConfirmPatterns.length > 0 && !patternConfig.sellConfirmPatterns.includes(patSig)) continue;
       }
 
-      const hasLong = !!openPositionMap.current[label];
-      if (signal === 'BUY' && !hasLong) {
-        openLong(label, close, candleTime, regime);
-      } else if (signal === 'SELL' && hasLong) {
-        closeLong(label, close, candleTime, 'SIGNAL');
+      const pos      = openPositionMap.current[label];
+      const hasLong  = pos?.type === 'LONG';
+      const hasShort = pos?.type === 'SHORT';
+      const allowShort = !!strat.allowShorting;
+
+      if (signal === 'BUY') {
+        if (hasShort) {
+          closeShort(label, close, candleTime, 'SIGNAL');
+          if (allowShort) openLong(label, close, candleTime, regime); // reversal SHORT→LONG
+        } else if (!hasLong) {
+          openLong(label, close, candleTime, regime);
+        }
+      } else if (signal === 'SELL') {
+        if (hasLong) {
+          closeLong(label, close, candleTime, 'SIGNAL');
+          if (allowShort) openShort(label, close, candleTime, regime); // reversal LONG→SHORT
+        } else if (!hasShort && allowShort) {
+          openShort(label, close, candleTime, regime); // FLAT → SHORT
+        }
+      }
+    }
+
+    // ── Combined regime-switched pool ──────────────────────────────────────
+    if (capitalMap.current[COMBINED_LABEL] !== undefined) {
+      // SL/TP for combined position
+      const cPos = openPositionMap.current[COMBINED_LABEL];
+      if (cPos && riskConfig.enabled) {
+        if (cPos.type === 'LONG') {
+          if (cPos.slPrice && low  <= cPos.slPrice)  closeLong(COMBINED_LABEL,  cPos.slPrice,  candleTime, 'STOP_LOSS');
+          else if (cPos.tpPrice && high >= cPos.tpPrice) closeLong(COMBINED_LABEL, cPos.tpPrice, candleTime, 'TAKE_PROFIT');
+        } else if (cPos.type === 'SHORT') {
+          if (cPos.slPrice && high >= cPos.slPrice)  closeShort(COMBINED_LABEL, cPos.slPrice,  candleTime, 'STOP_LOSS');
+          else if (cPos.tpPrice && low  <= cPos.tpPrice) closeShort(COMBINED_LABEL, cPos.tpPrice, candleTime, 'TAKE_PROFIT');
+        }
+      }
+
+      // Use the first actionable signal from a regime-matched strategy
+      if (regime) {
+        for (const strat of strategies.filter(s => s.enabled)) {
+          const stratLabel = strat.label || strat.strategyType;
+          const allowed = STRATEGY_REGIME_MAP[strat.strategyType] || [];
+          if (allowed.length > 0 && !allowed.includes(regime)) continue;
+          const signal = latestSignals[stratLabel];
+          if (!signal || signal === 'HOLD') continue;
+
+          const cp       = openPositionMap.current[COMBINED_LABEL];
+          const cHasLong  = cp?.type === 'LONG';
+          const cHasShort = cp?.type === 'SHORT';
+          const allowShort = !!strat.allowShorting;
+
+          if (signal === 'BUY') {
+            if (cHasShort) { closeShort(COMBINED_LABEL, close, candleTime, 'SIGNAL'); if (allowShort) openLong(COMBINED_LABEL, close, candleTime, regime); }
+            else if (!cHasLong) openLong(COMBINED_LABEL, close, candleTime, regime);
+          } else if (signal === 'SELL') {
+            if (cHasLong) { closeLong(COMBINED_LABEL, close, candleTime, 'SIGNAL'); if (allowShort) openShort(COMBINED_LABEL, close, candleTime, regime); }
+            else if (!cHasShort && allowShort) openShort(COMBINED_LABEL, close, candleTime, regime);
+          }
+          break; // first matching strategy wins
+        }
       }
     }
 
@@ -1630,6 +1722,15 @@ function ReplayTest() {
       equityMap.current[label] = [{ time: 'start', capital: initCap }];
       dailyCapMap.current[label] = { date: '', startCapital: initCap, halted: false };
     }
+    // Combined regime-switched pool — single capital that follows the regime-matched strategy
+    if (regimeConfig.enabled && strategies.filter(s => s.enabled).length > 1) {
+      capitalMap.current[COMBINED_LABEL]      = initCap;
+      openPositionMap.current[COMBINED_LABEL] = null;
+      closedTradesMap.current[COMBINED_LABEL] = [];
+      equityMap.current[COMBINED_LABEL]       = [{ time: 'start', capital: initCap }];
+      dailyCapMap.current[COMBINED_LABEL]     = { date: '', startCapital: initCap, halted: false };
+    }
+
     patternEvalRef.current = patternConfig.enabled
       ? new LocalCandlePatternEvaluator(patternConfig.buyConfirmPatterns[0] || 'HAMMER', patternConfig.minWickRatio, patternConfig.maxBodyPct)
       : null;
@@ -2083,7 +2184,7 @@ function ReplayTest() {
                     </tr>
                   </thead>
                   <tbody>
-                    {allLabels.map(lbl => {
+                    {allLabels.filter(l => l !== COMBINED_LABEL).map(lbl => {
                       const st = stratStates[lbl];
                       const cap = st?.capital ?? initCap;
                       const pnl = cap - initCap;
@@ -2101,6 +2202,27 @@ function ReplayTest() {
                         </tr>
                       );
                     })}
+                    {stratStates[COMBINED_LABEL] && (() => {
+                      const st  = stratStates[COMBINED_LABEL];
+                      const cap = st?.capital ?? initCap;
+                      const pnl = cap - initCap;
+                      const pct = (pnl / initCap) * 100;
+                      const trades = st?.closedTrades || [];
+                      const wins = trades.filter(t => t.pnl >= 0).length;
+                      return (
+                        <tr style={{ borderTop: '2px solid rgba(139,92,246,0.4)', background: 'rgba(139,92,246,0.06)' }}>
+                          <td style={{ padding: '6px 8px', fontWeight: 700 }}>
+                            <span style={{ color: '#8b5cf6' }}>{COMBINED_LABEL}</span>
+                            <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 6 }}>regime-switched</span>
+                          </td>
+                          <td style={{ padding: '6px 8px', fontWeight: 600 }}>{fmtRs(cap)}</td>
+                          <td style={{ padding: '6px 8px', fontWeight: 600, color: pnl >= 0 ? '#22c55e' : '#ef4444' }}>{fmtRs(pnl)}</td>
+                          <td style={{ padding: '6px 8px', fontWeight: 600, color: pct >= 0 ? '#22c55e' : '#ef4444' }}>{pct.toFixed(2)}%</td>
+                          <td style={{ padding: '6px 8px' }}>{trades.length}</td>
+                          <td style={{ padding: '6px 8px' }}>{trades.length ? `${(wins/trades.length*100).toFixed(1)}%` : '—'}</td>
+                        </tr>
+                      );
+                    })()}
                   </tbody>
                 </table>
               )}
@@ -2117,10 +2239,15 @@ function ReplayTest() {
               {allLabels.filter(l => stratStates[l]?.openPosition).length > 0
                 ? allLabels.filter(l => stratStates[l]?.openPosition).map(lbl => {
                     const pos = stratStates[lbl].openPosition;
+                    const isCombined = lbl === COMBINED_LABEL;
                     return (
-                      <div key={lbl} style={{ display: 'flex', gap: 12, flexWrap: 'wrap', padding: '8px 0', borderBottom: '1px solid var(--border)', fontSize: 13 }}>
-                        <span style={{ fontWeight: 600, minWidth: 120 }}>{lbl}</span>
-                        <span className="badge badge-success">LONG</span>
+                      <div key={lbl} style={{ display: 'flex', gap: 12, flexWrap: 'wrap', padding: '8px 0', borderBottom: '1px solid var(--border)', fontSize: 13,
+                        ...(isCombined ? { background: 'rgba(139,92,246,0.06)', borderRadius: 6, padding: '8px 10px' } : {}) }}>
+                        <span style={{ fontWeight: 600, minWidth: 120, color: isCombined ? '#8b5cf6' : undefined }}>{lbl}</span>
+                        {pos.type === 'SHORT'
+                          ? <span className="badge" style={{ background: 'rgba(139,92,246,0.15)', color: '#8b5cf6', border: '1px solid rgba(139,92,246,0.3)', borderRadius: 4, padding: '2px 7px', fontSize: 11, fontWeight: 700 }}>SHORT↓</span>
+                          : <span className="badge badge-success">LONG↑</span>}
+                        {isCombined && pos.regime && <span className={`bt-regime-badge bt-regime-${pos.regime}`}>{pos.regime}</span>}
                         <span>Entry: <strong>₹{Number(pos.entryPrice).toFixed(2)}</strong></span>
                         <span>Qty: {pos.qty}</span>
                         <span style={{ color: 'var(--text-muted)' }}>{pos.entryTime}</span>
@@ -2133,16 +2260,19 @@ function ReplayTest() {
               {allLabels.some(l => (stratStates[l]?.closedTrades || []).length > 0) && (
                 <>
                   <h3 className="section-title" style={{ margin: '16px 0 10px' }}>Trade History</h3>
-                  {allLabels.map(lbl => {
+                  {allLabels.filter(l => l !== COMBINED_LABEL).concat(stratStates[COMBINED_LABEL] ? [COMBINED_LABEL] : []).map(lbl => {
                     const trades = stratStates[lbl]?.closedTrades || [];
                     if (!trades.length) return null;
+                    const isCombined = lbl === COMBINED_LABEL;
                     return (
-                      <div key={lbl} style={{ marginBottom: 16 }}>
-                        <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 6 }}>{lbl}</div>
+                      <div key={lbl} style={{ marginBottom: 16, ...(isCombined ? { background: 'rgba(139,92,246,0.05)', borderRadius: 8, padding: '8px 10px', border: '1px solid rgba(139,92,246,0.2)' } : {}) }}>
+                        <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 6, color: isCombined ? '#8b5cf6' : undefined }}>
+                          {lbl}{isCombined && <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 8, fontWeight: 400 }}>regime-switched pool</span>}
+                        </div>
                         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
                           <thead>
                             <tr style={{ borderBottom: '1px solid var(--border)' }}>
-                              {['Entry','Exit','Qty','Entry ₹','Exit ₹','P&L','Reason'].map(h => (
+                              {['Dir','Regime','Entry','Exit','Qty','Entry ₹','Exit ₹','P&L','Reason'].map(h => (
                                 <th key={h} style={{ textAlign: 'left', padding: '3px 6px', color: 'var(--text-muted)' }}>{h}</th>
                               ))}
                             </tr>
@@ -2150,6 +2280,16 @@ function ReplayTest() {
                           <tbody>
                             {trades.map((t, i) => (
                               <tr key={i} style={{ borderBottom: '1px solid var(--border)' }}>
+                                <td style={{ padding: '4px 6px' }}>
+                                  {t.type === 'SHORT'
+                                    ? <span style={{ color: '#8b5cf6', fontWeight: 700, fontSize: 11 }}>SHORT↓</span>
+                                    : <span style={{ color: '#22c55e', fontWeight: 700, fontSize: 11 }}>LONG↑</span>}
+                                </td>
+                                <td style={{ padding: '4px 6px' }}>
+                                  {t.regime
+                                    ? <span className={`bt-regime-badge bt-regime-${t.regime}`}>{t.regime}</span>
+                                    : <span style={{ color: 'var(--text-muted)' }}>—</span>}
+                                </td>
                                 <td style={{ padding: '4px 6px' }}>{t.entryTime}</td>
                                 <td style={{ padding: '4px 6px' }}>{t.exitTime}</td>
                                 <td style={{ padding: '4px 6px' }}>{t.qty}</td>
@@ -2177,7 +2317,17 @@ function ReplayTest() {
       {/* ── Bottom: Strategies full-width ──────────────────────────────── */}
       <div className="card bt-live-strategies-row" style={{ marginTop: 16 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-          <h3 className="section-title" style={{ margin: 0 }}>Strategies</h3>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <h3 className="section-title" style={{ margin: 0 }}>Strategies</h3>
+            <button type="button" disabled={isRunning}
+              onClick={toggleMasterShorting}
+              style={{ fontSize: 11, padding: '2px 10px', borderRadius: 12, border: '1px solid', cursor: 'pointer',
+                background: strategies.every(s => s.allowShorting) ? 'rgba(139,92,246,0.15)' : 'transparent',
+                color:      strategies.every(s => s.allowShorting) ? '#8b5cf6' : 'var(--text-muted)',
+                borderColor:strategies.every(s => s.allowShorting) ? 'rgba(139,92,246,0.4)' : 'var(--border)' }}>
+              {strategies.every(s => s.allowShorting) ? 'Short ON' : 'Short OFF'}
+            </button>
+          </div>
           {!isRunning && <button type="button" className="btn-secondary btn-sm" onClick={addStrategy}>+ Add</button>}
         </div>
         <div className="bt-live-strategies-grid">
@@ -2209,6 +2359,15 @@ function ReplayTest() {
                         <span className="bt-param-hint">{def.hint}</span>
                       </div>
                     ))}
+                  </div>
+                )}
+                {s.enabled && (
+                  <div style={{ marginTop: 6 }}>
+                    <label className="checkbox-label" style={{ fontSize: 12, gap: 6 }}>
+                      <input type="checkbox" checked={!!s.allowShorting} disabled={isRunning}
+                        onChange={e => updateStrategy(idx, 'allowShorting', e.target.checked)} />
+                      Allow Shorting
+                    </label>
                   </div>
                 )}
                 {regimeConfig.enabled && s.enabled && (
