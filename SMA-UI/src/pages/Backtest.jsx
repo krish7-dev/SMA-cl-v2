@@ -488,6 +488,19 @@ const STRATEGY_REGIME_MAP = {
   LIQUIDITY_SWEEP:     ['VOLATILE'],
   CANDLE_PATTERN:      ['RANGING', 'VOLATILE'],
 };
+// Weights per strategy: how much each score component matters (0–1, sum ≈ 1)
+const STRATEGY_SCORE_WEIGHTS = {
+  SMA_CROSSOVER:       { trend: 0.50, volatility: 0.10, momentum: 0.30, confidence: 0.10 },
+  EMA_CROSSOVER:       { trend: 0.50, volatility: 0.10, momentum: 0.30, confidence: 0.10 },
+  MACD:                { trend: 0.35, volatility: 0.25, momentum: 0.30, confidence: 0.10 },
+  RSI:                 { trend: 0.15, volatility: 0.15, momentum: 0.60, confidence: 0.10 },
+  RSI_REVERSAL:        { trend: 0.10, volatility: 0.25, momentum: 0.55, confidence: 0.10 },
+  BREAKOUT:            { trend: 0.20, volatility: 0.50, momentum: 0.20, confidence: 0.10 },
+  VWAP_PULLBACK:       { trend: 0.40, volatility: 0.20, momentum: 0.30, confidence: 0.10 },
+  BOLLINGER_REVERSION: { trend: 0.10, volatility: 0.30, momentum: 0.50, confidence: 0.10 },
+  LIQUIDITY_SWEEP:     { trend: 0.10, volatility: 0.60, momentum: 0.20, confidence: 0.10 },
+  CANDLE_PATTERN:      { trend: 0.15, volatility: 0.35, momentum: 0.40, confidence: 0.10 },
+};
 const COMBINED_LABEL = '⚡ Combined';
 const EMPTY_REGIME_CONFIG = {
   enabled: false,
@@ -688,6 +701,110 @@ class LocalRegimeDetector {
     if (atrPct < this.atrCompressionPct) return 'COMPRESSION';
     if (lastAdx >= this.adxTrendThreshold) return 'TRENDING';
     return 'RANGING';
+  }
+}
+
+/**
+ * Score-based strategy selector for the ⚡ Combined pool.
+ * Computes trendStrength (ADX proxy), volatility (ATR%), direction-aware momentum (ROC),
+ * and a regime-confidence bonus, then weights them per-strategy to pick the best fit.
+ */
+class LocalStrategyScorer {
+  constructor(adxPeriod = 14, atrPeriod = 14, rocPeriod = 10) {
+    this.adxPeriod = adxPeriod;
+    this.atrPeriod = atrPeriod;
+    this.rocPeriod = rocPeriod;
+    this.H = []; this.L = []; this.C = [];
+  }
+
+  addCandle(high, low, close) {
+    this.H.push(parseFloat(high));
+    this.L.push(parseFloat(low));
+    this.C.push(parseFloat(close));
+    const keep = Math.max(this.adxPeriod, this.atrPeriod, this.rocPeriod) * 4;
+    if (this.H.length > keep) { this.H.shift(); this.L.shift(); this.C.shift(); }
+  }
+
+  reset() { this.H = []; this.L = []; this.C = []; }
+
+  _smooth(arr, p) {
+    if (arr.length < p) return arr.map(() => 0);
+    const r = new Array(arr.length).fill(0);
+    let s = 0; for (let i = 0; i < p; i++) s += arr[i]; r[p-1] = s / p;
+    for (let i = p; i < arr.length; i++) r[i] = (r[i-1] * (p-1) + arr[i]) / p;
+    return r;
+  }
+
+  /** trendStrength: 0–100 (ADX-based) */
+  _trendStrength() {
+    const { H, L, C, adxPeriod: p } = this;
+    const n = C.length;
+    if (n < p * 2) return 0;
+    const trs = [], pdms = [], mdms = [];
+    for (let i = 1; i < n; i++) {
+      trs.push(Math.max(H[i]-L[i], Math.abs(H[i]-C[i-1]), Math.abs(L[i]-C[i-1])));
+      const up = H[i]-H[i-1], dn = L[i-1]-L[i];
+      pdms.push(up > dn && up > 0 ? up : 0);
+      mdms.push(dn > up && dn > 0 ? dn : 0);
+    }
+    const sTR = this._smooth(trs, p), sPDM = this._smooth(pdms, p), sMDM = this._smooth(mdms, p);
+    const dxs = sTR.map((tr, i) => {
+      if (tr === 0) return 0;
+      const pdi = sPDM[i]/tr*100, mdi = sMDM[i]/tr*100, sum = pdi + mdi;
+      return sum === 0 ? 0 : Math.abs(pdi-mdi)/sum*100;
+    });
+    const adx = this._smooth(dxs, p);
+    return Math.min(adx[adx.length-1], 100);
+  }
+
+  /** volatility: 0–100 (ATR% of price, scaled so 5% ATR ≈ 100) */
+  _volatility() {
+    const { H, L, C, atrPeriod: ap } = this;
+    const n = C.length;
+    if (n < 2) return 0;
+    const trs = [];
+    for (let i = 1; i < n; i++) {
+      trs.push(Math.max(H[i]-L[i], Math.abs(H[i]-C[i-1]), Math.abs(L[i]-C[i-1])));
+    }
+    const atr = this._smooth(trs, ap);
+    const atrPct = (atr[atr.length-1] / C[C.length-1]) * 100;
+    return Math.min(atrPct / 5 * 100, 100); // 5% ATR → 100
+  }
+
+  /**
+   * momentum: 0–100, direction-aware.
+   * BUY signal → high ROC is good; SELL signal → negative ROC (falling) is good.
+   */
+  _momentum(signal) {
+    const { C, rocPeriod: rp } = this;
+    if (C.length < rp + 1) return 50;
+    const roc = (C[C.length-1] - C[C.length-1-rp]) / C[C.length-1-rp] * 100;
+    if (signal === 'BUY')  return Math.min(Math.max((roc + 5) / 10 * 100, 0), 100);
+    if (signal === 'SELL') return Math.min(Math.max((-roc + 5) / 10 * 100, 0), 100);
+    return 50;
+  }
+
+  /**
+   * confidence: 0–25 bonus when strategy's preferred regimes include the current regime.
+   */
+  _confidence(strategyType, regime) {
+    if (!regime) return 0;
+    const preferred = STRATEGY_REGIME_MAP[strategyType] || [];
+    return preferred.includes(regime) ? 25 : 0;
+  }
+
+  /**
+   * Compute weighted score for a strategy given its signal and current regime.
+   * Returns { total, trendStrength, volatility, momentum, confidence }
+   */
+  score(strategyType, signal, regime) {
+    const w = STRATEGY_SCORE_WEIGHTS[strategyType] || { trend: 0.25, volatility: 0.25, momentum: 0.25, confidence: 0.25 };
+    const trendStrength = this._trendStrength();
+    const volatility    = this._volatility();
+    const momentum      = this._momentum(signal);
+    const confidence    = this._confidence(strategyType, regime);
+    const total = w.trend * trendStrength + w.volatility * volatility + w.momentum * momentum + w.confidence * confidence;
+    return { total, trendStrength, volatility, momentum, confidence };
   }
 }
 
@@ -1436,10 +1553,11 @@ function ReplayTest() {
   const openPositionMap   = useRef({});
   const closedTradesMap   = useRef({});
   const equityMap         = useRef({});
-  const regimeDetectorRef = useRef(null);
-  const patternEvalRef    = useRef(null);
-  const cooldownRef       = useRef({});
-  const dailyCapMap       = useRef({});
+  const regimeDetectorRef  = useRef(null);
+  const strategyScorerRef  = useRef(null);
+  const patternEvalRef     = useRef(null);
+  const cooldownRef        = useRef({});
+  const dailyCapMap        = useRef({});
 
   useEffect(() => {
     getStrategyTypes().then(r => { if (r?.data) setKnownTypes([...r.data].sort()); }).catch(() => {});
@@ -1657,6 +1775,9 @@ function ReplayTest() {
       }
     }
 
+    // Feed current candle into scorer (always, so it has enough history)
+    strategyScorerRef.current?.addCandle(high, low, close);
+
     // ── Combined regime-switched pool ──────────────────────────────────────
     const combinedDetails = []; // enriched context for ⚡ Combined actions this candle
     if (capitalMap.current[COMBINED_LABEL] !== undefined) {
@@ -1682,46 +1803,54 @@ function ReplayTest() {
         }
       }
 
-      // Use the first actionable signal from a regime-matched strategy
-      if (regime) {
+      // Score-based strategy selection — pick highest-scoring actionable signal
+      {
+        let bestStrat = null, bestSignal = null, bestScore = null;
         for (const strat of strategies.filter(s => s.enabled)) {
           const stratLabel = strat.label || strat.strategyType;
-          const allowed = STRATEGY_REGIME_MAP[strat.strategyType] || [];
-          if (allowed.length > 0 && !allowed.includes(regime)) continue;
           const signal = latestSignals[stratLabel];
           if (!signal || signal === 'HOLD') continue;
+          const sc = strategyScorerRef.current
+            ? strategyScorerRef.current.score(strat.strategyType, signal, regime)
+            : { total: 0, trendStrength: 0, volatility: 0, momentum: 0, confidence: 0 };
+          if (!bestScore || sc.total > bestScore.total) {
+            bestStrat = strat; bestSignal = signal; bestScore = sc;
+          }
+        }
 
-          const cp        = openPositionMap.current[COMBINED_LABEL];
-          const cHasLong  = cp?.type === 'LONG';
-          const cHasShort = cp?.type === 'SHORT';
-          const allowShort = !!strat.allowShorting;
+        if (bestStrat && bestSignal) {
+          const stratLabel  = bestStrat.label || bestStrat.strategyType;
+          const cp          = openPositionMap.current[COMBINED_LABEL];
+          const cHasLong    = cp?.type === 'LONG';
+          const cHasShort   = cp?.type === 'SHORT';
+          const allowShort  = !!bestStrat.allowShorting;
+          const trigger     = `Score-based signal (score=${bestScore.total.toFixed(1)}, trend=${bestScore.trendStrength.toFixed(1)}, vol=${bestScore.volatility.toFixed(1)}, mom=${bestScore.momentum.toFixed(1)}, conf=${bestScore.confidence.toFixed(1)})`;
 
-          if (signal === 'BUY') {
+          if (bestSignal === 'BUY') {
             if (cHasShort) {
               closeShort(COMBINED_LABEL, close, candleTime, 'SIGNAL');
-              combinedDetails.push({ action: 'Exit Short', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger: 'Regime matched signal' });
+              combinedDetails.push({ action: 'Exit Short', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
               if (allowShort) {
                 openLong(COMBINED_LABEL, close, candleTime, regime);
-                combinedDetails.push({ action: 'Enter Long', price: close, reason: 'Reversal SHORT→LONG', regime, sourceStrategy: stratLabel, trigger: 'Regime matched signal' });
+                combinedDetails.push({ action: 'Enter Long', price: close, reason: 'Reversal SHORT→LONG', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
               }
             } else if (!cHasLong) {
               openLong(COMBINED_LABEL, close, candleTime, regime);
-              combinedDetails.push({ action: 'Enter Long', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger: 'Regime matched signal' });
+              combinedDetails.push({ action: 'Enter Long', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
             }
-          } else if (signal === 'SELL') {
+          } else if (bestSignal === 'SELL') {
             if (cHasLong) {
               closeLong(COMBINED_LABEL, close, candleTime, 'SIGNAL');
-              combinedDetails.push({ action: 'Exit Long', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger: 'Regime matched signal' });
+              combinedDetails.push({ action: 'Exit Long', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
               if (allowShort) {
                 openShort(COMBINED_LABEL, close, candleTime, regime);
-                combinedDetails.push({ action: 'Enter Short', price: close, reason: 'Reversal LONG→SHORT', regime, sourceStrategy: stratLabel, trigger: 'Regime matched signal' });
+                combinedDetails.push({ action: 'Enter Short', price: close, reason: 'Reversal LONG→SHORT', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
               }
             } else if (!cHasShort && allowShort) {
               openShort(COMBINED_LABEL, close, candleTime, regime);
-              combinedDetails.push({ action: 'Enter Short', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger: 'Regime matched signal' });
+              combinedDetails.push({ action: 'Enter Short', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
             }
           }
-          break; // first matching strategy wins
         }
       }
     }
@@ -1785,6 +1914,11 @@ function ReplayTest() {
           parseFloat(regimeConfig.adxTrendThreshold)||25, parseFloat(regimeConfig.atrVolatilePct)||2,
           parseFloat(regimeConfig.atrCompressionPct)||0.5)
       : null;
+    strategyScorerRef.current = new LocalStrategyScorer(
+      parseInt(regimeConfig.adxPeriod,10)||14,
+      parseInt(regimeConfig.atrPeriod,10)||14,
+      10
+    );
 
     try {
       const res = await startReplay({
@@ -2491,7 +2625,9 @@ function ReplayTest() {
                   `${cd.action} @${Number(cd.price).toFixed(2)}` +
                   (cd.sourceStrategy ? ` via ${cd.sourceStrategy}` : '') +
                   (cd.regime         ? ` [${cd.regime}]`           : '') +
-                  ` · ${cd.reason} · ${cd.trigger}`
+                  ` · ${cd.reason}` +
+                  (cd.score ? ` · score=${cd.score.total.toFixed(1)}(trend=${cd.score.trendStrength.toFixed(0)},vol=${cd.score.volatility.toFixed(0)},mom=${cd.score.momentum.toFixed(0)},conf=${cd.score.confidence.toFixed(0)})` : '') +
+                  ` · ${cd.trigger}`
                 ).join(' | ');
                 lines.push(row(
                   r.ts,
@@ -2631,7 +2767,8 @@ function ReplayTest() {
                                             {cd.sourceStrategy ? ` · via ${cd.sourceStrategy}` : ''}
                                             {cd.regime ? ` · ${cd.regime}` : ''}
                                             {' · '}{cd.reason}
-                                            {' · '}<span style={{ color: cd.trigger === 'Risk Management' ? '#f59e0b' : 'var(--text-muted)' }}>{cd.trigger}</span>
+                                            {cd.score ? ` · score=${cd.score.total.toFixed(1)} (trend=${cd.score.trendStrength.toFixed(0)} vol=${cd.score.volatility.toFixed(0)} mom=${cd.score.momentum.toFixed(0)} conf=${cd.score.confidence.toFixed(0)})` : ''}
+                                            {' · '}<span style={{ color: cd.trigger?.startsWith('Score') ? '#6366f1' : cd.trigger === 'Risk Management' ? '#f59e0b' : 'var(--text-muted)' }}>{cd.trigger}</span>
                                           </span>
                                         </div>
                                       );
