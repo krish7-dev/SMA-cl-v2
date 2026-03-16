@@ -3,6 +3,8 @@ package com.sma.strategyengine.model.response;
 import lombok.Builder;
 import lombok.Value;
 
+import com.sma.strategyengine.service.StrategyScorer;
+
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
@@ -85,5 +87,8 @@ public class BacktestResult {
         String        direction;        // LONG | SHORT
         List<String>  entryPatterns;    // candlestick patterns detected on the entry candle (may be empty)
         String        regime;           // TRENDING | RANGING | VOLATILE | COMPRESSION — null when regime detection off
+        // Score-switched combined pool fields (null for non-combined runs)
+        String                        selectedStrategy; // strategy type chosen by scorer (null for single-strategy runs)
+        StrategyScorer.ScoreResult    scoreBreakdown;  // full score breakdown when score-switching was active
     }
 }

@@ -101,6 +101,22 @@ public class BacktestRequest {
     @Valid
     private RegimeConfig regimeConfig;
 
+    /**
+     * Optional score-based combined pool configuration.
+     * When enabled, a "Score-Switched" combined result is prepended using all strategy
+     * configs (regardless of activeRegimes). The scorer picks the highest-scoring
+     * strategy per candle from a single shared capital pool.
+     * Null or enabled=false → no score-based combined result.
+     */
+    @Valid
+    private ScoreConfig scoreConfig;
+
+    /**
+     * Instrument type — used by the scorer for quality penalties.
+     * "STOCK" (default) or "OPTION".
+     */
+    private String instrumentType = "STOCK";
+
     // ─── Nested types ─────────────────────────────────────────────────────────
 
     @Data
@@ -183,6 +199,20 @@ public class BacktestRequest {
          * E.g. 0.5 means ATR < 0.5% of current price.
          */
         @DecimalMin("0") private double atrCompressionPct = 0.5;
+    }
+
+    @Data
+    public static class ScoreConfig {
+
+        /** Master switch. */
+        private boolean enabled = false;
+
+        /**
+         * Minimum score threshold for entry (0–100). Signals with total score below
+         * this value are skipped. Default 30 — low enough not to miss strong signals.
+         */
+        @DecimalMin("0") @DecimalMax("100")
+        private double minScoreThreshold = 30.0;
     }
 
     @Data

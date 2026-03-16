@@ -130,12 +130,28 @@ function defaultStrategies() {
 }
 
 const EMPTY_DATA_CTX = {
-  symbol: '', exchange: 'NSE', instrumentToken: '',
+  symbol: '', exchange: 'NSE', instrumentToken: '', instrumentType: 'STOCK',
   interval: 'DAY', fromDate: '', toDate: '',
   initialCapital: '100000', quantity: '0', product: 'CNC',
 };
 
-const EMPTY_INST = { symbol: '', exchange: 'NSE', instrumentToken: '' };
+const EMPTY_INST = { symbol: '', exchange: 'NSE', instrumentToken: '', instrumentType: 'STOCK' };
+
+function deriveInstrumentType(kiteType) {
+  return ['CE', 'PE'].includes(kiteType) ? 'OPTION' : 'STOCK';
+}
+
+/** Resolve instrument type: explicit value → exchange-based → symbol pattern fallback. */
+function resolveInstrType(instrumentType, symbol, exchange) {
+  if (instrumentType === 'OPTION') return 'OPTION';
+  if (instrumentType === 'STOCK')  return 'STOCK';
+  // Exchange is the most reliable indicator: NFO/BFO = derivatives
+  const ex = (exchange || '').toUpperCase();
+  if (ex === 'NFO' || ex === 'BFO') return 'OPTION';
+  // Fallback: symbol ending with digits+CE/PE (e.g. NIFTY24000PE)
+  if (/\d(CE|PE)$/i.test(symbol || '')) return 'OPTION';
+  return 'STOCK';
+}
 
 const EMPTY_RISK = {
   enabled: false,
@@ -511,6 +527,11 @@ const EMPTY_REGIME_CONFIG = {
   atrCompressionPct: 0.5,
 };
 
+const EMPTY_SCORE_CONFIG = {
+  enabled: false,
+  minScoreThreshold: 30,
+};
+
 // ── Trading Rules ──────────────────────────────────────────────────────────
 const EMPTY_RULES_CONFIG = {
   enabled: true,
@@ -727,6 +748,16 @@ class LocalRegimeDetector {
  * Computes trendStrength (ADX proxy), volatility (ATR%), direction-aware momentum (ROC),
  * and a regime-confidence bonus, then weights them per-strategy to pick the best fit.
  */
+// Per-strategy penalty for instrument type mismatch
+const STRATEGY_INSTRUMENT_MISMATCH = {
+  SMA_CROSSOVER: { OPTION: 30 },
+  EMA_CROSSOVER: { OPTION: 25 },
+  MACD:          { OPTION: 15 },
+  RSI:           { OPTION: 10 },
+  RSI_REVERSAL:  { OPTION: 15 },
+  BREAKOUT:      { OPTION: 20 },
+};
+
 class LocalStrategyScorer {
   constructor(adxPeriod = 14, atrPeriod = 14, rocPeriod = 10) {
     this.adxPeriod = adxPeriod;
@@ -811,18 +842,119 @@ class LocalStrategyScorer {
     return preferred.includes(regime) ? 25 : 0;
   }
 
+  // ── Quality Penalties ──────────────────────────────────────────────────
+
   /**
-   * Compute weighted score for a strategy given its signal and current regime.
-   * Returns { total, trendStrength, volatility, momentum, confidence }
+   * reversalPenalty: penalise whipsaw. Detects sign-flips in recent close-to-close moves.
+   * Most-recent flip = 20, multiple flips in last 5 candles = 25.
    */
-  score(strategyType, signal, regime) {
+  _reversalPenalty() {
+    const { C } = this;
+    const n = C.length;
+    if (n < 4) return 0;
+    const diffs = [];
+    for (let i = Math.max(1, n - 5); i < n; i++) diffs.push(C[i] - C[i-1]);
+    let flips = 0;
+    for (let i = 1; i < diffs.length; i++) {
+      if (diffs[i] * diffs[i-1] < 0) flips++;
+    }
+    const lastFlip = diffs.length >= 2 && diffs[diffs.length-1] * diffs[diffs.length-2] < 0;
+    if (lastFlip && flips >= 2) return 25;
+    if (lastFlip)  return 20;
+    if (flips >= 2) return 12;
+    return 0;
+  }
+
+  /**
+   * overextensionPenalty: penalise entering when price is stretched from VWAP proxy.
+   * Uses equal-weighted typical-price mean over last 50 candles as VWAP proxy.
+   * Only penalises when signal is chasing the extension (BUY above VWAP, SELL below).
+   */
+  _overextensionPenalty(signal) {
+    const { H, L, C } = this;
+    const n = C.length;
+    if (n < 10) return 0;
+    const start = Math.max(0, n - 50);
+    let sumTP = 0;
+    for (let i = start; i < n; i++) sumTP += (H[i] + L[i] + C[i]) / 3;
+    const vwap = sumTP / (n - start);
+    const pctDev = (C[n-1] - vwap) / vwap * 100;
+    // Only penalise when chasing the extension direction
+    if (signal === 'BUY'  && pctDev <= 0) return 0;
+    if (signal === 'SELL' && pctDev >= 0) return 0;
+    const absPct = Math.abs(pctDev);
+    if (absPct > 2.0) return 30;
+    if (absPct > 1.5) return 22;
+    if (absPct > 1.0) return 15;
+    if (absPct > 0.5) return 8;
+    return 0;
+  }
+
+  /**
+   * sameColorPenalty: penalise entering after 3+ consecutive same-direction candles
+   * (chasing exhausted moves). Uses close-to-close direction as candle colour proxy.
+   */
+  _sameColorPenalty(signal) {
+    const { C } = this;
+    const n = C.length;
+    if (n < 4) return 0;
+    const lastUp = C[n-1] > C[n-2];
+    // Only penalise when signal chases the streak
+    if (signal === 'BUY'  && !lastUp) return 0;
+    if (signal === 'SELL' &&  lastUp) return 0;
+    let streak = 1;
+    for (let i = n - 2; i >= 1; i--) {
+      if ((C[i] > C[i-1]) === lastUp) streak++;
+      else break;
+    }
+    if (streak >= 5) return 30;
+    if (streak >= 4) return 20;
+    if (streak >= 3) return 12;
+    return 0;
+  }
+
+  /**
+   * instrumentMismatchPenalty: slow trend-following strategies perform poorly on options;
+   * penalise those pairings.
+   */
+  _instrumentMismatchPenalty(strategyType, instrType) {
+    return STRATEGY_INSTRUMENT_MISMATCH[strategyType]?.[instrType] || 0;
+  }
+
+  /**
+   * volatileOptionPenalty: VOLATILE regime on options is the highest-risk combination —
+   * options pricing becomes unreliable and spreads widen.
+   */
+  _volatileOptionPenalty(regime, instrType) {
+    return (instrType === 'OPTION' && regime === 'VOLATILE') ? 35 : 0;
+  }
+
+  /**
+   * Compute final score for a strategy given its signal, regime, and instrument type.
+   * finalScore = max(0, baseScore - penalties)
+   * Returns full breakdown including all penalty components.
+   */
+  score(strategyType, signal, regime, instrType = 'STOCK') {
     const w = STRATEGY_SCORE_WEIGHTS[strategyType] || { trend: 0.25, volatility: 0.25, momentum: 0.25, confidence: 0.25 };
     const trendStrength = this._trendStrength();
     const volatility    = this._volatility();
     const momentum      = this._momentum(signal);
     const confidence    = this._confidence(strategyType, regime);
-    const total = w.trend * trendStrength + w.volatility * volatility + w.momentum * momentum + w.confidence * confidence;
-    return { total, trendStrength, volatility, momentum, confidence };
+    const baseScore     = w.trend * trendStrength + w.volatility * volatility + w.momentum * momentum + w.confidence * confidence;
+
+    const reversalPenalty          = this._reversalPenalty();
+    const overextensionPenalty     = this._overextensionPenalty(signal);
+    const sameColorPenalty         = this._sameColorPenalty(signal);
+    const instrumentMismatchPenalty = this._instrumentMismatchPenalty(strategyType, instrType);
+    const volatileOptionPenalty    = this._volatileOptionPenalty(regime, instrType);
+    const totalPenalty = reversalPenalty + overextensionPenalty + sameColorPenalty + instrumentMismatchPenalty + volatileOptionPenalty;
+    const total = Math.max(0, baseScore - totalPenalty);
+
+    return {
+      total, baseScore, trendStrength, volatility, momentum, confidence,
+      reversalPenalty, overextensionPenalty, sameColorPenalty,
+      instrumentMismatchPenalty, volatileOptionPenalty, totalPenalty,
+    };
   }
 }
 
@@ -873,6 +1005,7 @@ function HistoricalBacktest() {
   const [riskConfig, setRiskConfig]         = useState({ ...EMPTY_RISK });
   const [patternConfig, setPatternConfig]   = useState({ ...EMPTY_PATTERN });
   const [regimeConfig, setRegimeConfig]     = useState({ ...EMPTY_REGIME_CONFIG });
+  const [scoreConfig, setScoreConfig]       = useState({ ...EMPTY_SCORE_CONFIG });
   const [loading, setLoading]       = useState(false);
   const [error, setError]           = useState('');
   const [result, setResult]         = useState(null);
@@ -924,7 +1057,7 @@ function HistoricalBacktest() {
   }
 
   function handleInstrumentSelect(inst) {
-    setDataCtx(p => ({ ...p, symbol: inst.tradingSymbol, exchange: inst.exchange, instrumentToken: String(inst.instrumentToken) }));
+    setDataCtx(p => ({ ...p, symbol: inst.tradingSymbol, exchange: inst.exchange, instrumentToken: String(inst.instrumentToken), instrumentType: deriveInstrumentType(inst.instrumentType) }));
     saveRecentInstrument(inst);
   }
 
@@ -976,6 +1109,11 @@ function HistoricalBacktest() {
           atrVolatilePct:     parseFloat(regimeConfig.atrVolatilePct)       || 2.0,
           atrCompressionPct:  parseFloat(regimeConfig.atrCompressionPct)    || 0.5,
         } : undefined,
+        scoreConfig: scoreConfig.enabled ? {
+          enabled:            true,
+          minScoreThreshold:  parseFloat(scoreConfig.minScoreThreshold) || 30,
+        } : undefined,
+        instrumentType: resolveInstrType(dataCtx.instrumentType, dataCtx.symbol, dataCtx.exchange),
       };
       const res = await runBacktest(payload);
       setResult(res?.data);
@@ -1276,6 +1414,45 @@ function HistoricalBacktest() {
         )}
       </div>
 
+      {/* Score-Based Combined Pool */}
+      <div className="bt-section-label" style={{ marginTop: 28 }}>
+        <span className="bt-section-title">Score-Based Combined Pool</span>
+        <span className="bt-section-sub">
+          {scoreConfig.enabled
+            ? `ON — min score ${scoreConfig.minScoreThreshold} · all strategies compete per candle`
+            : 'OFF — no score-based combined result'}
+        </span>
+      </div>
+      <div className="card bt-risk-card">
+        <div className="bt-risk-toggle-row">
+          <span className="bt-risk-label">
+            Score Switching
+            <span className={scoreConfig.enabled ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+              {scoreConfig.enabled ? 'enabled' : 'disabled'}
+            </span>
+          </span>
+          <button type="button"
+            className={scoreConfig.enabled ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+            onClick={() => setScoreConfig(p => ({ ...p, enabled: !p.enabled }))}>
+            {scoreConfig.enabled ? 'ON' : 'OFF'}
+          </button>
+          {!scoreConfig.enabled && (
+            <span className="bt-risk-hint">Enable to add a "Score-Switched" combined result — the scorer picks the highest-quality strategy per candle from one shared capital pool.</span>
+          )}
+        </div>
+        {scoreConfig.enabled && (
+          <div className="bt-risk-fields">
+            <div className="form-group">
+              <label>Min Score Threshold <span className="form-hint">(0–100)</span></label>
+              <input type="number" min="0" max="100" step="1"
+                value={scoreConfig.minScoreThreshold}
+                onChange={e => setScoreConfig(p => ({ ...p, minScoreThreshold: e.target.value }))} />
+              <small className="bt-risk-hint">Signals scoring below this are skipped</small>
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* Data Context */}
       <div className="bt-section-label" style={{ marginTop: 28 }}>
         <span className="bt-section-title">Instrument & Date Range</span>
@@ -1351,7 +1528,7 @@ function HistoricalBacktest() {
         <button type="submit" className="btn-primary" disabled={loading || !isActive || enabledCount === 0}>
           {loading ? `Running ${enabledCount} strateg${enabledCount !== 1 ? 'ies' : 'y'}…` : `Run Backtest — ${enabledCount} strateg${enabledCount !== 1 ? 'ies' : 'y'}`}
         </button>
-        <button type="button" className="btn-secondary" onClick={() => { setStrategies(defaultStrategies()); setDataCtx({ ...EMPTY_DATA_CTX }); setRiskConfig({ ...EMPTY_RISK }); setPatternConfig({ ...EMPTY_PATTERN }); setRegimeConfig({ ...EMPTY_REGIME_CONFIG }); setResult(null); setError(''); }} disabled={loading}>
+        <button type="button" className="btn-secondary" onClick={() => { setStrategies(defaultStrategies()); setDataCtx({ ...EMPTY_DATA_CTX }); setRiskConfig({ ...EMPTY_RISK }); setPatternConfig({ ...EMPTY_PATTERN }); setRegimeConfig({ ...EMPTY_REGIME_CONFIG }); setScoreConfig({ ...EMPTY_SCORE_CONFIG }); setResult(null); setError(''); }} disabled={loading}>
           Reset
         </button>
       </div>
@@ -1544,6 +1721,7 @@ function ReplayTest() {
   const [riskConfig, setRiskConfig]       = useState({ ...EMPTY_RISK });
   const [patternConfig, setPatternConfig] = useState({ ...EMPTY_PATTERN });
   const [regimeConfig, setRegimeConfig]   = useState({ ...EMPTY_REGIME_CONFIG });
+  const [scoreConfig, setScoreConfig]     = useState({ ...EMPTY_SCORE_CONFIG });
   const [currentRegime, setCurrentRegime] = useState(null);
 
   const [sessionId, setSessionId]       = useState(null);
@@ -1823,14 +2001,17 @@ function ReplayTest() {
 
       // Score-based strategy selection — pick highest-scoring actionable signal
       {
+        const replayInstrType   = resolveInstrType(inst.instrumentType, inst.symbol, inst.exchange);
+        const replayMinScore    = parseFloat(scoreConfig.minScoreThreshold) || 0;
         let bestStrat = null, bestSignal = null, bestScore = null;
         for (const strat of strategies.filter(s => s.enabled)) {
           const stratLabel = strat.label || strat.strategyType;
           const signal = latestSignals[stratLabel];
           if (!signal || signal === 'HOLD') continue;
           const sc = strategyScorerRef.current
-            ? strategyScorerRef.current.score(strat.strategyType, signal, regime)
+            ? strategyScorerRef.current.score(strat.strategyType, signal, regime, replayInstrType)
             : { total: 0, trendStrength: 0, volatility: 0, momentum: 0, confidence: 0 };
+          if (sc.total < replayMinScore) continue;
           if (!bestScore || sc.total > bestScore.total) {
             bestStrat = strat; bestSignal = signal; bestScore = sc;
           }
@@ -1842,18 +2023,24 @@ function ReplayTest() {
           const cHasLong    = cp?.type === 'LONG';
           const cHasShort   = cp?.type === 'SHORT';
           const allowShort  = !!bestStrat.allowShorting;
-          const trigger     = `Score-based signal (score=${bestScore.total.toFixed(1)}, trend=${bestScore.trendStrength.toFixed(1)}, vol=${bestScore.volatility.toFixed(1)}, mom=${bestScore.momentum.toFixed(1)}, conf=${bestScore.confidence.toFixed(1)})`;
+          const trigger     = `Score-based signal (final=${bestScore.total.toFixed(1)}, base=${bestScore.baseScore?.toFixed(1)??'—'}, trend=${bestScore.trendStrength.toFixed(1)}, vol=${bestScore.volatility.toFixed(1)}, mom=${bestScore.momentum.toFixed(1)}, conf=${bestScore.confidence.toFixed(1)}, pen=${bestScore.totalPenalty?.toFixed(1)??0})`;
 
+          const tagEntry = () => {
+            if (openPositionMap.current[COMBINED_LABEL]) {
+              openPositionMap.current[COMBINED_LABEL].sourceStrategy = stratLabel;
+              openPositionMap.current[COMBINED_LABEL].entryScore     = bestScore;
+            }
+          };
           if (bestSignal === 'BUY') {
             if (cHasShort) {
               closeShort(COMBINED_LABEL, close, candleTime, 'SIGNAL');
               combinedDetails.push({ action: 'Exit Short', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
               if (allowShort) {
-                openLong(COMBINED_LABEL, close, candleTime, regime);
+                openLong(COMBINED_LABEL, close, candleTime, regime); tagEntry();
                 combinedDetails.push({ action: 'Enter Long', price: close, reason: 'Reversal SHORT→LONG', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
               }
             } else if (!cHasLong) {
-              openLong(COMBINED_LABEL, close, candleTime, regime);
+              openLong(COMBINED_LABEL, close, candleTime, regime); tagEntry();
               combinedDetails.push({ action: 'Enter Long', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
             }
           } else if (bestSignal === 'SELL') {
@@ -1861,11 +2048,11 @@ function ReplayTest() {
               closeLong(COMBINED_LABEL, close, candleTime, 'SIGNAL');
               combinedDetails.push({ action: 'Exit Long', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
               if (allowShort) {
-                openShort(COMBINED_LABEL, close, candleTime, regime);
+                openShort(COMBINED_LABEL, close, candleTime, regime); tagEntry();
                 combinedDetails.push({ action: 'Enter Short', price: close, reason: 'Reversal LONG→SHORT', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
               }
             } else if (!cHasShort && allowShort) {
-              openShort(COMBINED_LABEL, close, candleTime, regime);
+              openShort(COMBINED_LABEL, close, candleTime, regime); tagEntry();
               combinedDetails.push({ action: 'Enter Short', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
             }
           }
@@ -1914,8 +2101,8 @@ function ReplayTest() {
       equityMap.current[label] = [{ time: 'start', capital: initCap }];
       dailyCapMap.current[label] = { date: '', startCapital: initCap, halted: false };
     }
-    // Combined regime-switched pool — single capital that follows the regime-matched strategy
-    if (regimeConfig.enabled && strategies.filter(s => s.enabled).length > 1) {
+    // Score-based combined pool — single capital pool, scorer picks best strategy each candle
+    if (scoreConfig.enabled && strategies.filter(s => s.enabled).length >= 1) {
       capitalMap.current[COMBINED_LABEL]      = initCap;
       openPositionMap.current[COMBINED_LABEL] = null;
       closedTradesMap.current[COMBINED_LABEL] = [];
@@ -2062,7 +2249,7 @@ function ReplayTest() {
               <InstrumentPicker
                 session={session}
                 symbol={inst.symbol} exchange={inst.exchange} instrumentToken={inst.instrumentToken}
-                onSelect={r => { setInst({ symbol: r.tradingSymbol, exchange: r.exchange, instrumentToken: String(r.instrumentToken) }); saveRecentInstrument(r); }}
+                onSelect={r => { setInst({ symbol: r.tradingSymbol, exchange: r.exchange, instrumentToken: String(r.instrumentToken), instrumentType: deriveInstrumentType(r.instrumentType) }); saveRecentInstrument(r); }}
                 onChange={patch => setInst(p => ({ ...p, ...patch }))}
                 disabled={isRunning}
               />
@@ -2190,6 +2377,32 @@ function ReplayTest() {
               <div style={{ marginTop: 8 }}>
                 <span className="bt-params-label" style={{ marginRight: 6 }}>Current:</span>
                 <span className={`bt-regime-badge bt-regime-${currentRegime}`}>{currentRegime}</span>
+              </div>
+            )}
+          </div>
+
+          {/* ── Score-Based Combined Pool ── */}
+          <div className="card bt-risk-card" style={{ marginTop: 12 }}>
+            <div className="bt-risk-toggle-row">
+              <span className="bt-risk-label">Score-Based Combined Pool
+                <span className={scoreConfig.enabled ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+                  {scoreConfig.enabled ? 'enabled' : 'disabled'}
+                </span>
+              </span>
+              <button type="button" disabled={isRunning}
+                className={scoreConfig.enabled ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+                onClick={() => setScoreConfig(p => ({ ...p, enabled: !p.enabled }))}>
+                {scoreConfig.enabled ? 'ON' : 'OFF'}
+              </button>
+            </div>
+            {scoreConfig.enabled && (
+              <div className="bt-risk-fields">
+                <div className="form-group">
+                  <label>Min Score Threshold</label>
+                  <input type="number" min="0" max="100" step="1" disabled={isRunning}
+                    value={scoreConfig.minScoreThreshold}
+                    onChange={e => setScoreConfig(p => ({ ...p, minScoreThreshold: e.target.value }))} />
+                </div>
               </div>
             )}
           </div>
@@ -2465,12 +2678,13 @@ function ReplayTest() {
                     return (
                       <div key={lbl} style={{ marginBottom: 16, ...(isCombined ? { background: 'rgba(139,92,246,0.05)', borderRadius: 8, padding: '8px 10px', border: '1px solid rgba(139,92,246,0.2)' } : {}) }}>
                         <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 6, color: isCombined ? '#8b5cf6' : undefined }}>
-                          {lbl}{isCombined && <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 8, fontWeight: 400 }}>regime-switched pool</span>}
+                          {lbl}{isCombined && <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 8, fontWeight: 400 }}>score-switched pool</span>}
                         </div>
                         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
                           <thead>
                             <tr style={{ borderBottom: '1px solid var(--border)' }}>
-                              {['Dir','Regime','Entry','Exit','Qty','Entry ₹','Exit ₹','P&L','Reason'].map(h => (
+                              {['Dir','Regime','Entry','Exit','Qty','Entry ₹','Exit ₹','P&L','Reason',
+                                ...(isCombined ? ['Strategy','Score'] : [])].map(h => (
                                 <th key={h} style={{ textAlign: 'left', padding: '3px 6px', color: 'var(--text-muted)' }}>{h}</th>
                               ))}
                             </tr>
@@ -2497,6 +2711,15 @@ function ReplayTest() {
                                   {t.pnl >= 0 ? '+' : ''}{fmtRs(t.pnl)} ({t.pnlPct?.toFixed(2)}%)
                                 </td>
                                 <td style={{ padding: '4px 6px', color: 'var(--text-muted)' }}>{t.exitReason}</td>
+                                {isCombined && (
+                                  <>
+                                    <td style={{ padding: '4px 6px', fontSize: 10 }}>{t.sourceStrategy || '—'}</td>
+                                    <td style={{ padding: '4px 6px', fontFamily: 'monospace', fontSize: 10,
+                                      color: t.entryScore?.total >= 60 ? '#22c55e' : t.entryScore?.total >= 40 ? '#f59e0b' : '#ef4444' }}>
+                                      {t.entryScore ? t.entryScore.total.toFixed(1) : '—'}
+                                    </td>
+                                  </>
+                                )}
                               </tr>
                             ))}
                           </tbody>
@@ -2605,12 +2828,22 @@ function ReplayTest() {
               });
               lines.push(blank);
 
+              // ── Score-Based Combined Pool ──────────────────────────────
+              if (scoreConfig.enabled) {
+                lines.push(row('=== Score-Based Combined Pool ==='));
+                lines.push(row('Min Score Threshold'));
+                lines.push(row(scoreConfig.minScoreThreshold));
+                lines.push(blank);
+              }
+
               // ── Trade History ─────────────────────────────────────────
               lines.push(row('=== Trade History ==='));
               lines.push(row('Strategy','Direction','Entry Time','Exit Time','Qty',
                 'Entry Price','Exit Price','P&L','P&L %','Exit Reason',
-                ...(regimeConfig.enabled ? ['Regime'] : [])));
+                ...(regimeConfig.enabled ? ['Regime'] : []),
+                ...(scoreConfig.enabled  ? ['Selected Strategy','Entry Score'] : [])));
               allPnlLabels.forEach(lbl => {
+                const isComb = lbl === COMBINED_LABEL;
                 const trades = stratStates[lbl]?.closedTrades || [];
                 trades.slice().reverse().forEach(t => {
                   lines.push(row(
@@ -2627,6 +2860,7 @@ function ReplayTest() {
                       : t.exitReason === 'TAKE_PROFIT' ? 'Take Profit hit'
                       : t.exitReason || 'Signal',
                     ...(regimeConfig.enabled ? [t.regime ?? ''] : []),
+                    ...(scoreConfig.enabled  ? [isComb ? (t.sourceStrategy || '') : '', isComb && t.entryScore ? t.entryScore.total.toFixed(1) : ''] : []),
                   ));
                 });
               });
@@ -2903,6 +3137,7 @@ function LiveTest() {
   const [riskConfig, setRiskConfig]         = useState({ ...EMPTY_RISK });
   const [patternConfig, setPatternConfig]   = useState({ ...EMPTY_PATTERN });
   const [regimeConfig, setRegimeConfig]     = useState({ ...EMPTY_REGIME_CONFIG });
+  const [scoreConfig, setScoreConfig]       = useState({ ...EMPTY_SCORE_CONFIG });
   const [rulesConfig, setRulesConfig]       = useState(JSON.parse(JSON.stringify(EMPTY_RULES_CONFIG)));
   const [initialCapital, setInitialCapital] = useState('100000');
   const [quantity, setQuantity]             = useState('0');
@@ -3123,7 +3358,7 @@ function LiveTest() {
   // token: string instrumentToken, instrConfig: {symbol, exchange, instrumentToken, candleInterval, instrumentType}
   function onCandleClose(candle, token, instrConfig) {
     const sym        = instrConfig.symbol;
-    const instrType  = instrConfig.instrumentType || 'STOCK';
+    const instrType  = resolveInstrType(instrConfig.instrumentType, instrConfig.symbol, instrConfig.exchange);
     const activeRules = rulesConfig.enabled
       ? (instrType === 'OPTION' ? rulesConfig.options : rulesConfig.stocks)
       : {};
@@ -3159,6 +3394,7 @@ function LiveTest() {
     const candleTime = new Date().toLocaleTimeString();
     const latestSignals = {};
     const logActions    = [];
+    const blockedSignals = [];   // signals generated but blocked by a rule
     // Track what was closed this candle per key (for no-same-candle-reversal)
     const candleClosedDir = {};
 
@@ -3197,20 +3433,30 @@ function LiveTest() {
       latestSignals[stratLabel] = signal;
       if (!signal || signal === 'HOLD') continue;
 
-      // Regime-based rules
+      // Regime-based rules — signal generated but blocked
       if (rulesConfig.enabled) {
         if (instrType === 'STOCK') {
-          if (activeRules.ranging_no_trade?.enabled       && regime === 'RANGING')     continue;
-          if (activeRules.compression_short_only?.enabled && regime === 'COMPRESSION' && signal === 'BUY') continue;
+          if (activeRules.ranging_no_trade?.enabled && regime === 'RANGING') {
+            blockedSignals.push({ strategy: stratLabel, signal, price: candle.close, reason: 'Rule: No trade in RANGING regime' }); continue;
+          }
+          if (activeRules.compression_short_only?.enabled && regime === 'COMPRESSION' && signal === 'BUY') {
+            blockedSignals.push({ strategy: stratLabel, signal, price: candle.close, reason: 'Rule: SHORT only in COMPRESSION (BUY blocked)' }); continue;
+          }
         } else {
-          if (activeRules.volatile_no_trade?.enabled && regime === 'VOLATILE') continue;
+          if (activeRules.volatile_no_trade?.enabled && regime === 'VOLATILE') {
+            blockedSignals.push({ strategy: stratLabel, signal, price: candle.close, reason: 'Rule: No trade in VOLATILE regime' }); continue;
+          }
         }
       }
 
       if (patternConfig.enabled && patternEvalsRef.current[token]) {
         const patSig = patternEvalsRef.current[token].next(candle.close, candle.high, candle.low, candle.volume||0, candle.open);
-        if (signal === 'BUY'  && patternConfig.buyConfirmPatterns.length  > 0 && !patternConfig.buyConfirmPatterns.includes(patSig))  continue;
-        if (signal === 'SELL' && patternConfig.sellConfirmPatterns.length > 0 && !patternConfig.sellConfirmPatterns.includes(patSig)) continue;
+        if (signal === 'BUY'  && patternConfig.buyConfirmPatterns.length  > 0 && !patternConfig.buyConfirmPatterns.includes(patSig)) {
+          blockedSignals.push({ strategy: stratLabel, signal, price: candle.close, reason: `Pattern: no BUY confirm (got ${patSig||'none'})` }); continue;
+        }
+        if (signal === 'SELL' && patternConfig.sellConfirmPatterns.length > 0 && !patternConfig.sellConfirmPatterns.includes(patSig)) {
+          blockedSignals.push({ strategy: stratLabel, signal, price: candle.close, reason: `Pattern: no SELL confirm (got ${patSig||'none'})` }); continue;
+        }
       }
 
       const pos        = openPositionMap.current[key];
@@ -3219,37 +3465,57 @@ function LiveTest() {
       const allowShort = !!strat.allowShorting;
       const noSameCandleRev = rulesConfig.enabled && activeRules.no_same_candle_reversal?.enabled;
 
-      // Helper: check LONG quality gate (STOCK rule 3)
-      const passesLongGate = () => {
-        if (instrType !== 'STOCK' || !rulesConfig.enabled || !activeRules.long_quality_gate?.enabled) return true;
-        const sc = scorersRef.current[token]?.score(strat.strategyType, 'BUY', regime) || { total: 0 };
-        if (sc.total < (parseFloat(activeRules.long_quality_gate.scoreMin) || 60)) return false;
-        if ((reversalCooldownRef.current[key] || 0) > 0) return false;
+      // Helper: check LONG quality gate (STOCK rule 3) — returns block reason or null
+      const longGateBlock = () => {
+        if (instrType !== 'STOCK' || !rulesConfig.enabled || !activeRules.long_quality_gate?.enabled) return null;
+        const sc = scorersRef.current[token]?.score(strat.strategyType, 'BUY', regime, instrType) || { total: 0 };
+        const minScore = parseFloat(activeRules.long_quality_gate.scoreMin) || 60;
+        if (sc.total < minScore) return `Rule: LONG gate — score ${sc.total.toFixed(1)} < ${minScore}`;
+        if ((reversalCooldownRef.current[key] || 0) > 0) return 'Rule: LONG gate — reversal cooldown active';
         if (vwap) {
           const extPct = Math.abs(candle.close - vwap) / vwap * 100;
-          if (extPct > (parseFloat(activeRules.long_quality_gate.vwapMaxPct) || 1.5)) return false;
+          const maxExt = parseFloat(activeRules.long_quality_gate.vwapMaxPct) || 1.5;
+          if (extPct > maxExt) return `Rule: LONG gate — price ${extPct.toFixed(2)}% from VWAP (max ${maxExt}%)`;
         }
-        return true;
+        return null;
       };
 
       if (signal === 'BUY') {
-        if (hasShort) {
-          if (noSameCandleRev && candleClosedDir[key] === 'SHORT') continue;
+        if (hasLong) {
+          blockedSignals.push({ strategy: stratLabel, signal, price: candle.close, reason: 'Already in LONG position' });
+        } else if (hasShort) {
+          if (noSameCandleRev && candleClosedDir[key] === 'SHORT') {
+            blockedSignals.push({ strategy: stratLabel, signal, price: candle.close, reason: 'Rule: No same-candle reversal (SHORT already closed)' }); continue;
+          }
           closeShort(key, candle.close, 'SIGNAL', sym);
           candleClosedDir[key] = 'SHORT';
           logActions.push({ strategy: stratLabel, signal: 'BUY', price: candle.close, reason: 'SIGNAL' });
-          if (allowShort && passesLongGate()) {
-            openLong(key, candle.close, regime, sym);
-            reversalCooldownRef.current[key] = 2;
-            logActions.push({ strategy: stratLabel, signal: 'BUY', price: candle.close, reason: '' });
+          if (allowShort) {
+            const gateBlock = longGateBlock();
+            if (!gateBlock) {
+              openLong(key, candle.close, regime, sym);
+              reversalCooldownRef.current[key] = 2;
+              logActions.push({ strategy: stratLabel, signal: 'BUY', price: candle.close, reason: '' });
+            } else {
+              blockedSignals.push({ strategy: stratLabel, signal, price: candle.close, reason: gateBlock });
+            }
           }
-        } else if (!hasLong && passesLongGate()) {
-          openLong(key, candle.close, regime, sym);
-          logActions.push({ strategy: stratLabel, signal: 'BUY', price: candle.close, reason: '' });
+        } else {
+          const gateBlock = longGateBlock();
+          if (!gateBlock) {
+            openLong(key, candle.close, regime, sym);
+            logActions.push({ strategy: stratLabel, signal: 'BUY', price: candle.close, reason: '' });
+          } else {
+            blockedSignals.push({ strategy: stratLabel, signal, price: candle.close, reason: gateBlock });
+          }
         }
       } else if (signal === 'SELL') {
-        if (hasLong) {
-          if (noSameCandleRev && candleClosedDir[key] === 'LONG') continue;
+        if (hasShort) {
+          blockedSignals.push({ strategy: stratLabel, signal, price: candle.close, reason: 'Already in SHORT position' });
+        } else if (hasLong) {
+          if (noSameCandleRev && candleClosedDir[key] === 'LONG') {
+            blockedSignals.push({ strategy: stratLabel, signal, price: candle.close, reason: 'Rule: No same-candle reversal (LONG already closed)' }); continue;
+          }
           closeLong(key, candle.close, 'SIGNAL', sym);
           candleClosedDir[key] = 'LONG';
           logActions.push({ strategy: stratLabel, signal: 'SELL', price: candle.close, reason: 'SIGNAL' });
@@ -3258,9 +3524,11 @@ function LiveTest() {
             reversalCooldownRef.current[key] = 2;
             logActions.push({ strategy: stratLabel, signal: 'SHORT', price: candle.close, reason: '' });
           }
-        } else if (!hasShort && allowShort) {
+        } else if (allowShort) {
           openShort(key, candle.close, regime, sym);
           logActions.push({ strategy: stratLabel, signal: 'SHORT', price: candle.close, reason: '' });
+        } else {
+          blockedSignals.push({ strategy: stratLabel, signal, price: candle.close, reason: 'Shorting disabled — no open LONG to exit' });
         }
       }
     }
@@ -3294,12 +3562,14 @@ function LiveTest() {
           const signal = latestSignals[stratLabel];
           if (!signal || signal === 'HOLD') continue;
           const sc = scorersRef.current[token]
-            ? scorersRef.current[token].score(strat.strategyType, signal, regime)
+            ? scorersRef.current[token].score(strat.strategyType, signal, regime, instrType)
             : { total: 0, trendStrength: 0, volatility: 0, momentum: 0, confidence: 0 };
           // Rule: OPTION — distrust score driven by high volatility
           if (instrType === 'OPTION' && rulesConfig.enabled && activeRules.distrust_high_vol_score?.enabled) {
             if (sc.volatility > (parseFloat(activeRules.distrust_high_vol_score.volScoreMax) || 70)) continue;
           }
+          const liveMinScore = parseFloat(scoreConfig.minScoreThreshold) || 0;
+          if (sc.total < liveMinScore) continue;
           if (!bestScore || sc.total > bestScore.total) {
             bestStrat = strat; bestSignal = signal; bestScore = sc;
           }
@@ -3313,7 +3583,7 @@ function LiveTest() {
           const cHasLong   = cp?.type === 'LONG';
           const cHasShort  = cp?.type === 'SHORT';
           const allowShort = !!bestStrat.allowShorting;
-          const trigger    = `Score-based (score=${bestScore.total.toFixed(1)}, trend=${bestScore.trendStrength.toFixed(1)}, vol=${bestScore.volatility.toFixed(1)}, mom=${bestScore.momentum.toFixed(1)}, conf=${bestScore.confidence.toFixed(1)})`;
+          const trigger    = `Score-based (final=${bestScore.total.toFixed(1)}, base=${bestScore.baseScore?.toFixed(1)??'—'}, trend=${bestScore.trendStrength.toFixed(1)}, vol=${bestScore.volatility.toFixed(1)}, mom=${bestScore.momentum.toFixed(1)}, conf=${bestScore.confidence.toFixed(1)}, pen=${bestScore.totalPenalty?.toFixed(1)??0})`;
 
           // STOCK rule 3 — LONG quality gate for Combined
           const combinedPassesLongGate = () => {
@@ -3327,6 +3597,12 @@ function LiveTest() {
             return true;
           };
 
+          const tagEntry = () => {
+            if (openPositionMap.current[combinedKey]) {
+              openPositionMap.current[combinedKey].sourceStrategy = stratLabel;
+              openPositionMap.current[combinedKey].entryScore     = bestScore;
+            }
+          };
           if (bestSignal === 'BUY') {
             if (cHasShort) {
               if (noSameCandleRevC && candleClosedDir[combinedKey] === 'SHORT') { /* skip */ }
@@ -3335,13 +3611,13 @@ function LiveTest() {
                 candleClosedDir[combinedKey] = 'SHORT';
                 combinedDetails.push({ action: 'Exit Short', price: candle.close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
                 if (allowShort && combinedPassesLongGate()) {
-                  openLong(combinedKey, candle.close, regime, sym);
+                  openLong(combinedKey, candle.close, regime, sym); tagEntry();
                   reversalCooldownRef.current[combinedKey] = 2;
                   combinedDetails.push({ action: 'Enter Long', price: candle.close, reason: 'Reversal SHORT→LONG', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
                 }
               }
             } else if (!cHasLong && combinedPassesLongGate()) {
-              openLong(combinedKey, candle.close, regime, sym);
+              openLong(combinedKey, candle.close, regime, sym); tagEntry();
               combinedDetails.push({ action: 'Enter Long', price: candle.close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
             }
           } else if (bestSignal === 'SELL') {
@@ -3352,13 +3628,13 @@ function LiveTest() {
                 candleClosedDir[combinedKey] = 'LONG';
                 combinedDetails.push({ action: 'Exit Long', price: candle.close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
                 if (allowShort) {
-                  openShort(combinedKey, candle.close, regime, sym);
+                  openShort(combinedKey, candle.close, regime, sym); tagEntry();
                   reversalCooldownRef.current[combinedKey] = 2;
                   combinedDetails.push({ action: 'Enter Short', price: candle.close, reason: 'Reversal LONG→SHORT', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
                 }
               }
             } else if (!cHasShort && allowShort) {
-              openShort(combinedKey, candle.close, regime, sym);
+              openShort(combinedKey, candle.close, regime, sym); tagEntry();
               combinedDetails.push({ action: 'Enter Short', price: candle.close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
             }
           }
@@ -3366,7 +3642,7 @@ function LiveTest() {
       }
     }
 
-    const logEntry = { ts: candleTime, open: candle.open, high: candle.high, low: candle.low, close: candle.close, volume: candle.volume, regime, signals: { ...latestSignals }, actions: logActions, combinedDetails };
+    const logEntry = { ts: candleTime, open: candle.open, high: candle.high, low: candle.low, close: candle.close, volume: candle.volume, regime, signals: { ...latestSignals }, actions: logActions, blockedSignals, combinedDetails };
     candleLogsRef.current[token] = [...(candleLogsRef.current[token] || []), logEntry];
     setCandleLogByToken(prev => ({ ...prev, [token]: [...candleLogsRef.current[token]] }));
   }
@@ -3406,8 +3682,8 @@ function LiveTest() {
         dailyCapMap.current[key]     = { date: todayStr, startCapital: initCap, halted: false };
         evaluatorsRef.current[key]   = buildLocalEvaluator(s.strategyType, s.parameters || {});
       });
-      // Combined pool (score-based regime-switched strategy)
-      if (stratList.length > 1) {
+      // Score-based combined pool — gated on scoreConfig.enabled
+      if (scoreConfig.enabled && stratList.length >= 1) {
         const cKey = `${token}::${COMBINED_LABEL}`;
         capitalMap.current[cKey]      = initCap;
         openPositionMap.current[cKey] = null;
@@ -3625,7 +3901,7 @@ function LiveTest() {
                       <InstrumentPicker
                         session={session}
                         symbol={instr.symbol} exchange={instr.exchange} instrumentToken={instr.instrumentToken}
-                        onSelect={r => { updateInstrument(instr.id, { symbol: r.tradingSymbol, exchange: r.exchange, instrumentToken: String(r.instrumentToken) }); saveRecentInstrument(r); }}
+                        onSelect={r => { updateInstrument(instr.id, { symbol: r.tradingSymbol, exchange: r.exchange, instrumentToken: String(r.instrumentToken), instrumentType: deriveInstrumentType(r.instrumentType) }); saveRecentInstrument(r); }}
                         onChange={patch => updateInstrument(instr.id, patch)}
                         disabled={connected}
                       />
@@ -3786,6 +4062,32 @@ function LiveTest() {
           )}
         </div>
 
+        {/* Score-Based Combined Pool */}
+        <div className="card bt-risk-card" style={{ marginBottom: 12 }}>
+          <div className="bt-risk-toggle-row">
+            <span className="bt-risk-label">Score-Based Combined Pool
+              <span className={scoreConfig.enabled ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+                {scoreConfig.enabled ? 'enabled' : 'disabled'}
+              </span>
+            </span>
+            <button type="button" disabled={connected}
+              className={scoreConfig.enabled ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+              onClick={() => setScoreConfig(p => ({ ...p, enabled: !p.enabled }))}>
+              {scoreConfig.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          {scoreConfig.enabled && (
+            <div className="bt-risk-fields">
+              <div className="form-group">
+                <label>Min Score Threshold</label>
+                <input type="number" min="0" max="100" step="1" disabled={connected}
+                  value={scoreConfig.minScoreThreshold}
+                  onChange={e => setScoreConfig(p => ({ ...p, minScoreThreshold: e.target.value }))} />
+              </div>
+            </div>
+          )}
+        </div>
+
         {/* Pattern Config */}
         <div className="card bt-risk-card">
           <div className="bt-risk-toggle-row">
@@ -3848,100 +4150,112 @@ function LiveTest() {
               {rulesConfig.enabled ? 'ON' : 'OFF'}
             </button>
           </div>
-          {rulesConfig.enabled && (
-            <>
-              {/* Stocks rules */}
-              <div className="bt-params-label" style={{ marginTop: 10, marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span style={{ fontSize: 11, background: 'rgba(34,197,94,0.15)', color: '#22c55e', borderRadius: 4, padding: '1px 7px', fontWeight: 700 }}>STOCK</span>
-                Rules
-              </div>
-              {[
-                ['ranging_no_trade',       'No trade in RANGING regime'],
-                ['compression_short_only', 'SHORT only in COMPRESSION regime'],
-                ['no_same_candle_reversal','No same-candle reversal'],
-              ].map(([key, lbl]) => (
-                <div key={key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '5px 0', borderBottom: '1px solid var(--border)' }}>
-                  <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1, paddingRight: 8 }}>{lbl}</span>
-                  <button type="button" disabled={connected}
-                    className={rulesConfig.stocks[key]?.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
-                    style={{ minWidth: 36 }}
-                    onClick={() => updateRule('stocks', key, 'enabled', !rulesConfig.stocks[key]?.enabled)}>
-                    {rulesConfig.stocks[key]?.enabled ? 'ON' : 'OFF'}
-                  </button>
-                </div>
-              ))}
-              {/* LONG quality gate with configurable params */}
-              <div style={{ padding: '6px 0', borderBottom: '1px solid var(--border)' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1, paddingRight: 8 }}>LONG requires min score + no recent reversal + within VWAP</span>
-                  <button type="button" disabled={connected}
-                    className={rulesConfig.stocks.long_quality_gate?.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
-                    style={{ minWidth: 36 }}
-                    onClick={() => updateRule('stocks', 'long_quality_gate', 'enabled', !rulesConfig.stocks.long_quality_gate?.enabled)}>
-                    {rulesConfig.stocks.long_quality_gate?.enabled ? 'ON' : 'OFF'}
-                  </button>
-                </div>
-                {rulesConfig.stocks.long_quality_gate?.enabled && (
-                  <div style={{ display: 'flex', gap: 10, marginTop: 6 }}>
-                    <div className="form-group" style={{ flex: 1 }}>
-                      <label>Min Score</label>
-                      <input type="number" min="0" max="100" step="5" disabled={connected}
-                        value={rulesConfig.stocks.long_quality_gate.scoreMin}
-                        onChange={e => updateRule('stocks', 'long_quality_gate', 'scoreMin', parseFloat(e.target.value))} />
+          {rulesConfig.enabled && (() => {
+            // Show only sections relevant to configured instrument types
+            const configuredTypes = instruments.map(i => resolveInstrType(i.instrumentType, i.symbol, i.exchange));
+            const hasStock  = configuredTypes.some(t => t !== 'OPTION');
+            const hasOption = configuredTypes.some(t => t === 'OPTION');
+            return (
+              <>
+                {/* Stock rules — shown only when at least one STOCK instrument configured */}
+                {hasStock && (
+                  <>
+                    <div className="bt-params-label" style={{ marginTop: 10, marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span style={{ fontSize: 11, background: 'rgba(34,197,94,0.15)', color: '#22c55e', borderRadius: 4, padding: '1px 7px', fontWeight: 700 }}>STOCK</span>
+                      Rules
                     </div>
-                    <div className="form-group" style={{ flex: 1 }}>
-                      <label>Max VWAP Ext %</label>
-                      <input type="number" min="0" step="0.1" disabled={connected}
-                        value={rulesConfig.stocks.long_quality_gate.vwapMaxPct}
-                        onChange={e => updateRule('stocks', 'long_quality_gate', 'vwapMaxPct', parseFloat(e.target.value))} />
+                    {[
+                      ['ranging_no_trade',       'No trade in RANGING regime'],
+                      ['compression_short_only', 'SHORT only in COMPRESSION regime'],
+                      ['no_same_candle_reversal','No same-candle reversal'],
+                    ].map(([key, lbl]) => (
+                      <div key={key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '5px 0', borderBottom: '1px solid var(--border)' }}>
+                        <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1, paddingRight: 8 }}>{lbl}</span>
+                        <button type="button" disabled={connected}
+                          className={rulesConfig.stocks[key]?.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
+                          style={{ minWidth: 36 }}
+                          onClick={() => updateRule('stocks', key, 'enabled', !rulesConfig.stocks[key]?.enabled)}>
+                          {rulesConfig.stocks[key]?.enabled ? 'ON' : 'OFF'}
+                        </button>
+                      </div>
+                    ))}
+                    <div style={{ padding: '6px 0', borderBottom: hasOption ? '1px solid var(--border)' : undefined }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1, paddingRight: 8 }}>LONG requires min score + no recent reversal + within VWAP</span>
+                        <button type="button" disabled={connected}
+                          className={rulesConfig.stocks.long_quality_gate?.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
+                          style={{ minWidth: 36 }}
+                          onClick={() => updateRule('stocks', 'long_quality_gate', 'enabled', !rulesConfig.stocks.long_quality_gate?.enabled)}>
+                          {rulesConfig.stocks.long_quality_gate?.enabled ? 'ON' : 'OFF'}
+                        </button>
+                      </div>
+                      {rulesConfig.stocks.long_quality_gate?.enabled && (
+                        <div style={{ display: 'flex', gap: 10, marginTop: 6 }}>
+                          <div className="form-group" style={{ flex: 1 }}>
+                            <label>Min Score</label>
+                            <input type="number" min="0" max="100" step="5" disabled={connected}
+                              value={rulesConfig.stocks.long_quality_gate.scoreMin}
+                              onChange={e => updateRule('stocks', 'long_quality_gate', 'scoreMin', parseFloat(e.target.value))} />
+                          </div>
+                          <div className="form-group" style={{ flex: 1 }}>
+                            <label>Max VWAP Ext %</label>
+                            <input type="number" min="0" step="0.1" disabled={connected}
+                              value={rulesConfig.stocks.long_quality_gate.vwapMaxPct}
+                              onChange={e => updateRule('stocks', 'long_quality_gate', 'vwapMaxPct', parseFloat(e.target.value))} />
+                          </div>
+                        </div>
+                      )}
                     </div>
-                  </div>
+                  </>
                 )}
-              </div>
 
-              {/* Options rules */}
-              <div className="bt-params-label" style={{ marginTop: 10, marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span style={{ fontSize: 11, background: 'rgba(245,158,11,0.15)', color: '#f59e0b', borderRadius: 4, padding: '1px 7px', fontWeight: 700 }}>OPTION</span>
-                Rules
-              </div>
-              {[
-                ['volatile_no_trade',       'No trade in VOLATILE regime'],
-                ['disable_sma_breakout',    'Disable SMA_CROSSOVER and BREAKOUT'],
-                ['use_only_specific',       'Use only VWAP_PULLBACK / LIQUIDITY_SWEEP / BOLLINGER_REVERSION'],
-                ['no_same_candle_reversal', 'No same-candle reversal'],
-              ].map(([key, lbl]) => (
-                <div key={key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '5px 0', borderBottom: '1px solid var(--border)' }}>
-                  <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1, paddingRight: 8 }}>{lbl}</span>
-                  <button type="button" disabled={connected}
-                    className={rulesConfig.options[key]?.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
-                    style={{ minWidth: 36 }}
-                    onClick={() => updateRule('options', key, 'enabled', !rulesConfig.options[key]?.enabled)}>
-                    {rulesConfig.options[key]?.enabled ? 'ON' : 'OFF'}
-                  </button>
-                </div>
-              ))}
-              {/* Distrust high vol score with configurable threshold */}
-              <div style={{ padding: '6px 0' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1, paddingRight: 8 }}>Distrust scores driven by high volatility</span>
-                  <button type="button" disabled={connected}
-                    className={rulesConfig.options.distrust_high_vol_score?.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
-                    style={{ minWidth: 36 }}
-                    onClick={() => updateRule('options', 'distrust_high_vol_score', 'enabled', !rulesConfig.options.distrust_high_vol_score?.enabled)}>
-                    {rulesConfig.options.distrust_high_vol_score?.enabled ? 'ON' : 'OFF'}
-                  </button>
-                </div>
-                {rulesConfig.options.distrust_high_vol_score?.enabled && (
-                  <div className="form-group" style={{ marginTop: 6 }}>
-                    <label>Max Volatility Score</label>
-                    <input type="number" min="0" max="100" step="5" disabled={connected}
-                      value={rulesConfig.options.distrust_high_vol_score.volScoreMax}
-                      onChange={e => updateRule('options', 'distrust_high_vol_score', 'volScoreMax', parseFloat(e.target.value))} />
-                  </div>
+                {/* Option rules — shown only when at least one OPTION instrument configured */}
+                {hasOption && (
+                  <>
+                    <div className="bt-params-label" style={{ marginTop: 10, marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span style={{ fontSize: 11, background: 'rgba(245,158,11,0.15)', color: '#f59e0b', borderRadius: 4, padding: '1px 7px', fontWeight: 700 }}>OPTION</span>
+                      Rules
+                    </div>
+                    {[
+                      ['volatile_no_trade',       'No trade in VOLATILE regime'],
+                      ['disable_sma_breakout',    'Disable SMA_CROSSOVER and BREAKOUT'],
+                      ['use_only_specific',       'Use only VWAP_PULLBACK / LIQUIDITY_SWEEP / BOLLINGER_REVERSION'],
+                      ['no_same_candle_reversal', 'No same-candle reversal'],
+                    ].map(([key, lbl]) => (
+                      <div key={key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '5px 0', borderBottom: '1px solid var(--border)' }}>
+                        <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1, paddingRight: 8 }}>{lbl}</span>
+                        <button type="button" disabled={connected}
+                          className={rulesConfig.options[key]?.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
+                          style={{ minWidth: 36 }}
+                          onClick={() => updateRule('options', key, 'enabled', !rulesConfig.options[key]?.enabled)}>
+                          {rulesConfig.options[key]?.enabled ? 'ON' : 'OFF'}
+                        </button>
+                      </div>
+                    ))}
+                    <div style={{ padding: '6px 0' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1, paddingRight: 8 }}>Distrust scores driven by high volatility</span>
+                        <button type="button" disabled={connected}
+                          className={rulesConfig.options.distrust_high_vol_score?.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
+                          style={{ minWidth: 36 }}
+                          onClick={() => updateRule('options', 'distrust_high_vol_score', 'enabled', !rulesConfig.options.distrust_high_vol_score?.enabled)}>
+                          {rulesConfig.options.distrust_high_vol_score?.enabled ? 'ON' : 'OFF'}
+                        </button>
+                      </div>
+                      {rulesConfig.options.distrust_high_vol_score?.enabled && (
+                        <div className="form-group" style={{ marginTop: 6 }}>
+                          <label>Max Volatility Score</label>
+                          <input type="number" min="0" max="100" step="5" disabled={connected}
+                            value={rulesConfig.options.distrust_high_vol_score.volScoreMax}
+                            onChange={e => updateRule('options', 'distrust_high_vol_score', 'volScoreMax', parseFloat(e.target.value))} />
+                        </div>
+                      )}
+                    </div>
+                  </>
                 )}
-              </div>
-            </>
-          )}
+              </>
+            );
+          })()}
         </div>
 
         </div>{/* end bt-live-center-col */}
@@ -4189,7 +4503,11 @@ function LiveTest() {
                         <div style={{ overflowX: 'auto' }}>
                           <table>
                             <thead>
-                              <tr><th>#</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>Return %</th><th>Exit Reason</th><th>Capital After</th></tr>
+                              <tr>
+                                <th>#</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>Return %</th><th>Exit Reason</th>
+                                {isCombined && <><th>Strategy</th><th>Score</th></>}
+                                <th>Capital After</th>
+                              </tr>
                             </thead>
                             <tbody>
                               {trades.map((t, i) => (
@@ -4206,6 +4524,15 @@ function LiveTest() {
                                   <td className={t.pnl >= 0 ? 'text-success' : 'text-danger'} style={{ fontWeight: 600 }}>{fmtRs(t.pnl)}</td>
                                   <td className={t.pnlPct >= 0 ? 'text-success' : 'text-danger'}>{t.pnlPct.toFixed(2)}%</td>
                                   <td><span className={`bt-exit-badge bt-exit-${(t.exitReason||'SIGNAL').toLowerCase().replace(/_/g,'-')}`}>{t.exitReason||'SIGNAL'}</span></td>
+                                  {isCombined && (
+                                    <>
+                                      <td style={{ fontSize: 10 }}>{t.sourceStrategy || '—'}</td>
+                                      <td style={{ fontFamily: 'monospace', fontSize: 10,
+                                        color: t.entryScore?.total >= 60 ? '#22c55e' : t.entryScore?.total >= 40 ? '#f59e0b' : '#ef4444' }}>
+                                        {t.entryScore ? t.entryScore.total.toFixed(1) : '—'}
+                                      </td>
+                                    </>
+                                  )}
                                   <td style={{ fontSize: 11 }}>{fmtRs(t.capitalAfter)}</td>
                                 </tr>
                               ))}
@@ -4442,7 +4769,7 @@ function LiveTest() {
 
             // ── Trading Rules ─────────────────────────────────────────
             if (rulesConfig.enabled) {
-              const instrType = (selInstrConfig.instrumentType || 'STOCK');
+              const instrType = resolveInstrType(selInstrConfig.instrumentType, selInstrConfig.symbol, selInstrConfig.exchange);
               lines.push(row(`=== Trading Rules (${instrType}) ===`));
               lines.push(row('Rule','Enabled','Parameters'));
               if (instrType === 'STOCK') {
@@ -4464,11 +4791,20 @@ function LiveTest() {
               lines.push(blank);
             }
 
+            // ── Score-Based Combined Pool ──────────────────────────────
+            if (scoreConfig.enabled) {
+              lines.push(row('=== Score-Based Combined Pool ==='));
+              lines.push(row('Min Score Threshold'));
+              lines.push(row(scoreConfig.minScoreThreshold));
+              lines.push(blank);
+            }
+
             // ── P&L Summary ───────────────────────────────────────────
             lines.push(row('=== P&L Summary ==='));
             lines.push(row('Strategy','Initial Capital','Final Capital','P&L','Return %','Total Trades','Wins','Losses','Win Rate %'));
             const liveInitCap = parseFloat(initialCapital) || 100000;
-            stratLabels.forEach(lbl => {
+            const allLivePnlLabels = [...stratLabels, ...(instrStratStates[COMBINED_LABEL] ? [COMBINED_LABEL] : [])];
+            allLivePnlLabels.forEach(lbl => {
               const st     = instrStratStates[lbl];
               const cap    = st?.capital ?? liveInitCap;
               const pnl    = cap - liveInitCap;
@@ -4484,8 +4820,10 @@ function LiveTest() {
             lines.push(row('=== Trade History ==='));
             lines.push(row('Strategy','Direction','Entry Time','Exit Time','Qty',
               'Entry Price','Exit Price','P&L','P&L %','Exit Reason',
-              ...(regimeConfig.enabled ? ['Regime'] : [])));
-            stratLabels.forEach(lbl => {
+              ...(regimeConfig.enabled ? ['Regime'] : []),
+              ...(scoreConfig.enabled  ? ['Selected Strategy','Entry Score'] : [])));
+            allLivePnlLabels.forEach(lbl => {
+              const isComb = lbl === COMBINED_LABEL;
               (instrStratStates[lbl]?.closedTrades || []).slice().reverse().forEach(t => {
                 lines.push(row(
                   lbl, t.type || 'LONG', t.entryTime, t.exitTime, t.qty,
@@ -4493,6 +4831,7 @@ function LiveTest() {
                   Number(t.pnl).toFixed(2), Number(t.pnlPct ?? 0).toFixed(2),
                   t.exitReason === 'STOP_LOSS' ? 'Stop Loss hit' : t.exitReason === 'TAKE_PROFIT' ? 'Take Profit hit' : t.exitReason || 'Signal',
                   ...(regimeConfig.enabled ? [t.regime ?? ''] : []),
+                  ...(scoreConfig.enabled  ? [isComb ? (t.sourceStrategy || '') : '', isComb && t.entryScore ? t.entryScore.total.toFixed(1) : ''] : []),
                 ));
               });
             });
@@ -4503,8 +4842,17 @@ function LiveTest() {
             const sigCols = stratLabels.map(l => `Signal_${l}`);
             lines.push(row('Time','Open','High','Low','Close','Volume',
               ...(regimeConfig.enabled ? ['Regime'] : []),
-              ...sigCols, 'Strategy Actions'));
+              ...sigCols, 'Strategy Actions', 'Blocked Signals', 'Combined Actions'));
             candleLogRef.current.forEach(r => {
+              const combinedActionsStr = (r.combinedDetails || []).map(cd =>
+                `${cd.action} @${Number(cd.price).toFixed(2)}` +
+                (cd.sourceStrategy ? ` via ${cd.sourceStrategy}` : '') +
+                (cd.regime         ? ` [${cd.regime}]`           : '') +
+                ` · ${cd.reason}`
+              ).join(' | ');
+              const blockedStr = (r.blockedSignals || []).map(b =>
+                `${b.strategy} ${b.signal} @${Number(b.price).toFixed(2)} — ${b.reason}`
+              ).join(' | ');
               lines.push(row(
                 r.ts,
                 Number(r.open).toFixed(2), Number(r.high).toFixed(2),
@@ -4513,6 +4861,8 @@ function LiveTest() {
                 ...(regimeConfig.enabled ? [r.regime ?? ''] : []),
                 ...stratLabels.map(l => r.signals?.[l] ?? ''),
                 r.actions.map(fmtAction).join(' | '),
+                blockedStr,
+                combinedActionsStr,
               ));
             });
 
@@ -4548,7 +4898,7 @@ function LiveTest() {
                 `Wick ≥ ${patternConfig.minWickRatio} · Body ≤ ${patternConfig.maxBodyPct}%`,
             ] }] : []),
             ...(rulesConfig.enabled ? (() => {
-              const iType = selInstrConfig.instrumentType || 'STOCK';
+              const iType = resolveInstrType(selInstrConfig.instrumentType, selInstrConfig.symbol, selInstrConfig.exchange);
               const items = iType === 'STOCK' ? [
                 rulesConfig.stocks.ranging_no_trade?.enabled        ? 'No trade in RANGING' : null,
                 rulesConfig.stocks.compression_short_only?.enabled  ? 'SHORT only in COMPRESSION' : null,
@@ -4604,7 +4954,7 @@ function LiveTest() {
                       </thead>
                       <tbody>
                         {[...candleLog].reverse().map((row, i) => (
-                          <tr key={i} style={{ borderBottom: '1px solid var(--border)', background: row.actions.length > 0 ? 'rgba(99,102,241,0.06)' : undefined }}>
+                          <tr key={i} style={{ borderBottom: '1px solid var(--border)', background: row.actions.length > 0 || row.combinedDetails?.length > 0 ? 'rgba(99,102,241,0.06)' : row.blockedSignals?.length > 0 ? 'rgba(245,158,11,0.04)' : undefined }}>
                             <td style={{ padding: '4px 6px', whiteSpace: 'nowrap', color: 'var(--text-muted)' }}>{row.ts}</td>
                             <td style={{ padding: '4px 6px' }}>{Number(row.open).toFixed(2)}</td>
                             <td style={{ padding: '4px 6px', color: '#22c55e' }}>{Number(row.high).toFixed(2)}</td>
@@ -4629,21 +4979,27 @@ function LiveTest() {
                                 </td>
                               );
                             })}
-                            <td style={{ padding: '4px 6px', minWidth: 220 }}>
-                              {row.actions.length === 0
-                                ? <span style={{ color: 'var(--text-muted)' }}>—</span>
-                                : row.actions.map((a, ai) => {
-                                    const lbl     = fmtAction(a);
-                                    const isEnter = !a.reason;
-                                    const color   = a.signal === 'SHORT' ? '#8b5cf6' : isEnter ? '#22c55e' : '#ef4444';
-                                    return (
-                                      <div key={ai} style={{ fontSize: 11, lineHeight: 1.6 }}>
-                                        <span style={{ fontWeight: 700, color }}>{lbl.split(' —')[0]}</span>
-                                        <span style={{ color: 'var(--text-muted)' }}>{' —' + lbl.split(' —').slice(1).join(' —')}</span>
-                                      </div>
-                                    );
-                                  })
-                              }
+                            <td style={{ padding: '4px 6px', minWidth: 260 }}>
+                              {row.actions.map((a, ai) => {
+                                const lbl     = fmtAction(a);
+                                const isEnter = !a.reason;
+                                const color   = a.signal === 'SHORT' ? '#8b5cf6' : isEnter ? '#22c55e' : '#ef4444';
+                                return (
+                                  <div key={ai} style={{ fontSize: 11, lineHeight: 1.6 }}>
+                                    <span style={{ fontWeight: 700, color }}>{lbl.split(' —')[0]}</span>
+                                    <span style={{ color: 'var(--text-muted)' }}>{' —' + lbl.split(' —').slice(1).join(' —')}</span>
+                                  </div>
+                                );
+                              })}
+                              {(row.blockedSignals || []).map((b, bi) => (
+                                <div key={`b${bi}`} style={{ fontSize: 11, lineHeight: 1.6, color: '#f59e0b' }}>
+                                  <span style={{ fontWeight: 700 }}>⊘ {b.strategy} {b.signal}</span>
+                                  <span style={{ color: '#a16207' }}> — {b.reason}</span>
+                                </div>
+                              ))}
+                              {row.actions.length === 0 && !row.blockedSignals?.length && (row.combinedDetails || []).length === 0 && (
+                                <span style={{ color: 'var(--text-muted)' }}>—</span>
+                              )}
                             </td>
                           </tr>
                         ))}
@@ -5094,13 +5450,15 @@ function BacktestResultPanel({ result, session, instrumentToken }) {
                 const m = r.metrics;
                 const isBest = r.label === result.bestStrategyLabel;
                 const isRegimeSwitched = r.strategyType === 'REGIME_SWITCHED';
+                const isScoreSwitched  = r.strategyType === 'SCORE_SWITCHED';
+                const isCombinedType   = isRegimeSwitched || isScoreSwitched;
                 return (
-                  <tr key={i} className={`bt-row ${i === selectedIdx ? 'bt-row-selected' : ''} ${isBest ? 'bt-row-best' : ''} ${isRegimeSwitched ? 'bt-row-regime-switched' : ''}`}
+                  <tr key={i} className={`bt-row ${i === selectedIdx ? 'bt-row-selected' : ''} ${isBest ? 'bt-row-best' : ''} ${isCombinedType ? 'bt-row-regime-switched' : ''}`}
                     onClick={() => switchStrategy(i)} style={{ cursor: 'pointer' }}>
-                    <td>{isBest && <span className="best-star">★</span>}{isRegimeSwitched && <span className="bt-regime-combined-star">⚡</span>}</td>
+                    <td>{isBest && <span className="best-star">★</span>}{isCombinedType && <span className="bt-regime-combined-star">{isScoreSwitched ? '🎯' : '⚡'}</span>}</td>
                     <td style={{ fontWeight: 600 }}>{r.label}</td>
-                    <td>{isRegimeSwitched
-                      ? <span className="bt-regime-combined-badge">Combined</span>
+                    <td>{isCombinedType
+                      ? <span className="bt-regime-combined-badge">{isScoreSwitched ? 'Score Combined' : 'Combined'}</span>
                       : <span className="instance-type">{r.strategyType}</span>
                     }</td>
                     <td>{m.totalTrades}</td>
@@ -5121,6 +5479,12 @@ function BacktestResultPanel({ result, session, instrumentToken }) {
           <div className="bt-regime-combined-hint">
             <span className="bt-regime-combined-badge" style={{ marginRight: 6 }}>⚡ Combined</span>
             The highlighted row uses a single capital pool that switches strategies based on the detected market regime.
+          </div>
+        )}
+        {result.results.some(r => r.strategyType === 'SCORE_SWITCHED') && (
+          <div className="bt-regime-combined-hint">
+            <span className="bt-regime-combined-badge" style={{ marginRight: 6 }}>🎯 Score Combined</span>
+            The highlighted row uses a single capital pool — the scorer picks the highest-quality strategy per candle using quality penalties (reversal, overextension, same-color, instrument mismatch, volatile option).
           </div>
         )}
       </div>
@@ -5231,7 +5595,9 @@ function BacktestResultPanel({ result, session, instrumentToken }) {
                 <tr>
                   <th>#</th><th>Entry Time</th><th>Exit Time</th>
                   <th>Entry Price</th><th>Exit Price</th><th>Qty</th>
-                  <th>PnL</th><th>Return %</th><th>Exit</th><th>Regime</th><th>Patterns</th><th>Capital After</th>
+                  <th>PnL</th><th>Return %</th><th>Exit</th><th>Regime</th>
+                  {selected.strategyType === 'SCORE_SWITCHED' && <><th>Strategy</th><th>Score</th></>}
+                  <th>Patterns</th><th>Capital After</th>
                 </tr>
               </thead>
               <tbody>
@@ -5254,6 +5620,24 @@ function BacktestResultPanel({ result, session, instrumentToken }) {
                         ? <span className={`bt-regime-badge bt-regime-${t.regime}`}>{t.regime}</span>
                         : <span className="bt-pattern-none">—</span>}
                     </td>
+                    {selected.strategyType === 'SCORE_SWITCHED' && (
+                      <>
+                        <td>
+                          {t.selectedStrategy
+                            ? <span className="instance-type" style={{ fontSize: 10 }}>{t.selectedStrategy}</span>
+                            : <span className="bt-pattern-none">—</span>}
+                        </td>
+                        <td>
+                          {t.scoreBreakdown
+                            ? <span title={`base=${fmt(t.scoreBreakdown.baseScore)} trend=${fmt(t.scoreBreakdown.trendStrength)} vol=${fmt(t.scoreBreakdown.volatilityScore)} mom=${fmt(t.scoreBreakdown.momentumScore)} pen=${fmt(t.scoreBreakdown.totalPenalty)}`}
+                                style={{ cursor: 'help', fontFamily: 'monospace', fontSize: 11,
+                                  color: t.scoreBreakdown.total >= 60 ? '#22c55e' : t.scoreBreakdown.total >= 40 ? '#f59e0b' : '#ef4444' }}>
+                                {fmt(t.scoreBreakdown.total)}
+                              </span>
+                            : <span className="bt-pattern-none">—</span>}
+                        </td>
+                      </>
+                    )}
                     <td className="bt-patterns-cell">
                       {t.entryPatterns && t.entryPatterns.length > 0
                         ? t.entryPatterns.map(p => (

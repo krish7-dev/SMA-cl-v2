@@ -7,6 +7,7 @@ import com.sma.strategyengine.model.request.BacktestRequest;
 import com.sma.strategyengine.model.request.BacktestRequest.PatternConfig;
 import com.sma.strategyengine.model.request.BacktestRequest.RegimeConfig;
 import com.sma.strategyengine.model.request.BacktestRequest.RiskConfig;
+import com.sma.strategyengine.model.request.BacktestRequest.ScoreConfig;
 import com.sma.strategyengine.model.request.BacktestRequest.StrategyConfig;
 import com.sma.strategyengine.model.response.BacktestResult;
 import com.sma.strategyengine.model.response.BacktestResult.Metrics;
@@ -125,6 +126,13 @@ public class BacktestService {
             if (!cfgsWithRegimes.isEmpty()) {
                 results.add(runRegimeSwitched(req, cfgsWithRegimes, candles, qty, finalRegimes));
             }
+        }
+
+        // When score config is enabled, prepend a score-based combined result
+        // (all strategies compete per candle; highest scorer above threshold enters).
+        ScoreConfig scoreCfg = req.getScoreConfig();
+        if (scoreCfg != null && scoreCfg.isEnabled() && req.getStrategies().size() >= 1) {
+            results.add(0, runScoreSwitched(req, req.getStrategies(), candles, qty, finalRegimes));
         }
 
         for (StrategyConfig cfg : req.getStrategies()) {
@@ -740,6 +748,326 @@ public class BacktestService {
                 .parameters(Map.of())
                 .metrics(metrics)
                 .trades(trades)
+                .build();
+    }
+
+    // ─── Score-Switched combined simulation ───────────────────────────────────
+    //
+    // All strategy logics are evaluated every candle (to maintain warmup state).
+    // The strategy with the highest quality score above the threshold is chosen.
+    // One shared capital pool → one combined P&L. Score breakdown stored per trade.
+
+    private StrategyRunResult runScoreSwitched(BacktestRequest req, List<StrategyConfig> cfgs,
+                                               List<CandleDto> candles, int resolvedQty,
+                                               MarketRegimeDetector.Regime[] regimes) {
+        ScoreConfig sc        = req.getScoreConfig();
+        double      minScore  = sc != null ? sc.getMinScoreThreshold() : 30.0;
+        String      instrType = req.getInstrumentType() != null ? req.getInstrumentType() : "STOCK";
+        boolean     allowShorting = req.isAllowShorting();
+
+        // One StrategyLogic + scorer per config
+        Map<StrategyConfig, StrategyLogic>        cfgLogic    = new java.util.IdentityHashMap<>();
+        Map<StrategyConfig, String>               cfgInstance = new java.util.IdentityHashMap<>();
+        Map<StrategyConfig, Map<String, String>>  cfgParams   = new java.util.IdentityHashMap<>();
+        Map<StrategyConfig, StrategyScorer>       cfgScorer   = new java.util.IdentityHashMap<>();
+        for (StrategyConfig cfg : cfgs) {
+            cfgLogic.put(cfg, strategyRegistry.resolve(cfg.getStrategyType()));
+            cfgInstance.put(cfg, "BT-SC-" + UUID.randomUUID().toString().replace("-", "").substring(0, 10).toUpperCase());
+            cfgParams.put(cfg, cfg.getParameters() != null ? cfg.getParameters() : Map.of());
+            cfgScorer.put(cfg, new StrategyScorer());
+        }
+
+        // Pattern config
+        PatternConfig pc        = req.getPatternConfig();
+        boolean       patternOn = pc != null && pc.isEnabled();
+        double        pMinWick  = patternOn ? pc.getMinWickRatio() : 2.0;
+        double        pMaxBody  = patternOn ? pc.getMaxBodyPct()   : 0.35;
+        Set<String>   buyConfirm  = patternOn && pc.getBuyConfirmPatterns()  != null
+                ? new HashSet<>(pc.getBuyConfirmPatterns())  : Set.of();
+        Set<String>   sellConfirm = patternOn && pc.getSellConfirmPatterns() != null
+                ? new HashSet<>(pc.getSellConfirmPatterns()) : Set.of();
+        double[] patPrev2 = null, patPrev1 = null;
+
+        // Risk config
+        RiskConfig rc     = req.getRiskConfig();
+        boolean    riskOn = rc != null && rc.isEnabled();
+        BigDecimal slFrac   = fracOrNull(rc == null ? null : rc.getStopLossPct());
+        BigDecimal tpFrac   = fracOrNull(rc == null ? null : rc.getTakeProfitPct());
+        BigDecimal riskFrac = (riskOn && slFrac != null) ? fracOrNull(rc.getMaxRiskPerTradePct()) : null;
+        BigDecimal capFrac  = fracOrNull(rc == null ? null : rc.getDailyLossCapPct());
+
+        // Capital / position state
+        List<TradeEntry>  trades         = new ArrayList<>();
+        BigDecimal        runningCapital = req.getInitialCapital();
+        BigDecimal        peak           = runningCapital;
+        double            maxDrawdown    = 0.0;
+        PositionDirection direction      = PositionDirection.FLAT;
+        BigDecimal        entryPrice     = null;
+        CandleDto         entryCandle    = null;
+        List<String>      entryPatterns  = List.of();
+        String            entryRegime    = null;
+        String            entryStrategy  = null;   // which strategy opened this trade
+        StrategyScorer.ScoreResult entryScore = null;
+        BigDecimal        slPrice        = null;
+        BigDecimal        tpPrice        = null;
+        int               tradeQty       = resolvedQty;
+        int               cooldownRemaining = 0;
+        LocalDate         currentDay        = null;
+        BigDecimal        dailyLossStart    = runningCapital;
+        int               slExits = 0, tpExits = 0, dailyCapHalts = 0;
+
+        try {
+            for (int ci = 0; ci < candles.size(); ci++) {
+                CandleDto candle     = candles.get(ci);
+                String    regimeName = regimes != null ? regimes[ci].name() : null;
+
+                // Day boundary reset
+                if (riskOn && candle.openTime() != null) {
+                    LocalDate day = candle.openTime().toLocalDate();
+                    if (!day.equals(currentDay)) { currentDay = day; dailyLossStart = runningCapital; }
+                }
+
+                // Feed candle into all scorers (maintains rolling window regardless of signal)
+                if (candle.open() != null && candle.high() != null && candle.low() != null && candle.close() != null) {
+                    double cO = candle.open().doubleValue(), cH = candle.high().doubleValue();
+                    double cL = candle.low().doubleValue(),  cC = candle.close().doubleValue();
+                    for (StrategyScorer scorer : cfgScorer.values()) scorer.push(cO, cH, cL, cC);
+                }
+
+                // Evaluate ALL strategy logics
+                Map<StrategyConfig, StrategyResult> allResults = new java.util.IdentityHashMap<>();
+                for (StrategyConfig cfg : cfgs) {
+                    StrategyContext ctx = StrategyContext.builder()
+                            .instanceId(cfgInstance.get(cfg))
+                            .strategyType(cfg.getStrategyType())
+                            .userId(req.getUserId()).brokerName(req.getBrokerName())
+                            .symbol(req.getSymbol().toUpperCase()).exchange(req.getExchange().toUpperCase())
+                            .product(req.getProduct()).quantity(tradeQty).orderType("MARKET")
+                            .currentDirection(direction).allowShorting(allowShorting)
+                            .candleOpenTime(candle.openTime() != null ? candle.openTime().toInstant(ZoneOffset.UTC) : null)
+                            .candleOpen(candle.open()).candleHigh(candle.high())
+                            .candleLow(candle.low()).candleClose(candle.close())
+                            .candleVolume(candle.volume() != null ? candle.volume() : 0L)
+                            .params(cfgParams.get(cfg))
+                            .build();
+                    allResults.put(cfg, cfgLogic.get(cfg).evaluate(ctx));
+                }
+
+                // Candle patterns
+                List<String> detectedPatterns = List.of();
+                if (candle.open() != null && candle.high() != null && candle.low() != null && candle.close() != null) {
+                    double cO = candle.open().doubleValue(), cH = candle.high().doubleValue();
+                    double cL = candle.low().doubleValue(),  cC = candle.close().doubleValue();
+                    detectedPatterns = CandlePatternDetector.detect(patPrev2, patPrev1, cO, cH, cL, cC, pMinWick, pMaxBody);
+                    patPrev2 = patPrev1;
+                    patPrev1 = new double[]{ cO, cH, cL, cC };
+                }
+                final List<String> fp = detectedPatterns;
+                boolean patOkBuy  = buyConfirm.isEmpty()  || fp.stream().anyMatch(buyConfirm::contains);
+                boolean patOkSell = sellConfirm.isEmpty() || fp.stream().anyMatch(sellConfirm::contains);
+
+                // ── In-position: exit checks (driven by the strategy that opened the trade) ─
+                if (direction != PositionDirection.FLAT) {
+                    BigDecimal exitPrice = null;
+                    String     exitReason = null;
+
+                    if (riskOn) {
+                        if (direction == PositionDirection.LONG) {
+                            if (slPrice != null && candle.low()  != null && candle.low() .compareTo(slPrice) <= 0) { exitPrice = slPrice; exitReason = "STOP_LOSS";   slExits++; }
+                            else if (tpPrice != null && candle.high() != null && candle.high().compareTo(tpPrice) >= 0) { exitPrice = tpPrice; exitReason = "TAKE_PROFIT"; tpExits++; }
+                        } else {
+                            if (slPrice != null && candle.high() != null && candle.high().compareTo(slPrice) >= 0) { exitPrice = slPrice; exitReason = "STOP_LOSS";   slExits++; }
+                            else if (tpPrice != null && candle.low()  != null && candle.low() .compareTo(tpPrice) <= 0) { exitPrice = tpPrice; exitReason = "TAKE_PROFIT"; tpExits++; }
+                        }
+                    }
+
+                    // Signal exit: use the strategy that opened this trade
+                    if (exitPrice == null && entryStrategy != null) {
+                        final String capturedEntryStrategy = entryStrategy;
+                        StrategyConfig activeCfg = cfgs.stream()
+                                .filter(c -> c.getStrategyType().equals(capturedEntryStrategy)).findFirst().orElse(null);
+                        StrategyResult activeResult = activeCfg != null ? allResults.get(activeCfg) : null;
+                        if (activeResult != null) {
+                            if (direction == PositionDirection.LONG && activeResult.isSell() && patOkSell) {
+                                exitPrice = candle.close(); exitReason = "SIGNAL";
+                            } else if (direction == PositionDirection.SHORT && activeResult.isBuy() && patOkBuy) {
+                                exitPrice = candle.close(); exitReason = "SIGNAL";
+                            }
+                        }
+                    }
+
+                    if (exitPrice != null) {
+                        PositionDirection closedDirection = direction;
+                        TradeEntry trade = buildScoreTrade(entryCandle, candle, entryPrice, exitPrice,
+                                tradeQty, runningCapital, exitReason, closedDirection,
+                                entryPatterns, entryRegime, entryStrategy, entryScore);
+                        trades.add(trade);
+                        runningCapital = trade.getRunningCapital();
+                        peak = peak.max(runningCapital);
+                        if (peak.compareTo(BigDecimal.ZERO) > 0) {
+                            double dd = peak.subtract(runningCapital).divide(peak, 6, RoundingMode.HALF_UP).doubleValue() * 100.0;
+                            maxDrawdown = Math.max(maxDrawdown, dd);
+                        }
+                        if (riskOn && rc.getCooldownCandles() > 0 && trade.getPnl().compareTo(BigDecimal.ZERO) <= 0) {
+                            cooldownRemaining = rc.getCooldownCandles();
+                        }
+                        direction = PositionDirection.FLAT;
+                        entryPrice = null; entryCandle = null; entryPatterns = List.of();
+                        entryRegime = null; entryStrategy = null; entryScore = null;
+                        slPrice = null; tpPrice = null;
+
+                        // Reversal on same candle (SIGNAL exit only)
+                        if (allowShorting && "SIGNAL".equals(exitReason) && candle.close() != null
+                                && candle.close().compareTo(BigDecimal.ZERO) > 0) {
+                            // Re-score for reversal direction
+                            StrategyScorer.ScoreResult bestRev = null;
+                            StrategyConfig bestRevCfg = null;
+                            for (StrategyConfig cfg : cfgs) {
+                                StrategyResult r = allResults.get(cfg);
+                                boolean wantBuy  = (closedDirection == PositionDirection.SHORT);
+                                if ((wantBuy && r.isBuy() && patOkBuy) || (!wantBuy && r.isSell() && patOkSell)) {
+                                    StrategyScorer.ScoreResult s = cfgScorer.get(cfg).score(
+                                            cfg.getStrategyType(), wantBuy, regimeName, instrType);
+                                    if (s.getTotal() >= minScore && (bestRev == null || s.getTotal() > bestRev.getTotal())) {
+                                        bestRev = s; bestRevCfg = cfg;
+                                    }
+                                }
+                            }
+                            if (bestRevCfg != null) {
+                                boolean wantBuy = (closedDirection == PositionDirection.SHORT);
+                                direction     = wantBuy ? PositionDirection.LONG : PositionDirection.SHORT;
+                                entryPrice    = candle.close(); entryCandle = candle;
+                                entryPatterns = detectedPatterns; entryRegime = regimeName;
+                                entryStrategy = bestRevCfg.getStrategyType(); entryScore = bestRev;
+                                tradeQty      = riskOn ? sizeQty(resolvedQty, runningCapital, entryPrice, riskFrac, slFrac) : resolvedQty;
+                                slPrice = computeSl(entryPrice, direction, slFrac);
+                                tpPrice = computeTp(entryPrice, direction, tpFrac);
+                            }
+                        }
+                    }
+
+                // ── Flat: score all signals, pick best ───────────────────────────────
+                } else {
+                    if (riskOn) {
+                        if (cooldownRemaining > 0) { cooldownRemaining--; continue; }
+                        boolean dailyCapHit = false;
+                        if (capFrac != null && dailyLossStart.compareTo(BigDecimal.ZERO) > 0) {
+                            BigDecimal lost = dailyLossStart.subtract(runningCapital).divide(dailyLossStart, 8, RoundingMode.HALF_UP);
+                            if (lost.compareTo(capFrac) >= 0) { dailyCapHit = true; dailyCapHalts++; }
+                        }
+                        if (dailyCapHit || candle.close() == null || candle.close().compareTo(BigDecimal.ZERO) <= 0) continue;
+                    }
+
+                    // Find best-scoring signal across all strategies
+                    StrategyScorer.ScoreResult bestScore = null;
+                    StrategyConfig             bestCfg   = null;
+                    PositionDirection          bestDir   = null;
+
+                    for (StrategyConfig cfg : cfgs) {
+                        StrategyResult r = allResults.get(cfg);
+                        if (r.isBuy() && patOkBuy && candle.close() != null) {
+                            StrategyScorer.ScoreResult s = cfgScorer.get(cfg).score(
+                                    cfg.getStrategyType(), true, regimeName, instrType);
+                            if (s.getTotal() >= minScore && (bestScore == null || s.getTotal() > bestScore.getTotal())) {
+                                bestScore = s; bestCfg = cfg; bestDir = PositionDirection.LONG;
+                            }
+                        }
+                        if (allowShorting && r.isSell() && patOkSell && candle.close() != null) {
+                            StrategyScorer.ScoreResult s = cfgScorer.get(cfg).score(
+                                    cfg.getStrategyType(), false, regimeName, instrType);
+                            if (s.getTotal() >= minScore && (bestScore == null || s.getTotal() > bestScore.getTotal())) {
+                                bestScore = s; bestCfg = cfg; bestDir = PositionDirection.SHORT;
+                            }
+                        }
+                    }
+
+                    if (bestCfg != null && bestDir != null && candle.close() != null) {
+                        tradeQty      = riskOn ? sizeQty(resolvedQty, runningCapital, candle.close(), riskFrac, slFrac) : resolvedQty;
+                        direction     = bestDir;
+                        entryPrice    = candle.close(); entryCandle = candle;
+                        entryPatterns = detectedPatterns; entryRegime = regimeName;
+                        entryStrategy = bestCfg.getStrategyType(); entryScore = bestScore;
+                        slPrice = computeSl(entryPrice, direction, slFrac);
+                        tpPrice = computeTp(entryPrice, direction, tpFrac);
+                    }
+                }
+            }
+
+            // Force-close open position at last candle
+            if (direction != PositionDirection.FLAT && !candles.isEmpty()) {
+                CandleDto last = candles.get(candles.size() - 1);
+                TradeEntry trade = buildScoreTrade(entryCandle, last, entryPrice, last.close(),
+                        tradeQty, runningCapital, "END_OF_BACKTEST", direction,
+                        entryPatterns, entryRegime, entryStrategy, entryScore);
+                trades.add(trade);
+                runningCapital = trade.getRunningCapital();
+                peak = peak.max(runningCapital);
+                if (peak.compareTo(BigDecimal.ZERO) > 0) {
+                    double dd = peak.subtract(runningCapital).divide(peak, 6, RoundingMode.HALF_UP).doubleValue() * 100.0;
+                    maxDrawdown = Math.max(maxDrawdown, dd);
+                }
+            }
+        } finally {
+            cfgs.forEach(cfg -> {
+                StrategyLogic l = cfgLogic.get(cfg);
+                if (l != null) l.onInstanceRemoved(cfgInstance.get(cfg));
+            });
+        }
+
+        String label = "Score-Switched [" + cfgs.stream()
+                .map(c -> c.getStrategyType()).distinct()
+                .collect(java.util.stream.Collectors.joining("|")) + "]";
+
+        Metrics metrics = computeMetrics(trades, req.getInitialCapital(), runningCapital,
+                maxDrawdown, Map.of(), "SCORE_SWITCHED", slExits, tpExits, dailyCapHalts);
+
+        log.info("Backtest [{}]: {} trades, winRate={}%, totalPnl={}, instrType={}, minScore={}",
+                label, metrics.getTotalTrades(), metrics.getWinRate(), metrics.getTotalPnl(),
+                instrType, minScore);
+
+        return StrategyRunResult.builder()
+                .strategyType("SCORE_SWITCHED")
+                .label(label)
+                .parameters(Map.of("instrType", instrType, "minScore", String.valueOf(minScore)))
+                .metrics(metrics)
+                .trades(trades)
+                .build();
+    }
+
+    /** Variant of buildTrade that also stores selectedStrategy and scoreBreakdown. */
+    private TradeEntry buildScoreTrade(CandleDto entry, CandleDto exit,
+                                       BigDecimal entryPrice, BigDecimal exitPrice,
+                                       int qty, BigDecimal capitalBefore, String exitReason,
+                                       PositionDirection direction,
+                                       List<String> entryPatterns, String regime,
+                                       String selectedStrategy,
+                                       StrategyScorer.ScoreResult scoreBreakdown) {
+        BigDecimal pnl;
+        if (direction == PositionDirection.SHORT) {
+            pnl = entryPrice.subtract(exitPrice).multiply(BigDecimal.valueOf(qty)).setScale(2, RoundingMode.HALF_UP);
+        } else {
+            pnl = exitPrice.subtract(entryPrice).multiply(BigDecimal.valueOf(qty)).setScale(2, RoundingMode.HALF_UP);
+        }
+        BigDecimal notional = entryPrice.multiply(BigDecimal.valueOf(qty));
+        double pnlPct = notional.compareTo(BigDecimal.ZERO) == 0 ? 0.0
+                : pnl.divide(notional, 6, RoundingMode.HALF_UP).doubleValue() * 100.0;
+        BigDecimal running = capitalBefore.add(pnl).setScale(2, RoundingMode.HALF_UP);
+
+        return TradeEntry.builder()
+                .entryTime(entry != null ? entry.openTime() : null)
+                .exitTime(exit.openTime())
+                .entryPrice(entryPrice.setScale(2, RoundingMode.HALF_UP))
+                .exitPrice(exitPrice.setScale(2, RoundingMode.HALF_UP))
+                .quantity(qty)
+                .pnl(pnl)
+                .pnlPct(Math.round(pnlPct * 100.0) / 100.0)
+                .runningCapital(running)
+                .exitReason(exitReason)
+                .direction(direction.name())
+                .entryPatterns(entryPatterns != null ? entryPatterns : List.of())
+                .regime(regime)
+                .selectedStrategy(selectedStrategy)
+                .scoreBreakdown(scoreBreakdown)
                 .build();
     }
 
