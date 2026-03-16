@@ -2879,7 +2879,7 @@ function ReplayTest() {
 function LiveTest() {
   const { session, isActive } = useSession();
 
-  // ── Config (mirrors HistoricalBacktest) ──────────────────────────────────
+  // ── Config ────────────────────────────────────────────────────────────────
   const [knownTypes, setKnownTypes]         = useState(['SMA_CROSSOVER']);
   const [strategies, setStrategies]         = useState(defaultStrategies);
   const [riskConfig, setRiskConfig]         = useState({ ...EMPTY_RISK });
@@ -2887,63 +2887,89 @@ function LiveTest() {
   const [regimeConfig, setRegimeConfig]     = useState({ ...EMPTY_REGIME_CONFIG });
   const [initialCapital, setInitialCapital] = useState('100000');
   const [quantity, setQuantity]             = useState('0');
-  const [inst, setInst]                     = useState({ ...EMPTY_INST });
-  const [candleInterval, setCandleInterval] = useState('MINUTE_5');
   const [mode, setMode]                     = useState('QUOTE');
   const [preload, setPreload]             = useState({ enabled: true, daysBack: 5, interval: 'MINUTE_5' });
-  const [preloadState, setPreloadState]   = useState(null);
+  const [preloadStateByToken, setPreloadStateByToken] = useState({});
+
+  // ── Multi-instrument ──────────────────────────────────────────────────────
+  const EMPTY_INSTR = () => ({ id: Date.now(), ...EMPTY_INST, candleInterval: 'MINUTE_5' });
+  const [instruments, setInstruments]           = useState([EMPTY_INSTR()]);
+  const [selectedInstrToken, setSelectedInstrToken] = useState(null);
 
   // ── Connection ────────────────────────────────────────────────────────────
   const [connected, setConnected]   = useState(false);
   const [status, setStatus]         = useState('idle');
   const [error, setError]           = useState('');
 
-  // ── Live data ─────────────────────────────────────────────────────────────
-  const [latestTick, setLatestTick]     = useState(null);
-  const [ticks, setTicks]               = useState([]);
-  const [signals, setSignals]           = useState([]);
-  const [liveCandles, setLiveCandles]   = useState([]);
-  const [currentCandle, setCurrentCandle] = useState(null);
-  const [currentRegime, setCurrentRegime] = useState(null);
+  // ── Live data — per instrument (keyed by token string) ───────────────────
+  const [ticksByToken, setTicksByToken]             = useState({});
+  const [signals, setSignals]                       = useState([]);
+  const [liveCandlesByToken, setLiveCandlesByToken] = useState({});
+  const [currentCandleByToken, setCurrentCandleByToken] = useState({});
+  const [currentRegimeByToken, setCurrentRegimeByToken] = useState({});
+  const [candleLogByToken, setCandleLogByToken]     = useState({});
 
-  // ── Paper trading — PER-STRATEGY state ───────────────────────────────────
-  // stratStates: { [label]: { capital, openPosition, closedTrades, equityHistory } }
-  const [stratStates, setStratStates]   = useState({});
-  const [selectedLabel, setSelectedLabel] = useState(null);
+  // ── Paper trading — keyed by `${token}::${stratLabel}` ───────────────────
+  const [stratStates, setStratStates] = useState({});
 
   // ── UI ────────────────────────────────────────────────────────────────────
-  const [rightTab, setRightTab] = useState('feed'); // 'feed' | 'pnl' | 'portfolio'
+  const [rightTab, setRightTab] = useState('feed');
+  const [expandedInstrs, setExpandedInstrs] = useState({});  // id → bool
 
-  // ── Refs (mutable, no re-render) ──────────────────────────────────────────
-  const evaluatorsRef     = useRef({});
-  const patternEvalRef    = useRef(null);
-  const regimeDetectorRef = useRef(null);
-  const sseRef            = useRef(null);
-  const ticksRef          = useRef([]);
-  const signalsRef        = useRef([]);
-  // Per-strategy maps (label → value)
-  const capitalMap        = useRef({});   // label → number
-  const openPositionMap   = useRef({});   // label → position | null
-  const closedTradesMap   = useRef({});   // label → []
-  const equityMap         = useRef({});   // label → []
-  const currentCandleRef  = useRef(null);
-  const liveCandlesRef    = useRef([]);
-  const cooldownRef       = useRef({});   // label → candles remaining
-  const dailyCapMap       = useRef({});   // label → { date, startCapital, halted }
-  const latestTickRef     = useRef(null);
+  // ── Refs ─────────────────────────────────────────────────────────────────
+  // evaluatorsRef: `${token}::${stratLabel}` → evaluator
+  const evaluatorsRef      = useRef({});
+  // patternEvalsRef: token → LocalCandlePatternEvaluator
+  const patternEvalsRef    = useRef({});
+  // regimeDetectorsRef: token → LocalRegimeDetector
+  const regimeDetectorsRef = useRef({});
+  const sseRef             = useRef(null);
+  const signalsRef         = useRef([]);
+  // Trading maps: `${token}::${stratLabel}` → value
+  const capitalMap         = useRef({});
+  const openPositionMap    = useRef({});
+  const closedTradesMap    = useRef({});
+  const equityMap          = useRef({});
+  const cooldownRef        = useRef({});
+  const dailyCapMap        = useRef({});
+  // Per-instrument refs: token → value
+  const currentCandlesRef  = useRef({});
+  const liveCandles_Ref    = useRef({});
+  const candleLogsRef      = useRef({});
+  const ticksRef           = useRef({});   // token → []
+  // Keep latest refs in sync so SSE closure can read current values
+  const instrumentsRef     = useRef([]);
+  const riskConfigRef      = useRef(riskConfig);
+  const scorersRef         = useRef({}); // token → LocalStrategyScorer
 
   useEffect(() => {
     getStrategyTypes().then(r => { if (r?.data) setKnownTypes([...r.data].sort()); }).catch(() => {});
     return () => cleanup();
   }, []);
 
+  // Keep refs in sync so SSE closure always reads current values
+  useEffect(() => { instrumentsRef.current = instruments; }, [instruments]);
+  useEffect(() => { riskConfigRef.current  = riskConfig;  }, [riskConfig]);
+
   function cleanup() {
     if (sseRef.current) { sseRef.current.close(); sseRef.current = null; }
   }
 
+  // ── Instrument helpers ────────────────────────────────────────────────────
+  function addInstrument() {
+    setInstruments(p => [...p, { id: Date.now(), ...EMPTY_INST, candleInterval: 'MINUTE_5' }]);
+  }
+  function removeInstrument(id) {
+    setInstruments(p => p.filter(i => i.id !== id));
+  }
+  function updateInstrument(id, patch) {
+    setInstruments(p => p.map(i => i.id === id ? { ...i, ...patch } : i));
+  }
+
   // ── Strategy config helpers ───────────────────────────────────────────────
   function addStrategy() {
-    setStrategies(p => [...p, { strategyType: 'SMA_CROSSOVER', enabled: true, label: '', parameters: defaultParams('SMA_CROSSOVER') }]);
+    const masterShort = strategies.every(s => s.allowShorting);
+    setStrategies(p => [...p, { strategyType: 'SMA_CROSSOVER', enabled: true, label: '', allowShorting: masterShort, parameters: defaultParams('SMA_CROSSOVER') }]);
   }
   function removeStrategy(idx) { setStrategies(p => p.filter((_, i) => i !== idx)); }
   function updateStrategy(idx, field, value) {
@@ -2956,6 +2982,10 @@ function LiveTest() {
   function updateStrategyParam(idx, key, value) {
     setStrategies(p => p.map((s, i) => i !== idx ? s : { ...s, parameters: { ...s.parameters, [key]: value } }));
   }
+  function toggleMasterShorting() {
+    const next = !strategies.every(s => s.allowShorting);
+    setStrategies(p => p.map(s => ({ ...s, allowShorting: next })));
+  }
   function updateRisk(f, v)    { setRiskConfig(p => ({ ...p, [f]: v })); }
   function updatePattern(f, v) { setPatternConfig(p => ({ ...p, [f]: v })); }
   function togglePatternList(f, v) {
@@ -2963,213 +2993,361 @@ function LiveTest() {
   }
   function updateRegime(f, v)  { setRegimeConfig(p => ({ ...p, [f]: v })); }
 
-  // ── Per-strategy state flush (refs → React state) ────────────────────────
-  function flushStrat(label) {
+  // ── Per-strategy state flush — key = `${token}::${stratLabel}` ───────────
+  function flushStrat(key) {
     setStratStates(prev => ({
       ...prev,
-      [label]: {
-        capital:      capitalMap.current[label],
-        openPosition: openPositionMap.current[label] || null,
-        closedTrades: [...(closedTradesMap.current[label] || [])],
-        equityHistory:[...(equityMap.current[label]     || [])],
+      [key]: {
+        capital:      capitalMap.current[key],
+        openPosition: openPositionMap.current[key] || null,
+        closedTrades: [...(closedTradesMap.current[key] || [])],
+        equityHistory:[...(equityMap.current[key]       || [])],
       },
     }));
   }
 
-  // ── Paper trading helpers (all per-strategy) ──────────────────────────────
-  function computeQty(label, entryPrice) {
-    const cap = capitalMap.current[label] || 0;
+  // ── Paper trading — key = `${token}::${stratLabel}`, symbol for signal log ─
+  function computeQty(key, entryPrice) {
+    const cap = capitalMap.current[key] || 0;
+    const rc  = riskConfigRef.current;
     const baseQty = parseInt(quantity, 10);
     if (baseQty > 0) return baseQty;
-    if (riskConfig.enabled && parseFloat(riskConfig.maxRiskPerTradePct) > 0 && parseFloat(riskConfig.stopLossPct) > 0) {
-      const riskAmt = cap * parseFloat(riskConfig.maxRiskPerTradePct) / 100;
-      const riskPS  = entryPrice * parseFloat(riskConfig.stopLossPct) / 100;
+    if (rc.enabled && parseFloat(rc.maxRiskPerTradePct) > 0 && parseFloat(rc.stopLossPct) > 0) {
+      const riskAmt = cap * parseFloat(rc.maxRiskPerTradePct) / 100;
+      const riskPS  = entryPrice * parseFloat(rc.stopLossPct) / 100;
       return Math.max(1, Math.floor(riskAmt / riskPS));
     }
     return Math.max(1, Math.floor(cap / entryPrice));
   }
 
-  function openPaperPosition(label, price, regime) {
-    if (openPositionMap.current[label]) return;                          // already in a position
-    const qty = computeQty(label, price);
-    if (price * qty > (capitalMap.current[label] || 0)) return;          // not enough capital
-    const sl = riskConfig.enabled && parseFloat(riskConfig.stopLossPct)   > 0 ? price * (1 - parseFloat(riskConfig.stopLossPct)/100)   : null;
-    const tp = riskConfig.enabled && parseFloat(riskConfig.takeProfitPct) > 0 ? price * (1 + parseFloat(riskConfig.takeProfitPct)/100) : null;
-    const pos = { strategyLabel: label, entryPrice: price, qty, entryTime: new Date().toLocaleTimeString(), slPrice: sl, tpPrice: tp, regime };
-    openPositionMap.current[label] = pos;
-    flushStrat(label);
-    const sig = { signal: 'BUY', price, symbol: inst.symbol, ts: pos.entryTime, strategyLabel: label };
-    signalsRef.current = [sig, ...signalsRef.current].slice(0, 100);
+  function openLong(key, price, regime, symbol) {
+    const rc = riskConfigRef.current;
+    if (openPositionMap.current[key]) return;
+    const qty = computeQty(key, price);
+    if (price * qty > (capitalMap.current[key] || 0)) return;
+    const sl = rc.enabled && parseFloat(rc.stopLossPct)   > 0 ? price * (1 - parseFloat(rc.stopLossPct)/100)   : null;
+    const tp = rc.enabled && parseFloat(rc.takeProfitPct) > 0 ? price * (1 + parseFloat(rc.takeProfitPct)/100) : null;
+    const stratLabel = key.split('::')[1];
+    const pos = { strategyLabel: stratLabel, type: 'LONG', entryPrice: price, qty, entryTime: new Date().toLocaleTimeString(), slPrice: sl, tpPrice: tp, regime };
+    openPositionMap.current[key] = pos;
+    flushStrat(key);
+    signalsRef.current = [{ signal: 'BUY', price, symbol, ts: pos.entryTime, strategyLabel: stratLabel }, ...signalsRef.current].slice(0, 200);
     setSignals([...signalsRef.current]);
   }
 
-  function closePaperPosition(label, exitPrice, exitReason) {
-    const pos = openPositionMap.current[label];
-    if (!pos) return;
+  function closeLong(key, exitPrice, exitReason, symbol) {
+    const rc  = riskConfigRef.current;
+    const pos = openPositionMap.current[key];
+    if (!pos || pos.type !== 'LONG') return;
     const pnl    = (exitPrice - pos.entryPrice) * pos.qty;
     const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
-    const newCap = (capitalMap.current[label] || 0) + pnl;
-    capitalMap.current[label] = newCap;
+    const newCap = (capitalMap.current[key] || 0) + pnl;
+    capitalMap.current[key] = newCap;
     const exitTime = new Date().toLocaleTimeString();
     const trade = { ...pos, exitPrice, exitTime, pnl, pnlPct, exitReason, capitalAfter: newCap };
-    closedTradesMap.current[label] = [trade, ...(closedTradesMap.current[label] || [])];
-    equityMap.current[label] = [...(equityMap.current[label] || []), { time: exitTime, capital: newCap }];
-    openPositionMap.current[label] = null;
-    flushStrat(label);
-    if (pnl < 0 && riskConfig.enabled && parseInt(riskConfig.cooldownCandles, 10) > 0) {
-      cooldownRef.current[label] = parseInt(riskConfig.cooldownCandles, 10);
-    }
-    const sig = { signal: 'SELL', price: exitPrice, symbol: inst.symbol, ts: exitTime, strategyLabel: label, reason: exitReason };
-    signalsRef.current = [sig, ...signalsRef.current].slice(0, 100);
+    closedTradesMap.current[key] = [trade, ...(closedTradesMap.current[key] || [])];
+    equityMap.current[key]       = [...(equityMap.current[key] || []), { time: exitTime, capital: newCap }];
+    openPositionMap.current[key] = null;
+    flushStrat(key);
+    if (pnl < 0 && rc.enabled && parseInt(rc.cooldownCandles, 10) > 0) cooldownRef.current[key] = parseInt(rc.cooldownCandles, 10);
+    const stratLabel = key.split('::')[1];
+    signalsRef.current = [{ signal: 'SELL', price: exitPrice, symbol, ts: exitTime, strategyLabel: stratLabel, reason: exitReason }, ...signalsRef.current].slice(0, 200);
     setSignals([...signalsRef.current]);
   }
 
-  // ── Candle close handler ──────────────────────────────────────────────────
-  function onCandleClose(candle) {
-    liveCandlesRef.current = [...liveCandlesRef.current, candle].slice(-500);
-    setLiveCandles([...liveCandlesRef.current]);
+  function openShort(key, price, regime, symbol) {
+    const rc = riskConfigRef.current;
+    if (openPositionMap.current[key]) return;
+    const qty = computeQty(key, price);
+    const sl = rc.enabled && parseFloat(rc.stopLossPct)   > 0 ? price * (1 + parseFloat(rc.stopLossPct)/100)   : null;
+    const tp = rc.enabled && parseFloat(rc.takeProfitPct) > 0 ? price * (1 - parseFloat(rc.takeProfitPct)/100) : null;
+    const stratLabel = key.split('::')[1];
+    const pos = { strategyLabel: stratLabel, type: 'SHORT', entryPrice: price, qty, entryTime: new Date().toLocaleTimeString(), slPrice: sl, tpPrice: tp, regime };
+    openPositionMap.current[key] = pos;
+    flushStrat(key);
+    signalsRef.current = [{ signal: 'SHORT', price, symbol, ts: pos.entryTime, strategyLabel: stratLabel }, ...signalsRef.current].slice(0, 200);
+    setSignals([...signalsRef.current]);
+  }
 
-    // Tick down cooldowns
-    Object.keys(cooldownRef.current).forEach(k => { if (cooldownRef.current[k] > 0) cooldownRef.current[k]--; });
+  function closeShort(key, exitPrice, exitReason, symbol) {
+    const rc  = riskConfigRef.current;
+    const pos = openPositionMap.current[key];
+    if (!pos || pos.type !== 'SHORT') return;
+    const pnl    = (pos.entryPrice - exitPrice) * pos.qty;
+    const pnlPct = ((pos.entryPrice - exitPrice) / pos.entryPrice) * 100;
+    const newCap = (capitalMap.current[key] || 0) + pnl;
+    capitalMap.current[key] = newCap;
+    const exitTime = new Date().toLocaleTimeString();
+    const trade = { ...pos, exitPrice, exitTime, pnl, pnlPct, exitReason, capitalAfter: newCap };
+    closedTradesMap.current[key] = [trade, ...(closedTradesMap.current[key] || [])];
+    equityMap.current[key]       = [...(equityMap.current[key] || []), { time: exitTime, capital: newCap }];
+    openPositionMap.current[key] = null;
+    flushStrat(key);
+    if (pnl < 0 && rc.enabled && parseInt(rc.cooldownCandles, 10) > 0) cooldownRef.current[key] = parseInt(rc.cooldownCandles, 10);
+    const stratLabel = key.split('::')[1];
+    signalsRef.current = [{ signal: 'BUY', price: exitPrice, symbol, ts: exitTime, strategyLabel: stratLabel, reason: exitReason }, ...signalsRef.current].slice(0, 200);
+    setSignals([...signalsRef.current]);
+  }
 
-    // Regime detection
+  function closePaperPosition(key, exitPrice, exitReason, symbol) {
+    const pos = openPositionMap.current[key];
+    if (!pos) return;
+    if (pos.type === 'SHORT') closeShort(key, exitPrice, exitReason, symbol);
+    else closeLong(key, exitPrice, exitReason, symbol);
+  }
+
+  // ── Candle close handler ─────────────────────────────────────────────────
+  // token: string instrumentToken, instrConfig: {symbol, exchange, instrumentToken, candleInterval}
+  function onCandleClose(candle, token, instrConfig) {
+    const sym = instrConfig.symbol;
+    liveCandles_Ref.current[token] = [...(liveCandles_Ref.current[token] || []), candle].slice(-500);
+    setLiveCandlesByToken(prev => ({ ...prev, [token]: [...(liveCandles_Ref.current[token])] }));
+
+    // Tick down cooldowns for this instrument
+    Object.keys(cooldownRef.current).forEach(k => {
+      if (k.startsWith(token + '::') && cooldownRef.current[k] > 0) cooldownRef.current[k]--;
+    });
+
+    // Regime detection (per instrument)
     let regime = null;
-    if (regimeConfig.enabled && regimeDetectorRef.current) {
-      regime = regimeDetectorRef.current.addCandle(candle.high, candle.low, candle.close);
-      setCurrentRegime(regime);
+    if (regimeConfig.enabled && regimeDetectorsRef.current[token]) {
+      regime = regimeDetectorsRef.current[token].addCandle(candle.high, candle.low, candle.close);
+      setCurrentRegimeByToken(prev => ({ ...prev, [token]: regime }));
     }
 
     const today = new Date().toDateString();
+    const candleTime = new Date().toLocaleTimeString();
+    const latestSignals = {};
+    const logActions    = [];
 
-    // Evaluate each enabled strategy independently
     for (const strat of strategies.filter(s => s.enabled)) {
-      const label = strat.label || strat.strategyType;
-      const ev = evaluatorsRef.current[label];
+      const stratLabel = strat.label || strat.strategyType;
+      const key = `${token}::${stratLabel}`;
+      const ev  = evaluatorsRef.current[key];
       if (!ev) continue;
-      if ((cooldownRef.current[label] || 0) > 0) continue;
+      if ((cooldownRef.current[key] || 0) > 0) continue;
 
-      // Per-strategy daily loss cap check
       if (riskConfig.enabled && riskConfig.dailyLossCapPct) {
-        const dc = dailyCapMap.current[label];
+        const dc = dailyCapMap.current[key];
         if (dc) {
           if (dc.date !== today) {
-            dailyCapMap.current[label] = { date: today, startCapital: capitalMap.current[label], halted: false };
+            dailyCapMap.current[key] = { date: today, startCapital: capitalMap.current[key], halted: false };
           } else {
-            const dayLoss = (capitalMap.current[label] - dc.startCapital) / dc.startCapital * 100;
-            if (dayLoss <= -parseFloat(riskConfig.dailyLossCapPct)) dailyCapMap.current[label].halted = true;
-            if (dailyCapMap.current[label].halted) continue;
+            const dayLoss = (capitalMap.current[key] - dc.startCapital) / dc.startCapital * 100;
+            if (dayLoss <= -parseFloat(riskConfig.dailyLossCapPct)) dailyCapMap.current[key].halted = true;
+            if (dailyCapMap.current[key].halted) continue;
           }
         }
       }
 
-      // Regime filter (auto-assigned)
       if (regimeConfig.enabled && regime) {
         const allowed = STRATEGY_REGIME_MAP[strat.strategyType] || [];
         if (allowed.length > 0 && !allowed.includes(regime)) continue;
       }
 
       const signal = ev.next(candle.close);
+      latestSignals[stratLabel] = signal;
 
-      // Pattern confirmation
-      if (patternConfig.enabled && patternEvalRef.current && signal !== 'HOLD') {
-        const patSig = patternEvalRef.current.next(candle.close, candle.high, candle.low, candle.volume||0, candle.open);
+      if (patternConfig.enabled && patternEvalsRef.current[token] && signal !== 'HOLD') {
+        const patSig = patternEvalsRef.current[token].next(candle.close, candle.high, candle.low, candle.volume||0, candle.open);
         if (signal === 'BUY'  && patternConfig.buyConfirmPatterns.length  > 0 && !patternConfig.buyConfirmPatterns.includes(patSig))  continue;
         if (signal === 'SELL' && patternConfig.sellConfirmPatterns.length > 0 && !patternConfig.sellConfirmPatterns.includes(patSig)) continue;
       }
 
-      const pos = openPositionMap.current[label];
-      if (signal === 'BUY' && !pos) {
-        openPaperPosition(label, candle.close, regime);
-      } else if (signal === 'SELL' && pos) {
-        closePaperPosition(label, candle.close, 'SIGNAL');
+      const pos        = openPositionMap.current[key];
+      const hasLong    = pos?.type === 'LONG';
+      const hasShort   = pos?.type === 'SHORT';
+      const allowShort = !!strat.allowShorting;
+
+      if (signal === 'BUY') {
+        if (hasShort) {
+          closeShort(key, candle.close, 'SIGNAL', sym);
+          logActions.push({ strategy: stratLabel, signal: 'BUY', price: candle.close, reason: 'SIGNAL' });
+          if (allowShort) { openLong(key, candle.close, regime, sym); logActions.push({ strategy: stratLabel, signal: 'BUY', price: candle.close, reason: '' }); }
+        } else if (!hasLong) {
+          openLong(key, candle.close, regime, sym);
+          logActions.push({ strategy: stratLabel, signal: 'BUY', price: candle.close, reason: '' });
+        }
+      } else if (signal === 'SELL') {
+        if (hasLong) {
+          closeLong(key, candle.close, 'SIGNAL', sym);
+          logActions.push({ strategy: stratLabel, signal: 'SELL', price: candle.close, reason: 'SIGNAL' });
+          if (allowShort) { openShort(key, candle.close, regime, sym); logActions.push({ strategy: stratLabel, signal: 'SHORT', price: candle.close, reason: '' }); }
+        } else if (!hasShort && allowShort) {
+          openShort(key, candle.close, regime, sym);
+          logActions.push({ strategy: stratLabel, signal: 'SHORT', price: candle.close, reason: '' });
+        }
       }
     }
+
+    // Feed scorer
+    scorersRef.current[token]?.addCandle(candle.high, candle.low, candle.close);
+
+    // ── Combined pool (score-based regime-switched) ───────────────────────
+    const combinedKey     = `${token}::${COMBINED_LABEL}`;
+    const combinedDetails = [];
+    if (capitalMap.current[combinedKey] !== undefined) {
+      let bestStrat = null, bestSignal = null, bestScore = null;
+      for (const strat of strategies.filter(s => s.enabled)) {
+        const stratLabel = strat.label || strat.strategyType;
+        const signal = latestSignals[stratLabel];
+        if (!signal || signal === 'HOLD') continue;
+        const sc = scorersRef.current[token]
+          ? scorersRef.current[token].score(strat.strategyType, signal, regime)
+          : { total: 0, trendStrength: 0, volatility: 0, momentum: 0, confidence: 0 };
+        if (!bestScore || sc.total > bestScore.total) {
+          bestStrat = strat; bestSignal = signal; bestScore = sc;
+        }
+      }
+      if (bestStrat && bestSignal) {
+        const stratLabel = bestStrat.label || bestStrat.strategyType;
+        const cp         = openPositionMap.current[combinedKey];
+        const cHasLong   = cp?.type === 'LONG';
+        const cHasShort  = cp?.type === 'SHORT';
+        const allowShort = !!bestStrat.allowShorting;
+        const trigger    = `Score-based (score=${bestScore.total.toFixed(1)}, trend=${bestScore.trendStrength.toFixed(1)}, vol=${bestScore.volatility.toFixed(1)}, mom=${bestScore.momentum.toFixed(1)}, conf=${bestScore.confidence.toFixed(1)})`;
+        if (bestSignal === 'BUY') {
+          if (cHasShort) {
+            closeShort(combinedKey, candle.close, 'SIGNAL', sym);
+            combinedDetails.push({ action: 'Exit Short', price: candle.close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
+            if (allowShort) {
+              openLong(combinedKey, candle.close, regime, sym);
+              combinedDetails.push({ action: 'Enter Long', price: candle.close, reason: 'Reversal SHORT→LONG', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
+            }
+          } else if (!cHasLong) {
+            openLong(combinedKey, candle.close, regime, sym);
+            combinedDetails.push({ action: 'Enter Long', price: candle.close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
+          }
+        } else if (bestSignal === 'SELL') {
+          if (cHasLong) {
+            closeLong(combinedKey, candle.close, 'SIGNAL', sym);
+            combinedDetails.push({ action: 'Exit Long', price: candle.close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
+            if (allowShort) {
+              openShort(combinedKey, candle.close, regime, sym);
+              combinedDetails.push({ action: 'Enter Short', price: candle.close, reason: 'Reversal LONG→SHORT', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
+            }
+          } else if (!cHasShort && allowShort) {
+            openShort(combinedKey, candle.close, regime, sym);
+            combinedDetails.push({ action: 'Enter Short', price: candle.close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
+          }
+        }
+      }
+    }
+
+    const logEntry = { ts: candleTime, open: candle.open, high: candle.high, low: candle.low, close: candle.close, volume: candle.volume, regime, signals: { ...latestSignals }, actions: logActions, combinedDetails };
+    candleLogsRef.current[token] = [...(candleLogsRef.current[token] || []), logEntry];
+    setCandleLogByToken(prev => ({ ...prev, [token]: [...candleLogsRef.current[token]] }));
   }
 
   // ── Connect handler ───────────────────────────────────────────────────────
   async function handleConnect(e) {
     e.preventDefault();
-    setError(''); setTicks([]); ticksRef.current = [];
-    setSignals([]); signalsRef.current = [];
-    setLatestTick(null); latestTickRef.current = null;
-    setPreloadState(null);
-    setLiveCandles([]); liveCandlesRef.current = [];
-    setCurrentCandle(null); currentCandleRef.current = null;
-    setCurrentRegime(null);
+    const validInstrs = instruments.filter(i => i.instrumentToken);
+    if (!validInstrs.length) { setError('Add at least one instrument with a token.'); return; }
+
+    setError(''); setSignals([]); signalsRef.current = [];
+    setTicksByToken({}); ticksRef.current = {};
+    setLiveCandlesByToken({}); liveCandles_Ref.current = {};
+    setCurrentCandleByToken({}); currentCandlesRef.current = {};
+    setCurrentRegimeByToken({}); candleLogsRef.current = {};
+    setCandleLogByToken({}); setPreloadStateByToken({});
     cooldownRef.current = {};
 
-    const initCap = parseFloat(initialCapital) || 100000;
+    const initCap  = parseFloat(initialCapital) || 100000;
     const todayStr = new Date().toDateString();
-    const allLabels = strategies.filter(s => s.enabled).map(s => s.label || s.strategyType);
-    capitalMap.current       = {};
-    openPositionMap.current  = {};
-    closedTradesMap.current  = {};
-    equityMap.current        = {};
-    dailyCapMap.current      = {};
-    allLabels.forEach(lbl => {
-      capitalMap.current[lbl]      = initCap;
-      openPositionMap.current[lbl] = null;
-      closedTradesMap.current[lbl] = [];
-      equityMap.current[lbl]       = [];
-      dailyCapMap.current[lbl]     = { date: todayStr, startCapital: initCap, halted: false };
-    });
+    const stratList = strategies.filter(s => s.enabled);
+    capitalMap.current = {}; openPositionMap.current = {};
+    closedTradesMap.current = {}; equityMap.current = {}; dailyCapMap.current = {};
+    evaluatorsRef.current = {}; regimeDetectorsRef.current = {}; patternEvalsRef.current = {};
+    scorersRef.current = {};
+
+    // Per-instrument setup
+    for (const instr of validInstrs) {
+      const token = String(instr.instrumentToken);
+      // Trading maps per strategy
+      stratList.forEach(s => {
+        const key = `${token}::${s.label || s.strategyType}`;
+        capitalMap.current[key]      = initCap;
+        openPositionMap.current[key] = null;
+        closedTradesMap.current[key] = [];
+        equityMap.current[key]       = [];
+        dailyCapMap.current[key]     = { date: todayStr, startCapital: initCap, halted: false };
+        evaluatorsRef.current[key]   = buildLocalEvaluator(s.strategyType, s.parameters || {});
+      });
+      // Combined pool (score-based regime-switched strategy)
+      if (stratList.length > 1) {
+        const cKey = `${token}::${COMBINED_LABEL}`;
+        capitalMap.current[cKey]      = initCap;
+        openPositionMap.current[cKey] = null;
+        closedTradesMap.current[cKey] = [];
+        equityMap.current[cKey]       = [];
+        dailyCapMap.current[cKey]     = { date: todayStr, startCapital: initCap, halted: false };
+      }
+      // Scorer per instrument
+      scorersRef.current[token] = new LocalStrategyScorer(
+        parseInt(regimeConfig.adxPeriod,10)||14,
+        parseInt(regimeConfig.atrPeriod,10)||14,
+        10
+      );
+      // Regime + pattern per instrument
+      regimeDetectorsRef.current[token] = regimeConfig.enabled
+        ? new LocalRegimeDetector(parseInt(regimeConfig.adxPeriod,10)||14, parseInt(regimeConfig.atrPeriod,10)||14,
+            parseFloat(regimeConfig.adxTrendThreshold)||25, parseFloat(regimeConfig.atrVolatilePct)||2,
+            parseFloat(regimeConfig.atrCompressionPct)||0.5)
+        : null;
+      patternEvalsRef.current[token] = patternConfig.enabled
+        ? new LocalCandlePatternEvaluator(patternConfig.buyConfirmPatterns[0] || 'HAMMER', patternConfig.minWickRatio, patternConfig.maxBodyPct)
+        : null;
+    }
     setStratStates({});
-    setSelectedLabel(allLabels[0] || null);
-
-    // Build evaluators for each enabled strategy
-    const evals = {};
-    strategies.filter(s => s.enabled).forEach(s => {
-      evals[s.label || s.strategyType] = buildLocalEvaluator(s.strategyType, s.parameters || {});
-    });
-    evaluatorsRef.current = evals;
-
-    patternEvalRef.current = patternConfig.enabled
-      ? new LocalCandlePatternEvaluator(patternConfig.buyConfirmPatterns[0] || 'HAMMER', patternConfig.minWickRatio, patternConfig.maxBodyPct)
-      : null;
-
-    regimeDetectorRef.current = regimeConfig.enabled
-      ? new LocalRegimeDetector(
-          parseInt(regimeConfig.adxPeriod,10)||14, parseInt(regimeConfig.atrPeriod,10)||14,
-          parseFloat(regimeConfig.adxTrendThreshold)||25, parseFloat(regimeConfig.atrVolatilePct)||2,
-          parseFloat(regimeConfig.atrCompressionPct)||0.5)
-      : null;
+    setSelectedInstrToken(String(validInstrs[0].instrumentToken));
 
     try {
-      // ── Preload warmup ──────────────────────────────────────────────────
-      if (preload.enabled && inst.instrumentToken) {
+      // ── Preload warmup (per instrument, sequential) ─────────────────────
+      if (preload.enabled) {
         setStatus('warming up');
-        setPreloadState({ status: 'loading', count: 0, error: null });
-        try {
-          const now = new Date();
-          const from = new Date(now.getTime() - parseInt(preload.daysBack,10)*24*60*60*1000);
-          from.setHours(9, 15, 0, 0);
-          const pad = n => String(n).padStart(2,'0');
-          const fmt = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-          const res = await fetchHistoricalData({
-            userId: session.userId, brokerName: session.brokerName,
-            apiKey: session.apiKey, accessToken: session.accessToken,
-            instrumentToken: parseInt(inst.instrumentToken,10),
-            symbol: inst.symbol.toUpperCase(), exchange: inst.exchange.toUpperCase(),
-            interval: preload.interval, fromDate: fmt(from), toDate: fmt(now), persist: true,
-          });
-          const candles = res?.data || [];
-          candles.forEach(c => {
-            Object.values(evaluatorsRef.current).forEach(ev => ev.next(parseFloat(c.close)));
-            if (regimeDetectorRef.current) regimeDetectorRef.current.addCandle(parseFloat(c.high), parseFloat(c.low), parseFloat(c.close));
-            if (patternEvalRef.current) patternEvalRef.current.next(parseFloat(c.close), parseFloat(c.high), parseFloat(c.low), parseFloat(c.volume||0), parseFloat(c.open));
-          });
-          setPreloadState({ status: 'done', count: candles.length, error: null });
-        } catch (err) {
-          setPreloadState({ status: 'error', count: 0, error: err.message });
+        for (const instr of validInstrs) {
+          const token = String(instr.instrumentToken);
+          setPreloadStateByToken(prev => ({ ...prev, [token]: { status: 'loading', count: 0, error: null } }));
+          try {
+            const now = new Date();
+            const from = new Date(now.getTime() - parseInt(preload.daysBack,10)*24*60*60*1000);
+            from.setHours(9, 15, 0, 0);
+            const pad = n => String(n).padStart(2,'0');
+            const fmt = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+            const res = await fetchHistoricalData({
+              userId: session.userId, brokerName: session.brokerName,
+              apiKey: session.apiKey, accessToken: session.accessToken,
+              instrumentToken: parseInt(instr.instrumentToken,10),
+              symbol: instr.symbol.toUpperCase(), exchange: instr.exchange.toUpperCase(),
+              interval: preload.interval, fromDate: fmt(from), toDate: fmt(now), persist: true,
+            });
+            const candles = res?.data || [];
+            candles.forEach(c => {
+              stratList.forEach(s => {
+                const key = `${token}::${s.label || s.strategyType}`;
+                evaluatorsRef.current[key]?.next(parseFloat(c.close));
+              });
+              regimeDetectorsRef.current[token]?.addCandle(parseFloat(c.high), parseFloat(c.low), parseFloat(c.close));
+              patternEvalsRef.current[token]?.next(parseFloat(c.close), parseFloat(c.high), parseFloat(c.low), parseFloat(c.volume||0), parseFloat(c.open));
+              scorersRef.current[token]?.addCandle(parseFloat(c.high), parseFloat(c.low), parseFloat(c.close));
+            });
+            setPreloadStateByToken(prev => ({ ...prev, [token]: { status: 'done', count: candles.length, error: null } }));
+          } catch (err) {
+            setPreloadStateByToken(prev => ({ ...prev, [token]: { status: 'error', count: 0, error: err.message } }));
+          }
         }
       }
 
-      // ── Subscribe live ──────────────────────────────────────────────────
+      // ── Subscribe all instruments ────────────────────────────────────────
       setStatus('connecting');
       await liveSubscribe({
         userId: session.userId, brokerName: session.brokerName,
         apiKey: session.apiKey, accessToken: session.accessToken, mode,
-        instruments: [{ instrumentToken: parseInt(inst.instrumentToken,10), symbol: inst.symbol.toUpperCase(), exchange: inst.exchange.toUpperCase() }],
+        instruments: validInstrs.map(i => ({
+          instrumentToken: parseInt(i.instrumentToken, 10),
+          symbol: i.symbol.toUpperCase(), exchange: i.exchange.toUpperCase(),
+        })),
       });
 
       const sse = new EventSource('/data-api/api/v1/data/stream/ticks');
@@ -3178,53 +3356,62 @@ function LiveTest() {
       sse.addEventListener('tick', (ev) => {
         try {
           const tick = JSON.parse(ev.data);
-          const ltp = parseFloat(tick.ltp);
-          const tsMs = Date.now();
-          latestTickRef.current = tick;
-          setLatestTick(tick);
-          ticksRef.current = [{ ...tick, ts: new Date().toLocaleTimeString() }, ...ticksRef.current].slice(0, 200);
-          setTicks([...ticksRef.current]);
+          const ltp   = parseFloat(tick.ltp);
+          const tsMs  = Date.now();
+          const token = String(tick.instrumentToken ?? tick.token ?? '');
+          if (!token) return;
 
-          // SL / TP check on every tick — per strategy
-          if (riskConfig.enabled) {
-            for (const lbl of Object.keys(openPositionMap.current)) {
-              const pos = openPositionMap.current[lbl];
+          // Find the instrument config for this token (read from ref to avoid stale closure)
+          const instrConfig = instrumentsRef.current.find(i => String(i.instrumentToken) === token);
+          if (!instrConfig) return;
+          const sym = instrConfig.symbol;
+
+          // Update ticks per instrument
+          ticksRef.current[token] = [{ ...tick, ts: new Date().toLocaleTimeString() }, ...(ticksRef.current[token] || [])].slice(0, 200);
+          setTicksByToken(prev => ({ ...prev, [token]: [...ticksRef.current[token]] }));
+
+          // SL / TP — only check positions for this instrument
+          const rc = riskConfigRef.current;
+          if (rc.enabled) {
+            for (const key of Object.keys(openPositionMap.current)) {
+              if (!key.startsWith(token + '::')) continue;
+              const pos = openPositionMap.current[key];
               if (!pos) continue;
-              if (pos.slPrice && ltp <= pos.slPrice) closePaperPosition(lbl, ltp, 'STOP_LOSS');
-              else if (pos.tpPrice && ltp >= pos.tpPrice) closePaperPosition(lbl, ltp, 'TAKE_PROFIT');
+              if (pos.type === 'SHORT') {
+                if (pos.slPrice && ltp >= pos.slPrice) closeShort(key, ltp, 'STOP_LOSS', sym);
+                else if (pos.tpPrice && ltp <= pos.tpPrice) closeShort(key, ltp, 'TAKE_PROFIT', sym);
+              } else {
+                if (pos.slPrice && ltp <= pos.slPrice) closeLong(key, ltp, 'STOP_LOSS', sym);
+                else if (pos.tpPrice && ltp >= pos.tpPrice) closeLong(key, ltp, 'TAKE_PROFIT', sym);
+              }
             }
           }
 
-          // Candle formation
-          const ivMs = INTERVAL_MS[candleInterval] || 300_000;
+          // Candle formation per instrument
+          const ivMs = INTERVAL_MS[instrConfig.candleInterval] || 300_000;
           const bucketStart = Math.floor(tsMs / ivMs) * ivMs;
-          const cur = currentCandleRef.current;
-          if (!cur) {
-            currentCandleRef.current = { open: ltp, high: ltp, low: ltp, close: ltp, volume: tick.volume||0, startTime: bucketStart };
-          } else if (bucketStart > cur.startTime) {
-            onCandleClose({ ...cur });
-            currentCandleRef.current = { open: ltp, high: ltp, low: ltp, close: ltp, volume: tick.volume||0, startTime: bucketStart };
+          if (!currentCandlesRef.current[token]) {
+            currentCandlesRef.current[token] = { open: ltp, high: ltp, low: ltp, close: ltp, volume: tick.volume||0, startTime: bucketStart };
+          } else if (bucketStart > currentCandlesRef.current[token].startTime) {
+            onCandleClose({ ...currentCandlesRef.current[token] }, token, instrConfig);
+            currentCandlesRef.current[token] = { open: ltp, high: ltp, low: ltp, close: ltp, volume: tick.volume||0, startTime: bucketStart };
           } else {
+            const cur = currentCandlesRef.current[token];
             cur.high = Math.max(cur.high, ltp); cur.low = Math.min(cur.low, ltp);
             cur.close = ltp; cur.volume += (tick.volume||0);
           }
-          setCurrentCandle(currentCandleRef.current ? { ...currentCandleRef.current } : null);
+          setCurrentCandleByToken(prev => ({ ...prev, [token]: { ...currentCandlesRef.current[token] } }));
         } catch {}
       });
 
       let sseErrorCount = 0;
       sse.onerror = () => {
         sseErrorCount++;
-        // EventSource fires onerror on transient drops and auto-reconnects;
-        // only tear down after repeated consecutive failures (not recoverable).
         if (sse.readyState === EventSource.CLOSED) {
           setConnected(false); setStatus('disconnected'); cleanup();
         } else {
-          // Transient error — SSE is auto-reconnecting, just update status briefly
           setStatus('reconnecting');
-          setTimeout(() => {
-            if (sse.readyState === EventSource.OPEN) setStatus('connected');
-          }, 3000);
+          setTimeout(() => { if (sse.readyState === EventSource.OPEN) setStatus('connected'); }, 3000);
         }
       };
       setConnected(true); setStatus('connected');
@@ -3232,22 +3419,38 @@ function LiveTest() {
   }
 
   async function handleDisconnect() {
-    try {
-      await liveUnsubscribe({ userId: session.userId, brokerName: session.brokerName, instrumentTokens: [parseInt(inst.instrumentToken,10)] });
-    } catch {}
+    const tokens = instruments.filter(i => i.instrumentToken).map(i => parseInt(i.instrumentToken, 10));
+    try { await liveUnsubscribe({ userId: session.userId, brokerName: session.brokerName, instrumentTokens: tokens }); } catch {}
     cleanup(); setConnected(false); setStatus('idle');
   }
 
-  // ── Derived values (per-strategy aggregates) ─────────────────────────────
-  const initCap         = parseFloat(initialCapital) || 100000;
-  const allStratLabels  = Object.keys(stratStates);
-  const numActive       = allStratLabels.length || 1;
-  const totalDeployed   = initCap * numActive;
-  const totalCapital    = allStratLabels.reduce((s, lbl) => s + (stratStates[lbl]?.capital ?? initCap), 0);
-  const totalPnl        = allStratLabels.reduce((s, lbl) => s + ((stratStates[lbl]?.capital ?? initCap) - initCap), 0);
-  const totalPnlPct     = totalDeployed > 0 ? (totalPnl / totalDeployed) * 100 : 0;
-  const allClosedTrades = allStratLabels.flatMap(lbl => stratStates[lbl]?.closedTrades || []);
-  const changeColor     = (latestTick?.change ?? 0) >= 0 ? '#22c55e' : '#ef4444';
+  // ── Derived values (filtered to selected instrument) ──────────────────────
+  const initCap = parseFloat(initialCapital) || 100000;
+  const selInstrConfig = instruments.find(i => String(i.instrumentToken) === selectedInstrToken) || instruments[0] || {};
+  // Keys for selected instrument
+  const allStratKeys      = selectedInstrToken ? Object.keys(stratStates).filter(k => k.startsWith(selectedInstrToken + '::')) : [];
+  const allStratLabels    = allStratKeys.map(k => k.split('::')[1]);
+  // Exclude ⚡ Combined from aggregate metrics (it's a separate pool, not additional capital)
+  const indivStratKeys    = allStratKeys.filter(k => !k.endsWith('::' + COMBINED_LABEL));
+  const numActive         = indivStratKeys.length || 1;
+  const totalDeployed     = initCap * numActive;
+  const totalCapital      = indivStratKeys.reduce((s, k) => s + (stratStates[k]?.capital ?? initCap), 0);
+  const totalPnl          = indivStratKeys.reduce((s, k) => s + ((stratStates[k]?.capital ?? initCap) - initCap), 0);
+  const totalPnlPct       = totalDeployed > 0 ? (totalPnl / totalDeployed) * 100 : 0;
+  const allClosedTrades   = indivStratKeys.flatMap(k => stratStates[k]?.closedTrades || []);
+  // Per-instrument selected state
+  const latestTick    = selectedInstrToken ? (ticksByToken[selectedInstrToken]?.[0] ?? null) : null;
+  const ticks         = selectedInstrToken ? (ticksByToken[selectedInstrToken] ?? []) : [];
+  const currentCandle = selectedInstrToken ? (currentCandleByToken[selectedInstrToken] ?? null) : null;
+  const currentRegime = selectedInstrToken ? (currentRegimeByToken[selectedInstrToken] ?? null) : null;
+  const liveCandles   = selectedInstrToken ? (liveCandlesByToken[selectedInstrToken] ?? []) : [];
+  const candleLog     = selectedInstrToken ? (candleLogByToken[selectedInstrToken] ?? []) : [];
+  const candleLogRef  = { current: selectedInstrToken ? (candleLogsRef.current[selectedInstrToken] ?? []) : [] };
+  // Map stratLabel → state for the selected instrument — used throughout JSX
+  const instrStratStates = Object.fromEntries(allStratKeys.map(k => [k.split('::')[1], stratStates[k]]));
+  // Composite key for closePaperPosition calls from manual close button
+  const instrKey = lbl => selectedInstrToken ? `${selectedInstrToken}::${lbl}` : lbl;
+  const changeColor   = (latestTick?.change ?? 0) >= 0 ? '#22c55e' : '#ef4444';
   const fmtRs = v => `₹${Number(v).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
 
   return (
@@ -3256,24 +3459,56 @@ function LiveTest() {
       {/* ── Top row ─────────────────────────────────────────────────────── */}
       <div className="bt-live-top-row">
 
-        {/* Instrument + connection */}
+        {/* Instruments + connection */}
         <div className="card bt-live-conn-card">
-          <h3 className="section-title">Instrument & Connection</h3>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <h3 className="section-title" style={{ margin: 0 }}>Instruments & Connection</h3>
+            {!connected && instruments.length < 6 && (
+              <button type="button" className="btn-secondary btn-xs" onClick={addInstrument}>+ Add Instrument</button>
+            )}
+          </div>
           <form onSubmit={handleConnect}>
-            <InstrumentPicker
-              session={session}
-              symbol={inst.symbol} exchange={inst.exchange} instrumentToken={inst.instrumentToken}
-              onSelect={r => { setInst({ symbol: r.tradingSymbol, exchange: r.exchange, instrumentToken: String(r.instrumentToken) }); saveRecentInstrument(r); }}
-              onChange={patch => setInst(p => ({ ...p, ...patch }))}
-              disabled={connected}
-            />
+            {/* Per-instrument rows */}
+            {instruments.map((instr, idx) => {
+              const isExpanded = expandedInstrs[instr.id] !== false; // default expanded
+              const displayName = instr.symbol ? `${instr.symbol}${instr.exchange ? ' · ' + instr.exchange : ''}` : `Instrument ${idx + 1}`;
+              return (
+                <div key={instr.id} style={{ border: '1px solid var(--border)', borderRadius: 8, marginBottom: 8, overflow: 'hidden' }}>
+                  {/* Header row */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 10px', background: 'var(--surface-2)', cursor: 'pointer', userSelect: 'none' }}
+                    onClick={() => setExpandedInstrs(p => ({ ...p, [instr.id]: !isExpanded }))}>
+                    <span style={{ fontSize: 13, fontWeight: 600, flex: 1, color: 'var(--text-primary)' }}>{displayName}</span>
+                    {instr.instrumentToken && (
+                      <span style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: 'monospace' }}>#{instr.instrumentToken}</span>
+                    )}
+                    <span style={{ fontSize: 12, color: 'var(--text-muted)', marginLeft: 2 }}>{isExpanded ? '▲' : '▼'}</span>
+                    {instruments.length > 1 && !connected && (
+                      <button type="button" className="btn-danger btn-xs" style={{ marginLeft: 4, padding: '1px 6px' }}
+                        onClick={e => { e.stopPropagation(); removeInstrument(instr.id); }}>✕</button>
+                    )}
+                  </div>
+                  {/* Collapsible body */}
+                  {isExpanded && (
+                    <div style={{ padding: '10px 10px 6px' }}>
+                      <InstrumentPicker
+                        session={session}
+                        symbol={instr.symbol} exchange={instr.exchange} instrumentToken={instr.instrumentToken}
+                        onSelect={r => { updateInstrument(instr.id, { symbol: r.tradingSymbol, exchange: r.exchange, instrumentToken: String(r.instrumentToken) }); saveRecentInstrument(r); }}
+                        onChange={patch => updateInstrument(instr.id, patch)}
+                        disabled={connected}
+                      />
+                      <div className="form-group" style={{ marginTop: 4 }}>
+                        <label>Candle Interval</label>
+                        <select value={instr.candleInterval} onChange={e => updateInstrument(instr.id, { candleInterval: e.target.value })} disabled={connected}>
+                          {INTERVALS.map(iv => <option key={iv.value} value={iv.value}>{iv.label}</option>)}
+                        </select>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
             <div className="form-row">
-              <div className="form-group">
-                <label>Candle Interval</label>
-                <select value={candleInterval} onChange={e => setCandleInterval(e.target.value)} disabled={connected}>
-                  {INTERVALS.map(iv => <option key={iv.value} value={iv.value}>{iv.label}</option>)}
-                </select>
-              </div>
               <div className="form-group">
                 <label>Mode</label>
                 <select value={mode} onChange={e => setMode(e.target.value)} disabled={connected}>
@@ -3319,13 +3554,17 @@ function LiveTest() {
                   </div>
                 </div>
               )}
-              {preloadState && (
-                <div className="de-preload-results">
-                  {preloadState.status === 'loading' && <span className="de-preload-loading">Fetching historical candles…</span>}
-                  {preloadState.status === 'done'    && <span className="de-preload-result-item de-preload-ok">{preloadState.count} candles — all evaluators warmed up</span>}
-                  {preloadState.status === 'error'   && <span className="de-preload-result-item de-preload-error">Preload failed: {preloadState.error} — continuing cold</span>}
-                </div>
-              )}
+              {/* Per-instrument preload status */}
+              {Object.entries(preloadStateByToken).map(([token, ps]) => {
+                const sym = instruments.find(i => String(i.instrumentToken) === token)?.symbol || token;
+                return (
+                  <div key={token} className="de-preload-results">
+                    {ps.status === 'loading' && <span className="de-preload-loading">{sym}: Fetching…</span>}
+                    {ps.status === 'done'    && <span className="de-preload-result-item de-preload-ok">{sym}: {ps.count} candles warmed up</span>}
+                    {ps.status === 'error'   && <span className="de-preload-result-item de-preload-error">{sym}: Preload failed — {ps.error}</span>}
+                  </div>
+                );
+              })}
             </div>
 
             {error    && <div className="error-msg" style={{ marginBottom: 12 }}>{error}</div>}
@@ -3459,9 +3698,31 @@ function LiveTest() {
         {/* ── Feed tabs (right col) ── */}
         <div className="bt-live-feed">
 
+        {/* Instrument selector (shown when multiple instruments) */}
+        {instruments.filter(i => i.instrumentToken).length > 1 && (
+          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', padding: '6px 0 4px', borderBottom: '1px solid var(--border)', marginBottom: 4 }}>
+            {instruments.filter(i => i.instrumentToken).map(instr => {
+              const token = String(instr.instrumentToken);
+              const isSel = token === selectedInstrToken;
+              const ltpVal = ticksByToken[token]?.[0]?.ltp;
+              return (
+                <button key={token} onClick={() => setSelectedInstrToken(token)}
+                  style={{ fontSize: 11, padding: '3px 10px', borderRadius: 12, border: '1px solid',
+                    background:   isSel ? 'var(--accent)' : 'transparent',
+                    color:        isSel ? '#fff' : 'var(--text-secondary)',
+                    borderColor:  isSel ? 'var(--accent)' : 'var(--border)',
+                    cursor: 'pointer', fontWeight: isSel ? 700 : 400 }}>
+                  {instr.symbol || token}
+                  {ltpVal != null && <span style={{ marginLeft: 5, opacity: 0.85 }}>₹{Number(ltpVal).toFixed(2)}</span>}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
         {/* Tab bar */}
         <div className="bt-live-right-tabs">
-          {[['feed','Feed'],['pnl','P&L'],['portfolio','Portfolio']].map(([k,l]) => (
+          {[['feed','Feed'],['pnl','P&L'],['portfolio','Portfolio'],['details','Details']].map(([k,l]) => (
             <button key={k} className={`bt-live-tab-btn ${rightTab===k?'active':''}`} onClick={() => setRightTab(k)}>{l}</button>
           ))}
           {currentRegime && (
@@ -3500,14 +3761,14 @@ function LiveTest() {
                 {/* Candles formed */}
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6 }}>
                   {liveCandles.length} candle{liveCandles.length !== 1 ? 's' : ''} closed · {ticks.length} ticks
-                  {allStratLabels.filter(lbl => stratStates[lbl]?.openPosition).map(lbl => {
-                    const pos = stratStates[lbl].openPosition;
-                    const ltp = parseFloat(latestTick?.ltp || pos.entryPrice);
-                    const uPnl = (ltp - pos.entryPrice) * pos.qty;
+                  {allStratLabels.filter(lbl => instrStratStates[lbl]?.openPosition).map(lbl => {
+                    const pos  = instrStratStates[lbl].openPosition;
+                    const ltp  = parseFloat(latestTick?.ltp || pos.entryPrice);
+                    const uPnl = pos.type === 'SHORT' ? (pos.entryPrice - ltp) * pos.qty : (ltp - pos.entryPrice) * pos.qty;
                     const uPct = (uPnl / (pos.entryPrice * pos.qty)) * 100;
                     return (
                       <span key={lbl} style={{ marginLeft: 12, color: uPnl >= 0 ? '#22c55e' : '#ef4444', fontWeight: 600 }}>
-                        OPEN {lbl} — {fmtRs(uPnl)} ({uPct.toFixed(2)}%)
+                        {pos.type === 'SHORT' ? 'SHORT↓' : 'LONG↑'} {lbl} — {fmtRs(uPnl)} ({uPct.toFixed(2)}%)
                       </span>
                     );
                   })}
@@ -3603,8 +3864,8 @@ function LiveTest() {
                       <tr><th>Strategy</th><th>Capital</th><th>P&L</th><th>Return %</th><th>Trades</th><th>Win Rate</th></tr>
                     </thead>
                     <tbody>
-                      {allStratLabels.map(lbl => {
-                        const st = stratStates[lbl];
+                      {allStratLabels.filter(lbl => lbl !== COMBINED_LABEL).map(lbl => {
+                        const st = instrStratStates[lbl];
                         const cap = st?.capital ?? initCap;
                         const pnl = cap - initCap;
                         const pct = initCap > 0 ? (pnl / initCap) * 100 : 0;
@@ -3621,29 +3882,54 @@ function LiveTest() {
                           </tr>
                         );
                       })}
+                      {instrStratStates[COMBINED_LABEL] && (() => {
+                        const st = instrStratStates[COMBINED_LABEL];
+                        const cap = st?.capital ?? initCap;
+                        const pnl = cap - initCap;
+                        const pct = initCap > 0 ? (pnl / initCap) * 100 : 0;
+                        const trades = st?.closedTrades || [];
+                        const wins = trades.filter(t => t.pnl >= 0).length;
+                        return (
+                          <tr style={{ borderTop: '2px solid rgba(139,92,246,0.4)', background: 'rgba(139,92,246,0.06)' }}>
+                            <td style={{ fontSize: 11, fontWeight: 700 }}>
+                              <span style={{ color: '#8b5cf6' }}>{COMBINED_LABEL}</span>
+                              <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 6 }}>score-switched</span>
+                            </td>
+                            <td style={{ fontSize: 11, fontWeight: 600 }}>{fmtRs(cap)}</td>
+                            <td className={pnl >= 0 ? 'text-success' : 'text-danger'} style={{ fontWeight: 700, fontSize: 11 }}>{fmtRs(pnl)}</td>
+                            <td className={pct >= 0 ? 'text-success' : 'text-danger'} style={{ fontSize: 11, fontWeight: 600 }}>{pct.toFixed(2)}%</td>
+                            <td style={{ fontSize: 11 }}>{trades.length}</td>
+                            <td style={{ fontSize: 11 }}>{trades.length ? `${(wins/trades.length*100).toFixed(1)}%` : '—'}</td>
+                          </tr>
+                        );
+                      })()}
                     </tbody>
                   </table>
                 </div>
               </div>
             )}
 
-            {/* Per-strategy detail — all shown automatically */}
-            {allStratLabels.map(lbl => {
-              const st = stratStates[lbl];
+            {/* Per-strategy detail — individual strategies first, Combined last */}
+            {allStratLabels.filter(lbl => lbl !== COMBINED_LABEL).concat(instrStratStates[COMBINED_LABEL] ? [COMBINED_LABEL] : []).map(lbl => {
+              const isCombined = lbl === COMBINED_LABEL;
+              const st = instrStratStates[lbl];
               const trades = st?.closedTrades || [];
               return (
-                <div key={lbl}>
+                <div key={lbl} style={isCombined ? { border: '1px solid rgba(139,92,246,0.3)', borderRadius: 8, marginBottom: 10, overflow: 'hidden' } : {}}>
                   {trades.length > 0 && (
-                    <div className="card" style={{ marginBottom: 10 }}>
-                      <div className="bt-params-label" style={{ marginBottom: 6 }}>Equity Curve — {lbl}</div>
+                    <div className="card" style={{ marginBottom: 10, ...(isCombined ? { background: 'rgba(139,92,246,0.04)', marginBottom: 0, borderRadius: 0 } : {}) }}>
+                      <div className="bt-params-label" style={{ marginBottom: 6, color: isCombined ? '#8b5cf6' : undefined }}>
+                        Equity Curve — {lbl}
+                        {isCombined && <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 8, fontWeight: 400 }}>score-switched pool</span>}
+                      </div>
                       <EquityCurve
                         trades={[...trades].reverse().map(t => ({ runningCapital: t.capitalAfter, pnl: t.pnl }))}
                       />
                     </div>
                   )}
-                  <div className="card" style={{ padding: 0, marginBottom: 10 }}>
+                  <div className="card" style={{ padding: 0, marginBottom: isCombined ? 0 : 10, ...(isCombined ? { borderRadius: 0, background: 'rgba(139,92,246,0.02)' } : {}) }}>
                     <div className="bt-feed-header">
-                      <span className="bt-params-label" style={{ margin: 0 }}>Closed Trades — {lbl}</span>
+                      <span className="bt-params-label" style={{ margin: 0, color: isCombined ? '#8b5cf6' : undefined }}>Closed Trades — {lbl}</span>
                       <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{trades.length} trade{trades.length !== 1 ? 's' : ''}</span>
                     </div>
                     {trades.length === 0
@@ -3652,12 +3938,17 @@ function LiveTest() {
                         <div style={{ overflowX: 'auto' }}>
                           <table>
                             <thead>
-                              <tr><th>#</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>Return %</th><th>Exit Reason</th><th>Capital After</th></tr>
+                              <tr><th>#</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>Return %</th><th>Exit Reason</th><th>Capital After</th></tr>
                             </thead>
                             <tbody>
                               {trades.map((t, i) => (
                                 <tr key={i}>
                                   <td>{trades.length - i}</td>
+                                  <td>
+                                    {t.type === 'SHORT'
+                                      ? <span style={{ fontSize: 10, fontWeight: 700, color: '#8b5cf6' }}>SHORT↓</span>
+                                      : <span style={{ fontSize: 10, fontWeight: 700, color: '#22c55e' }}>LONG↑</span>}
+                                  </td>
                                   <td><span className="mono-sm">{t.entryTime}</span><br/><span style={{ fontSize: 11 }}>{fmtRs(t.entryPrice)}</span></td>
                                   <td><span className="mono-sm">{t.exitTime}</span><br/><span style={{ fontSize: 11 }}>{fmtRs(t.exitPrice)}</span></td>
                                   <td>{t.qty}</td>
@@ -3701,12 +3992,12 @@ function LiveTest() {
                         <tr><th>Strategy</th><th>Initial</th><th>Current</th><th>P&L</th><th>Return %</th><th>Status</th></tr>
                       </thead>
                       <tbody>
-                        {allStratLabels.map(lbl => {
-                          const cap = stratStates[lbl]?.capital ?? initCap;
+                        {allStratLabels.filter(lbl => lbl !== COMBINED_LABEL).map(lbl => {
+                          const cap = instrStratStates[lbl]?.capital ?? initCap;
                           const pnl = cap - initCap;
                           const pct = initCap > 0 ? (pnl / initCap) * 100 : 0;
-                          const hasOpen = !!stratStates[lbl]?.openPosition;
-                          const halted  = dailyCapMap.current[lbl]?.halted || false;
+                          const hasOpen = !!instrStratStates[lbl]?.openPosition;
+                          const halted  = dailyCapMap.current[instrKey(lbl)]?.halted || false;
                           return (
                             <tr key={lbl}>
                               <td style={{ fontSize: 11, fontWeight: 600 }}>{lbl}</td>
@@ -3722,6 +4013,29 @@ function LiveTest() {
                             </tr>
                           );
                         })}
+                        {instrStratStates[COMBINED_LABEL] && (() => {
+                          const lbl = COMBINED_LABEL;
+                          const cap = instrStratStates[lbl]?.capital ?? initCap;
+                          const pnl = cap - initCap;
+                          const pct = initCap > 0 ? (pnl / initCap) * 100 : 0;
+                          const hasOpen = !!instrStratStates[lbl]?.openPosition;
+                          return (
+                            <tr style={{ borderTop: '2px solid rgba(139,92,246,0.4)', background: 'rgba(139,92,246,0.06)' }}>
+                              <td style={{ fontSize: 11, fontWeight: 700, color: '#8b5cf6' }}>
+                                {lbl}
+                                <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 6, fontWeight: 400 }}>score-switched</span>
+                              </td>
+                              <td style={{ fontSize: 11 }}>{fmtRs(initCap)}</td>
+                              <td style={{ fontSize: 11, fontWeight: 600 }}>{fmtRs(cap)}</td>
+                              <td className={pnl >= 0 ? 'text-success' : 'text-danger'} style={{ fontWeight: 700, fontSize: 11 }}>{fmtRs(pnl)}</td>
+                              <td className={pct >= 0 ? 'text-success' : 'text-danger'} style={{ fontSize: 11, fontWeight: 600 }}>{pct.toFixed(2)}%</td>
+                              <td style={{ fontSize: 11 }}>
+                                {hasOpen ? <span className="badge badge-success">IN POSITION</span>
+                                :          <span className="badge badge-muted">IDLE</span>}
+                              </td>
+                            </tr>
+                          );
+                        })()}
                       </tbody>
                     </table>
                   </div>
@@ -3730,19 +4044,24 @@ function LiveTest() {
             </div>
 
             {/* Open positions — one card per strategy */}
-            {allStratLabels.filter(lbl => stratStates[lbl]?.openPosition).length > 0 && (
+            {allStratLabels.filter(lbl => instrStratStates[lbl]?.openPosition).length > 0 && (
               <div className="card" style={{ marginBottom: 10 }}>
                 <h3 className="section-title" style={{ marginBottom: 10 }}>Open Positions</h3>
-                {allStratLabels.filter(lbl => stratStates[lbl]?.openPosition).map(lbl => {
-                  const pos = stratStates[lbl].openPosition;
-                  const ltp = parseFloat(latestTick?.ltp || pos.entryPrice);
-                  const uPnl = (ltp - pos.entryPrice) * pos.qty;
+                {allStratLabels.filter(lbl => instrStratStates[lbl]?.openPosition).map(lbl => {
+                  const isCombined = lbl === COMBINED_LABEL;
+                  const pos  = instrStratStates[lbl].openPosition;
+                  const ltp  = parseFloat(latestTick?.ltp || pos.entryPrice);
+                  const uPnl = pos.type === 'SHORT' ? (pos.entryPrice - ltp) * pos.qty : (ltp - pos.entryPrice) * pos.qty;
                   const uPct = (uPnl / (pos.entryPrice * pos.qty)) * 100;
                   return (
-                    <div key={lbl} className="bt-live-position-card" style={{ marginBottom: 8 }}>
+                    <div key={lbl} className="bt-live-position-card" style={{ marginBottom: 8, ...(isCombined ? { border: '1px solid rgba(139,92,246,0.35)', background: 'rgba(139,92,246,0.06)' } : {}) }}>
                       <div className="bt-live-pos-row">
                         <span className="bt-metric-label">Strategy</span>
-                        <span className="instance-type">{lbl}</span>
+                        <span className="instance-type" style={isCombined ? { color: '#8b5cf6' } : {}}>{lbl}</span>
+                        {isCombined && <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 4 }}>score-switched</span>}
+                        {pos.type === 'SHORT'
+                          ? <span style={{ fontSize: 10, fontWeight: 700, color: '#8b5cf6', background: 'rgba(139,92,246,0.12)', borderRadius: 4, padding: '1px 5px', marginLeft: 4 }}>SHORT↓</span>
+                          : <span style={{ fontSize: 10, fontWeight: 700, color: '#22c55e', background: 'rgba(34,197,94,0.12)', borderRadius: 4, padding: '1px 5px', marginLeft: 4 }}>LONG↑</span>}
                       </div>
                       <div className="bt-live-pos-row">
                         <span className="bt-metric-label">Entry</span>
@@ -3762,7 +4081,7 @@ function LiveTest() {
                       {pos.tpPrice && <div className="bt-live-pos-row"><span className="bt-metric-label">TP</span><span style={{ color: '#22c55e' }}>{fmtRs(pos.tpPrice)}</span></div>}
                       {pos.regime && <div className="bt-live-pos-row"><span className="bt-metric-label">Regime</span><span className={`bt-regime-badge bt-regime-${pos.regime}`}>{pos.regime}</span></div>}
                       <button type="button" className="btn-danger btn-sm" style={{ marginTop: 8 }}
-                        onClick={() => closePaperPosition(lbl, parseFloat(latestTickRef.current?.ltp || pos.entryPrice), 'MANUAL')}>
+                        onClick={() => closePaperPosition(instrKey(lbl), ltp, 'MANUAL')}>
                         Close {lbl}
                       </button>
                     </div>
@@ -3776,7 +4095,7 @@ function LiveTest() {
               <h3 className="section-title" style={{ marginBottom: 10 }}>Strategy Warmup</h3>
               {strategies.filter(s => s.enabled).map(s => {
                 const label = s.label || s.strategyType;
-                const ev = evaluatorsRef.current[label];
+                const ev = evaluatorsRef.current[selectedInstrToken ? `${selectedInstrToken}::${label}` : label];
                 const seen = ev?.candlesSeen || 0;
                 const need = ev?.warmupNeeded || 1;
                 const warmed = seen >= need;
@@ -3796,6 +4115,256 @@ function LiveTest() {
           </>
         )}
 
+        {/* ── Details tab ── */}
+        {rightTab === 'details' && (() => {
+          const stratLabels = strategies.filter(s => s.enabled).map(s => s.label || s.strategyType);
+
+          function fmtAction(a) {
+            const r = a.reason === 'STOP_LOSS'   ? 'Stop Loss hit'
+                    : a.reason === 'TAKE_PROFIT' ? 'Take Profit hit'
+                    : a.reason === 'SIGNAL'      ? 'Signal'
+                    : a.reason || '';
+            if (a.signal === 'SHORT')             return `Enter Short — ${a.strategy} @${Number(a.price).toFixed(2)}`;
+            if (a.signal === 'BUY'  && !a.reason) return `Enter Long — ${a.strategy} @${Number(a.price).toFixed(2)}`;
+            if (a.signal === 'BUY'  &&  a.reason) return `Exit Short — ${a.strategy} @${Number(a.price).toFixed(2)} [${r}]`;
+            if (a.signal === 'SELL')               return `Exit Long — ${a.strategy} @${Number(a.price).toFixed(2)} [${r}]`;
+            return `${a.signal} — ${a.strategy} @${Number(a.price).toFixed(2)}`;
+          }
+
+          function downloadCSV() {
+            const q   = v => `"${String(v ?? '').replace(/"/g,'""')}"`;
+            const row = (...cols) => cols.map(q).join(',');
+            const blank = '';
+            const lines = [];
+            const today = new Date().toISOString().slice(0, 10);
+
+            // ── Instrument Details ─────────────────────────────────────
+            lines.push(row('=== Instrument Details ==='));
+            lines.push(row('Symbol','Exchange','Token','Interval','Mode','Date'));
+            lines.push(row(selInstrConfig.symbol, selInstrConfig.exchange, selInstrConfig.instrumentToken, selInstrConfig.candleInterval, mode, today));
+            lines.push(blank);
+
+            // ── Strategies ────────────────────────────────────────────
+            lines.push(row('=== Strategies ==='));
+            lines.push(row('Name','Type','Allow Shorting'));
+            strategies.filter(s => s.enabled).forEach(s => {
+              lines.push(row(s.label || s.strategyType, s.strategyType, s.allowShorting ? 'Yes' : 'No'));
+            });
+            lines.push(blank);
+
+            // ── Risk Management ───────────────────────────────────────
+            if (riskConfig.enabled) {
+              lines.push(row('=== Risk Management ==='));
+              lines.push(row('Stop Loss %','Take Profit %','Max Risk Per Trade %','Cooldown Candles','Daily Loss Cap %'));
+              lines.push(row(
+                riskConfig.stopLossPct        || '—',
+                riskConfig.takeProfitPct      || '—',
+                riskConfig.maxRiskPerTradePct || '—',
+                riskConfig.cooldownCandles    || '—',
+                riskConfig.dailyLossCapPct    || '—',
+              ));
+              lines.push(blank);
+            }
+
+            // ── Market Regime Detection ───────────────────────────────
+            if (regimeConfig.enabled) {
+              lines.push(row('=== Market Regime Detection ==='));
+              lines.push(row('ADX Period','ATR Period','ADX Trend Threshold','ATR Volatile %','ATR Compression %'));
+              lines.push(row(
+                regimeConfig.adxPeriod, regimeConfig.atrPeriod,
+                regimeConfig.adxTrendThreshold, regimeConfig.atrVolatilePct, regimeConfig.atrCompressionPct,
+              ));
+              lines.push(blank);
+            }
+
+            // ── Pattern Confirmation ───────────────────────────────────
+            if (patternConfig.enabled) {
+              lines.push(row('=== Pattern Confirmation ==='));
+              lines.push(row('Buy Confirm Patterns','Sell Confirm Patterns','Min Wick Ratio','Max Body %'));
+              lines.push(row(
+                (patternConfig.buyConfirmPatterns  || []).join('; ') || 'Any',
+                (patternConfig.sellConfirmPatterns || []).join('; ') || 'Any',
+                patternConfig.minWickRatio, patternConfig.maxBodyPct,
+              ));
+              lines.push(blank);
+            }
+
+            // ── P&L Summary ───────────────────────────────────────────
+            lines.push(row('=== P&L Summary ==='));
+            lines.push(row('Strategy','Initial Capital','Final Capital','P&L','Return %','Total Trades','Wins','Losses','Win Rate %'));
+            const liveInitCap = parseFloat(initialCapital) || 100000;
+            stratLabels.forEach(lbl => {
+              const st     = instrStratStates[lbl];
+              const cap    = st?.capital ?? liveInitCap;
+              const pnl    = cap - liveInitCap;
+              const pct    = ((pnl / liveInitCap) * 100).toFixed(2);
+              const trades = st?.closedTrades || [];
+              const wins   = trades.filter(t => t.pnl >= 0).length;
+              lines.push(row(lbl, liveInitCap.toFixed(2), cap.toFixed(2), pnl.toFixed(2), pct, trades.length, wins, trades.length - wins,
+                trades.length ? ((wins / trades.length) * 100).toFixed(1) : '—'));
+            });
+            lines.push(blank);
+
+            // ── Trade History ─────────────────────────────────────────
+            lines.push(row('=== Trade History ==='));
+            lines.push(row('Strategy','Direction','Entry Time','Exit Time','Qty',
+              'Entry Price','Exit Price','P&L','P&L %','Exit Reason',
+              ...(regimeConfig.enabled ? ['Regime'] : [])));
+            stratLabels.forEach(lbl => {
+              (instrStratStates[lbl]?.closedTrades || []).slice().reverse().forEach(t => {
+                lines.push(row(
+                  lbl, t.type || 'LONG', t.entryTime, t.exitTime, t.qty,
+                  Number(t.entryPrice).toFixed(2), Number(t.exitPrice).toFixed(2),
+                  Number(t.pnl).toFixed(2), Number(t.pnlPct ?? 0).toFixed(2),
+                  t.exitReason === 'STOP_LOSS' ? 'Stop Loss hit' : t.exitReason === 'TAKE_PROFIT' ? 'Take Profit hit' : t.exitReason || 'Signal',
+                  ...(regimeConfig.enabled ? [t.regime ?? ''] : []),
+                ));
+              });
+            });
+            lines.push(blank);
+
+            // ── Candle Data ───────────────────────────────────────────
+            lines.push(row('=== Candle Data ==='));
+            const sigCols = stratLabels.map(l => `Signal_${l}`);
+            lines.push(row('Time','Open','High','Low','Close','Volume',
+              ...(regimeConfig.enabled ? ['Regime'] : []),
+              ...sigCols, 'Strategy Actions'));
+            candleLogRef.current.forEach(r => {
+              lines.push(row(
+                r.ts,
+                Number(r.open).toFixed(2), Number(r.high).toFixed(2),
+                Number(r.low).toFixed(2), Number(r.close).toFixed(2),
+                r.volume ?? '',
+                ...(regimeConfig.enabled ? [r.regime ?? ''] : []),
+                ...stratLabels.map(l => r.signals?.[l] ?? ''),
+                r.actions.map(fmtAction).join(' | '),
+              ));
+            });
+
+            const csv  = lines.join('\n');
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url  = URL.createObjectURL(blob);
+            const a    = document.createElement('a');
+            a.href = url; a.download = `live_${selInstrConfig.symbol || 'data'}_${today}.csv`; a.click();
+            URL.revokeObjectURL(url);
+          }
+
+          // ── Feature summary cards ──────────────────────────────────
+          const infoBlocks = [
+            { label: 'Instrument', items: [
+                `${selInstrConfig.symbol || '—'} · ${selInstrConfig.exchange || '—'}`,
+                `Token: ${selInstrConfig.instrumentToken || '—'}`,
+                `${selInstrConfig.candleInterval || '—'} · Mode: ${mode}`,
+            ]},
+            ...(riskConfig.enabled ? [{ label: 'Risk Management', items: [
+                riskConfig.stopLossPct        ? `SL: ${riskConfig.stopLossPct}%`                 : null,
+                riskConfig.takeProfitPct      ? `TP: ${riskConfig.takeProfitPct}%`               : null,
+                riskConfig.maxRiskPerTradePct ? `Max Risk/Trade: ${riskConfig.maxRiskPerTradePct}%` : null,
+                riskConfig.cooldownCandles    ? `Cooldown: ${riskConfig.cooldownCandles} candles` : null,
+                riskConfig.dailyLossCapPct    ? `Daily Cap: ${riskConfig.dailyLossCapPct}%`       : null,
+            ].filter(Boolean) }] : []),
+            ...(regimeConfig.enabled ? [{ label: 'Regime Detection', items: [
+                `ADX ${regimeConfig.adxPeriod}p · Trend ≥ ${regimeConfig.adxTrendThreshold}`,
+                `ATR ${regimeConfig.atrPeriod}p · Volatile ≥ ${regimeConfig.atrVolatilePct}% · Compress ≤ ${regimeConfig.atrCompressionPct}%`,
+            ] }] : []),
+            ...(patternConfig.enabled ? [{ label: 'Pattern Confirmation', items: [
+                `Buy: ${(patternConfig.buyConfirmPatterns||[]).join(', ') || 'Any'}`,
+                `Sell: ${(patternConfig.sellConfirmPatterns||[]).join(', ') || 'Any'}`,
+                `Wick ≥ ${patternConfig.minWickRatio} · Body ≤ ${patternConfig.maxBodyPct}%`,
+            ] }] : []),
+          ];
+
+          return (
+            <div className="card" style={{ padding: 0 }}>
+              <div className="bt-feed-header">
+                <span className="bt-params-label" style={{ margin: 0 }}>Candle Details</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{candleLog.length} candles</span>
+                  {candleLog.length > 0 && (
+                    <button type="button" className="btn-secondary btn-xs" onClick={downloadCSV}>Download CSV</button>
+                  )}
+                </div>
+              </div>
+
+              {/* Feature summary */}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '10px 12px', borderBottom: '1px solid var(--border)' }}>
+                {infoBlocks.map(blk => (
+                  <div key={blk.label} style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 12px', minWidth: 160, flex: '1 1 160px' }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: 4 }}>{blk.label}</div>
+                    {blk.items.map((it, i) => <div key={i} style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6 }}>{it}</div>)}
+                  </div>
+                ))}
+              </div>
+
+              {candleLog.length === 0
+                ? <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>Candle details will appear as candles close.</div>
+                : (
+                  <div style={{ overflowX: 'auto', maxHeight: 480, overflowY: 'auto' }}>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+                      <thead style={{ position: 'sticky', top: 0, background: 'var(--card-bg)', zIndex: 1 }}>
+                        <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                          {['Time','O','H','L','C','Vol',
+                            ...(regimeConfig.enabled ? ['Regime'] : []),
+                            ...stratLabels.map(l => l.length > 10 ? l.slice(0,10)+'…' : l),
+                            'Actions'].map(h => (
+                            <th key={h} style={{ padding: '5px 6px', textAlign: 'left', color: 'var(--text-muted)', fontWeight: 600, whiteSpace: 'nowrap' }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[...candleLog].reverse().map((row, i) => (
+                          <tr key={i} style={{ borderBottom: '1px solid var(--border)', background: row.actions.length > 0 ? 'rgba(99,102,241,0.06)' : undefined }}>
+                            <td style={{ padding: '4px 6px', whiteSpace: 'nowrap', color: 'var(--text-muted)' }}>{row.ts}</td>
+                            <td style={{ padding: '4px 6px' }}>{Number(row.open).toFixed(2)}</td>
+                            <td style={{ padding: '4px 6px', color: '#22c55e' }}>{Number(row.high).toFixed(2)}</td>
+                            <td style={{ padding: '4px 6px', color: '#ef4444' }}>{Number(row.low).toFixed(2)}</td>
+                            <td style={{ padding: '4px 6px', fontWeight: 600 }}>{Number(row.close).toFixed(2)}</td>
+                            <td style={{ padding: '4px 6px', color: 'var(--text-muted)' }}>{row.volume?.toLocaleString() ?? '—'}</td>
+                            {regimeConfig.enabled && (
+                              <td style={{ padding: '4px 6px' }}>
+                                {row.regime
+                                  ? <span className={`bt-regime-badge bt-regime-${row.regime}`}>{row.regime}</span>
+                                  : <span style={{ color: 'var(--text-muted)' }}>—</span>}
+                              </td>
+                            )}
+                            {stratLabels.map(l => {
+                              const sig = row.signals?.[l];
+                              return (
+                                <td key={l} style={{ padding: '4px 6px' }}>
+                                  {sig === 'BUY'  ? <span style={{ color: '#22c55e', fontWeight: 700 }}>BUY</span>
+                                  : sig === 'SELL' ? <span style={{ color: '#ef4444', fontWeight: 700 }}>SELL</span>
+                                  : sig === 'SHORT'? <span style={{ color: '#8b5cf6', fontWeight: 700 }}>SHORT</span>
+                                  : <span style={{ color: 'var(--text-muted)' }}>—</span>}
+                                </td>
+                              );
+                            })}
+                            <td style={{ padding: '4px 6px', minWidth: 220 }}>
+                              {row.actions.length === 0
+                                ? <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                : row.actions.map((a, ai) => {
+                                    const lbl     = fmtAction(a);
+                                    const isEnter = !a.reason;
+                                    const color   = a.signal === 'SHORT' ? '#8b5cf6' : isEnter ? '#22c55e' : '#ef4444';
+                                    return (
+                                      <div key={ai} style={{ fontSize: 11, lineHeight: 1.6 }}>
+                                        <span style={{ fontWeight: 700, color }}>{lbl.split(' —')[0]}</span>
+                                        <span style={{ color: 'var(--text-muted)' }}>{' —' + lbl.split(' —').slice(1).join(' —')}</span>
+                                      </div>
+                                    );
+                                  })
+                              }
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )
+              }
+            </div>
+          );
+        })()}
+
         </div>{/* end bt-live-feed */}
       </div>{/* end bt-live-top-row */}
 
@@ -3803,7 +4372,13 @@ function LiveTest() {
       <div className="card bt-live-strategies-row">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
           <h3 className="section-title" style={{ margin: 0 }}>Strategies</h3>
-          {!connected && <button type="button" className="btn-secondary btn-sm" onClick={addStrategy}>+ Add</button>}
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button type="button" className={`btn-sm ${strategies.every(s => s.allowShorting) ? 'btn-secondary' : 'btn-muted'}`}
+              style={{ fontSize: 11 }} onClick={toggleMasterShorting}>
+              Short {strategies.every(s => s.allowShorting) ? 'ON' : 'OFF'}
+            </button>
+            {!connected && <button type="button" className="btn-secondary btn-sm" onClick={addStrategy}>+ Add</button>}
+          </div>
         </div>
         <div className="bt-live-strategies-grid">
           {strategies.map((s, idx) => {
@@ -3836,13 +4411,21 @@ function LiveTest() {
                     ))}
                   </div>
                 )}
-                {regimeConfig.enabled && s.enabled && (
-                  <div style={{ marginTop: 6, display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
-                    <span className="bt-params-label" style={{ marginRight: 4 }}>Regimes</span>
-                    <span className="bt-regime-auto-tag">auto</span>
-                    {(STRATEGY_REGIME_MAP[s.strategyType] || []).map(r => (
-                      <span key={r} className={`bt-regime-badge bt-regime-${r}`}>{r}</span>
-                    ))}
+                {s.enabled && (
+                  <div style={{ marginTop: 6, display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <label className="checkbox-label" style={{ fontSize: 11, margin: 0 }}>
+                      <input type="checkbox" checked={!!s.allowShorting} disabled={connected}
+                        onChange={e => updateStrategy(idx, 'allowShorting', e.target.checked)} />
+                      Allow Short
+                    </label>
+                    {regimeConfig.enabled && (
+                      <>
+                        <span className="bt-regime-auto-tag">auto</span>
+                        {(STRATEGY_REGIME_MAP[s.strategyType] || []).map(r => (
+                          <span key={r} className={`bt-regime-badge bt-regime-${r}`}>{r}</span>
+                        ))}
+                      </>
+                    )}
                   </div>
                 )}
               </div>
