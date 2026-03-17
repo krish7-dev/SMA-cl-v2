@@ -43,6 +43,23 @@ public class LiveMarketDataService {
     // ─── Public API ───────────────────────────────────────────────────────────
 
     /**
+     * Establishes the KiteTicker WebSocket connection without subscribing any instruments.
+     * Safe to call multiple times — idempotent if already connected.
+     */
+    public void connect(String userId, String brokerName, String apiKey, String accessToken) {
+        String sessionKey = sessionKey(userId, brokerName);
+        activeSessions.computeIfAbsent(sessionKey, k -> {
+            log.info("Connecting KiteTicker for session: {}", k);
+            MarketDataAdapter a = adapterRegistry.resolve(brokerName);
+            a.setTickListener(ticks -> ticks.forEach(tick ->
+                    eventPublisher.publishEvent(new TickDataEvent(this, tick))
+            ));
+            a.connect(apiKey, accessToken);
+            return a;
+        });
+    }
+
+    /**
      * Opens a live subscription for the requested instruments.
      * If a session already exists for (userId, brokerName), adds to it.
      * If not, creates a new WebSocket connection via the appropriate adapter.
