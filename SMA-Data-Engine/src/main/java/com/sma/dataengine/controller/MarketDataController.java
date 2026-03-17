@@ -1,5 +1,6 @@
 package com.sma.dataengine.controller;
 
+import com.sma.dataengine.model.request.ConnectRequest;
 import com.sma.dataengine.model.request.SubscriptionRequest;
 import com.sma.dataengine.model.request.UnsubscribeRequest;
 import com.sma.dataengine.model.response.ApiResponse;
@@ -23,6 +24,21 @@ import org.springframework.web.bind.annotation.*;
 public class MarketDataController {
 
     private final LiveMarketDataService liveMarketDataService;
+
+    /**
+     * Establishes the KiteTicker WebSocket connection without subscribing any instruments.
+     * Call this first, then poll GET /status until connected=true, then call /subscribe.
+     *
+     * POST /api/v1/data/live/connect
+     */
+    @PostMapping("/connect")
+    public ResponseEntity<ApiResponse<Void>> connect(
+            @Valid @RequestBody ConnectRequest request) {
+        liveMarketDataService.connect(
+                request.getUserId(), request.getBrokerName(),
+                request.getApiKey(), request.getAccessToken());
+        return ResponseEntity.ok(ApiResponse.ok(null, "KiteTicker connecting"));
+    }
 
     /**
      * Opens a live WebSocket subscription for the given instruments.

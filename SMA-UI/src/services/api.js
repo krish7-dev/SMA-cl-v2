@@ -134,6 +134,10 @@ export async function liveStatus(userId, brokerName) {
   );
 }
 
+export async function liveConnect(payload) {
+  return request(`${DATA}/api/v1/data/live/connect`, { method: 'POST', body: payload });
+}
+
 // ─── Data Engine — Replay ─────────────────────────────────────────────────────
 
 export async function startReplay(payload) {

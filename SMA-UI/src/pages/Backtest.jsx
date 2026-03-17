@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import {
   getStrategyTypes, runBacktest,
-  liveSubscribe, liveUnsubscribe,
+  liveSubscribe, liveUnsubscribe, liveConnect, liveStatus,
   searchInstruments, fetchHistoricalData,
   startReplayEval,
   startLiveEval, stopLiveEval,
@@ -3162,6 +3162,7 @@ function LiveTest() {
   const [selectedInstrToken, setSelectedInstrToken] = useState(null);
 
   // ── Connection ────────────────────────────────────────────────────────────
+  const [kiteConnected, setKiteConnected] = useState(false);
   const [connected, setConnected]   = useState(false);
   const [status, setStatus]         = useState('idle');
   const [error, setError]           = useState('');
@@ -3179,6 +3180,7 @@ function LiveTest() {
   const [stratStates, setStratStates] = useState({});
 
   // ── UI ────────────────────────────────────────────────────────────────────
+  const [combinedOnlyMode, setCombinedOnlyMode] = useState(false);
   const [rightTab, setRightTab] = useState('feed');
   const [expandedInstrs, setExpandedInstrs] = useState({});  // id → bool
 
@@ -3666,8 +3668,37 @@ function LiveTest() {
     setCandleLogByToken(prev => ({ ...prev, [token]: [...candleLogsRef.current[token]] }));
   }
 
-  // ── Connect handler ───────────────────────────────────────────────────────
-  async function handleConnect(e) {
+  // ── KiteTicker connect handler (Step 1: establish WebSocket only) ─────────
+  async function handleKiteConnect(e) {
+    e.preventDefault();
+    setError('');
+    setStatus('connecting');
+    try {
+      await liveConnect({
+        userId: session.userId, brokerName: session.brokerName,
+        apiKey: session.apiKey, accessToken: session.accessToken,
+      });
+
+      // Poll until KiteTicker is connected (async handshake)
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 500));
+        const res = await liveStatus(session.userId, session.brokerName);
+        if (res?.data === true) {
+          setKiteConnected(true);
+          setStatus('kite_ready');
+          return;
+        }
+      }
+      throw new Error('KiteTicker did not connect within 10 seconds — check credentials and try again');
+    } catch (err) {
+      setError(err.message);
+      setStatus('idle');
+    }
+  }
+
+  // ── Go Live handler (Step 2: subscribe instruments + start eval) ──────────
+  async function handleGoLive(e) {
     e.preventDefault();
     const validInstrs = instruments.filter(i => i.instrumentToken);
     if (!validInstrs.length) { setError('Add at least one instrument with a token.'); return; }
@@ -3683,7 +3714,7 @@ function LiveTest() {
     setSelectedInstrToken(String(validInstrs[0].instrumentToken));
 
     try {
-      // ── Step 1: Subscribe to Data Engine for price ticker display ────────
+      // ── Subscribe to Data Engine for price ticker display ─────────────────
       setStatus('connecting');
       await liveSubscribe({
         userId: session.userId, brokerName: session.brokerName,
@@ -3768,7 +3799,26 @@ function LiveTest() {
         patternConfig: patternConfig.enabled ? patternConfig : null,
         regimeConfig:  regimeConfig.enabled  ? regimeConfig  : null,
         scoreConfig:   scoreConfig.enabled   ? scoreConfig   : null,
-        rulesConfig:   rulesConfig.enabled   ? rulesConfig   : null,
+        rulesConfig: rulesConfig.enabled ? {
+          enabled: true,
+          stocks: {
+            rangingNoTrade:       rulesConfig.stocks?.ranging_no_trade?.enabled ?? true,
+            compressionShortOnly: rulesConfig.stocks?.compression_short_only?.enabled ?? true,
+            noSameCandleReversal: rulesConfig.stocks?.no_same_candle_reversal?.enabled ?? true,
+            longQualityGate: {
+              enabled:    rulesConfig.stocks?.long_quality_gate?.enabled ?? true,
+              scoreMin:   parseFloat(rulesConfig.stocks?.long_quality_gate?.scoreMin)  || 60,
+              vwapMaxPct: parseFloat(rulesConfig.stocks?.long_quality_gate?.vwapMaxPct) || 1.5,
+            },
+          },
+          options: {
+            volatileNoTrade:      rulesConfig.options?.volatile_no_trade?.enabled ?? true,
+            disableSmaBreakout:   rulesConfig.options?.disable_sma_breakout?.enabled ?? true,
+            distrustHighVolScore: rulesConfig.options?.distrust_high_vol_score?.enabled ?? true,
+            volScoreMax:          parseFloat(rulesConfig.options?.distrust_high_vol_score?.volScoreMax) || 70,
+            noSameCandleReversal: rulesConfig.options?.no_same_candle_reversal?.enabled ?? true,
+          },
+        } : { enabled: false },
       });
 
       const newSessionId = liveEvalRes?.data?.sessionId;
@@ -3912,7 +3962,7 @@ function LiveTest() {
     }
     // Unsubscribe from Data Engine
     try { await liveUnsubscribe({ userId: session.userId, brokerName: session.brokerName, instrumentTokens: tokens }); } catch {}
-    cleanup(); setConnected(false); setStatus('idle');
+    cleanup(); setConnected(false); setKiteConnected(false); setStatus('idle');
   }
 
   // ── Derived values (filtered to selected instrument) ──────────────────────
@@ -3957,7 +4007,7 @@ function LiveTest() {
               <button type="button" className="btn-secondary btn-xs" onClick={addInstrument}>+ Add Instrument</button>
             )}
           </div>
-          <form onSubmit={handleConnect}>
+          <form onSubmit={e => e.preventDefault()}>
             {/* Per-instrument rows */}
             {instruments.map((instr, idx) => {
               const isExpanded = expandedInstrs[instr.id] !== false; // default expanded
@@ -4070,12 +4120,21 @@ function LiveTest() {
             {!isActive && <div className="error-msg" style={{ marginBottom: 12 }}>No active session.</div>}
 
             <div style={{ display: 'flex', gap: 8 }}>
-              {!connected
-                ? <button type="submit" className="btn-primary" disabled={!isActive || ['warming up','connecting'].includes(status)}>
-                    {status === 'warming up' ? 'Warming up…' : status === 'connecting' ? 'Connecting…' : '⬤ Connect Live'}
+              {!kiteConnected
+                ? <button type="button" className="btn-secondary" disabled={!isActive || status === 'connecting'}
+                    onClick={handleKiteConnect}>
+                    {status === 'connecting' ? 'Connecting…' : '🔌 Connect Kite'}
                   </button>
-                : <button type="button" className="btn-danger" onClick={handleDisconnect}>✕ Unsubscribe</button>
+                : !connected
+                  ? <button type="button" className="btn-primary" disabled={!isActive || ['warming up','connecting'].includes(status)}
+                      onClick={handleGoLive}>
+                      {status === 'warming up' ? 'Warming up…' : status === 'connecting' ? 'Connecting…' : '▶ Go Live'}
+                    </button>
+                  : <button type="button" className="btn-danger" onClick={handleDisconnect}>✕ Unsubscribe</button>
               }
+              {kiteConnected && !connected && (
+                <span style={{ alignSelf: 'center', fontSize: 12, color: 'var(--success)' }}>● Kite connected</span>
+              )}
             </div>
           </form>
         </div>
@@ -5126,8 +5185,17 @@ function LiveTest() {
           <h3 className="section-title" style={{ margin: 0 }}>Strategies</h3>
           <div style={{ display: 'flex', gap: 6 }}>
             <button type="button" className={`btn-sm ${strategies.every(s => s.allowShorting) ? 'btn-secondary' : 'btn-muted'}`}
-              style={{ fontSize: 11 }} onClick={toggleMasterShorting}>
+              style={{ fontSize: 11 }} onClick={toggleMasterShorting} disabled={connected}>
               Short {strategies.every(s => s.allowShorting) ? 'ON' : 'OFF'}
+            </button>
+            <button type="button" disabled={connected}
+              onClick={() => setCombinedOnlyMode(m => !m)}
+              title="When ON: individual strategies only compute signals for the ⚡ Combined pool — they don't trade independently"
+              style={{ fontSize: 11, padding: '2px 10px', borderRadius: 12, border: '1px solid', cursor: 'pointer',
+                background:   combinedOnlyMode ? 'rgba(234,179,8,0.15)'  : 'transparent',
+                color:        combinedOnlyMode ? '#ca8a04'               : 'var(--text-muted)',
+                borderColor:  combinedOnlyMode ? 'rgba(234,179,8,0.4)'   : 'var(--border)' }}>
+              {combinedOnlyMode ? '⚡ Combined Only' : 'All Strategies'}
             </button>
             {!connected && <button type="button" className="btn-secondary btn-sm" onClick={addStrategy}>+ Add</button>}
           </div>

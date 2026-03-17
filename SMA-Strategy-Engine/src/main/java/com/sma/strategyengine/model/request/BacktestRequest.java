@@ -137,6 +137,12 @@ public class BacktestRequest {
          * Valid values: TRENDING, RANGING, VOLATILE, COMPRESSION
          */
         private List<String> activeRegimes = new java.util.ArrayList<>();
+
+        /**
+         * Allow this strategy to open short positions independently.
+         * When false (default), only long entries are taken.
+         */
+        private boolean allowShorting = false;
     }
 
     @Data

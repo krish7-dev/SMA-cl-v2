@@ -1205,6 +1205,7 @@ public class LiveEvalService {
                 dailyCaps.put(label, new DailyCapState(null, initCap, false));
             }
 
+            combinedScorer   = new StrategyScorer();
             combinedCapital  = initCap;
             combinedEquities = new ArrayList<>(List.of(
                     EquityPoint.builder().time("start").capital(initCap.doubleValue()).build()));
