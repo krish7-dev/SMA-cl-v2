@@ -4,6 +4,7 @@ import {
   liveSubscribe, liveUnsubscribe,
   searchInstruments, fetchHistoricalData,
   startReplayEval,
+  startLiveEval, stopLiveEval,
 } from '../services/api';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { useSession } from '../context/SessionContext';
@@ -3164,6 +3165,7 @@ function LiveTest() {
   const [connected, setConnected]   = useState(false);
   const [status, setStatus]         = useState('idle');
   const [error, setError]           = useState('');
+  const [liveSessionId, setLiveSessionId] = useState(null);
 
   // ── Live data — per instrument (keyed by token string) ───────────────────
   const [ticksByToken, setTicksByToken]             = useState({});
@@ -3188,6 +3190,7 @@ function LiveTest() {
   // regimeDetectorsRef: token → LocalRegimeDetector
   const regimeDetectorsRef = useRef({});
   const sseRef             = useRef(null);
+  const liveAbortCtrlRef   = useRef(null);
   const signalsRef         = useRef([]);
   // Trading maps: `${token}::${stratLabel}` → value
   const capitalMap         = useRef({});
@@ -3218,6 +3221,7 @@ function LiveTest() {
 
   function cleanup() {
     if (sseRef.current) { sseRef.current.close(); sseRef.current = null; }
+    if (liveAbortCtrlRef.current) { liveAbortCtrlRef.current.abort(); liveAbortCtrlRef.current = null; }
   }
 
   // ── Instrument helpers ────────────────────────────────────────────────────
@@ -3364,11 +3368,16 @@ function LiveTest() {
     else closeLong(key, exitPrice, exitReason, symbol);
   }
 
-  // ── Candle close handler ─────────────────────────────────────────────────
-  // token: string instrumentToken, instrConfig: {symbol, exchange, instrumentToken, candleInterval, instrumentType}
-  function onCandleClose(candle, token, instrConfig) {
-    const sym        = instrConfig.symbol;
-    const instrType  = resolveInstrType(instrConfig.instrumentType, instrConfig.symbol, instrConfig.exchange);
+  // NOTE: onCandleClose was removed — strategy evaluation is now handled by the Strategy Engine
+  // backend (LiveEvalService). The backend subscribes to Data Engine ticks, builds candles,
+  // runs the full evaluation pipeline, and streams ReplayCandleEvent objects via SSE.
+  //
+  // The following function is kept only to prevent reference errors in closePaperPosition
+  // calls from manual close buttons that still exist in JSX. Those calls are now no-ops for
+  // live mode since openPositionMap is no longer populated.
+  function _removedOnCandleClose(candle, token, instrConfig) {
+    const sym        = instrConfig?.symbol || '';
+    const instrType  = resolveInstrType(instrConfig?.instrumentType, instrConfig?.symbol, instrConfig?.exchange);
     const activeRules = rulesConfig.enabled
       ? (instrType === 'OPTION' ? rulesConfig.options : rulesConfig.stocks)
       : {};
@@ -3669,95 +3678,12 @@ function LiveTest() {
     setCurrentCandleByToken({}); currentCandlesRef.current = {};
     setCurrentRegimeByToken({}); candleLogsRef.current = {};
     setCandleLogByToken({}); setPreloadStateByToken({});
-    cooldownRef.current = {};
-
-    const initCap  = parseFloat(initialCapital) || 100000;
-    const todayStr = new Date().toDateString();
-    const stratList = strategies.filter(s => s.enabled);
-    capitalMap.current = {}; openPositionMap.current = {};
-    closedTradesMap.current = {}; equityMap.current = {}; dailyCapMap.current = {};
-    evaluatorsRef.current = {}; regimeDetectorsRef.current = {}; patternEvalsRef.current = {};
-    scorersRef.current = {}; reversalCooldownRef.current = {};
-
-    // Per-instrument setup
-    for (const instr of validInstrs) {
-      const token = String(instr.instrumentToken);
-      // Trading maps per strategy
-      stratList.forEach(s => {
-        const key = `${token}::${s.label || s.strategyType}`;
-        capitalMap.current[key]      = initCap;
-        openPositionMap.current[key] = null;
-        closedTradesMap.current[key] = [];
-        equityMap.current[key]       = [];
-        dailyCapMap.current[key]     = { date: todayStr, startCapital: initCap, halted: false };
-        evaluatorsRef.current[key]   = buildLocalEvaluator(s.strategyType, s.parameters || {});
-      });
-      // Score-based combined pool — gated on scoreConfig.enabled
-      if (scoreConfig.enabled && stratList.length >= 1) {
-        const cKey = `${token}::${COMBINED_LABEL}`;
-        capitalMap.current[cKey]      = initCap;
-        openPositionMap.current[cKey] = null;
-        closedTradesMap.current[cKey] = [];
-        equityMap.current[cKey]       = [];
-        dailyCapMap.current[cKey]     = { date: todayStr, startCapital: initCap, halted: false };
-      }
-      // Scorer per instrument
-      scorersRef.current[token] = new LocalStrategyScorer(
-        parseInt(regimeConfig.adxPeriod,10)||14,
-        parseInt(regimeConfig.atrPeriod,10)||14,
-        10
-      );
-      // Regime + pattern per instrument
-      regimeDetectorsRef.current[token] = regimeConfig.enabled
-        ? new LocalRegimeDetector(parseInt(regimeConfig.adxPeriod,10)||14, parseInt(regimeConfig.atrPeriod,10)||14,
-            parseFloat(regimeConfig.adxTrendThreshold)||25, parseFloat(regimeConfig.atrVolatilePct)||2,
-            parseFloat(regimeConfig.atrCompressionPct)||0.5)
-        : null;
-      patternEvalsRef.current[token] = patternConfig.enabled
-        ? new LocalCandlePatternEvaluator(patternConfig.buyConfirmPatterns[0] || 'HAMMER', patternConfig.minWickRatio, patternConfig.maxBodyPct)
-        : null;
-    }
     setStratStates({});
+    setLiveSessionId(null);
     setSelectedInstrToken(String(validInstrs[0].instrumentToken));
 
     try {
-      // ── Preload warmup (per instrument, sequential) ─────────────────────
-      if (preload.enabled) {
-        setStatus('warming up');
-        for (const instr of validInstrs) {
-          const token = String(instr.instrumentToken);
-          setPreloadStateByToken(prev => ({ ...prev, [token]: { status: 'loading', count: 0, error: null } }));
-          try {
-            const now = new Date();
-            const from = new Date(now.getTime() - parseInt(preload.daysBack,10)*24*60*60*1000);
-            from.setHours(9, 15, 0, 0);
-            const pad = n => String(n).padStart(2,'0');
-            const fmt = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-            const res = await fetchHistoricalData({
-              userId: session.userId, brokerName: session.brokerName,
-              apiKey: session.apiKey, accessToken: session.accessToken,
-              instrumentToken: parseInt(instr.instrumentToken,10),
-              symbol: instr.symbol.toUpperCase(), exchange: instr.exchange.toUpperCase(),
-              interval: preload.interval, fromDate: fmt(from), toDate: fmt(now), persist: true,
-            });
-            const candles = res?.data || [];
-            candles.forEach(c => {
-              stratList.forEach(s => {
-                const key = `${token}::${s.label || s.strategyType}`;
-                evaluatorsRef.current[key]?.next(parseFloat(c.close));
-              });
-              regimeDetectorsRef.current[token]?.addCandle(parseFloat(c.high), parseFloat(c.low), parseFloat(c.close));
-              patternEvalsRef.current[token]?.next(parseFloat(c.close), parseFloat(c.high), parseFloat(c.low), parseFloat(c.volume||0), parseFloat(c.open));
-              scorersRef.current[token]?.addCandle(parseFloat(c.high), parseFloat(c.low), parseFloat(c.close));
-            });
-            setPreloadStateByToken(prev => ({ ...prev, [token]: { status: 'done', count: candles.length, error: null } }));
-          } catch (err) {
-            setPreloadStateByToken(prev => ({ ...prev, [token]: { status: 'error', count: 0, error: err.message } }));
-          }
-        }
-      }
-
-      // ── Subscribe all instruments ────────────────────────────────────────
+      // ── Step 1: Subscribe to Data Engine for price ticker display ────────
       setStatus('connecting');
       await liveSubscribe({
         userId: session.userId, brokerName: session.brokerName,
@@ -3768,63 +3694,41 @@ function LiveTest() {
         })),
       });
 
+      // Open Data Engine tick SSE — only used for price ticker updates
       const sse = new EventSource('/data-api/api/v1/data/stream/ticks');
       sseRef.current = sse;
 
       sse.addEventListener('tick', (ev) => {
         try {
-          const tick = JSON.parse(ev.data);
-          const ltp   = parseFloat(tick.ltp);
-          const tsMs  = Date.now();
+          const tick  = JSON.parse(ev.data);
           const token = String(tick.instrumentToken ?? tick.token ?? '');
           if (!token) return;
-
-          // Find the instrument config for this token (read from ref to avoid stale closure)
           const instrConfig = instrumentsRef.current.find(i => String(i.instrumentToken) === token);
           if (!instrConfig) return;
-          const sym = instrConfig.symbol;
 
-          // Update ticks per instrument
+          // Update ticks per instrument (price ticker display only)
           ticksRef.current[token] = [{ ...tick, ts: new Date().toLocaleTimeString() }, ...(ticksRef.current[token] || [])].slice(0, 200);
           setTicksByToken(prev => ({ ...prev, [token]: [...ticksRef.current[token]] }));
 
-          // SL / TP — only check positions for this instrument
-          const rc = riskConfigRef.current;
-          if (rc.enabled) {
-            for (const key of Object.keys(openPositionMap.current)) {
-              if (!key.startsWith(token + '::')) continue;
-              const pos = openPositionMap.current[key];
-              if (!pos) continue;
-              if (pos.type === 'SHORT') {
-                if (pos.slPrice && ltp >= pos.slPrice) closeShort(key, ltp, 'STOP_LOSS', sym);
-                else if (pos.tpPrice && ltp <= pos.tpPrice) closeShort(key, ltp, 'TAKE_PROFIT', sym);
-              } else {
-                if (pos.slPrice && ltp <= pos.slPrice) closeLong(key, ltp, 'STOP_LOSS', sym);
-                else if (pos.tpPrice && ltp >= pos.tpPrice) closeLong(key, ltp, 'TAKE_PROFIT', sym);
-              }
-            }
-          }
-
-          // Candle formation per instrument
-          const ivMs = INTERVAL_MS[instrConfig.candleInterval] || 300_000;
+          // Update current forming candle for live price display
+          const ltp   = parseFloat(tick.ltp);
+          const tsMs  = Date.now();
+          const ivMs  = INTERVAL_MS[instrConfig.candleInterval] || 300_000;
           const bucketStart = Math.floor(tsMs / ivMs) * ivMs;
           if (!currentCandlesRef.current[token]) {
             currentCandlesRef.current[token] = { open: ltp, high: ltp, low: ltp, close: ltp, volume: tick.volume||0, startTime: bucketStart };
           } else if (bucketStart > currentCandlesRef.current[token].startTime) {
-            onCandleClose({ ...currentCandlesRef.current[token] }, token, instrConfig);
             currentCandlesRef.current[token] = { open: ltp, high: ltp, low: ltp, close: ltp, volume: tick.volume||0, startTime: bucketStart };
           } else {
             const cur = currentCandlesRef.current[token];
             cur.high = Math.max(cur.high, ltp); cur.low = Math.min(cur.low, ltp);
-            cur.close = ltp; cur.volume += (tick.volume||0);
+            cur.close = ltp; cur.volume = tick.volume || cur.volume;
           }
           setCurrentCandleByToken(prev => ({ ...prev, [token]: { ...currentCandlesRef.current[token] } }));
         } catch {}
       });
 
-      let sseErrorCount = 0;
       sse.onerror = () => {
-        sseErrorCount++;
         if (sse.readyState === EventSource.CLOSED) {
           setConnected(false); setStatus('disconnected'); cleanup();
         } else {
@@ -3832,12 +3736,181 @@ function LiveTest() {
           setTimeout(() => { if (sse.readyState === EventSource.OPEN) setStatus('connected'); }, 3000);
         }
       };
+
+      // ── Step 2: Start Strategy Engine live eval session ──────────────────
+      setStatus('warming up');
+      const stratList = strategies.filter(s => s.enabled);
+      const liveEvalRes = await startLiveEval({
+        userId:     session.userId,
+        brokerName: session.brokerName,
+        instruments: validInstrs.map(i => ({
+          instrumentToken: parseInt(i.instrumentToken, 10),
+          symbol:          i.symbol.toUpperCase(),
+          exchange:        i.exchange.toUpperCase(),
+          instrumentType:  resolveInstrType(i.instrumentType, i.symbol, i.exchange),
+        })),
+        candleInterval: mode,
+        preloadDaysBack: preload.enabled ? (parseInt(preload.daysBack, 10) || 5) : 0,
+        preloadInterval: preload.interval || mode,
+        initialCapital:  parseFloat(initialCapital) || 100000,
+        quantity:        parseInt(quantity, 10) || 0,
+        product:         'MIS',
+        combinedOnlyMode,
+        allowShorting:   strategies.every(s => s.allowShorting),
+        strategies:      stratList.map(s => ({
+          strategyType:  s.strategyType,
+          label:         s.label || '',
+          parameters:    s.parameters || {},
+          activeRegimes: s.activeRegimes || [],
+          allowShorting: !!s.allowShorting,
+        })),
+        riskConfig:    riskConfig.enabled   ? riskConfig   : null,
+        patternConfig: patternConfig.enabled ? patternConfig : null,
+        regimeConfig:  regimeConfig.enabled  ? regimeConfig  : null,
+        scoreConfig:   scoreConfig.enabled   ? scoreConfig   : null,
+        rulesConfig:   rulesConfig.enabled   ? rulesConfig   : null,
+      });
+
+      const newSessionId = liveEvalRes?.data?.sessionId;
+      if (!newSessionId) throw new Error('Strategy Engine did not return a sessionId');
+      setLiveSessionId(newSessionId);
+
+      // Mark each instrument as preloading (the backend does the warmup)
+      validInstrs.forEach(i => {
+        const token = String(i.instrumentToken);
+        setPreloadStateByToken(prev => ({ ...prev, [token]: { status: 'loading', count: 0, error: null } }));
+      });
+
+      // ── Step 3: Subscribe to Strategy Engine candle event SSE stream ─────
+      const abortCtrl = new AbortController();
+      liveAbortCtrlRef.current = abortCtrl;
+
+      // Use fetch + ReadableStream for the SSE (same pattern as Replay Test)
+      const sseResponse = await fetch(`/strategy-api/api/v1/strategy/live/stream/${newSessionId}`, {
+        headers: { Accept: 'text/event-stream' },
+        signal: abortCtrl.signal,
+      });
+      if (!sseResponse.ok) throw new Error(`Strategy Engine stream returned HTTP ${sseResponse.status}`);
+
       setConnected(true); setStatus('connected');
+
+      // Read SSE stream in background (non-blocking — React state updates from a microtask loop)
+      const reader   = sseResponse.body.getReader();
+      const decoder  = new TextDecoder();
+      let   buffer   = '';
+
+      const processStream = async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop(); // keep incomplete last line
+
+            let eventName  = null;
+            let dataBuffer = '';
+            for (const line of lines) {
+              if (line.startsWith('event:')) {
+                eventName = line.slice(6).trim();
+              } else if (line.startsWith('data:')) {
+                dataBuffer = line.slice(5).trim();
+              } else if (line === '' && dataBuffer) {
+                // Dispatch the event
+                try {
+                  if (eventName === 'candle') {
+                    const envelope = JSON.parse(dataBuffer);
+                    const token    = String(envelope.instrumentToken);
+                    const sym      = envelope.symbol;
+                    const ev       = envelope.candle;
+                    if (!ev) { dataBuffer = ''; eventName = null; continue; }
+
+                    // Update regime display
+                    if (ev.regime) setCurrentRegimeByToken(prev => ({ ...prev, [token]: ev.regime }));
+
+                    // Accumulate live candles
+                    const candleEntry = {
+                      time: ev.candleTime, open: ev.open, high: ev.high,
+                      low: ev.low, close: ev.close, volume: ev.volume,
+                    };
+                    liveCandles_Ref.current[token] = [...(liveCandles_Ref.current[token] || []), candleEntry].slice(-500);
+                    setLiveCandlesByToken(prev => ({ ...prev, [token]: [...liveCandles_Ref.current[token]] }));
+
+                    // Update strategy states (keyed by `${token}::${label}`)
+                    if (ev.strategyStates) {
+                      const patch = {};
+                      for (const [label, state] of Object.entries(ev.strategyStates)) {
+                        patch[`${token}::${label}`] = state;
+                      }
+                      setStratStates(prev => ({ ...prev, ...patch }));
+                    }
+
+                    // Update signals
+                    if (ev.signals) {
+                      const newSigs = Object.entries(ev.signals)
+                        .filter(([, sig]) => sig !== 'HOLD')
+                        .map(([label, sig]) => ({
+                          signal: sig, price: ev.close, symbol: sym,
+                          ts: ev.candleTime || new Date().toLocaleTimeString(),
+                          strategyLabel: label,
+                        }));
+                      if (newSigs.length > 0) {
+                        signalsRef.current = [...newSigs, ...signalsRef.current].slice(0, 200);
+                        setSignals([...signalsRef.current]);
+                      }
+                    }
+
+                    // Candle log for the activity feed
+                    const logEntry = {
+                      ts: ev.candleTime, open: ev.open, high: ev.high, low: ev.low,
+                      close: ev.close, volume: ev.volume, regime: ev.regime,
+                      signals: ev.signals || {}, actions: ev.actions || [],
+                      blockedSignals: ev.blockedSignals || [],
+                      combinedDetails: ev.combinedDetails || [],
+                    };
+                    candleLogsRef.current[token] = [...(candleLogsRef.current[token] || []), logEntry];
+                    setCandleLogByToken(prev => ({ ...prev, [token]: [...candleLogsRef.current[token]] }));
+
+                  } else if (eventName === 'info') {
+                    // Preload done notification
+                    try {
+                      const info = JSON.parse(dataBuffer);
+                      if (info.type === 'preload_done') {
+                        const token = String(info.instrumentToken);
+                        setPreloadStateByToken(prev => ({
+                          ...prev,
+                          [token]: { status: 'done', count: info.count || 0, error: null },
+                        }));
+                      }
+                    } catch {}
+                  } else if (eventName === 'error') {
+                    setError(`Strategy Engine: ${dataBuffer}`);
+                  }
+                } catch {}
+                dataBuffer = '';
+                eventName  = null;
+              }
+            }
+          }
+        } catch (err) {
+          if (err.name !== 'AbortError') {
+            setError(`Live eval stream error: ${err.message}`);
+            setConnected(false); setStatus('disconnected');
+          }
+        }
+      };
+      processStream(); // fire and forget — runs concurrently
     } catch (err) { setError(err.message); setStatus('idle'); cleanup(); }
   }
 
   async function handleDisconnect() {
     const tokens = instruments.filter(i => i.instrumentToken).map(i => parseInt(i.instrumentToken, 10));
+    // Stop Strategy Engine session first
+    if (liveSessionId) {
+      try { await stopLiveEval(liveSessionId); } catch {}
+      setLiveSessionId(null);
+    }
+    // Unsubscribe from Data Engine
     try { await liveUnsubscribe({ userId: session.userId, brokerName: session.brokerName, instrumentTokens: tokens }); } catch {}
     cleanup(); setConnected(false); setStatus('idle');
   }

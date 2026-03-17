@@ -259,6 +259,28 @@ export async function startReplayEval(config, signal) {
   return res; // caller reads res.body as ReadableStream
 }
 
+// ─── Strategy Engine — Live Eval ──────────────────────────────────────────────
+
+/**
+ * Starts a live evaluation session in the Strategy Engine.
+ * Returns { data: { sessionId: "..." } }
+ */
+export async function startLiveEval(config) {
+  return request(`${STRATEGY_API}/api/v1/strategy/live/evaluate`, {
+    method: 'POST',
+    body: config,
+  });
+}
+
+/**
+ * Stops a live evaluation session.
+ */
+export async function stopLiveEval(sessionId) {
+  return request(`${STRATEGY_API}/api/v1/strategy/live/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE',
+  });
+}
+
 // ─── Portfolio ────────────────────────────────────────────────────────────────
 
 export async function getPositions(userId, brokerName) {
