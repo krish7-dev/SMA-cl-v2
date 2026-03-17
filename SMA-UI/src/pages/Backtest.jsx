@@ -1722,6 +1722,7 @@ function ReplayTest() {
   const [patternConfig, setPatternConfig] = useState({ ...EMPTY_PATTERN });
   const [regimeConfig, setRegimeConfig]   = useState({ ...EMPTY_REGIME_CONFIG });
   const [scoreConfig, setScoreConfig]     = useState({ ...EMPTY_SCORE_CONFIG });
+  const [rulesConfig, setRulesConfig]     = useState(JSON.parse(JSON.stringify(EMPTY_RULES_CONFIG)));
   const [currentRegime, setCurrentRegime] = useState(null);
 
   const [sessionId, setSessionId]       = useState(null);
@@ -1749,11 +1750,12 @@ function ReplayTest() {
   const openPositionMap   = useRef({});
   const closedTradesMap   = useRef({});
   const equityMap         = useRef({});
-  const regimeDetectorRef  = useRef(null);
-  const strategyScorerRef  = useRef(null);
-  const patternEvalRef     = useRef(null);
-  const cooldownRef        = useRef({});
-  const dailyCapMap        = useRef({});
+  const regimeDetectorRef   = useRef(null);
+  const strategyScorerRef   = useRef(null);
+  const patternEvalRef      = useRef(null);
+  const cooldownRef         = useRef({});
+  const dailyCapMap         = useRef({});
+  const reversalCooldownRef = useRef({});
 
   useEffect(() => {
     getStrategyTypes().then(r => { if (r?.data) setKnownTypes([...r.data].sort()); }).catch(() => {});
@@ -1791,6 +1793,9 @@ function ReplayTest() {
     setPatternConfig(p => ({ ...p, [f]: p[f].includes(v) ? p[f].filter(x => x !== v) : [...p[f], v] }));
   }
   function updateRegime(f, v)  { setRegimeConfig(p => ({ ...p, [f]: v })); }
+  function updateRule(section, ruleKey, field, value) {
+    setRulesConfig(p => ({ ...p, [section]: { ...p[section], [ruleKey]: { ...p[section][ruleKey], [field]: value } } }));
+  }
 
   function flushStrat(label) {
     setStratStates(prev => ({
@@ -1916,7 +1921,24 @@ function ReplayTest() {
     }
 
     const today = candleTime.substring(0, 10);
+    const instrType  = resolveInstrType(inst.instrumentType, inst.symbol, inst.exchange);
+    const activeRules = rulesConfig.enabled
+      ? (instrType === 'OPTION' ? rulesConfig.options : rulesConfig.stocks)
+      : {};
+
+    // VWAP for LONG quality gate (using candleLog history accumulated so far)
+    const vwap = (() => {
+      const cls = candleLogRef.current;
+      if (!cls.length) return null;
+      let sumTV = 0, sumV = 0;
+      for (const c of cls.slice(-100)) { const tp = (c.high+c.low+c.close)/3; const v = c.volume||1; sumTV+=tp*v; sumV+=v; }
+      return sumV > 0 ? sumTV/sumV : null;
+    })();
+
     let latestSignals = {};
+    const blockedSignals = [];
+    const candleClosedDir = {};
+
     for (const strat of strategies.filter(s => s.enabled)) {
       const label = strat.label || strat.strategyType;
       const ev = evaluatorsRef.current[label];
@@ -1937,36 +1959,117 @@ function ReplayTest() {
         }
       }
 
+      // Rule: OPTION — disable specific strategy types
+      if (instrType === 'OPTION' && rulesConfig.enabled) {
+        if (activeRules.disable_sma_breakout?.enabled && ['SMA_CROSSOVER','BREAKOUT'].includes(strat.strategyType)) continue;
+        if (activeRules.use_only_specific?.enabled && !['VWAP_PULLBACK','LIQUIDITY_SWEEP','BOLLINGER_REVERSION'].includes(strat.strategyType)) continue;
+      }
+
+      if (regimeConfig.enabled && regime) {
+        const allowed = STRATEGY_REGIME_MAP[strat.strategyType] || [];
+        if (allowed.length > 0 && !allowed.includes(regime)) continue;
+      }
+
       const signal = ev.next(close, high, low, vol, open);
       latestSignals[label] = signal; // always record signal for Combined pool + Details tab
 
       if (combinedOnlyMode) continue; // don't trade individually — Combined pool handles it
 
-      // Pattern confirmation
-      if (patternConfig.enabled && patternEvalRef.current && signal !== 'HOLD') {
-        const patSig = patternEvalRef.current.next(close, high, low, vol, open);
-        if (signal === 'BUY'  && patternConfig.buyConfirmPatterns.length  > 0 && !patternConfig.buyConfirmPatterns.includes(patSig))  continue;
-        if (signal === 'SELL' && patternConfig.sellConfirmPatterns.length > 0 && !patternConfig.sellConfirmPatterns.includes(patSig)) continue;
+      if (!signal || signal === 'HOLD') continue;
+
+      // Regime-based rules — signal generated but blocked
+      if (rulesConfig.enabled) {
+        if (instrType === 'STOCK') {
+          if (activeRules.ranging_no_trade?.enabled && regime === 'RANGING') {
+            blockedSignals.push({ strategy: label, signal, price: close, reason: 'Rule: No trade in RANGING regime' }); continue;
+          }
+          if (activeRules.compression_short_only?.enabled && regime === 'COMPRESSION' && signal === 'BUY') {
+            blockedSignals.push({ strategy: label, signal, price: close, reason: 'Rule: SHORT only in COMPRESSION (BUY blocked)' }); continue;
+          }
+        } else {
+          if (activeRules.volatile_no_trade?.enabled && regime === 'VOLATILE') {
+            blockedSignals.push({ strategy: label, signal, price: close, reason: 'Rule: No trade in VOLATILE regime' }); continue;
+          }
+        }
       }
 
-      const pos      = openPositionMap.current[label];
-      const hasLong  = pos?.type === 'LONG';
-      const hasShort = pos?.type === 'SHORT';
+      // Pattern confirmation
+      if (patternConfig.enabled && patternEvalRef.current) {
+        const patSig = patternEvalRef.current.next(close, high, low, vol, open);
+        if (signal === 'BUY'  && patternConfig.buyConfirmPatterns.length  > 0 && !patternConfig.buyConfirmPatterns.includes(patSig)) {
+          blockedSignals.push({ strategy: label, signal, price: close, reason: `Pattern: no BUY confirm (got ${patSig||'none'})` }); continue;
+        }
+        if (signal === 'SELL' && patternConfig.sellConfirmPatterns.length > 0 && !patternConfig.sellConfirmPatterns.includes(patSig)) {
+          blockedSignals.push({ strategy: label, signal, price: close, reason: `Pattern: no SELL confirm (got ${patSig||'none'})` }); continue;
+        }
+      }
+
+      const pos        = openPositionMap.current[label];
+      const hasLong    = pos?.type === 'LONG';
+      const hasShort   = pos?.type === 'SHORT';
       const allowShort = !!strat.allowShorting;
+      const noSameCandleRev = rulesConfig.enabled && activeRules.no_same_candle_reversal?.enabled;
+
+      // Helper: LONG quality gate — returns block reason or null
+      const longGateBlock = () => {
+        if (instrType !== 'STOCK' || !rulesConfig.enabled || !activeRules.long_quality_gate?.enabled) return null;
+        const sc = strategyScorerRef.current
+          ? strategyScorerRef.current.score(strat.strategyType, 'BUY', regime, instrType)
+          : { total: 0 };
+        const minScore = parseFloat(activeRules.long_quality_gate.scoreMin) || 60;
+        if (sc.total < minScore) return `Rule: LONG gate — score ${sc.total.toFixed(1)} < ${minScore}`;
+        if ((reversalCooldownRef.current[label] || 0) > 0) return 'Rule: LONG gate — reversal cooldown active';
+        if (vwap) {
+          const extPct = Math.abs(close - vwap) / vwap * 100;
+          const maxExt = parseFloat(activeRules.long_quality_gate.vwapMaxPct) || 1.5;
+          if (extPct > maxExt) return `Rule: LONG gate — price ${extPct.toFixed(2)}% from VWAP (max ${maxExt}%)`;
+        }
+        return null;
+      };
 
       if (signal === 'BUY') {
-        if (hasShort) {
+        if (hasLong) {
+          blockedSignals.push({ strategy: label, signal, price: close, reason: 'Already in LONG position' });
+        } else if (hasShort) {
+          if (noSameCandleRev && candleClosedDir[label] === 'SHORT') {
+            blockedSignals.push({ strategy: label, signal, price: close, reason: 'Rule: No same-candle reversal (SHORT already closed)' }); continue;
+          }
           closeShort(label, close, candleTime, 'SIGNAL');
-          if (allowShort) openLong(label, close, candleTime, regime); // reversal SHORT→LONG
-        } else if (!hasLong) {
-          openLong(label, close, candleTime, regime);
+          candleClosedDir[label] = 'SHORT';
+          if (allowShort) {
+            const gateBlock = longGateBlock();
+            if (!gateBlock) {
+              openLong(label, close, candleTime, regime);
+              reversalCooldownRef.current[label] = 2;
+            } else {
+              blockedSignals.push({ strategy: label, signal, price: close, reason: gateBlock });
+            }
+          }
+        } else {
+          const gateBlock = longGateBlock();
+          if (!gateBlock) {
+            openLong(label, close, candleTime, regime);
+          } else {
+            blockedSignals.push({ strategy: label, signal, price: close, reason: gateBlock });
+          }
         }
       } else if (signal === 'SELL') {
-        if (hasLong) {
+        if (hasShort) {
+          blockedSignals.push({ strategy: label, signal, price: close, reason: 'Already in SHORT position' });
+        } else if (hasLong) {
+          if (noSameCandleRev && candleClosedDir[label] === 'LONG') {
+            blockedSignals.push({ strategy: label, signal, price: close, reason: 'Rule: No same-candle reversal (LONG already closed)' }); continue;
+          }
           closeLong(label, close, candleTime, 'SIGNAL');
-          if (allowShort) openShort(label, close, candleTime, regime); // reversal LONG→SHORT
-        } else if (!hasShort && allowShort) {
-          openShort(label, close, candleTime, regime); // FLAT → SHORT
+          candleClosedDir[label] = 'LONG';
+          if (allowShort) {
+            openShort(label, close, candleTime, regime);
+            reversalCooldownRef.current[label] = 2;
+          }
+        } else if (allowShort) {
+          openShort(label, close, candleTime, regime);
+        } else {
+          blockedSignals.push({ strategy: label, signal, price: close, reason: 'Shorting disabled — no open LONG to exit' });
         }
       }
     }
@@ -2001,20 +2104,41 @@ function ReplayTest() {
 
       // Score-based strategy selection — pick highest-scoring actionable signal
       {
-        const replayInstrType   = resolveInstrType(inst.instrumentType, inst.symbol, inst.exchange);
         const replayMinScore    = parseFloat(scoreConfig.minScoreThreshold) || 0;
+
+        // Rule: global regime block for combined pool
+        const combinedBlocked = rulesConfig.enabled && (
+          (instrType === 'STOCK'  && activeRules.ranging_no_trade?.enabled  && regime === 'RANGING') ||
+          (instrType === 'OPTION' && activeRules.volatile_no_trade?.enabled && regime === 'VOLATILE')
+        );
+
         let bestStrat = null, bestSignal = null, bestScore = null;
+        if (!combinedBlocked) {
         for (const strat of strategies.filter(s => s.enabled)) {
+          // Rule: OPTION — skip disabled strategy types in scoring
+          if (instrType === 'OPTION' && rulesConfig.enabled) {
+            if (activeRules.disable_sma_breakout?.enabled && ['SMA_CROSSOVER','BREAKOUT'].includes(strat.strategyType)) continue;
+            if (activeRules.use_only_specific?.enabled && !['VWAP_PULLBACK','LIQUIDITY_SWEEP','BOLLINGER_REVERSION'].includes(strat.strategyType)) continue;
+          }
+          // Rule: STOCK COMPRESSION — skip BUY signals
+          if (instrType === 'STOCK' && rulesConfig.enabled && activeRules.compression_short_only?.enabled && regime === 'COMPRESSION') {
+            if (latestSignals[strat.label || strat.strategyType] === 'BUY') continue;
+          }
           const stratLabel = strat.label || strat.strategyType;
           const signal = latestSignals[stratLabel];
           if (!signal || signal === 'HOLD') continue;
           const sc = strategyScorerRef.current
-            ? strategyScorerRef.current.score(strat.strategyType, signal, regime, replayInstrType)
+            ? strategyScorerRef.current.score(strat.strategyType, signal, regime, instrType)
             : { total: 0, trendStrength: 0, volatility: 0, momentum: 0, confidence: 0 };
+          // Rule: OPTION — distrust score driven by high volatility
+          if (instrType === 'OPTION' && rulesConfig.enabled && activeRules.distrust_high_vol_score?.enabled) {
+            if (sc.volatility > (parseFloat(activeRules.distrust_high_vol_score.volScoreMax) || 70)) continue;
+          }
           if (sc.total < replayMinScore) continue;
           if (!bestScore || sc.total > bestScore.total) {
             bestStrat = strat; bestSignal = signal; bestScore = sc;
           }
+        }
         }
 
         if (bestStrat && bestSignal) {
@@ -2023,7 +2147,20 @@ function ReplayTest() {
           const cHasLong    = cp?.type === 'LONG';
           const cHasShort   = cp?.type === 'SHORT';
           const allowShort  = !!bestStrat.allowShorting;
+          const noSameCandleRevC = rulesConfig.enabled && activeRules.no_same_candle_reversal?.enabled;
           const trigger     = `Score-based signal (final=${bestScore.total.toFixed(1)}, base=${bestScore.baseScore?.toFixed(1)??'—'}, trend=${bestScore.trendStrength.toFixed(1)}, vol=${bestScore.volatility.toFixed(1)}, mom=${bestScore.momentum.toFixed(1)}, conf=${bestScore.confidence.toFixed(1)}, pen=${bestScore.totalPenalty?.toFixed(1)??0})`;
+
+          // STOCK rule — LONG quality gate for Combined
+          const combinedPassesLongGate = () => {
+            if (instrType !== 'STOCK' || !rulesConfig.enabled || !activeRules.long_quality_gate?.enabled) return true;
+            if (bestScore.total < (parseFloat(activeRules.long_quality_gate.scoreMin) || 60)) return false;
+            if ((reversalCooldownRef.current[COMBINED_LABEL] || 0) > 0) return false;
+            if (vwap) {
+              const extPct = Math.abs(close - vwap) / vwap * 100;
+              if (extPct > (parseFloat(activeRules.long_quality_gate.vwapMaxPct) || 1.5)) return false;
+            }
+            return true;
+          };
 
           const tagEntry = () => {
             if (openPositionMap.current[COMBINED_LABEL]) {
@@ -2033,23 +2170,31 @@ function ReplayTest() {
           };
           if (bestSignal === 'BUY') {
             if (cHasShort) {
-              closeShort(COMBINED_LABEL, close, candleTime, 'SIGNAL');
-              combinedDetails.push({ action: 'Exit Short', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
-              if (allowShort) {
-                openLong(COMBINED_LABEL, close, candleTime, regime); tagEntry();
-                combinedDetails.push({ action: 'Enter Long', price: close, reason: 'Reversal SHORT→LONG', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
+              if (!(noSameCandleRevC && candleClosedDir[COMBINED_LABEL] === 'SHORT')) {
+                closeShort(COMBINED_LABEL, close, candleTime, 'SIGNAL');
+                candleClosedDir[COMBINED_LABEL] = 'SHORT';
+                combinedDetails.push({ action: 'Exit Short', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
+                if (allowShort && combinedPassesLongGate()) {
+                  openLong(COMBINED_LABEL, close, candleTime, regime); tagEntry();
+                  reversalCooldownRef.current[COMBINED_LABEL] = 2;
+                  combinedDetails.push({ action: 'Enter Long', price: close, reason: 'Reversal SHORT→LONG', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
+                }
               }
-            } else if (!cHasLong) {
+            } else if (!cHasLong && combinedPassesLongGate()) {
               openLong(COMBINED_LABEL, close, candleTime, regime); tagEntry();
               combinedDetails.push({ action: 'Enter Long', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
             }
           } else if (bestSignal === 'SELL') {
             if (cHasLong) {
-              closeLong(COMBINED_LABEL, close, candleTime, 'SIGNAL');
-              combinedDetails.push({ action: 'Exit Long', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
-              if (allowShort) {
-                openShort(COMBINED_LABEL, close, candleTime, regime); tagEntry();
-                combinedDetails.push({ action: 'Enter Short', price: close, reason: 'Reversal LONG→SHORT', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
+              if (!(noSameCandleRevC && candleClosedDir[COMBINED_LABEL] === 'LONG')) {
+                closeLong(COMBINED_LABEL, close, candleTime, 'SIGNAL');
+                candleClosedDir[COMBINED_LABEL] = 'LONG';
+                combinedDetails.push({ action: 'Exit Long', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
+                if (allowShort) {
+                  openShort(COMBINED_LABEL, close, candleTime, regime); tagEntry();
+                  reversalCooldownRef.current[COMBINED_LABEL] = 2;
+                  combinedDetails.push({ action: 'Enter Short', price: close, reason: 'Reversal LONG→SHORT', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
+                }
               }
             } else if (!cHasShort && allowShort) {
               openShort(COMBINED_LABEL, close, candleTime, regime); tagEntry();
@@ -2060,6 +2205,11 @@ function ReplayTest() {
       }
     }
 
+    // Tick down reversal cooldowns
+    Object.keys(reversalCooldownRef.current).forEach(k => {
+      if (reversalCooldownRef.current[k] > 0) reversalCooldownRef.current[k]--;
+    });
+
     const entry = { ...candle, signals: latestSignals, ts: candleTime };
     setCurrentCandle(entry);
     setProgress(prev => ({ ...prev, emitted: prev.emitted + 1 }));
@@ -2068,7 +2218,7 @@ function ReplayTest() {
     const logActions = feedRef.current
       .filter(f => f.ts === candleTime && f.strategyLabel !== COMBINED_LABEL)
       .map(f => ({ strategy: f.strategyLabel || '', signal: f.signal, price: f.close, reason: f.reason || '' }));
-    const logEntry = { ts: candleTime, open, high, low, close, volume: vol, regime, signals: { ...latestSignals }, actions: logActions, combinedDetails };
+    const logEntry = { ts: candleTime, open, high, low, close, volume: vol, regime, signals: { ...latestSignals }, actions: logActions, blockedSignals, combinedDetails };
     candleLogRef.current = [...candleLogRef.current, logEntry];
     setCandleLog([...candleLogRef.current]);
   }
@@ -2091,6 +2241,7 @@ function ReplayTest() {
     equityMap.current = {};
     cooldownRef.current = {};
     dailyCapMap.current = {};
+    reversalCooldownRef.current = {};
     setCurrentRegime(null);
     for (const strat of strategies.filter(s => s.enabled)) {
       const label = strat.label || strat.strategyType;
@@ -2455,6 +2606,124 @@ function ReplayTest() {
             )}
           </div>
 
+          {/* ── Trading Rules ── */}
+          <div className="card bt-risk-card" style={{ marginTop: 12 }}>
+            <div className="bt-risk-toggle-row">
+              <span className="bt-risk-label">Trading Rules
+                <span className={rulesConfig.enabled ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+                  {rulesConfig.enabled ? 'enabled' : 'disabled'}
+                </span>
+              </span>
+              <button type="button" disabled={isRunning}
+                className={rulesConfig.enabled ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+                onClick={() => setRulesConfig(p => ({ ...p, enabled: !p.enabled }))}>
+                {rulesConfig.enabled ? 'ON' : 'OFF'}
+              </button>
+            </div>
+            {rulesConfig.enabled && (() => {
+              const instrType  = resolveInstrType(inst.instrumentType, inst.symbol, inst.exchange);
+              const hasStock   = instrType !== 'OPTION';
+              const hasOption  = instrType === 'OPTION';
+              return (
+                <>
+                  {hasStock && (
+                    <>
+                      <div className="bt-params-label" style={{ marginTop: 10, marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span style={{ fontSize: 11, background: 'rgba(34,197,94,0.15)', color: '#22c55e', borderRadius: 4, padding: '1px 7px', fontWeight: 700 }}>STOCK</span>
+                        Rules
+                      </div>
+                      {[
+                        ['ranging_no_trade',       'No trade in RANGING regime'],
+                        ['compression_short_only', 'SHORT only in COMPRESSION regime'],
+                        ['no_same_candle_reversal','No same-candle reversal'],
+                      ].map(([key, lbl]) => (
+                        <div key={key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '5px 0', borderBottom: '1px solid var(--border)' }}>
+                          <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1, paddingRight: 8 }}>{lbl}</span>
+                          <button type="button" disabled={isRunning}
+                            className={rulesConfig.stocks[key]?.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
+                            style={{ minWidth: 36 }}
+                            onClick={() => updateRule('stocks', key, 'enabled', !rulesConfig.stocks[key]?.enabled)}>
+                            {rulesConfig.stocks[key]?.enabled ? 'ON' : 'OFF'}
+                          </button>
+                        </div>
+                      ))}
+                      <div style={{ padding: '6px 0', borderBottom: hasOption ? '1px solid var(--border)' : undefined }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1, paddingRight: 8 }}>LONG requires min score + no recent reversal + within VWAP</span>
+                          <button type="button" disabled={isRunning}
+                            className={rulesConfig.stocks.long_quality_gate?.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
+                            style={{ minWidth: 36 }}
+                            onClick={() => updateRule('stocks', 'long_quality_gate', 'enabled', !rulesConfig.stocks.long_quality_gate?.enabled)}>
+                            {rulesConfig.stocks.long_quality_gate?.enabled ? 'ON' : 'OFF'}
+                          </button>
+                        </div>
+                        {rulesConfig.stocks.long_quality_gate?.enabled && (
+                          <div style={{ display: 'flex', gap: 10, marginTop: 6 }}>
+                            <div className="form-group" style={{ flex: 1 }}>
+                              <label>Min Score</label>
+                              <input type="number" min="0" max="100" step="5" disabled={isRunning}
+                                value={rulesConfig.stocks.long_quality_gate.scoreMin}
+                                onChange={e => updateRule('stocks', 'long_quality_gate', 'scoreMin', parseFloat(e.target.value))} />
+                            </div>
+                            <div className="form-group" style={{ flex: 1 }}>
+                              <label>Max VWAP Ext %</label>
+                              <input type="number" min="0" step="0.1" disabled={isRunning}
+                                value={rulesConfig.stocks.long_quality_gate.vwapMaxPct}
+                                onChange={e => updateRule('stocks', 'long_quality_gate', 'vwapMaxPct', parseFloat(e.target.value))} />
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  )}
+                  {hasOption && (
+                    <>
+                      <div className="bt-params-label" style={{ marginTop: 10, marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span style={{ fontSize: 11, background: 'rgba(245,158,11,0.15)', color: '#f59e0b', borderRadius: 4, padding: '1px 7px', fontWeight: 700 }}>OPTION</span>
+                        Rules
+                      </div>
+                      {[
+                        ['volatile_no_trade',       'No trade in VOLATILE regime'],
+                        ['disable_sma_breakout',    'Disable SMA_CROSSOVER and BREAKOUT'],
+                        ['use_only_specific',       'Use only VWAP_PULLBACK / LIQUIDITY_SWEEP / BOLLINGER_REVERSION'],
+                        ['no_same_candle_reversal', 'No same-candle reversal'],
+                      ].map(([key, lbl]) => (
+                        <div key={key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '5px 0', borderBottom: '1px solid var(--border)' }}>
+                          <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1, paddingRight: 8 }}>{lbl}</span>
+                          <button type="button" disabled={isRunning}
+                            className={rulesConfig.options[key]?.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
+                            style={{ minWidth: 36 }}
+                            onClick={() => updateRule('options', key, 'enabled', !rulesConfig.options[key]?.enabled)}>
+                            {rulesConfig.options[key]?.enabled ? 'ON' : 'OFF'}
+                          </button>
+                        </div>
+                      ))}
+                      <div style={{ padding: '6px 0' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1, paddingRight: 8 }}>Distrust scores driven by high volatility</span>
+                          <button type="button" disabled={isRunning}
+                            className={rulesConfig.options.distrust_high_vol_score?.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
+                            style={{ minWidth: 36 }}
+                            onClick={() => updateRule('options', 'distrust_high_vol_score', 'enabled', !rulesConfig.options.distrust_high_vol_score?.enabled)}>
+                            {rulesConfig.options.distrust_high_vol_score?.enabled ? 'ON' : 'OFF'}
+                          </button>
+                        </div>
+                        {rulesConfig.options.distrust_high_vol_score?.enabled && (
+                          <div className="form-group" style={{ marginTop: 6 }}>
+                            <label>Max Volatility Score</label>
+                            <input type="number" min="0" max="100" step="5" disabled={isRunning}
+                              value={rulesConfig.options.distrust_high_vol_score.volScoreMax}
+                              onChange={e => updateRule('options', 'distrust_high_vol_score', 'volScoreMax', parseFloat(e.target.value))} />
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </>
+              );
+            })()}
+          </div>
+
         </div>
 
         {/* Right: tabs */}
@@ -2811,6 +3080,30 @@ function ReplayTest() {
                 lines.push(blank);
               }
 
+              // ── Trading Rules ──────────────────────────────────────────
+              if (rulesConfig.enabled) {
+                const csvInstrType = resolveInstrType(inst.instrumentType, inst.symbol, inst.exchange);
+                lines.push(row(`=== Trading Rules (${csvInstrType}) ===`));
+                lines.push(row('Rule','Enabled','Parameters'));
+                if (csvInstrType === 'STOCK') {
+                  const sr = rulesConfig.stocks;
+                  lines.push(row('No trade in RANGING regime',           sr.ranging_no_trade?.enabled        ? 'ON' : 'OFF', ''));
+                  lines.push(row('SHORT only in COMPRESSION regime',     sr.compression_short_only?.enabled  ? 'ON' : 'OFF', ''));
+                  lines.push(row('LONG quality gate',                    sr.long_quality_gate?.enabled       ? 'ON' : 'OFF',
+                    sr.long_quality_gate?.enabled ? `Min Score: ${sr.long_quality_gate.scoreMin} | Max VWAP Ext: ${sr.long_quality_gate.vwapMaxPct}%` : ''));
+                  lines.push(row('No same-candle reversal',              sr.no_same_candle_reversal?.enabled ? 'ON' : 'OFF', ''));
+                } else {
+                  const or = rulesConfig.options;
+                  lines.push(row('No trade in VOLATILE regime',               or.volatile_no_trade?.enabled       ? 'ON' : 'OFF', ''));
+                  lines.push(row('Disable SMA_CROSSOVER and BREAKOUT',        or.disable_sma_breakout?.enabled    ? 'ON' : 'OFF', ''));
+                  lines.push(row('Use only VWAP / LIQUIDITY / BOLLINGER',     or.use_only_specific?.enabled       ? 'ON' : 'OFF', ''));
+                  lines.push(row('No same-candle reversal',                   or.no_same_candle_reversal?.enabled ? 'ON' : 'OFF', ''));
+                  lines.push(row('Distrust scores driven by high volatility', or.distrust_high_vol_score?.enabled ? 'ON' : 'OFF',
+                    or.distrust_high_vol_score?.enabled ? `Max Vol Score: ${or.distrust_high_vol_score.volScoreMax}` : ''));
+                }
+                lines.push(blank);
+              }
+
               // ── P&L Summary ───────────────────────────────────────────
               lines.push(row('=== P&L Summary ==='));
               lines.push(row('Strategy','Initial Capital','Final Capital','P&L','Return %','Total Trades','Wins','Losses','Win Rate %'));
@@ -2871,7 +3164,7 @@ function ReplayTest() {
               const sigCols = stratLabels.map(l => `Signal_${l}`);
               lines.push(row('Time','Open','High','Low','Close','Volume',
                 ...(regimeConfig.enabled ? ['Regime'] : []),
-                ...sigCols, 'Strategy Actions', 'Combined Actions'));
+                ...sigCols, 'Strategy Actions', 'Blocked Signals', 'Combined Actions'));
               candleLogRef.current.forEach(r => {
                 const combinedActionsStr = (r.combinedDetails || []).map(cd =>
                   `${cd.action} @${Number(cd.price).toFixed(2)}` +
@@ -2880,6 +3173,9 @@ function ReplayTest() {
                   ` · ${cd.reason}` +
                   (cd.score ? ` · score=${cd.score.total.toFixed(1)}(trend=${cd.score.trendStrength.toFixed(0)},vol=${cd.score.volatility.toFixed(0)},mom=${cd.score.momentum.toFixed(0)},conf=${cd.score.confidence.toFixed(0)})` : '') +
                   ` · ${cd.trigger}`
+                ).join(' | ');
+                const blockedStr = (r.blockedSignals || []).map(b =>
+                  `${b.strategy} ${b.signal} @${Number(b.price).toFixed(2)} — ${b.reason}`
                 ).join(' | ');
                 lines.push(row(
                   r.ts,
@@ -2891,6 +3187,7 @@ function ReplayTest() {
                   ...(regimeConfig.enabled ? [r.regime ?? ''] : []),
                   ...stratLabels.map(l => r.signals?.[l] ?? ''),
                   r.actions.map(fmtAction).join(' | '),
+                  blockedStr,
                   combinedActionsStr,
                 ));
               });
@@ -2926,6 +3223,25 @@ function ReplayTest() {
                   `Sell: ${(patternConfig.sellConfirmPatterns||[]).join(', ') || 'Any'}`,
                   `Wick ≥ ${patternConfig.minWickRatio} · Body ≤ ${patternConfig.maxBodyPct}%`,
               ] }] : []),
+              ...(scoreConfig.enabled ? [{ label: 'Score-Based Pool', items: [
+                  `Min Score: ${scoreConfig.minScoreThreshold}`,
+              ] }] : []),
+              ...(rulesConfig.enabled ? (() => {
+                const iType = resolveInstrType(inst.instrumentType, inst.symbol, inst.exchange);
+                const items = iType === 'STOCK' ? [
+                  rulesConfig.stocks.ranging_no_trade?.enabled        ? 'No trade in RANGING' : null,
+                  rulesConfig.stocks.compression_short_only?.enabled  ? 'SHORT only in COMPRESSION' : null,
+                  rulesConfig.stocks.long_quality_gate?.enabled       ? `LONG gate: score≥${rulesConfig.stocks.long_quality_gate.scoreMin} VWAP≤${rulesConfig.stocks.long_quality_gate.vwapMaxPct}%` : null,
+                  rulesConfig.stocks.no_same_candle_reversal?.enabled ? 'No same-candle reversal' : null,
+                ].filter(Boolean) : [
+                  rulesConfig.options.volatile_no_trade?.enabled       ? 'No trade in VOLATILE' : null,
+                  rulesConfig.options.disable_sma_breakout?.enabled    ? 'SMA/BREAKOUT disabled' : null,
+                  rulesConfig.options.use_only_specific?.enabled       ? 'VWAP/LIQUIDITY/BOLLINGER only' : null,
+                  rulesConfig.options.no_same_candle_reversal?.enabled ? 'No same-candle reversal' : null,
+                  rulesConfig.options.distrust_high_vol_score?.enabled ? `Distrust vol score >${rulesConfig.options.distrust_high_vol_score.volScoreMax}` : null,
+                ].filter(Boolean);
+                return items.length ? [{ label: `Rules (${iType})`, items }] : [];
+              })() : []),
             ];
 
             return (
@@ -2967,7 +3283,7 @@ function ReplayTest() {
                         </thead>
                         <tbody>
                           {[...candleLog].reverse().map((row, i) => (
-                            <tr key={i} style={{ borderBottom: '1px solid var(--border)', background: (row.actions.length > 0 || row.combinedDetails?.length > 0) ? 'rgba(99,102,241,0.06)' : undefined }}>
+                            <tr key={i} style={{ borderBottom: '1px solid var(--border)', background: row.actions.length > 0 || row.combinedDetails?.length > 0 ? 'rgba(99,102,241,0.06)' : row.blockedSignals?.length > 0 ? 'rgba(245,158,11,0.04)' : undefined }}>
                               <td style={{ padding: '4px 6px', whiteSpace: 'nowrap', color: 'var(--text-muted)' }}>{row.ts}</td>
                               <td style={{ padding: '4px 6px' }}>{Number(row.open).toFixed(2)}</td>
                               <td style={{ padding: '4px 6px', color: '#22c55e' }}>{Number(row.high).toFixed(2)}</td>
@@ -2993,7 +3309,7 @@ function ReplayTest() {
                                 );
                               })}
                               <td style={{ padding: '4px 6px', minWidth: 220 }}>
-                                {row.actions.length === 0 && !row.combinedDetails?.length
+                                {row.actions.length === 0 && !row.blockedSignals?.length && !row.combinedDetails?.length
                                   ? <span style={{ color: 'var(--text-muted)' }}>—</span>
                                   : <>
                                     {row.actions.map((a, ai) => {
@@ -3007,11 +3323,17 @@ function ReplayTest() {
                                         </div>
                                       );
                                     })}
+                                    {(row.blockedSignals || []).map((b, bi) => (
+                                      <div key={`b${bi}`} style={{ fontSize: 11, lineHeight: 1.6, color: '#f59e0b' }}>
+                                        <span style={{ fontWeight: 700 }}>⊘ {b.strategy} {b.signal}</span>
+                                        <span style={{ color: '#a16207' }}> — {b.reason}</span>
+                                      </div>
+                                    ))}
                                     {(row.combinedDetails || []).map((cd, ci) => {
                                       const isEnter = cd.action.startsWith('Enter');
                                       const color   = cd.action.includes('Short') ? '#8b5cf6' : isEnter ? '#22c55e' : '#ef4444';
                                       return (
-                                        <div key={'c'+ci} style={{ fontSize: 11, lineHeight: 1.6, borderTop: ci === 0 && row.actions.length > 0 ? '1px dashed var(--border)' : undefined, marginTop: ci === 0 && row.actions.length > 0 ? 3 : 0, paddingTop: ci === 0 && row.actions.length > 0 ? 3 : 0 }}>
+                                        <div key={'c'+ci} style={{ fontSize: 11, lineHeight: 1.6, borderTop: ci === 0 && (row.actions.length > 0 || row.blockedSignals?.length > 0) ? '1px dashed var(--border)' : undefined, marginTop: ci === 0 && (row.actions.length > 0 || row.blockedSignals?.length > 0) ? 3 : 0, paddingTop: ci === 0 && (row.actions.length > 0 || row.blockedSignals?.length > 0) ? 3 : 0 }}>
                                           <span style={{ fontWeight: 700, color: '#8b5cf6', fontSize: 10 }}>⚡</span>
                                           {' '}<span style={{ fontWeight: 700, color }}>{cd.action}</span>
                                           {' '}<span style={{ color: 'var(--text-muted)', fontSize: 10 }}>
@@ -4848,7 +5170,9 @@ function LiveTest() {
                 `${cd.action} @${Number(cd.price).toFixed(2)}` +
                 (cd.sourceStrategy ? ` via ${cd.sourceStrategy}` : '') +
                 (cd.regime         ? ` [${cd.regime}]`           : '') +
-                ` · ${cd.reason}`
+                ` · ${cd.reason}` +
+                (cd.score ? ` · score=${cd.score.total.toFixed(1)}(trend=${cd.score.trendStrength.toFixed(0)},vol=${cd.score.volatility.toFixed(0)},mom=${cd.score.momentum.toFixed(0)},conf=${cd.score.confidence.toFixed(0)})` : '') +
+                (cd.trigger ? ` · ${cd.trigger}` : '')
               ).join(' | ');
               const blockedStr = (r.blockedSignals || []).map(b =>
                 `${b.strategy} ${b.signal} @${Number(b.price).toFixed(2)} — ${b.reason}`
@@ -4896,6 +5220,9 @@ function LiveTest() {
                 `Buy: ${(patternConfig.buyConfirmPatterns||[]).join(', ') || 'Any'}`,
                 `Sell: ${(patternConfig.sellConfirmPatterns||[]).join(', ') || 'Any'}`,
                 `Wick ≥ ${patternConfig.minWickRatio} · Body ≤ ${patternConfig.maxBodyPct}%`,
+            ] }] : []),
+            ...(scoreConfig.enabled ? [{ label: 'Score-Based Pool', items: [
+                `Min Score: ${scoreConfig.minScoreThreshold}`,
             ] }] : []),
             ...(rulesConfig.enabled ? (() => {
               const iType = resolveInstrType(selInstrConfig.instrumentType, selInstrConfig.symbol, selInstrConfig.exchange);
@@ -4997,6 +5324,24 @@ function LiveTest() {
                                   <span style={{ color: '#a16207' }}> — {b.reason}</span>
                                 </div>
                               ))}
+                              {(row.combinedDetails || []).map((cd, ci) => {
+                                const isEnter = cd.action.startsWith('Enter');
+                                const color   = cd.action.includes('Short') ? '#8b5cf6' : isEnter ? '#22c55e' : '#ef4444';
+                                return (
+                                  <div key={'c'+ci} style={{ fontSize: 11, lineHeight: 1.6, borderTop: ci === 0 && (row.actions.length > 0 || row.blockedSignals?.length > 0) ? '1px dashed var(--border)' : undefined, marginTop: ci === 0 && (row.actions.length > 0 || row.blockedSignals?.length > 0) ? 3 : 0, paddingTop: ci === 0 && (row.actions.length > 0 || row.blockedSignals?.length > 0) ? 3 : 0 }}>
+                                    <span style={{ fontWeight: 700, color: '#8b5cf6', fontSize: 10 }}>⚡</span>
+                                    {' '}<span style={{ fontWeight: 700, color }}>{cd.action}</span>
+                                    {' '}<span style={{ color: 'var(--text-muted)', fontSize: 10 }}>
+                                      @{Number(cd.price).toFixed(2)}
+                                      {cd.sourceStrategy ? ` · via ${cd.sourceStrategy}` : ''}
+                                      {cd.regime ? ` · ${cd.regime}` : ''}
+                                      {' · '}{cd.reason}
+                                      {cd.score ? ` · score=${cd.score.total.toFixed(1)} (trend=${cd.score.trendStrength.toFixed(0)} vol=${cd.score.volatility.toFixed(0)} mom=${cd.score.momentum.toFixed(0)} conf=${cd.score.confidence.toFixed(0)})` : ''}
+                                      {cd.trigger ? <span style={{ color: cd.trigger?.startsWith('Score') ? '#6366f1' : cd.trigger === 'Risk Management' ? '#f59e0b' : 'var(--text-muted)' }}> · {cd.trigger}</span> : null}
+                                    </span>
+                                  </div>
+                                );
+                              })}
                               {row.actions.length === 0 && !row.blockedSignals?.length && (row.combinedDetails || []).length === 0 && (
                                 <span style={{ color: 'var(--text-muted)' }}>—</span>
                               )}
