@@ -1,9 +1,9 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   getStrategyTypes, runBacktest,
-  startReplay, stopReplay, getReplayStatus,
-  liveSubscribe, liveUnsubscribe, liveStatus,
+  liveSubscribe, liveUnsubscribe,
   searchInstruments, fetchHistoricalData,
+  startReplayEval,
 } from '../services/api';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { useSession } from '../context/SessionContext';
@@ -114,9 +114,6 @@ function defaultParams(type) {
   return Object.fromEntries(defs.map(d => [d.key, d.placeholder]));
 }
 
-function emptyVariant(type) {
-  return { strategyType: type || 'SMA_CROSSOVER', label: '', parameters: defaultParams(type || 'SMA_CROSSOVER') };
-}
 
 // Fixed strategy entries — all strategies always shown, each with an enabled toggle
 function defaultStrategies() {
@@ -485,12 +482,6 @@ const PATTERN_LABELS = {
 };
 
 const REGIMES = ['TRENDING', 'RANGING', 'VOLATILE', 'COMPRESSION'];
-const REGIME_COLORS = {
-  TRENDING:    { bg: 'rgba(99,102,241,0.15)', text: '#818cf8', border: '#4f46e5' },
-  RANGING:     { bg: 'rgba(245,158,11,0.15)', text: '#fbbf24', border: '#d97706' },
-  VOLATILE:    { bg: 'rgba(239,68,68,0.15)',  text: '#f87171', border: '#dc2626' },
-  COMPRESSION: { bg: 'rgba(34,197,94,0.15)',  text: '#4ade80', border: '#16a34a' },
-};
 // Default regime suitability — auto-assigned when Market Regime Detection is ON
 const STRATEGY_REGIME_MAP = {
   SMA_CROSSOVER:       ['TRENDING'],
@@ -1541,7 +1532,7 @@ function HistoricalBacktest() {
 // ─── Instrument Picker ────────────────────────────────────────────────────────
 // Shared component used in all 3 tabs: search box + recent instruments list
 
-const FO_EXCHANGES = ['NFO', 'BFO', 'MCX', 'CDS'];
+
 const INSTRUMENT_TYPES = [
   { value: '',    label: 'All Types' },
   { value: 'EQ',  label: 'Equity (EQ)' },
@@ -1724,6 +1715,8 @@ function ReplayTest() {
   const [scoreConfig, setScoreConfig]     = useState({ ...EMPTY_SCORE_CONFIG });
   const [rulesConfig, setRulesConfig]     = useState(JSON.parse(JSON.stringify(EMPTY_RULES_CONFIG)));
   const [currentRegime, setCurrentRegime] = useState(null);
+  const [preload, setPreload]             = useState({ enabled: true, daysBack: 5, interval: 'MINUTE_5' });
+  const [preloadState, setPreloadState]   = useState({ status: 'idle', count: 0, error: null });
 
   const [sessionId, setSessionId]       = useState(null);
   const [status, setStatus]             = useState('idle');
@@ -1734,11 +1727,10 @@ function ReplayTest() {
   const [stratStates, setStratStates]   = useState({});
   const [rightTab, setRightTab]         = useState('feed');
   const [ticks, setTicks]               = useState([]);
-  const [latestTick, setLatestTick]     = useState(null);
   const [candleLog, setCandleLog]       = useState([]);
   const [combinedOnlyMode, setCombinedOnlyMode] = useState(false);
 
-  const evaluatorsRef     = useRef({});
+  const abortCtrlRef      = useRef(null);
   const sseRef            = useRef(null);
   const tickSseRef        = useRef(null);
   const ticksRef          = useRef([]);
@@ -1751,7 +1743,6 @@ function ReplayTest() {
   const closedTradesMap   = useRef({});
   const equityMap         = useRef({});
   const regimeDetectorRef   = useRef(null);
-  const strategyScorerRef   = useRef(null);
   const patternEvalRef      = useRef(null);
   const cooldownRef         = useRef({});
   const dailyCapMap         = useRef({});
@@ -1763,7 +1754,12 @@ function ReplayTest() {
   }, []);
 
   function cleanup() {
-    if (sseRef.current)     { sseRef.current.close(); sseRef.current = null; }
+    if (abortCtrlRef.current) { abortCtrlRef.current.abort(); abortCtrlRef.current = null; }
+    if (sseRef.current) {
+      if (typeof sseRef.current.close  === 'function') sseRef.current.close();
+      if (typeof sseRef.current.cancel === 'function') sseRef.current.cancel();
+      sseRef.current = null;
+    }
     if (tickSseRef.current) { tickSseRef.current.close(); tickSseRef.current = null; }
     if (pollRef.current)    { clearInterval(pollRef.current); pollRef.current = null; }
   }
@@ -1797,444 +1793,19 @@ function ReplayTest() {
     setRulesConfig(p => ({ ...p, [section]: { ...p[section], [ruleKey]: { ...p[section][ruleKey], [field]: value } } }));
   }
 
-  function flushStrat(label) {
-    setStratStates(prev => ({
-      ...prev,
-      [label]: {
-        capital:      capitalMap.current[label],
-        openPosition: openPositionMap.current[label] || null,
-        closedTrades: [...(closedTradesMap.current[label] || [])],
-        equityHistory:[...(equityMap.current[label]     || [])],
-      },
-    }));
-  }
-
-  function computeQty(label, entryPrice) {
-    const cap = capitalMap.current[label] || 0;
-    const baseQty = parseInt(quantity, 10);
-    if (baseQty > 0) return baseQty;
-    if (riskConfig.enabled && parseFloat(riskConfig.maxRiskPerTradePct) > 0 && parseFloat(riskConfig.stopLossPct) > 0) {
-      const riskAmt = cap * parseFloat(riskConfig.maxRiskPerTradePct) / 100;
-      const riskPS  = entryPrice * parseFloat(riskConfig.stopLossPct) / 100;
-      return Math.max(1, Math.floor(riskAmt / riskPS));
-    }
-    return Math.max(1, Math.floor(cap / entryPrice));
-  }
-
-  function openLong(label, price, candleTime, regime) {
-    if (openPositionMap.current[label]) return;
-    const qty = computeQty(label, price);
-    if (price * qty > (capitalMap.current[label] || 0)) return;
-    const sl = riskConfig.enabled && parseFloat(riskConfig.stopLossPct)   > 0 ? price * (1 - parseFloat(riskConfig.stopLossPct)/100)   : null;
-    const tp = riskConfig.enabled && parseFloat(riskConfig.takeProfitPct) > 0 ? price * (1 + parseFloat(riskConfig.takeProfitPct)/100) : null;
-    openPositionMap.current[label] = { entryPrice: price, qty, entryTime: candleTime, type: 'LONG', slPrice: sl, tpPrice: tp, regime };
-    flushStrat(label);
-    const sig = { signal: 'BUY', price, symbol: inst.symbol, ts: candleTime, strategyLabel: label };
-    feedRef.current = [{ ...sig, close: price }, ...feedRef.current].slice(0, 500);
-    setFeed([...feedRef.current]);
-  }
-
-  function closeLong(label, exitPrice, candleTime, exitReason) {
-    const pos = openPositionMap.current[label];
-    if (!pos || pos.type !== 'LONG') return;
-    const pnl    = (exitPrice - pos.entryPrice) * pos.qty;
-    const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
-    const newCap = (capitalMap.current[label] || 0) + pnl;
-    capitalMap.current[label] = newCap;
-    const trade = { ...pos, exitPrice, exitTime: candleTime, pnl, pnlPct, exitReason, capitalAfter: newCap };
-    closedTradesMap.current[label] = [trade, ...(closedTradesMap.current[label] || [])];
-    equityMap.current[label] = [...(equityMap.current[label] || []), { time: candleTime, capital: newCap }];
-    openPositionMap.current[label] = null;
-    flushStrat(label);
-    if (pnl < 0 && riskConfig.enabled && parseInt(riskConfig.cooldownCandles, 10) > 0) {
-      cooldownRef.current[label] = parseInt(riskConfig.cooldownCandles, 10);
-    }
-    const sig = { signal: 'SELL', price: exitPrice, symbol: inst.symbol, ts: candleTime, strategyLabel: label, reason: exitReason };
-    feedRef.current = [{ ...sig, close: exitPrice }, ...feedRef.current].slice(0, 500);
-    setFeed([...feedRef.current]);
-  }
-
-  function openShort(label, price, candleTime, regime) {
-    if (openPositionMap.current[label]) return;
-    const qty = computeQty(label, price);
-    const sl = riskConfig.enabled && parseFloat(riskConfig.stopLossPct)   > 0 ? price * (1 + parseFloat(riskConfig.stopLossPct)/100)   : null;
-    const tp = riskConfig.enabled && parseFloat(riskConfig.takeProfitPct) > 0 ? price * (1 - parseFloat(riskConfig.takeProfitPct)/100) : null;
-    openPositionMap.current[label] = { entryPrice: price, qty, entryTime: candleTime, type: 'SHORT', slPrice: sl, tpPrice: tp, regime };
-    flushStrat(label);
-    const sig = { signal: 'SHORT', price, symbol: inst.symbol, ts: candleTime, strategyLabel: label };
-    feedRef.current = [{ ...sig, close: price }, ...feedRef.current].slice(0, 500);
-    setFeed([...feedRef.current]);
-  }
-
-  function closeShort(label, exitPrice, candleTime, exitReason) {
-    const pos = openPositionMap.current[label];
-    if (!pos || pos.type !== 'SHORT') return;
-    const pnl    = (pos.entryPrice - exitPrice) * pos.qty;
-    const pnlPct = ((pos.entryPrice - exitPrice) / pos.entryPrice) * 100;
-    const newCap = (capitalMap.current[label] || 0) + pnl;
-    capitalMap.current[label] = newCap;
-    const trade = { ...pos, exitPrice, exitTime: candleTime, pnl, pnlPct, exitReason, capitalAfter: newCap };
-    closedTradesMap.current[label] = [trade, ...(closedTradesMap.current[label] || [])];
-    equityMap.current[label] = [...(equityMap.current[label] || []), { time: candleTime, capital: newCap }];
-    openPositionMap.current[label] = null;
-    flushStrat(label);
-    if (pnl < 0 && riskConfig.enabled && parseInt(riskConfig.cooldownCandles, 10) > 0) {
-      cooldownRef.current[label] = parseInt(riskConfig.cooldownCandles, 10);
-    }
-    const sig = { signal: 'BUY', price: exitPrice, symbol: inst.symbol, ts: candleTime, strategyLabel: label, reason: exitReason };
-    feedRef.current = [{ ...sig, close: exitPrice }, ...feedRef.current].slice(0, 500);
-    setFeed([...feedRef.current]);
-  }
-
-  function onCandleEvent(candle) {
-    const candleTime = candle.openTime?.substring(0, 16) || new Date().toLocaleTimeString();
-    const close = parseFloat(candle.close);
-    const high  = parseFloat(candle.high);
-    const low   = parseFloat(candle.low);
-    const vol   = parseFloat(candle.volume || 0);
-    const open  = parseFloat(candle.open);
-
-    // Tick down cooldowns
-    Object.keys(cooldownRef.current).forEach(k => { if (cooldownRef.current[k] > 0) cooldownRef.current[k]--; });
-
-    // Regime detection
-    let regime = null;
-    if (regimeConfig.enabled && regimeDetectorRef.current) {
-      regime = regimeDetectorRef.current.addCandle(high, low, close);
-      setCurrentRegime(regime);
-    }
-
-    // SL/TP check against candle's high/low before evaluating signals (skipped in combined-only mode)
-    if (!combinedOnlyMode) {
-      for (const strat of strategies.filter(s => s.enabled)) {
-        const label = strat.label || strat.strategyType;
-        const pos = openPositionMap.current[label];
-        if (!pos || !riskConfig.enabled) continue;
-        if (pos.type === 'LONG') {
-          if (pos.slPrice && low <= pos.slPrice) { closeLong(label, pos.slPrice, candleTime, 'STOP_LOSS'); continue; }
-          if (pos.tpPrice && high >= pos.tpPrice) { closeLong(label, pos.tpPrice, candleTime, 'TAKE_PROFIT'); continue; }
-        } else if (pos.type === 'SHORT') {
-          if (pos.slPrice && high >= pos.slPrice) { closeShort(label, pos.slPrice, candleTime, 'STOP_LOSS'); continue; }
-          if (pos.tpPrice && low <= pos.tpPrice) { closeShort(label, pos.tpPrice, candleTime, 'TAKE_PROFIT'); continue; }
-        }
-      }
-    }
-
-    const today = candleTime.substring(0, 10);
-    const instrType  = resolveInstrType(inst.instrumentType, inst.symbol, inst.exchange);
-    const activeRules = rulesConfig.enabled
-      ? (instrType === 'OPTION' ? rulesConfig.options : rulesConfig.stocks)
-      : {};
-
-    // VWAP for LONG quality gate (using candleLog history accumulated so far)
-    const vwap = (() => {
-      const cls = candleLogRef.current;
-      if (!cls.length) return null;
-      let sumTV = 0, sumV = 0;
-      for (const c of cls.slice(-100)) { const tp = (c.high+c.low+c.close)/3; const v = c.volume||1; sumTV+=tp*v; sumV+=v; }
-      return sumV > 0 ? sumTV/sumV : null;
-    })();
-
-    let latestSignals = {};
-    const blockedSignals = [];
-    const candleClosedDir = {};
-
-    for (const strat of strategies.filter(s => s.enabled)) {
-      const label = strat.label || strat.strategyType;
-      const ev = evaluatorsRef.current[label];
-      if (!ev) continue;
-      if ((cooldownRef.current[label] || 0) > 0) continue;
-
-      // Daily loss cap
-      if (riskConfig.enabled && riskConfig.dailyLossCapPct) {
-        const dc = dailyCapMap.current[label];
-        if (dc) {
-          if (dc.date !== today) {
-            dailyCapMap.current[label] = { date: today, startCapital: capitalMap.current[label], halted: false };
-          } else {
-            const dayLoss = (capitalMap.current[label] - dc.startCapital) / dc.startCapital * 100;
-            if (dayLoss <= -parseFloat(riskConfig.dailyLossCapPct)) dailyCapMap.current[label].halted = true;
-            if (dailyCapMap.current[label].halted) continue;
-          }
-        }
-      }
-
-      // Rule: OPTION — disable specific strategy types
-      if (instrType === 'OPTION' && rulesConfig.enabled) {
-        if (activeRules.disable_sma_breakout?.enabled && ['SMA_CROSSOVER','BREAKOUT'].includes(strat.strategyType)) continue;
-        if (activeRules.use_only_specific?.enabled && !['VWAP_PULLBACK','LIQUIDITY_SWEEP','BOLLINGER_REVERSION'].includes(strat.strategyType)) continue;
-      }
-
-      if (regimeConfig.enabled && regime) {
-        const allowed = STRATEGY_REGIME_MAP[strat.strategyType] || [];
-        if (allowed.length > 0 && !allowed.includes(regime)) continue;
-      }
-
-      const signal = ev.next(close, high, low, vol, open);
-      latestSignals[label] = signal; // always record signal for Combined pool + Details tab
-
-      if (combinedOnlyMode) continue; // don't trade individually — Combined pool handles it
-
-      if (!signal || signal === 'HOLD') continue;
-
-      // Regime-based rules — signal generated but blocked
-      if (rulesConfig.enabled) {
-        if (instrType === 'STOCK') {
-          if (activeRules.ranging_no_trade?.enabled && regime === 'RANGING') {
-            blockedSignals.push({ strategy: label, signal, price: close, reason: 'Rule: No trade in RANGING regime' }); continue;
-          }
-          if (activeRules.compression_short_only?.enabled && regime === 'COMPRESSION' && signal === 'BUY') {
-            blockedSignals.push({ strategy: label, signal, price: close, reason: 'Rule: SHORT only in COMPRESSION (BUY blocked)' }); continue;
-          }
-        } else {
-          if (activeRules.volatile_no_trade?.enabled && regime === 'VOLATILE') {
-            blockedSignals.push({ strategy: label, signal, price: close, reason: 'Rule: No trade in VOLATILE regime' }); continue;
-          }
-        }
-      }
-
-      // Pattern confirmation
-      if (patternConfig.enabled && patternEvalRef.current) {
-        const patSig = patternEvalRef.current.next(close, high, low, vol, open);
-        if (signal === 'BUY'  && patternConfig.buyConfirmPatterns.length  > 0 && !patternConfig.buyConfirmPatterns.includes(patSig)) {
-          blockedSignals.push({ strategy: label, signal, price: close, reason: `Pattern: no BUY confirm (got ${patSig||'none'})` }); continue;
-        }
-        if (signal === 'SELL' && patternConfig.sellConfirmPatterns.length > 0 && !patternConfig.sellConfirmPatterns.includes(patSig)) {
-          blockedSignals.push({ strategy: label, signal, price: close, reason: `Pattern: no SELL confirm (got ${patSig||'none'})` }); continue;
-        }
-      }
-
-      const pos        = openPositionMap.current[label];
-      const hasLong    = pos?.type === 'LONG';
-      const hasShort   = pos?.type === 'SHORT';
-      const allowShort = !!strat.allowShorting;
-      const noSameCandleRev = rulesConfig.enabled && activeRules.no_same_candle_reversal?.enabled;
-
-      // Helper: LONG quality gate — returns block reason or null
-      const longGateBlock = () => {
-        if (instrType !== 'STOCK' || !rulesConfig.enabled || !activeRules.long_quality_gate?.enabled) return null;
-        const sc = strategyScorerRef.current
-          ? strategyScorerRef.current.score(strat.strategyType, 'BUY', regime, instrType)
-          : { total: 0 };
-        const minScore = parseFloat(activeRules.long_quality_gate.scoreMin) || 60;
-        if (sc.total < minScore) return `Rule: LONG gate — score ${sc.total.toFixed(1)} < ${minScore}`;
-        if ((reversalCooldownRef.current[label] || 0) > 0) return 'Rule: LONG gate — reversal cooldown active';
-        if (vwap) {
-          const extPct = Math.abs(close - vwap) / vwap * 100;
-          const maxExt = parseFloat(activeRules.long_quality_gate.vwapMaxPct) || 1.5;
-          if (extPct > maxExt) return `Rule: LONG gate — price ${extPct.toFixed(2)}% from VWAP (max ${maxExt}%)`;
-        }
-        return null;
-      };
-
-      if (signal === 'BUY') {
-        if (hasLong) {
-          blockedSignals.push({ strategy: label, signal, price: close, reason: 'Already in LONG position' });
-        } else if (hasShort) {
-          if (noSameCandleRev && candleClosedDir[label] === 'SHORT') {
-            blockedSignals.push({ strategy: label, signal, price: close, reason: 'Rule: No same-candle reversal (SHORT already closed)' }); continue;
-          }
-          closeShort(label, close, candleTime, 'SIGNAL');
-          candleClosedDir[label] = 'SHORT';
-          if (allowShort) {
-            const gateBlock = longGateBlock();
-            if (!gateBlock) {
-              openLong(label, close, candleTime, regime);
-              reversalCooldownRef.current[label] = 2;
-            } else {
-              blockedSignals.push({ strategy: label, signal, price: close, reason: gateBlock });
-            }
-          }
-        } else {
-          const gateBlock = longGateBlock();
-          if (!gateBlock) {
-            openLong(label, close, candleTime, regime);
-          } else {
-            blockedSignals.push({ strategy: label, signal, price: close, reason: gateBlock });
-          }
-        }
-      } else if (signal === 'SELL') {
-        if (hasShort) {
-          blockedSignals.push({ strategy: label, signal, price: close, reason: 'Already in SHORT position' });
-        } else if (hasLong) {
-          if (noSameCandleRev && candleClosedDir[label] === 'LONG') {
-            blockedSignals.push({ strategy: label, signal, price: close, reason: 'Rule: No same-candle reversal (LONG already closed)' }); continue;
-          }
-          closeLong(label, close, candleTime, 'SIGNAL');
-          candleClosedDir[label] = 'LONG';
-          if (allowShort) {
-            openShort(label, close, candleTime, regime);
-            reversalCooldownRef.current[label] = 2;
-          }
-        } else if (allowShort) {
-          openShort(label, close, candleTime, regime);
-        } else {
-          blockedSignals.push({ strategy: label, signal, price: close, reason: 'Shorting disabled — no open LONG to exit' });
-        }
-      }
-    }
-
-    // Feed current candle into scorer (always, so it has enough history)
-    strategyScorerRef.current?.addCandle(high, low, close);
-
-    // ── Combined regime-switched pool ──────────────────────────────────────
-    const combinedDetails = []; // enriched context for ⚡ Combined actions this candle
-    if (capitalMap.current[COMBINED_LABEL] !== undefined) {
-      // SL/TP for combined position
-      const cPos = openPositionMap.current[COMBINED_LABEL];
-      if (cPos && riskConfig.enabled) {
-        if (cPos.type === 'LONG') {
-          if (cPos.slPrice && low <= cPos.slPrice) {
-            closeLong(COMBINED_LABEL, cPos.slPrice, candleTime, 'STOP_LOSS');
-            combinedDetails.push({ action: 'Exit Long', price: cPos.slPrice, reason: 'Stop Loss hit', regime, sourceStrategy: null, trigger: 'Risk Management' });
-          } else if (cPos.tpPrice && high >= cPos.tpPrice) {
-            closeLong(COMBINED_LABEL, cPos.tpPrice, candleTime, 'TAKE_PROFIT');
-            combinedDetails.push({ action: 'Exit Long', price: cPos.tpPrice, reason: 'Take Profit hit', regime, sourceStrategy: null, trigger: 'Risk Management' });
-          }
-        } else if (cPos.type === 'SHORT') {
-          if (cPos.slPrice && high >= cPos.slPrice) {
-            closeShort(COMBINED_LABEL, cPos.slPrice, candleTime, 'STOP_LOSS');
-            combinedDetails.push({ action: 'Exit Short', price: cPos.slPrice, reason: 'Stop Loss hit', regime, sourceStrategy: null, trigger: 'Risk Management' });
-          } else if (cPos.tpPrice && low <= cPos.tpPrice) {
-            closeShort(COMBINED_LABEL, cPos.tpPrice, candleTime, 'TAKE_PROFIT');
-            combinedDetails.push({ action: 'Exit Short', price: cPos.tpPrice, reason: 'Take Profit hit', regime, sourceStrategy: null, trigger: 'Risk Management' });
-          }
-        }
-      }
-
-      // Score-based strategy selection — pick highest-scoring actionable signal
-      {
-        const replayMinScore    = parseFloat(scoreConfig.minScoreThreshold) || 0;
-
-        // Rule: global regime block for combined pool
-        const combinedBlocked = rulesConfig.enabled && (
-          (instrType === 'STOCK'  && activeRules.ranging_no_trade?.enabled  && regime === 'RANGING') ||
-          (instrType === 'OPTION' && activeRules.volatile_no_trade?.enabled && regime === 'VOLATILE')
-        );
-
-        let bestStrat = null, bestSignal = null, bestScore = null;
-        if (!combinedBlocked) {
-        for (const strat of strategies.filter(s => s.enabled)) {
-          // Rule: OPTION — skip disabled strategy types in scoring
-          if (instrType === 'OPTION' && rulesConfig.enabled) {
-            if (activeRules.disable_sma_breakout?.enabled && ['SMA_CROSSOVER','BREAKOUT'].includes(strat.strategyType)) continue;
-            if (activeRules.use_only_specific?.enabled && !['VWAP_PULLBACK','LIQUIDITY_SWEEP','BOLLINGER_REVERSION'].includes(strat.strategyType)) continue;
-          }
-          // Rule: STOCK COMPRESSION — skip BUY signals
-          if (instrType === 'STOCK' && rulesConfig.enabled && activeRules.compression_short_only?.enabled && regime === 'COMPRESSION') {
-            if (latestSignals[strat.label || strat.strategyType] === 'BUY') continue;
-          }
-          const stratLabel = strat.label || strat.strategyType;
-          const signal = latestSignals[stratLabel];
-          if (!signal || signal === 'HOLD') continue;
-          const sc = strategyScorerRef.current
-            ? strategyScorerRef.current.score(strat.strategyType, signal, regime, instrType)
-            : { total: 0, trendStrength: 0, volatility: 0, momentum: 0, confidence: 0 };
-          // Rule: OPTION — distrust score driven by high volatility
-          if (instrType === 'OPTION' && rulesConfig.enabled && activeRules.distrust_high_vol_score?.enabled) {
-            if (sc.volatility > (parseFloat(activeRules.distrust_high_vol_score.volScoreMax) || 70)) continue;
-          }
-          if (sc.total < replayMinScore) continue;
-          if (!bestScore || sc.total > bestScore.total) {
-            bestStrat = strat; bestSignal = signal; bestScore = sc;
-          }
-        }
-        }
-
-        if (bestStrat && bestSignal) {
-          const stratLabel  = bestStrat.label || bestStrat.strategyType;
-          const cp          = openPositionMap.current[COMBINED_LABEL];
-          const cHasLong    = cp?.type === 'LONG';
-          const cHasShort   = cp?.type === 'SHORT';
-          const allowShort  = !!bestStrat.allowShorting;
-          const noSameCandleRevC = rulesConfig.enabled && activeRules.no_same_candle_reversal?.enabled;
-          const trigger     = `Score-based signal (final=${bestScore.total.toFixed(1)}, base=${bestScore.baseScore?.toFixed(1)??'—'}, trend=${bestScore.trendStrength.toFixed(1)}, vol=${bestScore.volatility.toFixed(1)}, mom=${bestScore.momentum.toFixed(1)}, conf=${bestScore.confidence.toFixed(1)}, pen=${bestScore.totalPenalty?.toFixed(1)??0})`;
-
-          // STOCK rule — LONG quality gate for Combined
-          const combinedPassesLongGate = () => {
-            if (instrType !== 'STOCK' || !rulesConfig.enabled || !activeRules.long_quality_gate?.enabled) return true;
-            if (bestScore.total < (parseFloat(activeRules.long_quality_gate.scoreMin) || 60)) return false;
-            if ((reversalCooldownRef.current[COMBINED_LABEL] || 0) > 0) return false;
-            if (vwap) {
-              const extPct = Math.abs(close - vwap) / vwap * 100;
-              if (extPct > (parseFloat(activeRules.long_quality_gate.vwapMaxPct) || 1.5)) return false;
-            }
-            return true;
-          };
-
-          const tagEntry = () => {
-            if (openPositionMap.current[COMBINED_LABEL]) {
-              openPositionMap.current[COMBINED_LABEL].sourceStrategy = stratLabel;
-              openPositionMap.current[COMBINED_LABEL].entryScore     = bestScore;
-            }
-          };
-          if (bestSignal === 'BUY') {
-            if (cHasShort) {
-              if (!(noSameCandleRevC && candleClosedDir[COMBINED_LABEL] === 'SHORT')) {
-                closeShort(COMBINED_LABEL, close, candleTime, 'SIGNAL');
-                candleClosedDir[COMBINED_LABEL] = 'SHORT';
-                combinedDetails.push({ action: 'Exit Short', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
-                if (allowShort && combinedPassesLongGate()) {
-                  openLong(COMBINED_LABEL, close, candleTime, regime); tagEntry();
-                  reversalCooldownRef.current[COMBINED_LABEL] = 2;
-                  combinedDetails.push({ action: 'Enter Long', price: close, reason: 'Reversal SHORT→LONG', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
-                }
-              }
-            } else if (!cHasLong && combinedPassesLongGate()) {
-              openLong(COMBINED_LABEL, close, candleTime, regime); tagEntry();
-              combinedDetails.push({ action: 'Enter Long', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
-            }
-          } else if (bestSignal === 'SELL') {
-            if (cHasLong) {
-              if (!(noSameCandleRevC && candleClosedDir[COMBINED_LABEL] === 'LONG')) {
-                closeLong(COMBINED_LABEL, close, candleTime, 'SIGNAL');
-                candleClosedDir[COMBINED_LABEL] = 'LONG';
-                combinedDetails.push({ action: 'Exit Long', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
-                if (allowShort) {
-                  openShort(COMBINED_LABEL, close, candleTime, regime); tagEntry();
-                  reversalCooldownRef.current[COMBINED_LABEL] = 2;
-                  combinedDetails.push({ action: 'Enter Short', price: close, reason: 'Reversal LONG→SHORT', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
-                }
-              }
-            } else if (!cHasShort && allowShort) {
-              openShort(COMBINED_LABEL, close, candleTime, regime); tagEntry();
-              combinedDetails.push({ action: 'Enter Short', price: close, reason: 'Signal', regime, sourceStrategy: stratLabel, trigger, score: bestScore });
-            }
-          }
-        }
-      }
-    }
-
-    // Tick down reversal cooldowns
-    Object.keys(reversalCooldownRef.current).forEach(k => {
-      if (reversalCooldownRef.current[k] > 0) reversalCooldownRef.current[k]--;
-    });
-
-    const entry = { ...candle, signals: latestSignals, ts: candleTime };
-    setCurrentCandle(entry);
-    setProgress(prev => ({ ...prev, emitted: prev.emitted + 1 }));
-
-    // Build candle log — exclude ⚡ Combined from feed-based actions (we have richer combinedDetails)
-    const logActions = feedRef.current
-      .filter(f => f.ts === candleTime && f.strategyLabel !== COMBINED_LABEL)
-      .map(f => ({ strategy: f.strategyLabel || '', signal: f.signal, price: f.close, reason: f.reason || '' }));
-    const logEntry = { ts: candleTime, open, high, low, close, volume: vol, regime, signals: { ...latestSignals }, actions: logActions, blockedSignals, combinedDetails };
-    candleLogRef.current = [...candleLogRef.current, logEntry];
-    setCandleLog([...candleLogRef.current]);
-  }
-
   async function handleStart(e) {
     e.preventDefault();
     cleanup();
     setError(''); setFeed([]); feedRef.current = [];
-    setTicks([]); ticksRef.current = []; setLatestTick(null); latestTickRef.current = null;
+    setTicks([]); ticksRef.current = []; latestTickRef.current = null;
     setCandleLog([]); candleLogRef.current = [];
     setProgress({ emitted: 0, total: 0 });
     setStatus('starting'); setSessionId(null); setCurrentCandle(null);
     setStratStates({});
+    setCurrentRegime(null);
+    setPreloadState({ status: 'loading', count: 0, error: null });
 
-    const initCap = parseFloat(initialCapital) || 100000;
-    evaluatorsRef.current = {};
+    // Reset all local tracking refs
     capitalMap.current = {};
     openPositionMap.current = {};
     closedTradesMap.current = {};
@@ -2242,113 +1813,143 @@ function ReplayTest() {
     cooldownRef.current = {};
     dailyCapMap.current = {};
     reversalCooldownRef.current = {};
-    setCurrentRegime(null);
-    for (const strat of strategies.filter(s => s.enabled)) {
-      const label = strat.label || strat.strategyType;
-      evaluatorsRef.current[label] = buildLocalEvaluator(strat.strategyType, strat.parameters || {});
-      capitalMap.current[label] = initCap;
-      openPositionMap.current[label] = null;
-      closedTradesMap.current[label] = [];
-      equityMap.current[label] = [{ time: 'start', capital: initCap }];
-      dailyCapMap.current[label] = { date: '', startCapital: initCap, halted: false };
-    }
-    // Score-based combined pool — single capital pool, scorer picks best strategy each candle
-    if (scoreConfig.enabled && strategies.filter(s => s.enabled).length >= 1) {
-      capitalMap.current[COMBINED_LABEL]      = initCap;
-      openPositionMap.current[COMBINED_LABEL] = null;
-      closedTradesMap.current[COMBINED_LABEL] = [];
-      equityMap.current[COMBINED_LABEL]       = [{ time: 'start', capital: initCap }];
-      dailyCapMap.current[COMBINED_LABEL]     = { date: '', startCapital: initCap, halted: false };
-    }
 
-    patternEvalRef.current = patternConfig.enabled
-      ? new LocalCandlePatternEvaluator(patternConfig.buyConfirmPatterns[0] || 'HAMMER', patternConfig.minWickRatio, patternConfig.maxBodyPct)
-      : null;
-    regimeDetectorRef.current = regimeConfig.enabled
-      ? new LocalRegimeDetector(
-          parseInt(regimeConfig.adxPeriod,10)||14, parseInt(regimeConfig.atrPeriod,10)||14,
-          parseFloat(regimeConfig.adxTrendThreshold)||25, parseFloat(regimeConfig.atrVolatilePct)||2,
-          parseFloat(regimeConfig.atrCompressionPct)||0.5)
-      : null;
-    strategyScorerRef.current = new LocalStrategyScorer(
-      parseInt(regimeConfig.adxPeriod,10)||14,
-      parseInt(regimeConfig.atrPeriod,10)||14,
-      10
-    );
+    const instrType = resolveInstrType(inst.instrumentType, inst.symbol, inst.exchange);
+
+    // Build rulesConfig for backend — translate frontend shape to backend Java camelCase shape
+    const rulesPayload = rulesConfig.enabled ? {
+      enabled: true,
+      stocks: {
+        rangingNoTrade:       rulesConfig.stocks?.ranging_no_trade?.enabled ?? true,
+        compressionShortOnly: rulesConfig.stocks?.compression_short_only?.enabled ?? true,
+        noSameCandleReversal: rulesConfig.stocks?.no_same_candle_reversal?.enabled ?? true,
+        longQualityGate: {
+          enabled:    rulesConfig.stocks?.long_quality_gate?.enabled ?? true,
+          scoreMin:   parseFloat(rulesConfig.stocks?.long_quality_gate?.scoreMin)  || 60,
+          vwapMaxPct: parseFloat(rulesConfig.stocks?.long_quality_gate?.vwapMaxPct) || 1.5,
+        },
+      },
+      options: {
+        volatileNoTrade:      rulesConfig.options?.volatile_no_trade?.enabled ?? true,
+        disableSmaBreakout:   rulesConfig.options?.disable_sma_breakout?.enabled ?? true,
+        distrustHighVolScore: rulesConfig.options?.distrust_high_vol_score?.enabled ?? true,
+        volScoreMax:          parseFloat(rulesConfig.options?.distrust_high_vol_score?.volScoreMax) || 70,
+        noSameCandleReversal: rulesConfig.options?.no_same_candle_reversal?.enabled ?? true,
+      },
+    } : { enabled: false };
+
+    const payload = {
+      userId:          session.userId,
+      brokerName:      session.brokerName,
+      symbol:          inst.symbol.toUpperCase(),
+      exchange:        inst.exchange.toUpperCase(),
+      instrumentToken: parseInt(inst.instrumentToken, 10),
+      instrumentType:  instrType,
+      interval:        replayInterval,
+      fromDate:        fromDate + 'T09:15:00',
+      toDate:          toDate   + 'T15:30:00',
+      speedMultiplier:  parseFloat(speed) || 1,
+      combinedOnlyMode: combinedOnlyMode,
+      initialCapital:   parseFloat(initialCapital) || 100000,
+      quantity:        parseInt(quantity, 10) || 0,
+      product:         'MIS',
+      preloadDaysBack: preload.enabled ? (parseInt(preload.daysBack, 10) || 5) : 0,
+      preloadInterval: preload.enabled ? preload.interval : replayInterval,
+      strategies: strategies.filter(s => s.enabled).map(s => ({
+        strategyType: s.strategyType,
+        label:        s.label || undefined,
+        parameters:   s.parameters,
+        activeRegimes: regimeConfig.enabled
+          ? (STRATEGY_REGIME_MAP[s.strategyType] || [])
+          : [],
+      })),
+      riskConfig: riskConfig.enabled ? {
+        enabled:            true,
+        stopLossPct:        parseFloat(riskConfig.stopLossPct)        || null,
+        takeProfitPct:      parseFloat(riskConfig.takeProfitPct)      || null,
+        maxRiskPerTradePct: parseFloat(riskConfig.maxRiskPerTradePct) || null,
+        dailyLossCapPct:    parseFloat(riskConfig.dailyLossCapPct)    || null,
+        cooldownCandles:    parseInt(riskConfig.cooldownCandles, 10)  || 0,
+      } : null,
+      patternConfig: patternConfig.enabled ? {
+        enabled:             true,
+        minWickRatio:        parseFloat(patternConfig.minWickRatio) || 2,
+        maxBodyPct:          parseFloat(patternConfig.maxBodyPct)   || 0.35,
+        buyConfirmPatterns:  patternConfig.buyConfirmPatterns,
+        sellConfirmPatterns: patternConfig.sellConfirmPatterns,
+      } : null,
+      regimeConfig: regimeConfig.enabled ? {
+        enabled:           true,
+        adxPeriod:         parseInt(regimeConfig.adxPeriod, 10)       || 14,
+        atrPeriod:         parseInt(regimeConfig.atrPeriod, 10)       || 14,
+        adxTrendThreshold: parseFloat(regimeConfig.adxTrendThreshold) || 25,
+        atrVolatilePct:    parseFloat(regimeConfig.atrVolatilePct)    || 2.0,
+        atrCompressionPct: parseFloat(regimeConfig.atrCompressionPct) || 0.5,
+      } : null,
+      scoreConfig: scoreConfig.enabled ? {
+        enabled:           true,
+        minScoreThreshold: parseFloat(scoreConfig.minScoreThreshold) || 30,
+      } : null,
+      rulesConfig: rulesPayload,
+    };
 
     try {
-      const res = await startReplay({
-        userId:          session.userId,
-        brokerName:      session.brokerName,
-        instrumentToken: parseInt(inst.instrumentToken, 10),
-        symbol:          inst.symbol.toUpperCase(),
-        exchange:        inst.exchange.toUpperCase(),
-        interval:        replayInterval,
-        fromDate:        fromDate + 'T09:15:00',
-        toDate:          toDate   + 'T15:30:00',
-        speedMultiplier: speed,
-      });
-
-      const sid = res?.data?.sessionId;
-      if (!sid) throw new Error('No session ID returned');
-      setSessionId(sid);
-      setProgress({ emitted: 0, total: res?.data?.totalCandles || 0 });
       setStatus('running');
+      setPreloadState({ status: 'loading', count: 0, error: null });
 
-      const sse = new EventSource(`/data-api/api/v1/data/stream/candles?sessionId=${encodeURIComponent(sid)}`);
-      sseRef.current = sse;
+      const abortCtrl = new AbortController();
+      abortCtrlRef.current = abortCtrl;
 
-      sse.addEventListener('candle', (ev) => {
-        try { onCandleEvent(JSON.parse(ev.data)); } catch {}
-      });
+      const response = await startReplayEval(payload, abortCtrl.signal);
+      if (!response.body) throw new Error('No response body from Strategy Engine');
 
-      // Backend sends "done" after the last candle — only close then, not via the poll,
-      // to avoid dropping buffered SSE events at high speed.
-      sse.addEventListener('done', () => {
-        setStatus('completed');
-        cleanup();
-      });
+      // Read the SSE stream manually (POST SSE — cannot use EventSource)
+      const reader   = response.body.getReader();
+      const decoder  = new TextDecoder();
+      sseRef.current = reader;
 
-      sse.onerror = () => {
-        setStatus(s => s === 'running' ? 'completed' : s);
-        cleanup();
-      };
+      let buffer = '';
+      let done   = false;
 
-      const tickSse = new EventSource(`/data-api/api/v1/data/stream/ticks?sessionId=${encodeURIComponent(sid)}`);
-      tickSseRef.current = tickSse;
-      tickSse.addEventListener('tick', (ev) => {
+      while (!done) {
+        let chunk;
         try {
-          const t = JSON.parse(ev.data);
-          const entry = {
-            ts:     t.timestamp ? new Date(t.timestamp).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '--',
-            symbol: t.symbol || '',
-            ltp:    t.ltp ?? 0,
-            change: t.change,
-          };
-          latestTickRef.current = entry;
-          setLatestTick(entry);
-          const next = [entry, ...ticksRef.current].slice(0, 200);
-          ticksRef.current = next;
-          setTicks(next);
-        } catch {}
-      });
-      tickSse.onerror = () => { if (tickSseRef.current) { tickSseRef.current.close(); tickSseRef.current = null; } };
+          const result = await reader.read();
+          done  = result.done;
+          chunk = result.value;
+        } catch {
+          break; // stream cancelled (cleanup called)
+        }
+        if (chunk) buffer += decoder.decode(chunk, { stream: true });
 
-      // Poll is a fallback for STOPPED/FAILED; COMPLETED is handled by the "done" SSE event.
-      pollRef.current = setInterval(async () => {
-        try {
-          const statusRes = await getReplayStatus(sid);
-          const st = statusRes?.data?.status;
-          if (st === 'STOPPED' || st === 'FAILED') {
-            setStatus(st.toLowerCase());
-            cleanup();
-          } else if (st === 'COMPLETED') {
-            // Update progress display but don't close SSE — wait for "done" event.
-            setStatus('completed');
-            clearInterval(pollRef.current); pollRef.current = null;
+        // Parse SSE events from buffer
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop(); // keep incomplete tail
+
+        for (const part of parts) {
+          const lines = part.split('\n');
+          let eventName = null;
+          let data = null;
+          for (const line of lines) {
+            if (line.startsWith('event:')) eventName = line.slice(6).trim();
+            else if (line.startsWith('data:')) data = line.slice(5).trim();
           }
-        } catch {}
-      }, 2000);
+          if (eventName === 'init' && data) {
+            try {
+              const init = JSON.parse(data);
+              setPreloadState({ status: 'done', count: init.warmupCount || 0, error: null });
+              setProgress({ emitted: 0, total: init.totalCandles || 0 });
+            } catch {}
+          } else if (eventName === 'candle' && data) {
+            try {
+              const event = JSON.parse(data);
+              onReplayCandleEvent(event);
+            } catch {}
+          }
+        }
+      }
+
+      setStatus(s => (s === 'running' || s === 'starting') ? 'completed' : s);
 
     } catch (err) {
       setError(err.message);
@@ -2357,16 +1958,69 @@ function ReplayTest() {
     }
   }
 
+  /**
+   * Handles a ReplayCandleEvent received from the Strategy Engine SSE stream.
+   * Replaces the old frontend-local onCandleEvent — all evaluation is now server-side.
+   */
+  function onReplayCandleEvent(event) {
+    const candleTime = event.candleTime || '';
+    const close = event.close;
+    const high  = event.high;
+    const low   = event.low;
+    const open  = event.open;
+    const vol   = event.volume || 0;
+
+    // Update regime display
+    if (event.regime) setCurrentRegime(event.regime);
+
+    // Update progress
+    setProgress({ emitted: event.emitted || 0, total: event.total || 0 });
+
+    // Update current candle display
+    setCurrentCandle({ openTime: candleTime, open, high, low, close, volume: vol, signals: event.signals });
+
+    // Append to candle log
+    const logEntry = {
+      ts: candleTime, open, high, low, close, volume: vol,
+      regime: event.regime,
+      signals: event.signals || {},
+      actions: (event.actions || []).map(a => ({
+        strategy: a.strategyLabel, signal: a.action, price: a.price, reason: a.reason || '',
+      })),
+      blockedSignals: event.blockedSignals || [],
+      combinedDetails: event.combinedDetails || [],
+    };
+    candleLogRef.current = [...candleLogRef.current, logEntry];
+    setCandleLog([...candleLogRef.current]);
+
+    // Update feed (for the right-panel feed tab) from actions
+    if (event.actions && event.actions.length > 0) {
+      for (const a of event.actions) {
+        const feedEntry = {
+          ts: candleTime, strategyLabel: a.strategyLabel,
+          signal: a.action, close, reason: a.reason || '',
+        };
+        feedRef.current = [feedEntry, ...feedRef.current].slice(0, 500);
+      }
+      setFeed([...feedRef.current]);
+    }
+
+    // Update strategy states from server snapshot
+    if (event.strategyStates) {
+      setStratStates(event.strategyStates);
+    }
+  }
+
   async function handleStop() {
-    if (!sessionId) return;
-    try { await stopReplay(sessionId); setStatus('stopped'); } catch {}
+    // Cancel the server-side SSE stream (reader.cancel() is called by cleanup)
+    setStatus('stopped');
     cleanup();
   }
 
   function handleReset() {
     cleanup();
     setFeed([]); feedRef.current = [];
-    setTicks([]); ticksRef.current = []; setLatestTick(null); latestTickRef.current = null;
+    setTicks([]); ticksRef.current = []; latestTickRef.current = null;
     setCandleLog([]); candleLogRef.current = [];
     setStatus('idle'); setSessionId(null);
     setProgress({ emitted: 0, total: 0 });
@@ -2376,6 +2030,7 @@ function ReplayTest() {
     closedTradesMap.current = {}; equityMap.current = {};
     cooldownRef.current = {}; dailyCapMap.current = {};
     regimeDetectorRef.current = null; patternEvalRef.current = null;
+    setPreloadState({ status: 'idle', count: 0, error: null });
   }
 
   const isRunning      = status === 'running' || status === 'starting';
@@ -2452,12 +2107,45 @@ function ReplayTest() {
                 </div>
               </div>
 
+              {/* ── Preload warmup ── */}
+              <div className="de-preload-block" style={{ marginBottom: 14, marginTop: 4 }}>
+                <div className="de-preload-header">
+                  <label className="checkbox-label" style={{ margin: 0, fontWeight: 600 }}>
+                    <input type="checkbox" checked={preload.enabled} disabled={isRunning}
+                      onChange={e => setPreload(p => ({ ...p, enabled: e.target.checked }))} />
+                    Preload past candles
+                  </label>
+                  <span className="de-preload-hint">Warms up indicators before replay start date</span>
+                </div>
+                {preload.enabled && (
+                  <div className="de-preload-fields">
+                    <div className="form-group">
+                      <label>Days back</label>
+                      <input type="number" min="1" max="60" value={preload.daysBack} disabled={isRunning}
+                        onChange={e => setPreload(p => ({ ...p, daysBack: e.target.value }))} style={{ width: 80 }} />
+                    </div>
+                    <div className="form-group">
+                      <label>Interval</label>
+                      <select value={preload.interval} disabled={isRunning}
+                        onChange={e => setPreload(p => ({ ...p, interval: e.target.value }))}>
+                        {INTERVALS.map(iv => <option key={iv.value} value={iv.value}>{iv.label}</option>)}
+                      </select>
+                    </div>
+                  </div>
+                )}
+                {preloadState.status === 'loading' && <div className="de-preload-results"><span className="de-preload-loading">{inst.symbol || 'Instrument'}: Fetching…</span></div>}
+                {preloadState.status === 'done'    && <div className="de-preload-results"><span className="de-preload-result-item de-preload-ok">{inst.symbol}: {preloadState.count} candles warmed up</span></div>}
+                {preloadState.status === 'error'   && <div className="de-preload-results"><span className="de-preload-result-item de-preload-error">Preload failed — {preloadState.error}</span></div>}
+              </div>
+
               {error && <div className="error-msg" style={{ marginBottom: 12 }}>{error}</div>}
               {!isActive && <div className="error-msg" style={{ marginBottom: 12 }}>No active session.</div>}
 
               <div style={{ display: 'flex', gap: 8 }}>
                 {!isRunning
-                  ? <button type="submit" className="btn-primary" disabled={!isActive}>▶ Start Replay</button>
+                  ? <button type="submit" className="btn-primary" disabled={!isActive || status === 'warming up'}>
+                      {status === 'warming up' ? 'Warming up…' : '▶ Start Replay'}
+                    </button>
                   : <button type="button" className="btn-danger" onClick={handleStop}>■ Stop</button>
                 }
                 {!isRunning && <button type="button" className="btn-secondary" onClick={handleReset}>Reset</button>}
@@ -4164,7 +3852,6 @@ function LiveTest() {
   const indivStratKeys    = allStratKeys.filter(k => !k.endsWith('::' + COMBINED_LABEL));
   const numActive         = indivStratKeys.length || 1;
   const totalDeployed     = initCap * numActive;
-  const totalCapital      = indivStratKeys.reduce((s, k) => s + (stratStates[k]?.capital ?? initCap), 0);
   const totalPnl          = indivStratKeys.reduce((s, k) => s + ((stratStates[k]?.capital ?? initCap) - initCap), 0);
   const totalPnlPct       = totalDeployed > 0 ? (totalPnl / totalDeployed) * 100 : 0;
   const allClosedTrades   = indivStratKeys.flatMap(k => stratStates[k]?.closedTrades || []);
