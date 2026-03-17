@@ -24,6 +24,13 @@ export default defineConfig({
         timeout: 0,
         proxyTimeout: 0,
       },
+      '/strategy-api': {
+        target: 'http://localhost:9006',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/strategy-api/, ''),
+        timeout: 0,
+        proxyTimeout: 0,
+      },
       '/strategy': {
         target: 'http://localhost:9006',
         changeOrigin: true,

@@ -1,9 +1,10 @@
 // Base URLs are proxied through Vite dev server to avoid CORS in development.
 // In production, set VITE_BROKER_URL etc. as env vars.
-const BROKER   = import.meta.env.VITE_BROKER_URL   || '/broker';
-const EXECUTION = import.meta.env.VITE_EXECUTION_URL || '/execution';
-const DATA      = import.meta.env.VITE_DATA_URL      || '/data-api';
-const STRATEGY  = import.meta.env.VITE_STRATEGY_URL  || '/strategy';
+const BROKER        = import.meta.env.VITE_BROKER_URL        || '/broker';
+const EXECUTION     = import.meta.env.VITE_EXECUTION_URL     || '/execution';
+const DATA          = import.meta.env.VITE_DATA_URL          || '/data-api';
+const STRATEGY      = import.meta.env.VITE_STRATEGY_URL      || '/strategy';
+const STRATEGY_API  = import.meta.env.VITE_STRATEGY_API_URL  || '/strategy-api';
 
 async function request(url, options = {}) {
   const res = await fetch(url, {
@@ -228,6 +229,34 @@ export async function getSignalsBySymbol(symbol, exchange) {
 
 export async function runBacktest(payload) {
   return request(`${STRATEGY}/api/v1/strategy/backtest`, { method: 'POST', body: payload });
+}
+
+/**
+ * Starts a server-side replay evaluation stream.
+ *
+ * Returns a fetch Response whose body is a text/event-stream.
+ * Events are named "candle" and carry JSON-serialised ReplayCandleEvent objects.
+ *
+ * Usage:
+ *   const res = await startReplayEval(config);
+ *   // then read res.body as a ReadableStream and parse SSE events manually
+ */
+export async function startReplayEval(config, signal) {
+  const res = await fetch(`${STRATEGY_API}/api/v1/strategy/replay/evaluate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify(config),
+    signal,
+  });
+  if (!res.ok) {
+    let errorMsg = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      errorMsg = err.message || err.error || errorMsg;
+    } catch (_) {}
+    throw new Error(errorMsg);
+  }
+  return res; // caller reads res.body as ReadableStream
 }
 
 // ─── Portfolio ────────────────────────────────────────────────────────────────

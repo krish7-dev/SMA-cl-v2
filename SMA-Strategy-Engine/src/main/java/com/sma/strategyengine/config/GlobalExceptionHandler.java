@@ -2,9 +2,11 @@ package com.sma.strategyengine.config;
 
 import com.sma.strategyengine.client.DataEngineClient.DataEngineException;
 import com.sma.strategyengine.model.response.ApiResponse;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolationException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -47,8 +49,14 @@ public class GlobalExceptionHandler {
     }
 
     @ExceptionHandler(Exception.class)
-    public ResponseEntity<ApiResponse<Void>> handleGeneral(Exception ex) {
+    public ResponseEntity<?> handleGeneral(Exception ex, HttpServletRequest request) {
         log.error("Unhandled exception: {}", ex.getMessage(), ex);
+        // SSE endpoints declare Accept: text/event-stream — returning JSON would cause
+        // HttpMediaTypeNotAcceptableException, so skip the body for those requests.
+        String accept = request.getHeader("Accept");
+        if (accept != null && accept.contains(MediaType.TEXT_EVENT_STREAM_VALUE)) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(ApiResponse.error("Internal server error: " + ex.getMessage()));
     }
