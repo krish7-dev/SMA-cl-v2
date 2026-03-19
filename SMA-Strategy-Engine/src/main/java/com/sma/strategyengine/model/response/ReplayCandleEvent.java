@@ -53,6 +53,38 @@ public class ReplayCandleEvent {
      */
     List<CombinedDetail> combinedDetails;
 
+    // ─── Combined pool analytics (per candle) ─────────────────────────────────
+
+    /** Label of the strategy with the highest score this candle; null when combined didn't score. */
+    String combinedWinner;
+
+    /** Total score of the winning strategy; null if no winner this candle. */
+    Double combinedWinnerScore;
+
+    /**
+     * ALL strategies that produced a non-HOLD signal and were scored this candle,
+     * sorted by score descending. Format: "LABEL SIGNAL score=XX.X".
+     * Includes strategies below the score threshold (use combinedCandidates for above-threshold only).
+     */
+    List<String> combinedAllScored;
+
+    /**
+     * Strategies that passed the score threshold this candle (subset of combinedAllScored).
+     * Format: "label:signal(score)". Empty when combined is blocked or scoreConfig is off.
+     */
+    List<String> combinedCandidates;
+
+    /** Reason the combined pool was blocked from acting this candle; null if not blocked. */
+    String combinedBlockReason;
+
+    // ─── Market context ───────────────────────────────────────────────────────
+
+    /** Cumulative intraday VWAP up to this candle; null when volume is zero. */
+    Double vwap;
+
+    /** Distance of close from VWAP as a percentage: (close − vwap) / vwap × 100. */
+    Double distanceFromVwapPct;
+
     /** Per-label snapshot of capital, open position, closed trades, equity history. */
     Map<String, StrategyState> strategyStates;
 

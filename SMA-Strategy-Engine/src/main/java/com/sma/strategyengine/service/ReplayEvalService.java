@@ -382,7 +382,9 @@ public class ReplayEvalService {
             }
             vwapSumTV += ((cH + cL + cC) / 3.0) * cV;
             vwapSumV  += cV;
-            double currentVwap = vwapSumV > 0 ? vwapSumTV / vwapSumV : 0.0;
+            double currentVwap        = vwapSumV > 0 ? vwapSumTV / vwapSumV : 0.0;
+            Double eventVwap          = currentVwap > 0 ? currentVwap : null;
+            Double eventDistVwapPct   = currentVwap > 0 ? ((cC - currentVwap) / currentVwap) * 100.0 : null;
 
             // ── Day boundary reset for daily cap tracking ──────────────────
             LocalDate candleDay = candle.openTime() != null ? candle.openTime().toLocalDate() : null;
@@ -411,6 +413,12 @@ public class ReplayEvalService {
             List<CombinedDetail> combinedDetails = new ArrayList<>();
             Map<String, String>  signals         = new LinkedHashMap<>();
             Map<String, String>  candleClosedDir = new HashMap<>();
+            String       combinedWinner      = null;
+            Double       combinedWinnerScore = null;
+            List<String> combinedCandidates  = new ArrayList<>();
+            String       combinedBlockReason = null;
+            List<String[]> allScoredTuples   = new ArrayList<>();
+            List<String> combinedAllScored   = new ArrayList<>();
 
             // ── SL/TP check for individual positions ──────────────────────
             for (StrategyConfig cfg : stratCfgs) {
@@ -674,6 +682,10 @@ public class ReplayEvalService {
                         (!isOption && stockRules.isRangingNoTrade()       && "RANGING".equals(regime)) ||
                         (isOption  && optionRules.isVolatileNoTrade()     && "VOLATILE".equals(regime))
                 );
+                if (combinedBlocked) {
+                    combinedBlockReason = !isOption ? "RANGING regime — no-trade rule"
+                                                    : "VOLATILE regime — no-trade rule";
+                }
 
                 String bestLabel   = null;
                 String bestSignal  = null;
@@ -707,12 +719,20 @@ public class ReplayEvalService {
                             if (sc.getVolatilityScore() > optionRules.getVolScoreMax()) continue;
                         }
 
+                        allScoredTuples.add(new String[]{lbl, sig, String.format("%.1f", sc.getTotal())});
                         if (sc.getTotal() < minScore) continue;
 
+                        combinedCandidates.add(lbl + ":" + sig + String.format("(%.1f)", sc.getTotal()));
                         if (bestScore == null || sc.getTotal() > bestScore.getTotal()) {
                             bestScore = sc; bestLabel = lbl; bestSignal = sig;
                         }
                     }
+                    combinedWinner      = bestLabel;
+                    combinedWinnerScore = bestScore != null ? bestScore.getTotal() : null;
+                    combinedAllScored = allScoredTuples.stream()
+                            .sorted((a, b) -> Double.compare(Double.parseDouble(b[2]), Double.parseDouble(a[2])))
+                            .map(t -> t[0] + " " + t[1] + " score=" + t[2])
+                            .collect(java.util.stream.Collectors.toList());
                 }
 
                 if (bestLabel != null && bestSignal != null) {
@@ -758,7 +778,11 @@ public class ReplayEvalService {
                                             .action("Enter Long").reason("Reversal SHORT->LONG")
                                             .price(cC).regime(regime).sourceStrategy(bestLabel).trigger(trigger)
                                             .score(ReplayCandleEvent.toScoreDetail(finalBestScore)).build());
+                                } else if (!passesGate) {
+                                    combinedBlockReason = "LONG quality gate (post-short-exit)";
                                 }
+                            } else {
+                                combinedBlockReason = "same-candle reversal (BUY after SHORT close)";
                             }
                         } else if (!cHasLong) {
                             boolean passesGate = combinedLongGateCheck(cC, regime, instrType, finalBestScore,
@@ -771,6 +795,8 @@ public class ReplayEvalService {
                                         .action("Enter Long").reason("Signal")
                                         .price(cC).regime(regime).sourceStrategy(bestLabel).trigger(trigger)
                                         .score(ReplayCandleEvent.toScoreDetail(finalBestScore)).build());
+                            } else {
+                                combinedBlockReason = "LONG quality gate";
                             }
                         }
                     } else { // SELL
@@ -795,6 +821,8 @@ public class ReplayEvalService {
                                             .price(cC).regime(regime).sourceStrategy(bestLabel).trigger(trigger)
                                             .score(ReplayCandleEvent.toScoreDetail(finalBestScore)).build());
                                 }
+                            } else {
+                                combinedBlockReason = "same-candle reversal (SELL after LONG close)";
                             }
                         } else if (!cHasShort && bestAllowShort) {
                             int qty = sizeQty(resolvedQty, combinedCapital, cC, riskFrac, slFrac);
@@ -804,6 +832,8 @@ public class ReplayEvalService {
                                     .action("Enter Short").reason("Signal")
                                     .price(cC).regime(regime).sourceStrategy(bestLabel).trigger(trigger)
                                     .score(ReplayCandleEvent.toScoreDetail(finalBestScore)).build());
+                        } else if (!cHasShort) {
+                            combinedBlockReason = "shorting disabled for " + bestLabel;
                         }
                     }
                 }
@@ -837,6 +867,13 @@ public class ReplayEvalService {
                     .actions(actions)
                     .blockedSignals(blockedSignals)
                     .combinedDetails(combinedDetails)
+                    .combinedWinner(combinedWinner)
+                    .combinedWinnerScore(combinedWinnerScore)
+                    .combinedAllScored(combinedAllScored)
+                    .combinedCandidates(combinedCandidates)
+                    .combinedBlockReason(combinedBlockReason)
+                    .vwap(eventVwap)
+                    .distanceFromVwapPct(eventDistVwapPct)
                     .strategyStates(stratStates)
                     .emitted(emitted)
                     .total(total)
