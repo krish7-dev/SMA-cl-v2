@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import {
   getStrategyTypes, runBacktest,
   liveSubscribe, liveUnsubscribe, liveConnect, liveStatus,
+  getLiveSnapshot, deleteLiveSnapshot,
   searchInstruments, fetchHistoricalData,
   startReplayEval,
   startLiveEval, stopLiveEval,
@@ -3161,6 +3162,10 @@ function LiveTest() {
   const [instruments, setInstruments]           = useState([EMPTY_INSTR()]);
   const [selectedInstrToken, setSelectedInstrToken] = useState(null);
 
+  // ── Snapshot / resume ─────────────────────────────────────────────────────
+  const [savedSnapshot, setSavedSnapshot]     = useState(null);   // LiveSessionSnapshot from backend
+  const [resumeFromSnapshot, setResumeFromSnapshot] = useState(false);
+
   // ── Connection ────────────────────────────────────────────────────────────
   const [kiteConnected, setKiteConnected] = useState(false);
   const [connected, setConnected]   = useState(false);
@@ -3216,6 +3221,14 @@ function LiveTest() {
     getStrategyTypes().then(r => { if (r?.data) setKnownTypes([...r.data].sort()); }).catch(() => {});
     return () => cleanup();
   }, []);
+
+  // Check for a saved snapshot whenever the session becomes active
+  useEffect(() => {
+    if (!isActive || !session?.userId || !session?.brokerName) return;
+    getLiveSnapshot(session.userId, session.brokerName)
+      .then(res => setSavedSnapshot(res?.data ?? null))
+      .catch(() => setSavedSnapshot(null));
+  }, [isActive, session?.userId, session?.brokerName]);
 
   // Keep refs in sync so SSE closure always reads current values
   useEffect(() => { instrumentsRef.current = instruments; }, [instruments]);
@@ -3774,6 +3787,7 @@ function LiveTest() {
       const liveEvalRes = await startLiveEval({
         userId:     session.userId,
         brokerName: session.brokerName,
+        resumeFromSnapshot,
         instruments: validInstrs.map(i => ({
           instrumentToken: parseInt(i.instrumentToken, 10),
           symbol:          i.symbol.toUpperCase(),
@@ -3921,6 +3935,52 @@ function LiveTest() {
                     candleLogsRef.current[token] = [...(candleLogsRef.current[token] || []), logEntry];
                     setCandleLogByToken(prev => ({ ...prev, [token]: [...candleLogsRef.current[token]] }));
 
+                  } else if (eventName === 'restore') {
+                    // Session restored from snapshot — repopulate UI state
+                    try {
+                      const snap = JSON.parse(dataBuffer);
+                      if (snap?.instruments) {
+                        const newStratStates = {};
+                        const newCandleLogs  = {};
+                        for (const [token, instrSnap] of Object.entries(snap.instruments)) {
+                          // Strategy states → stratStates keyed by `${token}::${label}`
+                          if (instrSnap.strategies) {
+                            for (const [label, ss] of Object.entries(instrSnap.strategies)) {
+                              newStratStates[`${token}::${label}`] = {
+                                capital:      ss.capital,
+                                openPosition: ss.openPosition,
+                                closedTrades: ss.closedTrades || [],
+                                equityPoints: ss.equityPoints || [],
+                              };
+                            }
+                          }
+                          if (instrSnap.combined) {
+                            newStratStates[`${token}::${COMBINED_LABEL}`] = {
+                              capital:      instrSnap.combined.capital,
+                              openPosition: instrSnap.combined.openPosition,
+                              closedTrades: instrSnap.combined.closedTrades || [],
+                              equityPoints: instrSnap.combined.equityPoints || [],
+                            };
+                          }
+                        }
+                        // Candle logs
+                        if (snap.candleLogs) {
+                          for (const [token, entries] of Object.entries(snap.candleLogs)) {
+                            const logs = (entries || []).map(e => ({
+                              ts: e.candleTime, open: e.open, high: e.high, low: e.low,
+                              close: e.close, volume: e.volume, regime: e.regime,
+                              signals: e.signals || {}, actions: e.actions || [],
+                              blockedSignals: e.blockedSignals || [],
+                              combinedDetails: e.combinedDetails || [],
+                            }));
+                            candleLogsRef.current[token] = logs;
+                            newCandleLogs[token] = logs;
+                          }
+                        }
+                        setStratStates(prev => ({ ...prev, ...newStratStates }));
+                        setCandleLogByToken(prev => ({ ...prev, ...newCandleLogs }));
+                      }
+                    } catch {}
                   } else if (eventName === 'info') {
                     // Preload done notification
                     try {
@@ -4115,6 +4175,33 @@ function LiveTest() {
                 );
               })}
             </div>
+
+            {/* Saved snapshot banner */}
+            {savedSnapshot && !connected && (
+              <div style={{ background: 'rgba(234,179,8,0.12)', border: '1px solid rgba(234,179,8,0.4)', borderRadius: 8, padding: '8px 12px', marginBottom: 10 }}>
+                <div style={{ fontSize: 12, color: '#ca8a04', fontWeight: 600, marginBottom: 4 }}>
+                  💾 Saved session found — {new Date(savedSnapshot.savedAt).toLocaleString()}
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>
+                  Resume to continue from your last recorded positions and trades.
+                </div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={resumeFromSnapshot}
+                      onChange={e => setResumeFromSnapshot(e.target.checked)} />
+                    Resume from saved state
+                  </label>
+                  <button type="button" className="btn-secondary btn-xs" style={{ marginLeft: 'auto' }}
+                    onClick={() => {
+                      deleteLiveSnapshot(session.userId, session.brokerName).catch(() => {});
+                      setSavedSnapshot(null);
+                      setResumeFromSnapshot(false);
+                    }}>
+                    Discard
+                  </button>
+                </div>
+              </div>
+            )}
 
             {error    && <div className="error-msg" style={{ marginBottom: 12 }}>{error}</div>}
             {!isActive && <div className="error-msg" style={{ marginBottom: 12 }}>No active session.</div>}

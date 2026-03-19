@@ -17,6 +17,7 @@ import com.sma.strategyengine.model.request.ReplayRequest.RulesConfig.StockRules
 import com.sma.strategyengine.model.request.ReplayRequest.RulesConfig.StockRules.LongQualityGate;
 import com.sma.strategyengine.model.response.ReplayCandleEvent;
 import com.sma.strategyengine.model.response.ReplayCandleEvent.*;
+import com.sma.strategyengine.model.snapshot.LiveSessionSnapshot;
 import com.sma.strategyengine.strategy.PositionDirection;
 import com.sma.strategyengine.strategy.StrategyContext;
 import com.sma.strategyengine.strategy.StrategyLogic;
@@ -41,6 +42,7 @@ import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
 /**
  * Live strategy evaluation service.
@@ -75,9 +77,10 @@ public class LiveEvalService {
             "DAY",       86_400_000L
     );
 
-    private final DataEngineClient dataEngineClient;
-    private final StrategyRegistry strategyRegistry;
-    private final ObjectMapper     objectMapper;
+    private final DataEngineClient  dataEngineClient;
+    private final StrategyRegistry  strategyRegistry;
+    private final ObjectMapper      objectMapper;
+    private final LiveSessionStore  sessionStore;
 
     @Value("${strategy.data-engine.base-url:http://localhost:9005}")
     private String dataEngineBaseUrl;
@@ -132,6 +135,14 @@ public class LiveEvalService {
     public void stop(String sessionId) {
         cleanup(sessionId);
         log.info("Live eval session {} stopped externally", sessionId);
+    }
+
+    public Optional<LiveSessionSnapshot> getSnapshot(String userId, String brokerName) {
+        return sessionStore.load(userId, brokerName);
+    }
+
+    public void deleteSnapshot(String userId, String brokerName) {
+        sessionStore.delete(userId, brokerName);
     }
 
     private void cleanup(String sessionId) {
@@ -190,6 +201,9 @@ public class LiveEvalService {
         // Candle emitted counters per token
         final ConcurrentHashMap<Long, Integer> emittedByToken = new ConcurrentHashMap<>();
 
+        // Candle log per token: accumulates entries for snapshot persistence (bounded to 1000)
+        final ConcurrentHashMap<Long, List<LiveSessionSnapshot.CandleLogEntry>> candleLog = new ConcurrentHashMap<>();
+
         volatile boolean  stopped    = false;
         volatile Future<?> tickFuture = null;
 
@@ -243,6 +257,7 @@ public class LiveEvalService {
                 }
                 evalStates.put(ic.getInstrumentToken(), state);
                 emittedByToken.put(ic.getInstrumentToken(), 0);
+                candleLog.put(ic.getInstrumentToken(), new ArrayList<>());
             }
 
             // ── Phase 2: Preload warmup candles ────────────────────────────────
@@ -288,9 +303,166 @@ public class LiveEvalService {
                 }
             }
 
+            // ── Phase 2b: Restore from snapshot if requested ───────────────────
+            if (req.isResumeFromSnapshot()) {
+                restoreFromSnapshot();
+            }
+
             // ── Phase 3: Subscribe to Data Engine tick SSE ─────────────────────
             if (!stopped) {
                 tickFuture = executor.submit(this::readTickStream);
+            }
+        }
+
+        /**
+         * Attempts to load a persisted snapshot for this (userId, brokerName) and restore
+         * capital, open positions, closed trades, equity history, and candle log into the
+         * already-initialised InstrEvalState maps.
+         * After restoration, emits a {@code restore} SSE event with the full snapshot JSON.
+         */
+        private void restoreFromSnapshot() {
+            Optional<LiveSessionSnapshot> opt = sessionStore.load(req.getUserId(), req.getBrokerName());
+            if (opt.isEmpty()) {
+                log.info("Live eval session {}: no snapshot found for {}/{} — starting fresh",
+                        sessionId, req.getUserId(), req.getBrokerName());
+                return;
+            }
+            LiveSessionSnapshot snap = opt.get();
+            log.info("Live eval session {}: restoring from snapshot saved at {} for {}/{}",
+                    sessionId, snap.getSavedAt(), req.getUserId(), req.getBrokerName());
+
+            if (snap.getInstruments() != null) {
+                for (Map.Entry<String, LiveSessionSnapshot.InstrumentSnapshot> entry : snap.getInstruments().entrySet()) {
+                    long token;
+                    try { token = Long.parseLong(entry.getKey()); } catch (NumberFormatException ignored) { continue; }
+
+                    InstrEvalState state = evalStates.get(token);
+                    if (state == null) continue;
+
+                    LiveSessionSnapshot.InstrumentSnapshot instrSnap = entry.getValue();
+
+                    // Restore per-strategy state
+                    if (instrSnap.getStrategies() != null) {
+                        for (Map.Entry<String, LiveSessionSnapshot.StrategyState> se : instrSnap.getStrategies().entrySet()) {
+                            String label = se.getKey();
+                            LiveSessionSnapshot.StrategyState ss = se.getValue();
+                            if (!state.capitals.containsKey(label)) continue;
+
+                            state.capitals.put(label, BigDecimal.valueOf(ss.getCapital()));
+                            state.cooldowns.put(label, ss.getCooldown());
+                            state.revCooldowns.put(label, ss.getRevCooldown());
+
+                            // Restore open position
+                            if (ss.getOpenPosition() != null) {
+                                LiveSessionSnapshot.OpenPos op = ss.getOpenPosition();
+                                PositionDirection dir = PositionDirection.valueOf(op.getType());
+                                state.positions.put(label, new PositionState(
+                                        dir, op.getEntryPrice(), op.getQty(), op.getEntryTime(),
+                                        op.getRegime(), op.getSourceStrategy(), op.getSlPrice(), op.getTpPrice()));
+                            } else {
+                                state.positions.put(label, null);
+                            }
+
+                            // Restore closed trades
+                            if (ss.getClosedTrades() != null) {
+                                List<ClosedTrade> trades = state.trades.get(label);
+                                trades.clear();
+                                for (LiveSessionSnapshot.ClosedTradeEntry cte : ss.getClosedTrades()) {
+                                    trades.add(ClosedTrade.builder()
+                                            .type(cte.getDirection())
+                                            .entryTime(cte.getEntryTime())
+                                            .exitTime(cte.getExitTime())
+                                            .exitReason(cte.getExitReason())
+                                            .regime(cte.getRegime())
+                                            .sourceStrategy(cte.getStrategyLabel())
+                                            .entryPrice(cte.getEntryPrice())
+                                            .exitPrice(cte.getExitPrice())
+                                            .pnl(cte.getPnl())
+                                            .pnlPct(0.0)
+                                            .capitalAfter(ss.getCapital())
+                                            .qty(cte.getQty())
+                                            .build());
+                                }
+                            }
+
+                            // Restore equity history
+                            if (ss.getEquityPoints() != null) {
+                                List<EquityPoint> equities = state.equities.get(label);
+                                equities.clear();
+                                for (LiveSessionSnapshot.EquityEntry ee : ss.getEquityPoints()) {
+                                    equities.add(EquityPoint.builder()
+                                            .time(ee.getTime()).capital(ee.getCapital()).build());
+                                }
+                            }
+                        }
+                    }
+
+                    // Restore combined state
+                    if (instrSnap.getCombined() != null) {
+                        LiveSessionSnapshot.StrategyState cs = instrSnap.getCombined();
+                        state.combinedCapital = BigDecimal.valueOf(cs.getCapital());
+                        state.combinedRevCooldown = cs.getRevCooldown();
+
+                        if (cs.getOpenPosition() != null) {
+                            LiveSessionSnapshot.OpenPos op = cs.getOpenPosition();
+                            PositionDirection dir = PositionDirection.valueOf(op.getType());
+                            state.combinedPos = new PositionState(
+                                    dir, op.getEntryPrice(), op.getQty(), op.getEntryTime(),
+                                    op.getRegime(), op.getSourceStrategy(), op.getSlPrice(), op.getTpPrice());
+                        } else {
+                            state.combinedPos = null;
+                        }
+
+                        if (cs.getClosedTrades() != null) {
+                            state.combinedTrades.clear();
+                            for (LiveSessionSnapshot.ClosedTradeEntry cte : cs.getClosedTrades()) {
+                                state.combinedTrades.add(ClosedTrade.builder()
+                                        .type(cte.getDirection())
+                                        .entryTime(cte.getEntryTime())
+                                        .exitTime(cte.getExitTime())
+                                        .exitReason(cte.getExitReason())
+                                        .regime(cte.getRegime())
+                                        .sourceStrategy(cte.getStrategyLabel())
+                                        .entryPrice(cte.getEntryPrice())
+                                        .exitPrice(cte.getExitPrice())
+                                        .pnl(cte.getPnl())
+                                        .pnlPct(0.0)
+                                        .capitalAfter(cs.getCapital())
+                                        .qty(cte.getQty())
+                                        .build());
+                            }
+                        }
+
+                        if (cs.getEquityPoints() != null) {
+                            state.combinedEquities.clear();
+                            for (LiveSessionSnapshot.EquityEntry ee : cs.getEquityPoints()) {
+                                state.combinedEquities.add(EquityPoint.builder()
+                                        .time(ee.getTime()).capital(ee.getCapital()).build());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Restore candle logs
+            if (snap.getCandleLogs() != null) {
+                for (Map.Entry<String, List<LiveSessionSnapshot.CandleLogEntry>> entry : snap.getCandleLogs().entrySet()) {
+                    long token;
+                    try { token = Long.parseLong(entry.getKey()); } catch (NumberFormatException ignored) { continue; }
+                    List<LiveSessionSnapshot.CandleLogEntry> logList = candleLog.get(token);
+                    if (logList != null && entry.getValue() != null) {
+                        logList.addAll(entry.getValue());
+                    }
+                }
+            }
+
+            // Emit restore SSE event so the frontend can repopulate its UI
+            try {
+                String snapJson = objectMapper.writeValueAsString(snap);
+                emitter.send(SseEmitter.event().name("restore").data(snapJson));
+                log.info("Live eval session {}: restore SSE event emitted", sessionId);
+            } catch (Exception e) {
+                log.warn("Live eval session {}: failed to emit restore event: {}", sessionId, e.getMessage());
             }
         }
 
@@ -962,6 +1134,157 @@ public class LiveEvalService {
                         sessionId, ic.getSymbol());
                 stopped = true;
             }
+
+            // ── Accumulate candle log entry ────────────────────────────────────
+            try {
+                Map<String, Object> sigMap = signals.entrySet().stream()
+                        .collect(Collectors.toMap(Map.Entry::getKey, e2 -> (Object) e2.getValue()));
+                List<Object> actList = actions.stream().map(a -> (Object) a).collect(Collectors.toList());
+                List<Object> blkList = blockedSignals.stream().map(b -> (Object) b).collect(Collectors.toList());
+                List<Object> cmbList = combinedDetails.stream().map(c -> (Object) c).collect(Collectors.toList());
+
+                LiveSessionSnapshot.CandleLogEntry logEntry = LiveSessionSnapshot.CandleLogEntry.builder()
+                        .candleTime(candleTime)
+                        .open(cO).high(cH).low(cL).close(cC).volume(cV)
+                        .regime(regime)
+                        .signals(sigMap)
+                        .actions(actList)
+                        .blockedSignals(blkList)
+                        .combinedDetails(cmbList)
+                        .build();
+
+                List<LiveSessionSnapshot.CandleLogEntry> tokenLog = candleLog.get(token);
+                if (tokenLog != null) {
+                    tokenLog.add(logEntry);
+                    // Bound to last 1000 entries to prevent unbounded file growth
+                    if (tokenLog.size() > 1000) {
+                        tokenLog.remove(0);
+                    }
+                }
+            } catch (Exception e) {
+                log.debug("Live eval session {}: candle log accumulation failed: {}", sessionId, e.getMessage());
+            }
+
+            // ── Save snapshot after each candle close ──────────────────────────
+            saveSnapshot();
+        }
+
+        /**
+         * Builds and persists a {@link LiveSessionSnapshot} from the current session state.
+         * Called after every candle close for all instruments.
+         */
+        private void saveSnapshot() {
+            try {
+                Map<String, LiveSessionSnapshot.InstrumentSnapshot> instrMap = new LinkedHashMap<>();
+
+                for (Map.Entry<Long, InstrEvalState> e : evalStates.entrySet()) {
+                    Long token = e.getKey();
+                    InstrEvalState state = e.getValue();
+
+                    // Per-strategy states
+                    Map<String, LiveSessionSnapshot.StrategyState> stratStates = new LinkedHashMap<>();
+                    for (String label : state.capitals.keySet()) {
+                        stratStates.put(label, buildSnapshotStrategyState(label, state));
+                    }
+
+                    // Combined state
+                    LiveSessionSnapshot.StrategyState combinedState = buildSnapshotCombinedState(state);
+
+                    instrMap.put(String.valueOf(token), LiveSessionSnapshot.InstrumentSnapshot.builder()
+                            .strategies(stratStates)
+                            .combined(combinedState)
+                            .build());
+                }
+
+                // Candle logs (copy to avoid concurrent modification)
+                Map<String, List<LiveSessionSnapshot.CandleLogEntry>> logMap = new LinkedHashMap<>();
+                for (Map.Entry<Long, List<LiveSessionSnapshot.CandleLogEntry>> e : candleLog.entrySet()) {
+                    logMap.put(String.valueOf(e.getKey()), new ArrayList<>(e.getValue()));
+                }
+
+                String configJson = null;
+                try { configJson = objectMapper.writeValueAsString(req); } catch (Exception ignored) {}
+
+                LiveSessionSnapshot snapshot = LiveSessionSnapshot.builder()
+                        .sessionId(sessionId)
+                        .userId(req.getUserId())
+                        .brokerName(req.getBrokerName())
+                        .savedAt(java.time.Instant.now().toString())
+                        .configJson(configJson)
+                        .instruments(instrMap)
+                        .candleLogs(logMap)
+                        .build();
+
+                sessionStore.save(snapshot);
+            } catch (Exception e) {
+                log.debug("Live eval session {}: snapshot save failed: {}", sessionId, e.getMessage());
+            }
+        }
+
+        private LiveSessionSnapshot.StrategyState buildSnapshotStrategyState(String label, InstrEvalState state) {
+            BigDecimal capital = state.capitals.getOrDefault(label, BigDecimal.ZERO);
+            PositionState pos = state.positions.get(label);
+            List<ClosedTrade> trades = state.trades.getOrDefault(label, List.of());
+            List<EquityPoint> equities = state.equities.getOrDefault(label, List.of());
+            int cooldown = state.cooldowns.getOrDefault(label, 0);
+            int revCooldown = state.revCooldowns.getOrDefault(label, 0);
+
+            return LiveSessionSnapshot.StrategyState.builder()
+                    .capital(capital.doubleValue())
+                    .openPosition(posToSnap(pos))
+                    .closedTrades(tradesToSnap(trades, label))
+                    .equityPoints(equitiesToSnap(equities))
+                    .cooldown(cooldown)
+                    .revCooldown(revCooldown)
+                    .build();
+        }
+
+        private LiveSessionSnapshot.StrategyState buildSnapshotCombinedState(InstrEvalState state) {
+            return LiveSessionSnapshot.StrategyState.builder()
+                    .capital(state.combinedCapital.doubleValue())
+                    .openPosition(posToSnap(state.combinedPos))
+                    .closedTrades(tradesToSnap(state.combinedTrades, COMBINED_LABEL))
+                    .equityPoints(equitiesToSnap(state.combinedEquities))
+                    .cooldown(0)
+                    .revCooldown(state.combinedRevCooldown)
+                    .build();
+        }
+
+        private LiveSessionSnapshot.OpenPos posToSnap(PositionState pos) {
+            if (pos == null) return null;
+            return LiveSessionSnapshot.OpenPos.builder()
+                    .type(pos.type.name())
+                    .entryPrice(pos.entryPrice)
+                    .qty(pos.qty)
+                    .entryTime(pos.entryTime)
+                    .regime(pos.regime)
+                    .sourceStrategy(pos.sourceStrategy)
+                    .slPrice(pos.slPrice)
+                    .tpPrice(pos.tpPrice)
+                    .build();
+        }
+
+        private List<LiveSessionSnapshot.ClosedTradeEntry> tradesToSnap(List<ClosedTrade> trades, String label) {
+            if (trades == null) return List.of();
+            return trades.stream().map(ct -> LiveSessionSnapshot.ClosedTradeEntry.builder()
+                    .entryTime(ct.getEntryTime())
+                    .exitTime(ct.getExitTime())
+                    .direction(ct.getType())
+                    .entryPrice(ct.getEntryPrice())
+                    .exitPrice(ct.getExitPrice())
+                    .qty(ct.getQty())
+                    .pnl(ct.getPnl())
+                    .exitReason(ct.getExitReason())
+                    .regime(ct.getRegime())
+                    .strategyLabel(label)
+                    .build()).collect(Collectors.toList());
+        }
+
+        private List<LiveSessionSnapshot.EquityEntry> equitiesToSnap(List<EquityPoint> equities) {
+            if (equities == null) return List.of();
+            return equities.stream().map(ep -> LiveSessionSnapshot.EquityEntry.builder()
+                    .time(ep.getTime()).capital(ep.getCapital()).build())
+                    .collect(Collectors.toList());
         }
 
         void stop() {

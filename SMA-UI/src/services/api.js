@@ -138,6 +138,19 @@ export async function liveConnect(payload) {
   return request(`${DATA}/api/v1/data/live/connect`, { method: 'POST', body: payload });
 }
 
+export async function getLiveSnapshot(userId, brokerName) {
+  return request(
+    `${STRATEGY_API}/api/v1/strategy/live/snapshot?userId=${encodeURIComponent(userId)}&brokerName=${encodeURIComponent(brokerName)}`
+  );
+}
+
+export async function deleteLiveSnapshot(userId, brokerName) {
+  return request(
+    `${STRATEGY_API}/api/v1/strategy/live/snapshot?userId=${encodeURIComponent(userId)}&brokerName=${encodeURIComponent(brokerName)}`,
+    { method: 'DELETE' }
+  );
+}
+
 // ─── Data Engine — Replay ─────────────────────────────────────────────────────
 
 export async function startReplay(payload) {
