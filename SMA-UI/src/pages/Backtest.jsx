@@ -1731,13 +1731,15 @@ function ReplayTest() {
   const [ticks, setTicks]               = useState([]);
   const [candleLog, setCandleLog]       = useState([]);
   const [combinedOnlyMode, setCombinedOnlyMode] = useState(false);
+  const [combOnlyView, setCombOnlyView] = useState(false);
 
   const abortCtrlRef      = useRef(null);
   const sseRef            = useRef(null);
   const tickSseRef        = useRef(null);
   const ticksRef          = useRef([]);
   const latestTickRef     = useRef(null);
-  const candleLogRef      = useRef([]);
+  const candleLogRef           = useRef([]);
+  const lastCombinedExitIdxRef = useRef(null);
   const pollRef           = useRef(null);
   const feedRef           = useRef([]);
   const capitalMap        = useRef({});
@@ -1758,11 +1760,11 @@ function ReplayTest() {
   function cleanup() {
     if (abortCtrlRef.current) { abortCtrlRef.current.abort(); abortCtrlRef.current = null; }
     if (sseRef.current) {
-      if (typeof sseRef.current.close  === 'function') sseRef.current.close();
-      if (typeof sseRef.current.cancel === 'function') sseRef.current.cancel();
+      try { if (typeof sseRef.current.close  === 'function') sseRef.current.close();  } catch (_) {}
+      try { if (typeof sseRef.current.cancel === 'function') sseRef.current.cancel().catch(() => {}); } catch (_) {}
       sseRef.current = null;
     }
-    if (tickSseRef.current) { tickSseRef.current.close(); tickSseRef.current = null; }
+    if (tickSseRef.current) { try { tickSseRef.current.close(); } catch (_) {} tickSseRef.current = null; }
     if (pollRef.current)    { clearInterval(pollRef.current); pollRef.current = null; }
   }
 
@@ -1800,7 +1802,7 @@ function ReplayTest() {
     cleanup();
     setError(''); setFeed([]); feedRef.current = [];
     setTicks([]); ticksRef.current = []; latestTickRef.current = null;
-    setCandleLog([]); candleLogRef.current = [];
+    setCandleLog([]); candleLogRef.current = []; lastCombinedExitIdxRef.current = null;
     setProgress({ emitted: 0, total: 0 });
     setStatus('starting'); setSessionId(null); setCurrentCandle(null);
     setStratStates({});
@@ -1954,6 +1956,7 @@ function ReplayTest() {
       setStatus(s => (s === 'running' || s === 'starting') ? 'completed' : s);
 
     } catch (err) {
+      if (err.name === 'AbortError') return; // intentional stop via handleStop — don't override status
       setError(err.message);
       setStatus('idle');
       cleanup();
@@ -1982,6 +1985,52 @@ function ReplayTest() {
     setCurrentCandle({ openTime: candleTime, open, high, low, close, volume: vol, signals: event.signals });
 
     // Append to candle log
+    const combinedState = event.strategyStates?.[COMBINED_LABEL];
+    const combinedPos   = combinedState?.openPosition ?? null;
+    const combinedUnrealizedPnl = combinedPos
+      ? combinedPos.type === 'LONG'
+        ? (close - combinedPos.entryPrice) * combinedPos.qty
+        : (combinedPos.entryPrice - close) * combinedPos.qty
+      : null;
+    const prevLog     = candleLogRef.current;
+    const prev3       = prevLog.length >= 3 ? prevLog[prevLog.length - 3] : null;
+    const prev5       = prevLog.length >= 5 ? prevLog[prevLog.length - 5] : null;
+    const recentMovePct  = (prev3 && close && prev3.close) ? ((close - prev3.close) / prev3.close * 100) : null;
+    const recentMove5Pct = (prev5 && close && prev5.close) ? ((close - prev5.close) / prev5.close * 100) : null;
+
+    // Score gap: winner - second-best (parsed from combinedAllScored sorted desc)
+    const allScored = event.combinedAllScored || [];
+    let scoreGap = null;
+    if (allScored.length >= 2) {
+      const parseScore = s => { const m = s.match(/score=([\d.]+)/); return m ? parseFloat(m[1]) : 0; };
+      scoreGap = parseScore(allScored[0]) - parseScore(allScored[1]);
+    }
+
+    // Entry type tag: REVERSAL > BREAKOUT > PULLBACK > CHOP
+    const combinedDetails = event.combinedDetails || [];
+    const hasExit  = combinedDetails.some(d => d.action?.startsWith('Exit'));
+    const hasEntry = combinedDetails.some(d => d.action?.startsWith('Enter'));
+    let entryTypeTag = null;
+    if (hasEntry) {
+      if (hasExit) {
+        entryTypeTag = 'REVERSAL';
+      } else {
+        const w = (event.combinedWinner || '').toUpperCase();
+        if (w.includes('BREAKOUT') || w.includes('BOLLINGER')) entryTypeTag = 'BREAKOUT';
+        else if (event.distanceFromVwapPct != null && Math.abs(event.distanceFromVwapPct) < 0.5) entryTypeTag = 'PULLBACK';
+        else if (event.regime === 'RANGING') entryTypeTag = 'CHOP';
+        else if (recentMovePct != null && Math.abs(recentMovePct) > 1.0) entryTypeTag = 'BREAKOUT';
+        else entryTypeTag = 'PULLBACK';
+      }
+    }
+
+    // Candles since last combined exit
+    const currentIdx = candleLogRef.current.length;
+    if (hasExit) lastCombinedExitIdxRef.current = currentIdx;
+    const candlesSinceLastTrade = lastCombinedExitIdxRef.current != null
+      ? currentIdx - lastCombinedExitIdxRef.current
+      : null;
+
     const logEntry = {
       ts: candleTime, open, high, low, close, volume: vol,
       regime: event.regime,
@@ -1990,7 +2039,24 @@ function ReplayTest() {
         strategy: a.strategyLabel, signal: a.action, price: a.price, reason: a.reason || '',
       })),
       blockedSignals: event.blockedSignals || [],
-      combinedDetails: event.combinedDetails || [],
+      combinedDetails,
+      // Combined pool analytics
+      combinedWinner:      event.combinedWinner      ?? null,
+      combinedWinnerScore: event.combinedWinnerScore ?? null,
+      combinedAllScored:   allScored,
+      combinedCandidates:  event.combinedCandidates  || [],
+      combinedBlockReason: event.combinedBlockReason ?? null,
+      combinedPosition:    combinedPos,
+      combinedUnrealizedPnl,
+      // Derived analytics
+      scoreGap,
+      entryTypeTag,
+      candlesSinceLastTrade,
+      // Market context
+      vwap:               event.vwap               ?? null,
+      distanceFromVwapPct: event.distanceFromVwapPct ?? null,
+      recentMovePct,
+      recentMove5Pct,
     };
     candleLogRef.current = [...candleLogRef.current, logEntry];
     setCandleLog([...candleLogRef.current]);
@@ -2023,7 +2089,7 @@ function ReplayTest() {
     cleanup();
     setFeed([]); feedRef.current = [];
     setTicks([]); ticksRef.current = []; latestTickRef.current = null;
-    setCandleLog([]); candleLogRef.current = [];
+    setCandleLog([]); candleLogRef.current = []; lastCombinedExitIdxRef.current = null;
     setStatus('idle'); setSessionId(null);
     setProgress({ emitted: 0, total: 0 });
     setCurrentCandle(null); setError('');
@@ -2721,6 +2787,17 @@ function ReplayTest() {
                 replayInterval, fromDate, toDate, `${speed}x`));
               lines.push(blank);
 
+              // ── Preload / Warmup ──────────────────────────────────────
+              lines.push(row('=== Preload / Warmup ==='));
+              lines.push(row('Enabled','Days Back','Interval','Candles Warmed Up'));
+              lines.push(row(
+                preload.enabled ? 'Yes' : 'No',
+                preload.enabled ? preload.daysBack : '—',
+                preload.enabled ? preload.interval : '—',
+                preloadState.status === 'done' ? preloadState.count : '—',
+              ));
+              lines.push(blank);
+
               // ── Strategies ────────────────────────────────────────────
               lines.push(row('=== Strategies ==='));
               lines.push(row('Name','Type','Allow Shorting'));
@@ -2851,36 +2928,100 @@ function ReplayTest() {
 
               // ── Candle Data ───────────────────────────────────────────
               lines.push(row('=== Candle Data ==='));
-              const sigCols = stratLabels.map(l => `Signal_${l}`);
-              lines.push(row('Time','Open','High','Low','Close','Volume',
-                ...(regimeConfig.enabled ? ['Regime'] : []),
-                ...sigCols, 'Strategy Actions', 'Blocked Signals', 'Combined Actions'));
-              candleLogRef.current.forEach(r => {
-                const combinedActionsStr = (r.combinedDetails || []).map(cd =>
-                  `${cd.action} @${Number(cd.price).toFixed(2)}` +
-                  (cd.sourceStrategy ? ` via ${cd.sourceStrategy}` : '') +
-                  (cd.regime         ? ` [${cd.regime}]`           : '') +
-                  ` · ${cd.reason}` +
-                  (cd.score ? ` · score=${cd.score.total.toFixed(1)}(trend=${cd.score.trendStrength.toFixed(0)},vol=${cd.score.volatility.toFixed(0)},mom=${cd.score.momentum.toFixed(0)},conf=${cd.score.confidence.toFixed(0)})` : '') +
-                  ` · ${cd.trigger}`
-                ).join(' | ');
-                const blockedStr = (r.blockedSignals || []).map(b =>
-                  `${b.strategy} ${b.signal} @${Number(b.price).toFixed(2)} — ${b.reason}`
-                ).join(' | ');
-                lines.push(row(
-                  r.ts,
-                  Number(r.open).toFixed(2),
-                  Number(r.high).toFixed(2),
-                  Number(r.low).toFixed(2),
-                  Number(r.close).toFixed(2),
-                  r.volume ?? '',
-                  ...(regimeConfig.enabled ? [r.regime ?? ''] : []),
-                  ...stratLabels.map(l => r.signals?.[l] ?? ''),
-                  r.actions.map(fmtAction).join(' | '),
-                  blockedStr,
-                  combinedActionsStr,
-                ));
-              });
+              const fmtCombinedAction = cd =>
+                `${cd.action} @${Number(cd.price).toFixed(2)}` +
+                (cd.sourceStrategy ? ` via ${cd.sourceStrategy}` : '') +
+                (cd.regime         ? ` [${cd.regime}]`           : '') +
+                ` · ${cd.reason}` +
+                (cd.score ? ` · score=${cd.score.total.toFixed(1)}(trend=${cd.score.trendStrength.toFixed(0)},vol=${cd.score.volatility.toFixed(0)},mom=${cd.score.momentum.toFixed(0)},conf=${cd.score.confidence.toFixed(0)})` : '') +
+                (cd.trigger ? ` · ${cd.trigger}` : '');
+              // Shared extra columns for every candle
+              const extraCols = [
+                'Comb Position','Comb Unreal P&L','Comb Winner','Comb Winner Score','Confidence(ScoreGap)',
+                'Comb All Scored','Comb Above Threshold','Comb Block Reason',
+                'VWAP','DistanceFromVWAP%','RecentMove3%','RecentMove5%','Entry Phase','Entry Type','BarsSinceLastTrade',
+              ];
+              const fmtCombPos = r => {
+                if (!r.combinedPosition) return '';
+                const p = r.combinedPosition;
+                return `${p.type} @${Number(p.entryPrice).toFixed(2)} x${p.qty}`;
+              };
+              const fmtEntryPhase = r => {
+                const d = r.distanceFromVwapPct, m = r.recentMovePct;
+                if (d == null || m == null) return '';
+                const absD = Math.abs(d), absM = Math.abs(m);
+                if (absD < 0.5 && absM < 0.5) return 'EARLY';
+                if (absD > 1.5 || absM > 1.5) return 'LATE';
+                return 'MID';
+              };
+              const fmtExtraCols = r => [
+                fmtCombPos(r),
+                r.combinedUnrealizedPnl != null ? Number(r.combinedUnrealizedPnl).toFixed(2) : '',
+                r.combinedWinner || '',
+                r.combinedWinnerScore != null ? Number(r.combinedWinnerScore).toFixed(1) : '',
+                r.scoreGap != null ? Number(r.scoreGap).toFixed(1) : '',
+                (r.combinedAllScored || []).join(' / '),
+                (r.combinedCandidates || []).join(' | '),
+                r.combinedBlockReason || '',
+                r.vwap != null ? Number(r.vwap).toFixed(2) : '',
+                r.distanceFromVwapPct != null ? Number(r.distanceFromVwapPct).toFixed(2) : '',
+                r.recentMovePct != null ? Number(r.recentMovePct).toFixed(2) : '',
+                r.recentMove5Pct != null ? Number(r.recentMove5Pct).toFixed(2) : '',
+                fmtEntryPhase(r),
+                r.entryTypeTag || '',
+                r.candlesSinceLastTrade != null ? r.candlesSinceLastTrade : '',
+              ];
+
+              if (combinedOnlyMode) {
+                // Combined-only CSV: no per-strategy signal/action columns
+                lines.push(row('Time','Open','High','Low','Close','Volume',
+                  ...(regimeConfig.enabled ? ['Regime'] : []),
+                  'Strategy Signals', ...extraCols, 'Combined Actions', 'Blocked Signals'));
+                candleLogRef.current.forEach(r => {
+                  const stratSignalsStr = Object.entries(r.signals || {})
+                    .map(([lbl, sig]) => `${lbl}: ${sig}`).join(' | ');
+                  const blockedStr = (r.blockedSignals || []).map(b =>
+                    `${b.strategy} ${b.signal} @${Number(b.price).toFixed(2)} — ${b.reason}`
+                  ).join(' | ');
+                  lines.push(row(
+                    r.ts,
+                    Number(r.open).toFixed(2),
+                    Number(r.high).toFixed(2),
+                    Number(r.low).toFixed(2),
+                    Number(r.close).toFixed(2),
+                    r.volume ?? '',
+                    ...(regimeConfig.enabled ? [r.regime ?? ''] : []),
+                    stratSignalsStr,
+                    ...fmtExtraCols(r),
+                    (r.combinedDetails || []).map(fmtCombinedAction).join(' | '),
+                    blockedStr,
+                  ));
+                });
+              } else {
+                const sigCols = stratLabels.map(l => `Signal_${l}`);
+                lines.push(row('Time','Open','High','Low','Close','Volume',
+                  ...(regimeConfig.enabled ? ['Regime'] : []),
+                  ...sigCols, ...extraCols, 'Strategy Actions', 'Blocked Signals', 'Combined Actions'));
+                candleLogRef.current.forEach(r => {
+                  const blockedStr = (r.blockedSignals || []).map(b =>
+                    `${b.strategy} ${b.signal} @${Number(b.price).toFixed(2)} — ${b.reason}`
+                  ).join(' | ');
+                  lines.push(row(
+                    r.ts,
+                    Number(r.open).toFixed(2),
+                    Number(r.high).toFixed(2),
+                    Number(r.low).toFixed(2),
+                    Number(r.close).toFixed(2),
+                    r.volume ?? '',
+                    ...(regimeConfig.enabled ? [r.regime ?? ''] : []),
+                    ...stratLabels.map(l => r.signals?.[l] ?? ''),
+                    ...fmtExtraCols(r),
+                    r.actions.map(fmtAction).join(' | '),
+                    blockedStr,
+                    (r.combinedDetails || []).map(fmtCombinedAction).join(' | '),
+                  ));
+                });
+              }
 
               const csv  = lines.join('\n');
               const blob = new Blob([csv], { type: 'text/csv' });
@@ -2940,6 +3081,14 @@ function ReplayTest() {
                   <span className="bt-params-label" style={{ margin: 0 }}>Candle Details</span>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{candleLog.length} candles</span>
+                    <button type="button"
+                      onClick={() => setCombOnlyView(v => !v)}
+                      style={{ fontSize: 11, padding: '2px 10px', borderRadius: 12, border: '1px solid', cursor: 'pointer',
+                        background:  combOnlyView ? 'rgba(234,179,8,0.15)'  : 'transparent',
+                        color:       combOnlyView ? '#ca8a04'               : 'var(--text-muted)',
+                        borderColor: combOnlyView ? 'rgba(234,179,8,0.4)'   : 'var(--border)' }}>
+                      {combOnlyView ? '⚡ Combined View' : 'All View'}
+                    </button>
                     {candleLog.length > 0 && (
                       <button type="button" className="btn-secondary btn-xs" onClick={downloadCSV}>Download CSV</button>
                     )}
@@ -2965,8 +3114,16 @@ function ReplayTest() {
                           <tr style={{ borderBottom: '1px solid var(--border)' }}>
                             {['Time','O','H','L','C','Vol',
                               ...(regimeConfig.enabled ? ['Regime'] : []),
-                              ...stratLabels.map(l => l.length > 10 ? l.slice(0,10)+'…' : l),
-                              'Actions'].map(h => (
+                              ...(combOnlyView
+                                ? ['Strategy Signals', 'Comb Position', 'Comb Unreal P&L',
+                                   'Winner', 'Winner Score', 'Confidence',
+                                   'All Scored', 'Above Threshold', 'Block Reason',
+                                   'VWAP', 'VWAP Dist%', 'Move3%', 'Move5%', 'Entry Phase',
+                                   'Entry Type', 'Bars Since Trade',
+                                   'Combined Analysis', 'Blocked']
+                                : [...stratLabels.map(l => l.length > 10 ? l.slice(0,10)+'…' : l),
+                                   'VWAP', 'Dist VWAP%', 'Move%(3c)', 'Actions']
+                              )].map(h => (
                               <th key={h} style={{ padding: '5px 6px', textAlign: 'left', color: 'var(--text-muted)', fontWeight: 600, whiteSpace: 'nowrap' }}>{h}</th>
                             ))}
                           </tr>
@@ -2987,59 +3144,265 @@ function ReplayTest() {
                                     : <span style={{ color: 'var(--text-muted)' }}>—</span>}
                                 </td>
                               )}
-                              {stratLabels.map(l => {
-                                const sig = row.signals?.[l];
-                                return (
-                                  <td key={l} style={{ padding: '4px 6px' }}>
-                                    {sig === 'BUY'  ? <span style={{ color: '#22c55e', fontWeight: 700 }}>BUY</span>
-                                    : sig === 'SELL' ? <span style={{ color: '#ef4444', fontWeight: 700 }}>SELL</span>
-                                    : sig === 'SHORT'? <span style={{ color: '#8b5cf6', fontWeight: 700 }}>SHORT</span>
-                                    : <span style={{ color: 'var(--text-muted)' }}>—</span>}
+                              {combOnlyView ? (
+                                <>
+                                  {/* Strategy Signals — every strategy's signal for this candle */}
+                                  <td style={{ padding: '4px 6px', minWidth: 160 }}>
+                                    {Object.keys(row.signals || {}).length === 0
+                                      ? <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                      : Object.entries(row.signals).map(([lbl, sig]) => (
+                                        <div key={lbl} style={{ lineHeight: 1.7, whiteSpace: 'nowrap' }}>
+                                          <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>{lbl}: </span>
+                                          {sig === 'BUY'  ? <span style={{ color: '#22c55e', fontWeight: 700 }}>BUY</span>
+                                          : sig === 'SELL' ? <span style={{ color: '#ef4444', fontWeight: 700 }}>SELL</span>
+                                          : sig === 'SHORT'? <span style={{ color: '#8b5cf6', fontWeight: 700 }}>SHORT</span>
+                                          : <span style={{ color: 'var(--text-muted)' }}>HOLD</span>}
+                                        </div>
+                                      ))
+                                    }
                                   </td>
-                                );
-                              })}
-                              <td style={{ padding: '4px 6px', minWidth: 220 }}>
-                                {row.actions.length === 0 && !row.blockedSignals?.length && !row.combinedDetails?.length
-                                  ? <span style={{ color: 'var(--text-muted)' }}>—</span>
-                                  : <>
-                                    {row.actions.map((a, ai) => {
-                                      const label   = fmtAction(a);
-                                      const isEnter = !a.reason;
-                                      const color   = a.signal === 'SHORT' ? '#8b5cf6' : isEnter ? '#22c55e' : '#ef4444';
-                                      return (
-                                        <div key={ai} style={{ fontSize: 11, lineHeight: 1.6 }}>
-                                          <span style={{ fontWeight: 700, color }}>{label.split(' —')[0]}</span>
-                                          <span style={{ color: 'var(--text-muted)' }}>{' —' + label.split(' —').slice(1).join(' —')}</span>
+                                  {/* Combined Position */}
+                                  <td style={{ padding: '4px 6px', whiteSpace: 'nowrap', minWidth: 110 }}>
+                                    {row.combinedPosition
+                                      ? <>
+                                          <span style={{ fontWeight: 700, color: row.combinedPosition.type === 'LONG' ? '#22c55e' : '#8b5cf6' }}>{row.combinedPosition.type}</span>
+                                          <span style={{ fontSize: 10, color: 'var(--text-muted)' }}> @{Number(row.combinedPosition.entryPrice).toFixed(2)} ×{row.combinedPosition.qty}</span>
+                                        </>
+                                      : <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                    }
+                                  </td>
+                                  {/* Combined Unrealized P&L */}
+                                  <td style={{ padding: '4px 6px', whiteSpace: 'nowrap' }}>
+                                    {row.combinedUnrealizedPnl != null
+                                      ? <span style={{ fontWeight: 600, color: row.combinedUnrealizedPnl >= 0 ? '#22c55e' : '#ef4444' }}>
+                                          {row.combinedUnrealizedPnl >= 0 ? '+' : ''}₹{Number(row.combinedUnrealizedPnl).toFixed(2)}
+                                        </span>
+                                      : <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                    }
+                                  </td>
+                                  {/* Combined Winner */}
+                                  <td style={{ padding: '4px 6px', fontSize: 10, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
+                                    {row.combinedWinner || <span style={{ color: 'var(--text-muted)' }}>—</span>}
+                                  </td>
+                                  {/* Combined Winner Score */}
+                                  <td style={{ padding: '4px 6px', whiteSpace: 'nowrap' }}>
+                                    {row.combinedWinnerScore != null
+                                      ? <span style={{ fontWeight: 600, color: '#6366f1' }}>{Number(row.combinedWinnerScore).toFixed(1)}</span>
+                                      : <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                    }
+                                  </td>
+                                  {/* Score Gap — winner minus second-best */}
+                                  <td style={{ padding: '4px 6px', whiteSpace: 'nowrap' }}>
+                                    {row.scoreGap != null
+                                      ? <span style={{ fontWeight: 600, color: row.scoreGap >= 5 ? '#22c55e' : row.scoreGap >= 2 ? '#f59e0b' : '#ef4444' }}>
+                                          +{Number(row.scoreGap).toFixed(1)}
+                                        </span>
+                                      : <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                    }
+                                  </td>
+                                  {/* All Scored — every strategy with a non-HOLD signal and its raw score */}
+                                  <td style={{ padding: '4px 6px', minWidth: 180 }}>
+                                    {!row.combinedAllScored?.length
+                                      ? <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                      : row.combinedAllScored.map((c, ci) => (
+                                          <div key={ci} style={{ fontSize: 10, color: 'var(--text-secondary)', lineHeight: 1.6, whiteSpace: 'nowrap', fontFamily: 'monospace' }}>{c}</div>
+                                        ))
+                                    }
+                                  </td>
+                                  {/* Above Threshold — candidates that passed minScore */}
+                                  <td style={{ padding: '4px 6px', minWidth: 140 }}>
+                                    {!row.combinedCandidates?.length
+                                      ? <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                      : row.combinedCandidates.map((c, ci) => (
+                                          <div key={ci} style={{ fontSize: 10, color: '#6366f1', lineHeight: 1.6, whiteSpace: 'nowrap' }}>{c}</div>
+                                        ))
+                                    }
+                                  </td>
+                                  {/* Combined Block Reason */}
+                                  <td style={{ padding: '4px 6px', fontSize: 10, minWidth: 160 }}>
+                                    {row.combinedBlockReason
+                                      ? <span style={{ color: '#f59e0b' }}>{row.combinedBlockReason}</span>
+                                      : <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                    }
+                                  </td>
+                                  {/* VWAP */}
+                                  <td style={{ padding: '4px 6px', whiteSpace: 'nowrap', fontSize: 10, color: 'var(--text-secondary)' }}>
+                                    {row.vwap != null ? Number(row.vwap).toFixed(2) : <span style={{ color: 'var(--text-muted)' }}>—</span>}
+                                  </td>
+                                  {/* Distance from VWAP % */}
+                                  <td style={{ padding: '4px 6px', whiteSpace: 'nowrap' }}>
+                                    {row.distanceFromVwapPct != null
+                                      ? <span style={{ fontSize: 10, fontWeight: 600, color: row.distanceFromVwapPct >= 0 ? '#22c55e' : '#ef4444' }}>
+                                          {row.distanceFromVwapPct >= 0 ? '+' : ''}{Number(row.distanceFromVwapPct).toFixed(2)}%
+                                        </span>
+                                      : <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                    }
+                                  </td>
+                                  {/* Recent Move % (3 candles) */}
+                                  <td style={{ padding: '4px 6px', whiteSpace: 'nowrap' }}>
+                                    {row.recentMovePct != null
+                                      ? <span style={{ fontSize: 10, fontWeight: 600, color: row.recentMovePct >= 0 ? '#22c55e' : '#ef4444' }}>
+                                          {row.recentMovePct >= 0 ? '+' : ''}{Number(row.recentMovePct).toFixed(2)}%
+                                        </span>
+                                      : <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                    }
+                                  </td>
+                                  {/* Recent Move % (5 candles) */}
+                                  <td style={{ padding: '4px 6px', whiteSpace: 'nowrap' }}>
+                                    {row.recentMove5Pct != null
+                                      ? <span style={{ fontSize: 10, fontWeight: 600, color: row.recentMove5Pct >= 0 ? '#22c55e' : '#ef4444' }}>
+                                          {row.recentMove5Pct >= 0 ? '+' : ''}{Number(row.recentMove5Pct).toFixed(2)}%
+                                        </span>
+                                      : <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                    }
+                                  </td>
+                                  {/* Entry Phase — EARLY / MID / LATE */}
+                                  {(() => {
+                                    const d = row.distanceFromVwapPct, m = row.recentMovePct;
+                                    if (d == null || m == null) return <td style={{ padding: '4px 6px', color: 'var(--text-muted)' }}>—</td>;
+                                    const absD = Math.abs(d), absM = Math.abs(m);
+                                    const phase = absD < 0.5 && absM < 0.5 ? 'EARLY' : absD > 1.5 || absM > 1.5 ? 'LATE' : 'MID';
+                                    const color = phase === 'EARLY' ? '#22c55e' : phase === 'LATE' ? '#ef4444' : '#f59e0b';
+                                    return <td style={{ padding: '4px 6px', whiteSpace: 'nowrap' }}><span style={{ fontSize: 10, fontWeight: 700, color }}>{phase}</span></td>;
+                                  })()}
+                                  {/* Entry Type — BREAKOUT / PULLBACK / REVERSAL / CHOP */}
+                                  <td style={{ padding: '4px 6px', whiteSpace: 'nowrap' }}>
+                                    {row.entryTypeTag
+                                      ? (() => {
+                                          const c = row.entryTypeTag === 'BREAKOUT' ? '#f59e0b'
+                                                  : row.entryTypeTag === 'REVERSAL'  ? '#8b5cf6'
+                                                  : row.entryTypeTag === 'PULLBACK'  ? '#22c55e'
+                                                  : '#6b7280'; // CHOP
+                                          return <span style={{ fontSize: 10, fontWeight: 700, color: c }}>{row.entryTypeTag}</span>;
+                                        })()
+                                      : <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                    }
+                                  </td>
+                                  {/* Candles Since Last Exit */}
+                                  <td style={{ padding: '4px 6px', whiteSpace: 'nowrap', textAlign: 'center' }}>
+                                    {row.candlesSinceLastTrade != null
+                                      ? <span style={{ fontSize: 10, fontWeight: 600, color: row.candlesSinceLastTrade <= 2 ? '#ef4444' : row.candlesSinceLastTrade <= 5 ? '#f59e0b' : 'var(--text-secondary)' }}>
+                                          {row.candlesSinceLastTrade}
+                                        </span>
+                                      : <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                    }
+                                  </td>
+                                  {/* Combined Analysis — full per-action detail */}
+                                  <td style={{ padding: '4px 6px', minWidth: 260 }}>
+                                    {!row.combinedDetails?.length
+                                      ? <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                      : row.combinedDetails.map((cd, ci) => {
+                                          const isEnter = cd.action === 'BUY' || cd.action === 'SHORT';
+                                          const color   = cd.action === 'SHORT' ? '#8b5cf6' : isEnter ? '#22c55e' : '#ef4444';
+                                          return (
+                                            <div key={ci} style={{ lineHeight: 1.7, borderTop: ci > 0 ? '1px dashed var(--border)' : undefined, paddingTop: ci > 0 ? 3 : 0, marginTop: ci > 0 ? 3 : 0 }}>
+                                              <span style={{ fontWeight: 700, color: '#8b5cf6', fontSize: 10 }}>⚡ </span>
+                                              <span style={{ fontWeight: 700, color }}>{cd.action}</span>
+                                              <span style={{ color: 'var(--text-muted)', fontSize: 10 }}> @{Number(cd.price).toFixed(2)}</span>
+                                              {cd.sourceStrategy && <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>via <span style={{ color: 'var(--text-secondary)' }}>{cd.sourceStrategy}</span></div>}
+                                              {cd.regime && <div style={{ fontSize: 10 }}><span className={`bt-regime-badge bt-regime-${cd.regime}`} style={{ fontSize: 9 }}>{cd.regime}</span></div>}
+                                              <div style={{ fontSize: 10, color: 'var(--text-secondary)' }}>{cd.reason}</div>
+                                              {cd.score && (
+                                                <div style={{ fontSize: 10, color: '#6366f1', fontFamily: 'monospace' }}>
+                                                  score <span style={{ fontWeight: 700 }}>{cd.score.total.toFixed(1)}</span>
+                                                  {' '}(T:{cd.score.trendStrength.toFixed(0)} V:{cd.score.volatility.toFixed(0)} M:{cd.score.momentum.toFixed(0)} C:{cd.score.confidence.toFixed(0)})
+                                                </div>
+                                              )}
+                                              {cd.trigger && <div style={{ fontSize: 10, color: cd.trigger.startsWith('Score') ? '#6366f1' : cd.trigger === 'Risk Management' ? '#f59e0b' : 'var(--text-muted)' }}>{cd.trigger}</div>}
+                                            </div>
+                                          );
+                                        })
+                                    }
+                                  </td>
+                                  {/* Blocked */}
+                                  <td style={{ padding: '4px 6px', minWidth: 160 }}>
+                                    {!row.blockedSignals?.length
+                                      ? <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                      : row.blockedSignals.map((b, bi) => (
+                                        <div key={bi} style={{ fontSize: 11, lineHeight: 1.6, color: '#f59e0b' }}>
+                                          <span style={{ fontWeight: 700 }}>⊘ {b.strategy} {b.signal}</span>
+                                          <span style={{ color: '#a16207', fontSize: 10 }}> — {b.reason}</span>
                                         </div>
-                                      );
-                                    })}
-                                    {(row.blockedSignals || []).map((b, bi) => (
-                                      <div key={`b${bi}`} style={{ fontSize: 11, lineHeight: 1.6, color: '#f59e0b' }}>
-                                        <span style={{ fontWeight: 700 }}>⊘ {b.strategy} {b.signal}</span>
-                                        <span style={{ color: '#a16207' }}> — {b.reason}</span>
-                                      </div>
-                                    ))}
-                                    {(row.combinedDetails || []).map((cd, ci) => {
-                                      const isEnter = cd.action.startsWith('Enter');
-                                      const color   = cd.action.includes('Short') ? '#8b5cf6' : isEnter ? '#22c55e' : '#ef4444';
-                                      return (
-                                        <div key={'c'+ci} style={{ fontSize: 11, lineHeight: 1.6, borderTop: ci === 0 && (row.actions.length > 0 || row.blockedSignals?.length > 0) ? '1px dashed var(--border)' : undefined, marginTop: ci === 0 && (row.actions.length > 0 || row.blockedSignals?.length > 0) ? 3 : 0, paddingTop: ci === 0 && (row.actions.length > 0 || row.blockedSignals?.length > 0) ? 3 : 0 }}>
-                                          <span style={{ fontWeight: 700, color: '#8b5cf6', fontSize: 10 }}>⚡</span>
-                                          {' '}<span style={{ fontWeight: 700, color }}>{cd.action}</span>
-                                          {' '}<span style={{ color: 'var(--text-muted)', fontSize: 10 }}>
-                                            @{Number(cd.price).toFixed(2)}
-                                            {cd.sourceStrategy ? ` · via ${cd.sourceStrategy}` : ''}
-                                            {cd.regime ? ` · ${cd.regime}` : ''}
-                                            {' · '}{cd.reason}
-                                            {cd.score ? ` · score=${cd.score.total.toFixed(1)} (trend=${cd.score.trendStrength.toFixed(0)} vol=${cd.score.volatility.toFixed(0)} mom=${cd.score.momentum.toFixed(0)} conf=${cd.score.confidence.toFixed(0)})` : ''}
-                                            {' · '}<span style={{ color: cd.trigger?.startsWith('Score') ? '#6366f1' : cd.trigger === 'Risk Management' ? '#f59e0b' : 'var(--text-muted)' }}>{cd.trigger}</span>
-                                          </span>
-                                        </div>
-                                      );
-                                    })}
-                                  </>
-                                }
-                              </td>
+                                      ))
+                                    }
+                                  </td>
+                                </>
+                              ) : (
+                                <>
+                                  {stratLabels.map(l => {
+                                    const sig = row.signals?.[l];
+                                    return (
+                                      <td key={l} style={{ padding: '4px 6px' }}>
+                                        {sig === 'BUY'  ? <span style={{ color: '#22c55e', fontWeight: 700 }}>BUY</span>
+                                        : sig === 'SELL' ? <span style={{ color: '#ef4444', fontWeight: 700 }}>SELL</span>
+                                        : sig === 'SHORT'? <span style={{ color: '#8b5cf6', fontWeight: 700 }}>SHORT</span>
+                                        : <span style={{ color: 'var(--text-muted)' }}>—</span>}
+                                      </td>
+                                    );
+                                  })}
+                                  <td style={{ padding: '4px 6px', whiteSpace: 'nowrap', fontSize: 10, color: 'var(--text-secondary)' }}>
+                                    {row.vwap != null ? Number(row.vwap).toFixed(2) : <span style={{ color: 'var(--text-muted)' }}>—</span>}
+                                  </td>
+                                  <td style={{ padding: '4px 6px', whiteSpace: 'nowrap' }}>
+                                    {row.distanceFromVwapPct != null
+                                      ? <span style={{ fontSize: 10, fontWeight: 600, color: row.distanceFromVwapPct >= 0 ? '#22c55e' : '#ef4444' }}>
+                                          {row.distanceFromVwapPct >= 0 ? '+' : ''}{Number(row.distanceFromVwapPct).toFixed(2)}%
+                                        </span>
+                                      : <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                    }
+                                  </td>
+                                  <td style={{ padding: '4px 6px', whiteSpace: 'nowrap' }}>
+                                    {row.recentMovePct != null
+                                      ? <span style={{ fontSize: 10, fontWeight: 600, color: row.recentMovePct >= 0 ? '#22c55e' : '#ef4444' }}>
+                                          {row.recentMovePct >= 0 ? '+' : ''}{Number(row.recentMovePct).toFixed(2)}%
+                                        </span>
+                                      : <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                    }
+                                  </td>
+                                  <td style={{ padding: '4px 6px', minWidth: 220 }}>
+                                    {row.actions.length === 0 && !row.blockedSignals?.length && !row.combinedDetails?.length
+                                      ? <span style={{ color: 'var(--text-muted)' }}>—</span>
+                                      : <>
+                                        {row.actions.map((a, ai) => {
+                                          const label   = fmtAction(a);
+                                          const isEnter = !a.reason;
+                                          const color   = a.signal === 'SHORT' ? '#8b5cf6' : isEnter ? '#22c55e' : '#ef4444';
+                                          return (
+                                            <div key={ai} style={{ fontSize: 11, lineHeight: 1.6 }}>
+                                              <span style={{ fontWeight: 700, color }}>{label.split(' —')[0]}</span>
+                                              <span style={{ color: 'var(--text-muted)' }}>{' —' + label.split(' —').slice(1).join(' —')}</span>
+                                            </div>
+                                          );
+                                        })}
+                                        {(row.blockedSignals || []).map((b, bi) => (
+                                          <div key={`b${bi}`} style={{ fontSize: 11, lineHeight: 1.6, color: '#f59e0b' }}>
+                                            <span style={{ fontWeight: 700 }}>⊘ {b.strategy} {b.signal}</span>
+                                            <span style={{ color: '#a16207' }}> — {b.reason}</span>
+                                          </div>
+                                        ))}
+                                        {(row.combinedDetails || []).map((cd, ci) => {
+                                          const isEnter = cd.action.startsWith('Enter');
+                                          const color   = cd.action.includes('Short') ? '#8b5cf6' : isEnter ? '#22c55e' : '#ef4444';
+                                          return (
+                                            <div key={'c'+ci} style={{ fontSize: 11, lineHeight: 1.6, borderTop: ci === 0 && (row.actions.length > 0 || row.blockedSignals?.length > 0) ? '1px dashed var(--border)' : undefined, marginTop: ci === 0 && (row.actions.length > 0 || row.blockedSignals?.length > 0) ? 3 : 0, paddingTop: ci === 0 && (row.actions.length > 0 || row.blockedSignals?.length > 0) ? 3 : 0 }}>
+                                              <span style={{ fontWeight: 700, color: '#8b5cf6', fontSize: 10 }}>⚡</span>
+                                              {' '}<span style={{ fontWeight: 700, color }}>{cd.action}</span>
+                                              {' '}<span style={{ color: 'var(--text-muted)', fontSize: 10 }}>
+                                                @{Number(cd.price).toFixed(2)}
+                                                {cd.sourceStrategy ? ` · via ${cd.sourceStrategy}` : ''}
+                                                {cd.regime ? ` · ${cd.regime}` : ''}
+                                                {' · '}{cd.reason}
+                                                {cd.score ? ` · score=${cd.score.total.toFixed(1)} (trend=${cd.score.trendStrength.toFixed(0)} vol=${cd.score.volatility.toFixed(0)} mom=${cd.score.momentum.toFixed(0)} conf=${cd.score.confidence.toFixed(0)})` : ''}
+                                                {' · '}<span style={{ color: cd.trigger?.startsWith('Score') ? '#6366f1' : cd.trigger === 'Risk Management' ? '#f59e0b' : 'var(--text-muted)' }}>{cd.trigger}</span>
+                                              </span>
+                                            </div>
+                                          );
+                                        })}
+                                      </>
+                                    }
+                                  </td>
+                                </>
+                              )}
                             </tr>
                           ))}
                         </tbody>
