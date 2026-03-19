@@ -84,6 +84,12 @@ public class LiveEvalRequest {
     private boolean combinedOnlyMode = false;
 
     /**
+     * When true, the session will attempt to restore capital, positions, closed trades,
+     * and candle log history from the last saved snapshot for this (userId, brokerName) pair.
+     */
+    private boolean resumeFromSnapshot = false;
+
+    /**
      * Master shorting flag — overrides per-strategy allowShorting when false.
      */
     private boolean allowShorting = true;

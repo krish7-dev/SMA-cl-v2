@@ -2,6 +2,7 @@ package com.sma.strategyengine.controller;
 
 import com.sma.strategyengine.model.request.LiveEvalRequest;
 import com.sma.strategyengine.model.response.ApiResponse;
+import com.sma.strategyengine.model.snapshot.LiveSessionSnapshot;
 import com.sma.strategyengine.service.LiveEvalService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -99,5 +100,30 @@ public class LiveEvalController {
     public ResponseEntity<ApiResponse<Void>> stop(@PathVariable String sessionId) {
         liveEvalService.stop(sessionId);
         return ResponseEntity.ok(ApiResponse.ok(null, "Session stopped"));
+    }
+
+    /**
+     * Returns the last saved snapshot for a (userId, brokerName) pair, if one exists.
+     * The frontend can call this on mount to detect a resumable session.
+     */
+    @GetMapping("/snapshot")
+    public ResponseEntity<ApiResponse<LiveSessionSnapshot>> getSnapshot(
+            @RequestParam String userId,
+            @RequestParam String brokerName) {
+        return liveEvalService.getSnapshot(userId, brokerName)
+                .map(snap -> ResponseEntity.ok(ApiResponse.ok(snap, "Snapshot found")))
+                .orElse(ResponseEntity.ok(ApiResponse.ok(null, "No snapshot")));
+    }
+
+    /**
+     * Deletes the saved snapshot for a (userId, brokerName) pair.
+     * The frontend calls this when the user explicitly discards a previous session.
+     */
+    @DeleteMapping("/snapshot")
+    public ResponseEntity<ApiResponse<Void>> deleteSnapshot(
+            @RequestParam String userId,
+            @RequestParam String brokerName) {
+        liveEvalService.deleteSnapshot(userId, brokerName);
+        return ResponseEntity.ok(ApiResponse.ok(null, "Snapshot deleted"));
     }
 }
