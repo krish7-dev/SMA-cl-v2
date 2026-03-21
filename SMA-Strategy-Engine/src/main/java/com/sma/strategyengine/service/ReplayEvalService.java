@@ -10,6 +10,7 @@ import com.sma.strategyengine.model.request.BacktestRequest.RiskConfig;
 import com.sma.strategyengine.model.request.BacktestRequest.ScoreConfig;
 import com.sma.strategyengine.model.request.BacktestRequest.StrategyConfig;
 import com.sma.strategyengine.model.request.ReplayRequest;
+import com.sma.strategyengine.model.request.ReplayRequest.EntryFilterConfig;
 import com.sma.strategyengine.model.request.ReplayRequest.RulesConfig;
 import com.sma.strategyengine.model.request.ReplayRequest.RulesConfig.OptionRules;
 import com.sma.strategyengine.model.request.ReplayRequest.RulesConfig.StockRules;
@@ -136,6 +137,9 @@ public class ReplayEvalService {
 
         StockRules   stockRules  = rulesCfg.getStocks()  != null ? rulesCfg.getStocks()  : new StockRules();
         OptionRules  optionRules = rulesCfg.getOptions() != null ? rulesCfg.getOptions() : new OptionRules();
+
+        EntryFilterConfig efCfg     = req.getEntryFilterConfig() != null ? req.getEntryFilterConfig() : new EntryFilterConfig();
+        boolean           efEnabled = efCfg.isEnabled();
 
         // ── Risk fractions ────────────────────────────────────────────────
         BigDecimal slFrac   = fracOrNull(riskCfg == null ? null : riskCfg.getStopLossPct());
@@ -278,6 +282,8 @@ public class ReplayEvalService {
                 List.of(EquityPoint.builder().time("start").capital(initCap.doubleValue()).build()));
         int combinedRevCooldown = 0;
         DailyCapState combinedDailyCap = new DailyCapState(null, initCap, false);
+        int combinedCandleIndex    = 0;   // incremented each candle (live candles only, not warmup)
+        int combinedLastExitCandle = -1;  // candle index when last combined position was closed
 
         // ── Pattern state ─────────────────────────────────────────────────
         double[] patPrev2 = null;
@@ -350,6 +356,11 @@ public class ReplayEvalService {
         for (int ri = 0; ri < replayCandles.size(); ri++) {
             CandleDto candle = replayCandles.get(ri);
             int       ai     = warmupOffset + ri; // index into regimeArr / allCandles
+
+            combinedCandleIndex++;
+            int barsSinceLastExit = combinedLastExitCandle < 0 ? Integer.MAX_VALUE
+                    : combinedCandleIndex - combinedLastExitCandle;
+            PositionState combinedPosBeforeCandle = combinedPos; // to detect exits at end of candle
 
             double cO = dbl(candle.open()), cH = dbl(candle.high()),
                    cL = dbl(candle.low()),  cC = dbl(candle.close());
@@ -735,6 +746,63 @@ public class ReplayEvalService {
                             .collect(java.util.stream.Collectors.toList());
                 }
 
+                // ── Entry Filters ──────────────────────────────────────────
+                if (bestLabel != null && bestSignal != null && efEnabled) {
+                    boolean efForThis = isOption ? efCfg.getScoreGap().isOptions() || efCfg.getCooldown().isOptions()
+                            || efCfg.getVwapExtension().isOptions() || efCfg.getStrategyFilter().isOptions()
+                            || efCfg.getConfidenceGate().isOptions()
+                            : efCfg.getScoreGap().isStocks() || efCfg.getCooldown().isStocks()
+                            || efCfg.getVwapExtension().isStocks() || efCfg.getStrategyFilter().isStocks()
+                            || efCfg.getConfidenceGate().isStocks();
+                    if (efForThis) {
+                        double computedScoreGap = 0;
+                        if (allScoredTuples.size() >= 2) {
+                            List<String[]> sorted = allScoredTuples.stream()
+                                    .sorted((a, b) -> Double.compare(Double.parseDouble(b[2]), Double.parseDouble(a[2])))
+                                    .collect(java.util.stream.Collectors.toList());
+                            computedScoreGap = Double.parseDouble(sorted.get(0)[2]) - Double.parseDouble(sorted.get(1)[2]);
+                        } else if (allScoredTuples.size() == 1) {
+                            computedScoreGap = Double.parseDouble(allScoredTuples.get(0)[2]);
+                        }
+
+                        String efBlock = null;
+                        // Rule: Score Gap
+                        boolean sgActive = isOption ? efCfg.getScoreGap().isOptions() : efCfg.getScoreGap().isStocks();
+                        if (efBlock == null && sgActive && computedScoreGap < efCfg.getMinGap())
+                            efBlock = "Score gap " + String.format("%.1f", computedScoreGap) + " < " + efCfg.getMinGap();
+                        // Rule: Cooldown
+                        boolean cdActive = isOption ? efCfg.getCooldown().isOptions() : efCfg.getCooldown().isStocks();
+                        if (efBlock == null && cdActive && barsSinceLastExit < efCfg.getMinBars())
+                            efBlock = "Cooldown " + barsSinceLastExit + " < " + efCfg.getMinBars();
+                        // Rule: VWAP Extension
+                        boolean veActive = isOption ? efCfg.getVwapExtension().isOptions() : efCfg.getVwapExtension().isStocks();
+                        Double distVwap = currentVwap > 0 ? ((cC - currentVwap) / currentVwap * 100.0) : null;
+                        if (efBlock == null && veActive && distVwap != null && Math.abs(distVwap) > efCfg.getMaxDistPct())
+                            efBlock = "VWAP ext " + String.format("%.2f", distVwap) + "% > " + efCfg.getMaxDistPct() + "%";
+                        // Rule: Strategy Filter (blocked list)
+                        boolean sfActive = isOption ? efCfg.getStrategyFilter().isOptions() : efCfg.getStrategyFilter().isStocks();
+                        if (efBlock == null && sfActive && efCfg.getBlocked() != null) {
+                            for (String blocked : efCfg.getBlocked().split(",")) {
+                                if (bestLabel.equalsIgnoreCase(blocked.trim())) {
+                                    efBlock = "Strategy " + bestLabel + " is blocked"; break;
+                                }
+                            }
+                        }
+                        // Rule: Confidence Gate
+                        boolean cgActive = isOption ? efCfg.getConfidenceGate().isOptions() : efCfg.getConfidenceGate().isStocks();
+                        if (efBlock == null && cgActive) {
+                            String exception = efCfg.getExceptionStrategy() != null ? efCfg.getExceptionStrategy().trim() : "";
+                            if (computedScoreGap < efCfg.getMinConfGap() && !bestLabel.equalsIgnoreCase(exception))
+                                efBlock = "Confidence gap " + String.format("%.1f", computedScoreGap) + " < " + efCfg.getMinConfGap();
+                        }
+
+                        if (efBlock != null) {
+                            combinedBlockReason = (combinedBlockReason != null ? combinedBlockReason + "; " : "") + "[EF] " + efBlock;
+                            bestLabel = null; bestSignal = null; // suppress entry
+                        }
+                    }
+                }
+
                 if (bestLabel != null && bestSignal != null) {
                     boolean isBuyBest = "BUY".equals(bestSignal);
                     boolean cHasLong  = combinedPos != null && combinedPos.type == PositionDirection.LONG;
@@ -857,6 +925,11 @@ public class ReplayEvalService {
                         combinedCapital, combinedPos, combinedTrades, combinedEquities));
             }
 
+            // Track combined exit for cooldown filter
+            if (combinedPosBeforeCandle != null && combinedPos == null) {
+                combinedLastExitCandle = combinedCandleIndex;
+            }
+
             // ── Emit SSE event ─────────────────────────────────────────────
             emitted++;
             ReplayCandleEvent event = ReplayCandleEvent.builder()
@@ -918,6 +991,27 @@ public class ReplayEvalService {
                     regimeArr != null ? regimeArr[warmupOffset + replayCandles.size() - 1] : null,
                     combinedCapital, combinedTrades, combinedEquities);
             combinedCapital = BigDecimal.valueOf(ct.getCapitalAfter()).setScale(2, RoundingMode.HALF_UP);
+            combinedPos = null;
+        }
+
+        // Emit final summary event so frontend gets updated strategyStates after force-close
+        if (!replayCandles.isEmpty()) {
+            try {
+                Map<String, StrategyState> finalStates = new LinkedHashMap<>();
+                for (StrategyConfig cfg : stratCfgs) {
+                    String label = resolveLabel(cfg);
+                    finalStates.put(label, buildStrategyState(
+                            capitals.get(label), positions.get(label), trades.get(label), equities.get(label)));
+                }
+                if (scoreOn) {
+                    finalStates.put(COMBINED_LABEL, buildStrategyState(
+                            combinedCapital, null, combinedTrades, combinedEquities));
+                }
+                String summaryJson = objectMapper.writeValueAsString(Map.of("strategyStates", finalStates));
+                emitter.send(SseEmitter.event().name("summary").data(summaryJson));
+            } catch (Exception e) {
+                log.warn("Failed to emit summary event: {}", e.getMessage());
+            }
         }
 
         // Clean up strategy state

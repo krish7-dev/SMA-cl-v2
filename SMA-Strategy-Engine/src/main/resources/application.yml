@@ -6,9 +6,9 @@ spring:
     name: sma-strategy-engine
 
   datasource:
-    url: jdbc:postgresql://ep-falling-unit-ai397war-pooler.c-4.us-east-1.aws.neon.tech/neondb?sslmode=require
-    username: neondb_owner
-    password: npg_wJPYnHeF75SU
+    url: jdbc:postgresql://db.ubcfqlqowoybswafwyun.supabase.co:5432/postgres
+    username: postgres
+    password: SMARootKrishna
     driver-class-name: org.postgresql.Driver
     hikari:
       maximum-pool-size: 10
