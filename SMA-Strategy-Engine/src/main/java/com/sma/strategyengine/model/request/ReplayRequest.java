@@ -97,6 +97,12 @@ public class ReplayRequest {
      */
     private boolean combinedOnlyMode = false;
 
+    /**
+     * When true, any open combined position remaining after the last replay candle
+     * is force-closed at the last candle's close price so it appears in Trade History.
+     */
+    private boolean closeOpenPositionsAtEnd = false;
+
     // ─── Capital ──────────────────────────────────────────────────────────────
 
     @NotNull
@@ -134,6 +140,9 @@ public class ReplayRequest {
 
     @Valid
     private RulesConfig rulesConfig;
+
+    @Valid
+    private EntryFilterConfig entryFilterConfig;
 
     // ─── Nested types ─────────────────────────────────────────────────────────
 
@@ -213,5 +222,49 @@ public class ReplayRequest {
             /** Block same-candle reversals. */
             private boolean noSameCandleReversal = true;
         }
+    }
+
+    /**
+     * Post-signal entry filters applied after the combined pool picks a winner.
+     * Each rule has independent stocks/options on/off switches.
+     */
+    @Data
+    public static class EntryFilterConfig {
+
+        /** Master switch — when false all filters are skipped. */
+        private boolean enabled = false;
+
+        @Data
+        public static class RuleSwitch {
+            private boolean stocks  = false;
+            private boolean options = false;
+        }
+
+        // ── Score Gap ─────────────────────────────────────────────────────────
+        private RuleSwitch scoreGap = new RuleSwitch();
+        /** Skip entry if winner − second-best score < minGap. */
+        @DecimalMin("0") private double minGap = 2.0;
+
+        // ── Cooldown ──────────────────────────────────────────────────────────
+        private RuleSwitch cooldown = new RuleSwitch();
+        /** Skip entry if bars since last combined exit < minBars. */
+        @Min(0) private int minBars = 3;
+
+        // ── VWAP Extension ────────────────────────────────────────────────────
+        private RuleSwitch vwapExtension = new RuleSwitch();
+        /** Skip entry if |distanceFromVwap%| > maxDistPct. */
+        @DecimalMin("0") private double maxDistPct = 1.5;
+
+        // ── Strategy Filter ───────────────────────────────────────────────────
+        private RuleSwitch strategyFilter = new RuleSwitch();
+        /** Comma-separated strategy labels to block from triggering combined entries. */
+        private String blocked = "SMA_CROSSOVER,EMA_CROSSOVER,MACD";
+
+        // ── Confidence Gate ───────────────────────────────────────────────────
+        private RuleSwitch confidenceGate = new RuleSwitch();
+        /** Skip entry if scoreGap < minConfGap AND winner != exceptionStrategy. */
+        @DecimalMin("0") private double minConfGap = 3.0;
+        /** Strategy label exempt from confidence gate (e.g. LIQUIDITY_SWEEP). */
+        private String exceptionStrategy = "LIQUIDITY_SWEEP";
     }
 }

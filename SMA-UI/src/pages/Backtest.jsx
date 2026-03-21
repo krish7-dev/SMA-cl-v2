@@ -543,6 +543,46 @@ const EMPTY_RULES_CONFIG = {
   },
 };
 
+const EMPTY_ENTRY_FILTER_CONFIG = {
+  enabled: false,
+  scoreGap: {
+    label: 'Min Score Gap (winner − second)',
+    description: 'Skip entry if winner score is too close to next best',
+    stocks:  { enabled: false },
+    options: { enabled: false },
+    minGap: 2,
+  },
+  cooldown: {
+    label: 'Cooldown (bars since last trade)',
+    description: 'Skip entry if a trade just closed recently',
+    stocks:  { enabled: false },
+    options: { enabled: false },
+    minBars: 3,
+  },
+  vwapExtension: {
+    label: 'VWAP Extension Filter',
+    description: 'Skip if price is overextended from VWAP',
+    stocks:  { enabled: false },
+    options: { enabled: false },
+    maxDistPct: 1.5,
+  },
+  strategyFilter: {
+    label: 'Strategy Allowlist',
+    description: 'Block specific strategies from triggering combined entries',
+    stocks:  { enabled: false },
+    options: { enabled: false },
+    blocked: 'SMA_CROSSOVER, EMA_CROSSOVER, MACD',
+  },
+  confidenceGate: {
+    label: 'Confidence Gate (with exception)',
+    description: 'Skip low-gap entries unless from a trusted strategy',
+    stocks:  { enabled: false },
+    options: { enabled: false },
+    minGap: 3,
+    exceptionStrategy: 'LIQUIDITY_SWEEP',
+  },
+};
+
 class LocalCandlePatternEvaluator {
   constructor(pattern, minWickRatio, maxBodyPct) {
     this.pattern      = (pattern      || 'HAMMER').toUpperCase().trim();
@@ -1701,23 +1741,50 @@ function InstrumentPicker({ session, symbol, exchange, instrumentToken, onSelect
 function ReplayTest() {
   const { session, isActive } = useSession();
 
-  const [knownTypes, setKnownTypes]     = useState(['SMA_CROSSOVER']);
-  const [strategies, setStrategies]     = useState(defaultStrategies);
-  const [inst, setInst]                 = useState({ ...EMPTY_INST });
-  const [replayInterval, setReplayInterval] = useState('DAY');
-  const [fromDate, setFromDate]         = useState('');
-  const [toDate, setToDate]             = useState('');
-  const [speed, setSpeed]               = useState(1);
-  const [initialCapital, setInitialCapital] = useState('100000');
-  const [quantity, setQuantity]         = useState('0');
+  const ls = (key, def) => { try { const s = localStorage.getItem(key); if (!s) return def; const v = JSON.parse(s); return (Array.isArray(def) && !Array.isArray(v)) ? def : v; } catch { return def; } };
 
-  const [riskConfig, setRiskConfig]       = useState({ ...EMPTY_RISK });
-  const [patternConfig, setPatternConfig] = useState({ ...EMPTY_PATTERN });
-  const [regimeConfig, setRegimeConfig]   = useState({ ...EMPTY_REGIME_CONFIG });
-  const [scoreConfig, setScoreConfig]     = useState({ ...EMPTY_SCORE_CONFIG });
-  const [rulesConfig, setRulesConfig]     = useState(JSON.parse(JSON.stringify(EMPTY_RULES_CONFIG)));
-  const [currentRegime, setCurrentRegime] = useState(null);
-  const [preload, setPreload]             = useState({ enabled: true, daysBack: 5, interval: 'MINUTE_5' });
+  const [knownTypes, setKnownTypes]     = useState(['SMA_CROSSOVER']);
+  const [strategies, setStrategies]     = useState(() => ls('sma_replay_strategies', defaultStrategies()));
+  const [inst, setInst]                 = useState(() => ls('sma_replay_inst', { ...EMPTY_INST }));
+  const [replayInterval, setReplayInterval] = useState(() => ls('sma_replay_interval', 'DAY'));
+  const [fromDate, setFromDate]         = useState(() => ls('sma_replay_from', ''));
+  const [toDate, setToDate]             = useState(() => ls('sma_replay_to', ''));
+  const [speed, setSpeed]               = useState(() => ls('sma_replay_speed', 1));
+  const [initialCapital, setInitialCapital] = useState(() => ls('sma_replay_capital', '100000'));
+  const [quantity, setQuantity]         = useState(() => ls('sma_replay_qty', '0'));
+
+  const [riskConfig, setRiskConfig]       = useState(() => ls('sma_replay_risk',    { ...EMPTY_RISK }));
+  const [patternConfig, setPatternConfig] = useState(() => ls('sma_replay_pattern', { ...EMPTY_PATTERN }));
+  const [regimeConfig, setRegimeConfig]   = useState(() => ls('sma_replay_regime',  { ...EMPTY_REGIME_CONFIG }));
+  const [scoreConfig, setScoreConfig]     = useState(() => ls('sma_replay_score',   { ...EMPTY_SCORE_CONFIG }));
+  const [rulesConfig, setRulesConfig]         = useState(() => {
+    try { const s = localStorage.getItem('sma_rules_config');     return s ? { ...JSON.parse(JSON.stringify(EMPTY_RULES_CONFIG)),     ...JSON.parse(s) } : JSON.parse(JSON.stringify(EMPTY_RULES_CONFIG)); }
+    catch { return JSON.parse(JSON.stringify(EMPTY_RULES_CONFIG)); }
+  });
+  const [entryFilterConfig, setEntryFilterConfig] = useState(() => {
+    try { const s = localStorage.getItem('sma_entry_filter_config'); return s ? { ...JSON.parse(JSON.stringify(EMPTY_ENTRY_FILTER_CONFIG)), ...JSON.parse(s) } : JSON.parse(JSON.stringify(EMPTY_ENTRY_FILTER_CONFIG)); }
+    catch { return JSON.parse(JSON.stringify(EMPTY_ENTRY_FILTER_CONFIG)); }
+  });
+  const [currentRegime, setCurrentRegime]     = useState(null);
+  const [preload, setPreload]             = useState(() => ls('sma_replay_preload', { enabled: true, daysBack: 5, interval: 'MINUTE_5' }));
+  const [combinedOnlyMode, setCombinedOnlyMode] = useState(() => ls('sma_replay_combined_only', false));
+
+  useEffect(() => { try { localStorage.setItem('sma_rules_config',        JSON.stringify(rulesConfig));       } catch {} }, [rulesConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_entry_filter_config', JSON.stringify(entryFilterConfig)); } catch {} }, [entryFilterConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_replay_strategies',   JSON.stringify(strategies));        } catch {} }, [strategies]);
+  useEffect(() => { try { localStorage.setItem('sma_replay_inst',         JSON.stringify(inst));              } catch {} }, [inst]);
+  useEffect(() => { try { localStorage.setItem('sma_replay_interval',     JSON.stringify(replayInterval));    } catch {} }, [replayInterval]);
+  useEffect(() => { try { localStorage.setItem('sma_replay_from',         JSON.stringify(fromDate));          } catch {} }, [fromDate]);
+  useEffect(() => { try { localStorage.setItem('sma_replay_to',           JSON.stringify(toDate));            } catch {} }, [toDate]);
+  useEffect(() => { try { localStorage.setItem('sma_replay_speed',        JSON.stringify(speed));             } catch {} }, [speed]);
+  useEffect(() => { try { localStorage.setItem('sma_replay_capital',      JSON.stringify(initialCapital));    } catch {} }, [initialCapital]);
+  useEffect(() => { try { localStorage.setItem('sma_replay_qty',          JSON.stringify(quantity));          } catch {} }, [quantity]);
+  useEffect(() => { try { localStorage.setItem('sma_replay_risk',         JSON.stringify(riskConfig));        } catch {} }, [riskConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_replay_pattern',      JSON.stringify(patternConfig));     } catch {} }, [patternConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_replay_regime',       JSON.stringify(regimeConfig));      } catch {} }, [regimeConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_replay_score',        JSON.stringify(scoreConfig));       } catch {} }, [scoreConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_replay_preload',      JSON.stringify(preload));           } catch {} }, [preload]);
+  useEffect(() => { try { localStorage.setItem('sma_replay_combined_only',JSON.stringify(combinedOnlyMode));  } catch {} }, [combinedOnlyMode]);
   const [preloadState, setPreloadState]   = useState({ status: 'idle', count: 0, error: null });
 
   const [sessionId, setSessionId]       = useState(null);
@@ -1730,7 +1797,6 @@ function ReplayTest() {
   const [rightTab, setRightTab]         = useState('feed');
   const [ticks, setTicks]               = useState([]);
   const [candleLog, setCandleLog]       = useState([]);
-  const [combinedOnlyMode, setCombinedOnlyMode] = useState(false);
   const [combOnlyView, setCombOnlyView] = useState(false);
 
   const abortCtrlRef      = useRef(null);
@@ -1895,6 +1961,25 @@ function ReplayTest() {
         minScoreThreshold: parseFloat(scoreConfig.minScoreThreshold) || 30,
       } : null,
       rulesConfig: rulesPayload,
+      entryFilterConfig: entryFilterConfig.enabled ? {
+        enabled:    true,
+        // Score Gap
+        scoreGap:   { stocks: entryFilterConfig.scoreGap.stocks.enabled,   options: entryFilterConfig.scoreGap.options.enabled },
+        minGap:     parseFloat(entryFilterConfig.scoreGap.minGap) || 2,
+        // Cooldown
+        cooldown:   { stocks: entryFilterConfig.cooldown.stocks.enabled,   options: entryFilterConfig.cooldown.options.enabled },
+        minBars:    parseInt(entryFilterConfig.cooldown.minBars) || 3,
+        // VWAP Extension
+        vwapExtension: { stocks: entryFilterConfig.vwapExtension.stocks.enabled, options: entryFilterConfig.vwapExtension.options.enabled },
+        maxDistPct: parseFloat(entryFilterConfig.vwapExtension.maxDistPct) || 1.5,
+        // Strategy Filter
+        strategyFilter: { stocks: entryFilterConfig.strategyFilter.stocks.enabled, options: entryFilterConfig.strategyFilter.options.enabled },
+        blocked:    entryFilterConfig.strategyFilter.blocked || '',
+        // Confidence Gate
+        confidenceGate: { stocks: entryFilterConfig.confidenceGate.stocks.enabled, options: entryFilterConfig.confidenceGate.options.enabled },
+        minConfGap: parseFloat(entryFilterConfig.confidenceGate.minGap) || 3,
+        exceptionStrategy: entryFilterConfig.confidenceGate.exceptionStrategy || 'LIQUIDITY_SWEEP',
+      } : { enabled: false },
     };
 
     try {
@@ -1949,6 +2034,11 @@ function ReplayTest() {
               const event = JSON.parse(data);
               onReplayCandleEvent(event);
             } catch {}
+          } else if (eventName === 'summary' && data) {
+            try {
+              const summary = JSON.parse(data);
+              if (summary.strategyStates) setStratStates(summary.strategyStates);
+            } catch {}
           }
         }
       }
@@ -1999,11 +2089,14 @@ function ReplayTest() {
     const recentMove5Pct = (prev5 && close && prev5.close) ? ((close - prev5.close) / prev5.close * 100) : null;
 
     // Score gap: winner - second-best (parsed from combinedAllScored sorted desc)
+    // If only 1 strategy scored, gap = winner's score (no competition)
     const allScored = event.combinedAllScored || [];
+    const parseScore = s => { const m = s.match(/score=([\d.]+)/); return m ? parseFloat(m[1]) : 0; };
     let scoreGap = null;
     if (allScored.length >= 2) {
-      const parseScore = s => { const m = s.match(/score=([\d.]+)/); return m ? parseFloat(m[1]) : 0; };
       scoreGap = parseScore(allScored[0]) - parseScore(allScored[1]);
+    } else if (allScored.length === 1) {
+      scoreGap = parseScore(allScored[0]); // sole candidate — gap to 0
     }
 
     // Entry type tag: REVERSAL > BREAKOUT > PULLBACK > CHOP
@@ -2480,6 +2573,134 @@ function ReplayTest() {
             })()}
           </div>
 
+          {/* ── Entry Filters ── */}
+          <div className="card bt-risk-card" style={{ marginTop: 12 }}>
+            <div className="bt-risk-toggle-row">
+              <span className="bt-risk-label">Entry Filters
+                <span className={entryFilterConfig.enabled ? 'bt-status-badge bt-status-on' : 'bt-status-badge bt-status-off'}>
+                  {entryFilterConfig.enabled ? 'enabled' : 'disabled'}
+                </span>
+              </span>
+              <button type="button" disabled={isRunning}
+                className={entryFilterConfig.enabled ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+                onClick={() => setEntryFilterConfig(p => ({ ...p, enabled: !p.enabled }))}>
+                {entryFilterConfig.enabled ? 'ON' : 'OFF'}
+              </button>
+            </div>
+            {entryFilterConfig.enabled && <>
+              {[
+              ['scoreGap',      'minGap',     'Min Gap',   0, 50,  0.5],
+              ['cooldown',      'minBars',    'Min Bars',  1, 20,  1  ],
+              ['vwapExtension', 'maxDistPct', 'Max Dist%', 0, 10,  0.1],
+            ].map(([ruleKey, threshKey, threshLabel, min, max, step]) => {
+              const rule = entryFilterConfig[ruleKey];
+              const eitherOn = rule.stocks.enabled || rule.options.enabled;
+              return (
+                <div key={ruleKey} style={{ borderTop: '1px solid var(--border)', paddingTop: 8, marginTop: 8 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: eitherOn ? 'var(--text-primary)' : 'var(--text-muted)', marginBottom: 4 }}>
+                    {rule.label}
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>{rule.description}</div>
+                  {/* Stock / Option toggles */}
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6 }}>
+                    <span style={{ fontSize: 11, color: 'var(--text-muted)', width: 60 }}>Stocks</span>
+                    <button type="button" disabled={isRunning}
+                      className={rule.stocks.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
+                      style={{ minWidth: 36 }}
+                      onClick={() => setEntryFilterConfig(p => ({ ...p, [ruleKey]: { ...p[ruleKey], stocks: { enabled: !p[ruleKey].stocks.enabled } } }))}>
+                      {rule.stocks.enabled ? 'ON' : 'OFF'}
+                    </button>
+                    <span style={{ fontSize: 11, color: 'var(--text-muted)', width: 60, marginLeft: 8 }}>Options</span>
+                    <button type="button" disabled={isRunning}
+                      className={rule.options.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
+                      style={{ minWidth: 36 }}
+                      onClick={() => setEntryFilterConfig(p => ({ ...p, [ruleKey]: { ...p[ruleKey], options: { enabled: !p[ruleKey].options.enabled } } }))}>
+                      {rule.options.enabled ? 'ON' : 'OFF'}
+                    </button>
+                  </div>
+                  {/* Threshold — always visible for quick tuning */}
+                  <div className="form-group" style={{ marginBottom: 0 }}>
+                    <label>{threshLabel}</label>
+                    <input type="number" min={min} max={max} step={step} disabled={isRunning}
+                      value={rule[threshKey]}
+                      onChange={e => setEntryFilterConfig(p => ({ ...p, [ruleKey]: { ...p[ruleKey], [threshKey]: parseFloat(e.target.value) } }))} />
+                  </div>
+                </div>
+              );
+            })}
+              {/* Strategy Filter */}
+              {(() => {
+                const rule = entryFilterConfig.strategyFilter;
+                const eitherOn = rule.stocks.enabled || rule.options.enabled;
+                return (
+                  <div style={{ borderTop: '1px solid var(--border)', paddingTop: 8, marginTop: 8 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: eitherOn ? 'var(--text-primary)' : 'var(--text-muted)', marginBottom: 4 }}>{rule.label}</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>{rule.description}</div>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6 }}>
+                      <span style={{ fontSize: 11, color: 'var(--text-muted)', width: 60 }}>Stocks</span>
+                      <button type="button" disabled={isRunning}
+                        className={rule.stocks.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'} style={{ minWidth: 36 }}
+                        onClick={() => setEntryFilterConfig(p => ({ ...p, strategyFilter: { ...p.strategyFilter, stocks: { enabled: !p.strategyFilter.stocks.enabled } } }))}>
+                        {rule.stocks.enabled ? 'ON' : 'OFF'}
+                      </button>
+                      <span style={{ fontSize: 11, color: 'var(--text-muted)', width: 60, marginLeft: 8 }}>Options</span>
+                      <button type="button" disabled={isRunning}
+                        className={rule.options.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'} style={{ minWidth: 36 }}
+                        onClick={() => setEntryFilterConfig(p => ({ ...p, strategyFilter: { ...p.strategyFilter, options: { enabled: !p.strategyFilter.options.enabled } } }))}>
+                        {rule.options.enabled ? 'ON' : 'OFF'}
+                      </button>
+                    </div>
+                    <div className="form-group" style={{ marginBottom: 0 }}>
+                      <label>Blocked Strategies (comma-separated)</label>
+                      <input type="text" disabled={isRunning} placeholder="e.g. SMA_CROSSOVER, EMA_CROSSOVER, MACD"
+                        value={rule.blocked}
+                        onChange={e => setEntryFilterConfig(p => ({ ...p, strategyFilter: { ...p.strategyFilter, blocked: e.target.value } }))} />
+                    </div>
+                  </div>
+                );
+              })()}
+              {/* Confidence Gate */}
+              {(() => {
+                const rule = entryFilterConfig.confidenceGate;
+                const eitherOn = rule.stocks.enabled || rule.options.enabled;
+                return (
+                  <div style={{ borderTop: '1px solid var(--border)', paddingTop: 8, marginTop: 8 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: eitherOn ? 'var(--text-primary)' : 'var(--text-muted)', marginBottom: 4 }}>{rule.label}</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>{rule.description}</div>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6 }}>
+                      <span style={{ fontSize: 11, color: 'var(--text-muted)', width: 60 }}>Stocks</span>
+                      <button type="button" disabled={isRunning}
+                        className={rule.stocks.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'} style={{ minWidth: 36 }}
+                        onClick={() => setEntryFilterConfig(p => ({ ...p, confidenceGate: { ...p.confidenceGate, stocks: { enabled: !p.confidenceGate.stocks.enabled } } }))}>
+                        {rule.stocks.enabled ? 'ON' : 'OFF'}
+                      </button>
+                      <span style={{ fontSize: 11, color: 'var(--text-muted)', width: 60, marginLeft: 8 }}>Options</span>
+                      <button type="button" disabled={isRunning}
+                        className={rule.options.enabled ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'} style={{ minWidth: 36 }}
+                        onClick={() => setEntryFilterConfig(p => ({ ...p, confidenceGate: { ...p.confidenceGate, options: { enabled: !p.confidenceGate.options.enabled } } }))}>
+                        {rule.options.enabled ? 'ON' : 'OFF'}
+                      </button>
+                    </div>
+                    <div style={{ display: 'flex', gap: 10 }}>
+                      <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
+                        <label>Min Gap</label>
+                        <input type="number" min="0" max="50" step="0.5" disabled={isRunning}
+                          value={rule.minGap}
+                          onChange={e => setEntryFilterConfig(p => ({ ...p, confidenceGate: { ...p.confidenceGate, minGap: parseFloat(e.target.value) } }))} />
+                      </div>
+                      <div className="form-group" style={{ flex: 2, marginBottom: 0 }}>
+                        <label>Exception Strategy</label>
+                        <input type="text" disabled={isRunning} placeholder="e.g. LIQUIDITY_SWEEP"
+                          value={rule.exceptionStrategy}
+                          onChange={e => setEntryFilterConfig(p => ({ ...p, confidenceGate: { ...p.confidenceGate, exceptionStrategy: e.target.value } }))} />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+            </>}
+          </div>
+
         </div>
 
         {/* Right: tabs */}
@@ -2871,6 +3092,45 @@ function ReplayTest() {
                 lines.push(blank);
               }
 
+              // ── Entry Filters ──────────────────────────────────────────
+              {
+                const ef = entryFilterConfig;
+                lines.push(row('=== Entry Filters ==='));
+                lines.push(row('Master', ef.enabled ? 'ON' : 'OFF'));
+                lines.push(row('Rule', 'Stocks', 'Options', 'Threshold'));
+                lines.push(row(
+                  'Score Gap (winner − second)',
+                  ef.scoreGap.stocks.enabled  ? 'ON' : 'OFF',
+                  ef.scoreGap.options.enabled ? 'ON' : 'OFF',
+                  `Min Gap: ${ef.scoreGap.minGap}`,
+                ));
+                lines.push(row(
+                  'Cooldown (bars since last trade)',
+                  ef.cooldown.stocks.enabled  ? 'ON' : 'OFF',
+                  ef.cooldown.options.enabled ? 'ON' : 'OFF',
+                  `Min Bars: ${ef.cooldown.minBars}`,
+                ));
+                lines.push(row(
+                  'VWAP Extension Filter',
+                  ef.vwapExtension.stocks.enabled  ? 'ON' : 'OFF',
+                  ef.vwapExtension.options.enabled ? 'ON' : 'OFF',
+                  `Max Dist: ${ef.vwapExtension.maxDistPct}%`,
+                ));
+                lines.push(row(
+                  'Strategy Allowlist (blocked)',
+                  ef.strategyFilter.stocks.enabled  ? 'ON' : 'OFF',
+                  ef.strategyFilter.options.enabled ? 'ON' : 'OFF',
+                  `Blocked: ${ef.strategyFilter.blocked || '—'}`,
+                ));
+                lines.push(row(
+                  'Confidence Gate',
+                  ef.confidenceGate.stocks.enabled  ? 'ON' : 'OFF',
+                  ef.confidenceGate.options.enabled ? 'ON' : 'OFF',
+                  `Min Gap: ${ef.confidenceGate.minGap} | Exception: ${ef.confidenceGate.exceptionStrategy || '—'}`,
+                ));
+                lines.push(blank);
+              }
+
               // ── P&L Summary ───────────────────────────────────────────
               lines.push(row('=== P&L Summary ==='));
               lines.push(row('Strategy','Initial Capital','Final Capital','P&L','Return %','Total Trades','Wins','Losses','Win Rate %'));
@@ -2936,10 +3196,54 @@ function ReplayTest() {
                 (cd.score ? ` · score=${cd.score.total.toFixed(1)}(trend=${cd.score.trendStrength.toFixed(0)},vol=${cd.score.volatility.toFixed(0)},mom=${cd.score.momentum.toFixed(0)},conf=${cd.score.confidence.toFixed(0)})` : '') +
                 (cd.trigger ? ` · ${cd.trigger}` : '');
               // Shared extra columns for every candle
+              const csvInstrType = resolveInstrType(inst.instrumentType, inst.symbol, inst.exchange);
+              const csvIsOption  = csvInstrType === 'OPTION';
+
+              // Entry Filter: returns 'ALLOW' / 'SKIP: reason' for candles with combined entries, '' otherwise
+              const applyEntryFilters = r => {
+                const hasEntry = (r.combinedDetails || []).some(d =>
+                  typeof d.action === 'string' && d.action.toLowerCase().includes('enter')
+                );
+                if (!hasEntry) return '';
+                const reasons = [];
+                if (!entryFilterConfig.enabled) return 'ALLOW';
+                const active = k => csvIsOption ? entryFilterConfig[k].options.enabled : entryFilterConfig[k].stocks.enabled;
+
+                const sgRule = entryFilterConfig.scoreGap;
+                if (active('scoreGap') && r.scoreGap != null && r.scoreGap < parseFloat(sgRule.minGap || 2))
+                  reasons.push(`ScoreGap ${Number(r.scoreGap).toFixed(1)} < ${sgRule.minGap}`);
+
+                const cdRule = entryFilterConfig.cooldown;
+                if (active('cooldown') && r.candlesSinceLastTrade != null && r.candlesSinceLastTrade < parseInt(cdRule.minBars || 3))
+                  reasons.push(`Cooldown ${r.candlesSinceLastTrade} < ${cdRule.minBars}`);
+
+                const veRule = entryFilterConfig.vwapExtension;
+                if (active('vwapExtension') && r.distanceFromVwapPct != null && Math.abs(r.distanceFromVwapPct) > parseFloat(veRule.maxDistPct || 1.5))
+                  reasons.push(`VWAPExt ${Number(r.distanceFromVwapPct).toFixed(2)}% > ${veRule.maxDistPct}%`);
+
+                const sfRule = entryFilterConfig.strategyFilter;
+                if (active('strategyFilter') && r.combinedWinner) {
+                  const blockedList = (sfRule.blocked || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+                  if (blockedList.includes((r.combinedWinner || '').toUpperCase()))
+                    reasons.push(`Strategy ${r.combinedWinner} blocked`);
+                }
+
+                const cgRule = entryFilterConfig.confidenceGate;
+                if (active('confidenceGate')) {
+                  const exception = (cgRule.exceptionStrategy || '').trim().toUpperCase();
+                  const winner    = (r.combinedWinner || '').toUpperCase();
+                  if (r.scoreGap != null && r.scoreGap < parseFloat(cgRule.minGap || 3) && winner !== exception)
+                    reasons.push(`ConfGap ${Number(r.scoreGap).toFixed(1)} < ${cgRule.minGap} (not ${cgRule.exceptionStrategy})`);
+                }
+
+                return reasons.length > 0 ? `SKIP: ${reasons.join('; ')}` : 'ALLOW';
+              };
+
               const extraCols = [
                 'Comb Position','Comb Unreal P&L','Comb Winner','Comb Winner Score','Confidence(ScoreGap)',
                 'Comb All Scored','Comb Above Threshold','Comb Block Reason',
                 'VWAP','DistanceFromVWAP%','RecentMove3%','RecentMove5%','Entry Phase','Entry Type','BarsSinceLastTrade',
+                'Entry Filter',
               ];
               const fmtCombPos = r => {
                 if (!r.combinedPosition) return '';
@@ -2970,6 +3274,7 @@ function ReplayTest() {
                 fmtEntryPhase(r),
                 r.entryTypeTag || '',
                 r.candlesSinceLastTrade != null ? r.candlesSinceLastTrade : '',
+                applyEntryFilters(r),
               ];
 
               if (combinedOnlyMode) {
@@ -3119,7 +3424,7 @@ function ReplayTest() {
                                    'Winner', 'Winner Score', 'Confidence',
                                    'All Scored', 'Above Threshold', 'Block Reason',
                                    'VWAP', 'VWAP Dist%', 'Move3%', 'Move5%', 'Entry Phase',
-                                   'Entry Type', 'Bars Since Trade',
+                                   'Entry Type', 'Bars Since Trade', 'Entry Filter',
                                    'Combined Analysis', 'Blocked']
                                 : [...stratLabels.map(l => l.length > 10 ? l.slice(0,10)+'…' : l),
                                    'VWAP', 'Dist VWAP%', 'Move%(3c)', 'Actions']
@@ -3287,6 +3592,53 @@ function ReplayTest() {
                                       : <span style={{ color: 'var(--text-muted)' }}>—</span>
                                     }
                                   </td>
+                                  {/* Entry Filter — would this entry be skipped? */}
+                                  {(() => {
+                                    const tblInstrType = resolveInstrType(inst.instrumentType, inst.symbol, inst.exchange);
+                                    const tblIsOption  = tblInstrType === 'OPTION';
+                                    const hasEntry = (row.combinedDetails || []).some(d =>
+                                      typeof d.action === 'string' && d.action.toLowerCase().includes('enter')
+                                    );
+                                                    if (!hasEntry || !entryFilterConfig.enabled) return <td style={{ padding: '4px 6px', color: 'var(--text-muted)', textAlign: 'center' }}>—</td>;
+                                    const reasons = [];
+                                    const tblActive = k => tblIsOption ? entryFilterConfig[k].options.enabled : entryFilterConfig[k].stocks.enabled;
+
+                                    const sgRule = entryFilterConfig.scoreGap;
+                                    if (tblActive('scoreGap') && row.scoreGap != null && row.scoreGap < parseFloat(sgRule.minGap || 2))
+                                      reasons.push(`Gap ${Number(row.scoreGap).toFixed(1)}<${sgRule.minGap}`);
+
+                                    const cdRule = entryFilterConfig.cooldown;
+                                    if (tblActive('cooldown') && row.candlesSinceLastTrade != null && row.candlesSinceLastTrade < parseInt(cdRule.minBars || 3))
+                                      reasons.push(`CD ${row.candlesSinceLastTrade}<${cdRule.minBars}`);
+
+                                    const veRule = entryFilterConfig.vwapExtension;
+                                    if (tblActive('vwapExtension') && row.distanceFromVwapPct != null && Math.abs(row.distanceFromVwapPct) > parseFloat(veRule.maxDistPct || 1.5))
+                                      reasons.push(`VWAPExt ${Number(row.distanceFromVwapPct).toFixed(2)}%>${veRule.maxDistPct}%`);
+
+                                    const sfRule = entryFilterConfig.strategyFilter;
+                                    if (tblActive('strategyFilter') && row.combinedWinner) {
+                                      const blockedList = (sfRule.blocked || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+                                      if (blockedList.includes((row.combinedWinner || '').toUpperCase()))
+                                        reasons.push(`${row.combinedWinner} blocked`);
+                                    }
+
+                                    const cgRule = entryFilterConfig.confidenceGate;
+                                    if (tblActive('confidenceGate')) {
+                                      const exception = (cgRule.exceptionStrategy || '').trim().toUpperCase();
+                                      const winner    = (row.combinedWinner || '').toUpperCase();
+                                      if (row.scoreGap != null && row.scoreGap < parseFloat(cgRule.minGap || 3) && winner !== exception)
+                                        reasons.push(`Conf ${Number(row.scoreGap).toFixed(1)}<${cgRule.minGap}`);
+                                    }
+                                    const skip = reasons.length > 0;
+                                    return (
+                                      <td style={{ padding: '4px 6px', whiteSpace: 'nowrap', textAlign: 'center' }}>
+                                        <span style={{ fontSize: 10, fontWeight: 700, color: skip ? '#ef4444' : '#22c55e' }}>
+                                          {skip ? `SKIP` : 'ALLOW'}
+                                        </span>
+                                        {skip && <div style={{ fontSize: 9, color: '#ef4444' }}>{reasons.join('; ')}</div>}
+                                      </td>
+                                    );
+                                  })()}
                                   {/* Combined Analysis — full per-action detail */}
                                   <td style={{ padding: '4px 6px', minWidth: 260 }}>
                                     {!row.combinedDetails?.length
