@@ -6,6 +6,7 @@ import {
   searchInstruments, fetchHistoricalData,
   startReplayEval,
   startLiveEval, stopLiveEval,
+  startOptionsReplayEval,
 } from '../services/api';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { useSession } from '../context/SessionContext';
@@ -1007,9 +1008,10 @@ export default function Backtest() {
 
       <div className="tabs" style={{ marginBottom: 24 }}>
         {[
-          ['backtest', 'Historical Backtest'],
-          ['replay',   'Replay Test'],
-          ['live',     'Live Test'],
+          ['backtest',        'Historical Backtest'],
+          ['replay',          'Replay Test'],
+          ['live',            'Live Test'],
+          ['options-replay',  'Options Replay Test'],
         ].map(([key, label]) => (
           <button
             key={key}
@@ -1021,9 +1023,10 @@ export default function Backtest() {
         ))}
       </div>
 
-      {tab === 'backtest' && <HistoricalBacktest />}
-      {tab === 'replay'   && <ReplayTest />}
-      {tab === 'live'     && <LiveTest />}
+      {tab === 'backtest'       && <HistoricalBacktest />}
+      {tab === 'replay'         && <ReplayTest />}
+      {tab === 'live'           && <LiveTest />}
+      {tab === 'options-replay' && <OptionsReplayTest />}
     </div>
   );
 }
@@ -1603,8 +1606,13 @@ function InstrumentPicker({ session, symbol, exchange, instrumentToken, onSelect
   // Auto-detect F&O exchange from query pattern
   function resolveSearchExchange(q) {
     const u = q.toUpperCase();
-    if (/CE$|PE$/.test(u) || /\dFUT/.test(u) || /NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY/.test(u)) {
+    // F&O contracts: options (CE/PE suffix), futures (digit+FUT), or index derivatives with expiry digits
+    if (/CE$|PE$/.test(u) || /\dFUT/.test(u) || /(?:NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY)\d/.test(u)) {
       return 'NFO';
+    }
+    // Bare index names — always search NSE (where NIFTY 50, BANKNIFTY indices live)
+    if (/^(NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY|SENSEX|BANKEX)/.test(u)) {
+      return 'NSE';
     }
     return exchange;
   }
@@ -1678,7 +1686,7 @@ function InstrumentPicker({ session, symbol, exchange, instrumentToken, onSelect
             value={query}
             onChange={handleQueryChange}
             onFocus={() => query.trim() && setShowDrop(true)}
-            placeholder={session?.userId ? 'Type symbol or name  (e.g. RELIANCE, NIFTY24DEC24450CE)' : 'Activate a session to search instruments'}
+            placeholder={session?.userId ? 'Type symbol or name  (e.g. RELIANCE, NIFTY, NIFTY24DEC24450CE)' : 'Activate a session to search instruments'}
             disabled={disabled || !session?.userId}
           />
           <select
@@ -6631,3 +6639,1714 @@ function BacktestResultPanel({ result, session, instrumentToken }) {
     </div>
   );
 }
+
+// ─── Tab 4: Options Replay Test ────────────────────────────────────────────────
+
+const EMPTY_OPTION_INST = () => ({
+  id: Date.now() + Math.random(),
+  symbol: '', exchange: 'NFO', instrumentToken: '',
+});
+
+const OPT_INTERVALS = [
+  ['MINUTE_1','1 min'],['MINUTE_3','3 min'],['MINUTE_5','5 min'],['MINUTE_10','10 min'],
+  ['MINUTE_15','15 min'],['MINUTE_30','30 min'],['MINUTE_60','60 min'],['DAY','Day'],
+];
+
+const DEFAULT_DECISION = {
+  minScore: '40', minScoreGap: '8', maxRecentMove3: '1.5', maxRecentMove5: '2.5',
+  maxAbsVwapDist: '1.5', minBarsSinceTrade: '3', chopFilter: true, chopLookback: '8',
+};
+const DEFAULT_SELECTION = { minPremium: '50', maxPremium: '300' };
+const DEFAULT_SWITCH    = { switchConfirmationCandles: '2', maxSwitchesPerDay: '3' };
+const DEFAULT_REGIME_RULES = {
+  enabled: true,
+  rangingMinScore: '35',    rangingMinScoreGap: '6',
+  trendingMinScore: '25',   trendingMinScoreGap: '3',
+  compressionMinScore: '25', compressionMinScoreGap: '3',
+};
+const DEFAULT_OPTS_REGIME_CONFIG = {
+  enabled: false,
+  adxPeriod: 14,
+  atrPeriod: 14,
+  adxTrendThreshold: 25,
+  atrVolatilePct: 2.0,
+  atrCompressionPct: 0.5,
+};
+const DEFAULT_CHOP_RULES = {
+  enabled: false,
+  ranging:     { filterEnabled: true,  flipRatio: '0.65' },
+  trending:    { filterEnabled: false, flipRatio: '0.65' },
+  compression: { filterEnabled: false, flipRatio: '0.65' },
+  volatile:    { filterEnabled: true,  flipRatio: '0.80' },
+};
+const DEFAULT_TRADING_RULES = {
+  enabled: false,
+  rangingNoTrade:       false,
+  volatileNoTrade:      false,
+  noSameCandleReversal: false,
+};
+const DEFAULT_REGIME_STRATEGY_RULES = {
+  enabled: false,
+  ranging:     { enabled: false, allowed: [] },
+  trending:    { enabled: false, allowed: [] },
+  compression: { enabled: false, allowed: [] },
+  volatile:    { enabled: false, allowed: [] },
+};
+const DEFAULT_OPTS_RISK = {
+  enabled: false,
+  stopLossPct:        '2',
+  takeProfitPct:      '4',
+  maxRiskPerTradePct: '1',
+  dailyLossCapPct:    '5',
+  cooldownCandles:    '3',
+};
+const DEFAULT_RANGE_QUALITY = {
+  enabled: false,
+  lookbackBars:                  '10',
+  minUpperTouches:               '2',
+  minLowerTouches:               '2',
+  bandTouchTolerancePct:         '0.15',
+  minRangeWidthPct:              '0.4',
+  maxRangeWidthPct:              '2.0',
+  maxDirectionalDriftPctOfRange: '0.6',
+  chopFlipRatioLimit:            '0.65',
+  enableChopCheck:               true,
+};
+
+function fmt2(v) { return v != null ? Number(v).toFixed(2) : '—'; }
+function pnlStyle(v) { return { color: v > 0 ? '#22c55e' : v < 0 ? '#ef4444' : undefined, fontWeight: 600 }; }
+
+
+function OptionsReplayTest() {
+  const { session, isActive } = useSession();
+
+  const ls = (key, def) => { try { const s = localStorage.getItem(key); if (!s) return def; const v = JSON.parse(s); return (Array.isArray(def) && !Array.isArray(v)) ? def : v; } catch { return def; } };
+
+  // ── NIFTY instrument (NSE, decision source only)
+  const [nifty, setNifty] = useState(() => ls('sma_opts_nifty', { symbol: '', exchange: 'NSE', instrumentToken: '' }));
+
+  // ── Option pools
+  const [cePool, setCePool] = useState(() => ls('sma_opts_ce_pool', [EMPTY_OPTION_INST()]));
+  const [pePool, setPePool] = useState(() => ls('sma_opts_pe_pool', [EMPTY_OPTION_INST()]));
+
+  // ── Replay settings
+  const [interval,   setInterval]   = useState(() => ls('sma_opts_interval',   'MINUTE_5'));
+  const [fromDate,   setFromDate]   = useState(() => { const v = ls('sma_opts_from', ''); const d = v.split('T')[0]; return d ? `${d}T09:15` : ''; });
+  const [toDate,     setToDate]     = useState(() => { const v = ls('sma_opts_to',   ''); const d = v.split('T')[0]; return d ? `${d}T15:30` : ''; });
+  const [warmupDays, setWarmupDays] = useState(() => ls('sma_opts_warmup',      '5'));
+  const [speed,      setSpeed]      = useState(() => ls('sma_opts_speed',       '1'));
+  const [quantity,   setQuantity]   = useState(() => ls('sma_opts_qty',         '0'));
+  const [capital,    setCapital]    = useState(() => ls('sma_opts_capital',     '100000'));
+
+  // ── Strategies (on NIFTY)
+  const [strategies, setStrategies] = useState(() => ls('sma_opts_strategies', defaultStrategies()));
+
+  // ── Config
+  const [decisionCfg,  setDecisionCfg]  = useState(() => ls('sma_opts_decision',     DEFAULT_DECISION));
+  const [selectionCfg, setSelectionCfg] = useState(() => ls('sma_opts_selection',    DEFAULT_SELECTION));
+  const [switchCfg,    setSwitchCfg]    = useState(() => ls('sma_opts_switch',       DEFAULT_SWITCH));
+  const [optsRegimeCfg,        setOptsRegimeCfg]        = useState(() => ls('sma_opts_regime_cfg',           DEFAULT_OPTS_REGIME_CONFIG));
+  const [chopRules,            setChopRules]            = useState(() => ls('sma_opts_chop_rules',           DEFAULT_CHOP_RULES));
+  const [tradingRules,         setTradingRules]         = useState(() => ls('sma_opts_trading_rules',        DEFAULT_TRADING_RULES));
+  const [regimeRules,          setRegimeRules]          = useState(() => ls('sma_opts_regime_rules',          DEFAULT_REGIME_RULES));
+  const [regimeStrategyRules,  setRegimeStrategyRules]  = useState(() => ls('sma_opts_regime_strat_rules',    DEFAULT_REGIME_STRATEGY_RULES));
+  const [optsRisk,             setOptsRisk]             = useState(() => ls('sma_opts_risk',                  DEFAULT_OPTS_RISK));
+  const [rangeQuality,         setRangeQuality]         = useState(() => ls('sma_opts_range_quality',          DEFAULT_RANGE_QUALITY));
+
+  function updateOptsRisk(key, val) { setOptsRisk(p => ({ ...p, [key]: val })); }
+  function updateRangeQuality(key, val) { setRangeQuality(p => ({ ...p, [key]: val })); }
+
+  // ── Persist to localStorage on change
+  useEffect(() => { try { localStorage.setItem('sma_opts_nifty',      JSON.stringify(nifty));        } catch {} }, [nifty]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_ce_pool',    JSON.stringify(cePool));       } catch {} }, [cePool]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_pe_pool',    JSON.stringify(pePool));       } catch {} }, [pePool]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_interval',   JSON.stringify(interval));     } catch {} }, [interval]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_from',       JSON.stringify(fromDate));     } catch {} }, [fromDate]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_to',         JSON.stringify(toDate));       } catch {} }, [toDate]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_warmup',     JSON.stringify(warmupDays));   } catch {} }, [warmupDays]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_speed',      JSON.stringify(speed));        } catch {} }, [speed]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_qty',        JSON.stringify(quantity));     } catch {} }, [quantity]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_capital',    JSON.stringify(capital));      } catch {} }, [capital]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_strategies', JSON.stringify(strategies));   } catch {} }, [strategies]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_decision',   JSON.stringify(decisionCfg));  } catch {} }, [decisionCfg]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_selection',  JSON.stringify(selectionCfg)); } catch {} }, [selectionCfg]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_switch',       JSON.stringify(switchCfg));      } catch {} }, [switchCfg]);
+  // ── Recent replay dates ──────────────────────────────────────────────────
+  const [recentDates, setRecentDates] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('sma_opts_recent_dates') || '[]'); } catch { return []; }
+  });
+  function saveRecentDate(dateStr) {
+    if (!dateStr) return;
+    setRecentDates(prev => {
+      const next = [dateStr, ...prev.filter(d => d !== dateStr)].slice(0, 8);
+      try { localStorage.setItem('sma_opts_recent_dates', JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }
+
+  useEffect(() => { try { localStorage.setItem('sma_opts_regime_cfg',         JSON.stringify(optsRegimeCfg));       } catch {} }, [optsRegimeCfg]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_chop_rules',         JSON.stringify(chopRules));           } catch {} }, [chopRules]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_trading_rules',      JSON.stringify(tradingRules));        } catch {} }, [tradingRules]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_regime_rules',       JSON.stringify(regimeRules));         } catch {} }, [regimeRules]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_regime_strat_rules', JSON.stringify(regimeStrategyRules)); } catch {} }, [regimeStrategyRules]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_risk',               JSON.stringify(optsRisk));            } catch {} }, [optsRisk]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_range_quality',      JSON.stringify(rangeQuality));        } catch {} }, [rangeQuality]);
+
+  // ── Run state
+  const [status,   setStatus]   = useState('idle'); // idle|running|completed|error
+  const [feed,     setFeed]     = useState([]);      // OptionsReplayCandleEvent[]
+  const [summary,  setSummary]  = useState(null);    // final summary event data
+  const [initInfo, setInitInfo] = useState(null);    // { totalCandles, warmupCandles }
+  const [error,    setError]    = useState('');
+  const [rightTab, setRightTab] = useState('feed');
+  const abortRef = useRef(null);
+  const readerRef = useRef(null);
+
+  useEffect(() => () => { abortRef.current?.abort(); }, []);
+
+  // ── Pool helpers
+  function updatePoolInst(pool, setPool, id, patch) {
+    setPool(p => p.map(i => i.id === id ? { ...i, ...patch } : i));
+  }
+  function addPoolInst(setPool) {
+    setPool(p => [...p, EMPTY_OPTION_INST()]);
+  }
+  function removePoolInst(pool, setPool, id) {
+    setPool(p => p.length > 1 ? p.filter(i => i.id !== id) : p);
+  }
+
+  function updateStrategy(idx, patch) {
+    setStrategies(p => p.map((s, i) => i === idx ? { ...s, ...patch } : s));
+  }
+  function updateStratParam(idx, key, val) {
+    setStrategies(p => p.map((s, i) => i === idx ? { ...s, parameters: { ...s.parameters, [key]: val } } : s));
+  }
+
+  function stop() {
+    abortRef.current?.abort();
+    try { readerRef.current?.cancel(); } catch {}
+    setStatus(s => s === 'running' ? 'idle' : s);
+  }
+
+  function downloadCSV() {
+    const q   = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const row = (...cols) => cols.map(q).join(',');
+    const blank = '';
+    const lines = [];
+
+    // ── Run Config ──────────────────────────────────────────────────────────
+    lines.push(row('=== Run Config ==='));
+    lines.push(row('NIFTY Symbol', 'Exchange', 'Token', 'Interval', 'From', 'To', 'Warmup Days', 'Quantity', 'Capital'));
+    lines.push(row(
+      nifty.symbol || '—', nifty.exchange || '—', nifty.instrumentToken || '—',
+      interval, fromDate, toDate, warmupDays, quantity, capital,
+    ));
+    lines.push(blank);
+
+    // ── CE Pool ─────────────────────────────────────────────────────────────
+    lines.push(row('=== CE Options Pool ==='));
+    lines.push(row('Token', 'Symbol', 'Exchange'));
+    cePool.filter(i => i.instrumentToken).forEach(i =>
+      lines.push(row(i.instrumentToken, i.symbol, i.exchange)));
+    lines.push(blank);
+
+    // ── PE Pool ─────────────────────────────────────────────────────────────
+    lines.push(row('=== PE Options Pool ==='));
+    lines.push(row('Token', 'Symbol', 'Exchange'));
+    pePool.filter(i => i.instrumentToken).forEach(i =>
+      lines.push(row(i.instrumentToken, i.symbol, i.exchange)));
+    lines.push(blank);
+
+    // ── Strategies ──────────────────────────────────────────────────────────
+    lines.push(row('=== Strategies ==='));
+    lines.push(row('Strategy Type', 'Enabled', 'Parameters'));
+    strategies.forEach(s =>
+      lines.push(row(s.strategyType, s.enabled ? 'Yes' : 'No', JSON.stringify(s.parameters || {}))));
+    lines.push(blank);
+
+    // ── Decision Config ─────────────────────────────────────────────────────
+    lines.push(row('=== Decision Config ==='));
+    lines.push(row('Min Score', 'Min Score Gap', 'Max Recent Move 3%', 'Max Recent Move 5%',
+      'Max VWAP Dist%', 'Min Bars Since Trade', 'Chop Filter', 'Chop Lookback'));
+    lines.push(row(
+      decisionCfg.minScore, decisionCfg.minScoreGap,
+      decisionCfg.maxRecentMove3, decisionCfg.maxRecentMove5,
+      decisionCfg.maxAbsVwapDist, decisionCfg.minBarsSinceTrade,
+      decisionCfg.chopFilter ? 'Yes' : 'No', decisionCfg.chopLookback,
+    ));
+    lines.push(blank);
+
+    // ── Chop Filter Regime Rules ─────────────────────────────────────────────
+    lines.push(row('=== Chop Filter Regime Rules ==='));
+    lines.push(row('Enabled', 'Regime', 'Filter', 'Flip Ratio'));
+    lines.push(row(chopRules.enabled ? 'Yes' : 'No'));
+    if (chopRules.enabled) {
+      [['RANGING', 'ranging'], ['TRENDING', 'trending'], ['COMPRESSION', 'compression'], ['VOLATILE', 'volatile']].forEach(([label, rk]) =>
+        lines.push(row('', label, chopRules[rk].filterEnabled ? 'ON' : 'Disabled', chopRules[rk].filterEnabled ? chopRules[rk].flipRatio : '—'))
+      );
+    }
+    lines.push(blank);
+
+    // ── Market Regime Detection ──────────────────────────────────────────────
+    lines.push(row('=== Market Regime Detection ==='));
+    lines.push(row('Enabled', 'ADX Period', 'ATR Period', 'ADX Trend Threshold', 'ATR Volatile %', 'ATR Compression %'));
+    lines.push(row(
+      optsRegimeCfg.enabled ? 'Yes' : 'No',
+      optsRegimeCfg.adxPeriod, optsRegimeCfg.atrPeriod,
+      optsRegimeCfg.adxTrendThreshold, optsRegimeCfg.atrVolatilePct, optsRegimeCfg.atrCompressionPct,
+    ));
+    lines.push(blank);
+
+    // ── Selection Config ────────────────────────────────────────────────────
+    lines.push(row('=== Selection Config ==='));
+    lines.push(row('Min Premium', 'Max Premium'));
+    lines.push(row(selectionCfg.minPremium, selectionCfg.maxPremium));
+    lines.push(blank);
+
+    // ── Switch Config ───────────────────────────────────────────────────────
+    lines.push(row('=== Switch Config ==='));
+    lines.push(row('Switch Confirmation Candles', 'Max Switches Per Day'));
+    lines.push(row(switchCfg.switchConfirmationCandles, switchCfg.maxSwitchesPerDay));
+    lines.push(blank);
+
+    // ── Trading Rules ────────────────────────────────────────────────────────
+    lines.push(row('=== Trading Rules ==='));
+    lines.push(row('Enabled', 'No Trade in RANGING', 'No Trade in VOLATILE', 'No Same-Candle Reversal'));
+    lines.push(row(
+      tradingRules.enabled ? 'Yes' : 'No',
+      tradingRules.rangingNoTrade       ? 'ON' : 'OFF',
+      tradingRules.volatileNoTrade      ? 'ON' : 'OFF',
+      tradingRules.noSameCandleReversal ? 'ON' : 'OFF',
+    ));
+    lines.push(blank);
+
+    // ── Regime Score Rules ───────────────────────────────────────────────────
+    lines.push(row('=== Regime Score Rules ==='));
+    lines.push(row('Enabled', 'RANGING Min Score', 'RANGING Min Score Gap', 'TRENDING Min Score', 'TRENDING Min Score Gap', 'COMPRESSION Min Score', 'COMPRESSION Min Score Gap'));
+    lines.push(row(
+      regimeRules.enabled ? 'Yes' : 'No',
+      regimeRules.rangingMinScore,     regimeRules.rangingMinScoreGap,
+      regimeRules.trendingMinScore,    regimeRules.trendingMinScoreGap,
+      regimeRules.compressionMinScore, regimeRules.compressionMinScoreGap,
+    ));
+    lines.push(blank);
+
+    // ── Regime Strategy Rules ────────────────────────────────────────────────
+    lines.push(row('=== Regime Strategy Rules ==='));
+    lines.push(row('Enabled'));
+    lines.push(row(regimeStrategyRules.enabled ? 'Yes' : 'No'));
+    if (regimeStrategyRules.enabled) {
+      lines.push(blank);
+      lines.push(row('Regime', 'Filter Enabled', 'Allowed Strategies'));
+      [
+        ['RANGING',     regimeStrategyRules.ranging],
+        ['TRENDING',    regimeStrategyRules.trending],
+        ['COMPRESSION', regimeStrategyRules.compression],
+        ['VOLATILE',    regimeStrategyRules.volatile],
+      ].forEach(([label, cfg]) =>
+        lines.push(row(label, cfg.enabled ? 'Yes' : 'No', cfg.enabled ? (cfg.allowed.join(', ') || 'none selected') : 'all allowed'))
+      );
+    }
+    lines.push(blank);
+
+    // ── Range Quality Filter ─────────────────────────────────────────────────
+    lines.push(row('=== Range Quality Filter (RANGING only) ==='));
+    lines.push(row('Enabled', 'Lookback Bars', 'Min Upper Touches', 'Min Lower Touches',
+      'Band Touch Tol%', 'Min Range Width%', 'Max Range Width%',
+      'Max Drift Ratio', 'Chop Flip Limit', 'Chop Check'));
+    lines.push(row(
+      rangeQuality.enabled ? 'Yes' : 'No',
+      rangeQuality.lookbackBars, rangeQuality.minUpperTouches, rangeQuality.minLowerTouches,
+      rangeQuality.bandTouchTolerancePct, rangeQuality.minRangeWidthPct, rangeQuality.maxRangeWidthPct,
+      rangeQuality.maxDirectionalDriftPctOfRange, rangeQuality.chopFlipRatioLimit,
+      rangeQuality.enableChopCheck ? 'Yes' : 'No',
+    ));
+    lines.push(blank);
+
+    // ── Risk Management ─────────────────────────────────────────────────────
+    lines.push(row('=== Risk Management ==='));
+    lines.push(row('Enabled', 'Stop Loss %', 'Take Profit %', 'Max Risk / Trade %', 'Daily Loss Cap %', 'Cooldown Candles'));
+    lines.push(row(
+      optsRisk.enabled ? 'Yes' : 'No',
+      optsRisk.stopLossPct, optsRisk.takeProfitPct,
+      optsRisk.maxRiskPerTradePct, optsRisk.dailyLossCapPct, optsRisk.cooldownCandles,
+    ));
+    lines.push(blank);
+
+    // ── Summary ─────────────────────────────────────────────────────────────
+    if (summary) {
+      lines.push(row('=== Summary ==='));
+      lines.push(row('Total Trades', 'Realized P&L', 'Final Capital'));
+      lines.push(row(summary.totalTrades, summary.realizedPnl, summary.finalCapital));
+      lines.push(blank);
+    }
+
+    // ── Closed Trades ───────────────────────────────────────────────────────
+    const closedTradesForCsv = lastEvt?.closedTrades || summary?.closedTrades || [];
+    if (closedTradesForCsv.length > 0) {
+      lines.push(row('=== Closed Trades ==='));
+      lines.push(row('Entry Time', 'Exit Time', 'Type', 'Symbol', 'Strike', 'Expiry',
+        'Entry Px', 'Exit Px', 'Qty', 'P&L', 'P&L %', 'Bars', 'Exit Reason', 'Capital After'));
+      closedTradesForCsv.forEach(t => lines.push(row(
+        (t.entryTime || '').slice(0, 16), (t.exitTime || '').slice(0, 16),
+        t.optionType, t.tradingSymbol, t.strike, t.expiry,
+        t.entryPrice != null ? Number(t.entryPrice).toFixed(2) : '',
+        t.exitPrice  != null ? Number(t.exitPrice).toFixed(2)  : '',
+        t.quantity,
+        t.pnl    != null ? Number(t.pnl).toFixed(2)    : '',
+        t.pnlPct != null ? Number(t.pnlPct).toFixed(2) : '',
+        t.barsInTrade, t.exitReason,
+        t.capitalAfter != null ? Number(t.capitalAfter).toFixed(2) : '',
+      )));
+      lines.push(blank);
+    }
+
+    // ── Diagnostics (if available) ───────────────────────────────────────────
+    if (summary?.diagnostics) {
+      const d = summary.diagnostics;
+      lines.push(row('=== Replay Diagnostics ==='));
+      lines.push(row('Total Candles', 'With Buy Candidate', 'With Sell Candidate',
+        'With Eligible Candidate', 'Winner Selected', 'Stayed Neutral',
+        'No Signals', 'Below Score', 'Score Gap Too Small',
+        'Blocked RecentMove', 'Blocked VWAP', 'Blocked Chop'));
+      lines.push(row(
+        d.totalCandles, d.candlesWithBuyCandidate, d.candlesWithSellCandidate,
+        d.candlesWithEligibleCandidate, d.candlesWithWinner, d.candlesNeutral,
+        d.candlesNoSignals, d.candlesBlockedByScore, d.candlesBlockedByScoreGap,
+        d.candlesBlockedByRecentMove, d.candlesBlockedByVwap, d.candlesBlockedByChop,
+      ));
+      if (d.neutralReasonCounts && Object.keys(d.neutralReasonCounts).length > 0) {
+        lines.push(blank);
+        lines.push(row('=== Neutral Reason Breakdown ==='));
+        lines.push(row('Reason', 'Count'));
+        Object.entries(d.neutralReasonCounts).forEach(([r, c]) => lines.push(row(r, c)));
+      }
+      lines.push(blank);
+    }
+
+    // ── Per-Candle Feed ─────────────────────────────────────────────────────
+    if (feed.length > 0) {
+      lines.push(row('=== Per-Candle Feed ==='));
+      lines.push(row(
+        // Progress
+        'Candle #', 'Total Candles',
+        // NIFTY OHLCV
+        'Time', 'NIFTY Open', 'NIFTY High', 'NIFTY Low', 'NIFTY Close', 'NIFTY Volume',
+        // Decision
+        'Regime', 'Raw Bias', 'Prev Bias', 'Conf Bias',
+        'Winner Strategy', 'Winner Score', 'Score Gap', 'Confidence',
+        '2nd Strategy', '2nd Score',
+        'Neutral Reason',
+        'Shadow Winner', 'Shadow Score', 'Shadow Not-Taken Reason',
+        'Recent Move 3%', 'Recent Move 5%', 'VWAP Dist%',
+        'Entry Allowed', 'Block Reason',
+        'Switch Requested', 'Switch Confirmed', 'Switch Reason', 'Switch Count Today',
+        'Bars Since Trade',
+        // Candidates (compact signal:score:eligible per strategy)
+        'Candidates',
+        // Execution
+        'Position State', 'Desired Side', 'Action', 'Exit Reason',
+        'Selected Symbol', 'Option Type', 'Strike', 'Expiry',
+        'Entry Price', 'Exit Price', 'Bars In Trade',
+        'uPnL', 'rPnL', 'Total PnL', 'Capital',
+        // Option candle OHLCV
+        'Option Time', 'Option Open', 'Option High', 'Option Low', 'Option Close', 'Option Volume',
+      ));
+      const n2 = v => v != null ? Number(v).toFixed(2) : '';
+      feed.forEach(e => lines.push(row(
+        e.emitted ?? '', e.total ?? '',
+        (e.niftyTime || '').slice(0, 19),
+        n2(e.niftyOpen), n2(e.niftyHigh), n2(e.niftyLow), n2(e.niftyClose),
+        e.niftyVolume ?? '',
+        e.regime || '', e.niftyBias || '', e.previousNiftyBias || '', e.confirmedBias || '',
+        e.winnerStrategy || '', n2(e.winnerScore), n2(e.scoreGap),
+        e.confidenceLevel || '',
+        e.secondStrategy || '', n2(e.secondScore),
+        e.neutralReason || '',
+        e.shadowWinner || '', n2(e.shadowWinnerScore), e.shadowWinnerReasonNotTaken || '',
+        n2(e.recentMove3), n2(e.recentMove5), n2(e.distanceFromVwap),
+        e.entryAllowed ? 'Yes' : 'No', e.blockReason || '',
+        e.switchRequested ? 'Yes' : 'No', e.switchConfirmed ? 'Yes' : 'No',
+        e.switchReason || '', e.switchCountToday ?? '',
+        e.barsSinceLastTrade ?? '',
+        // Candidates: strategyType|signal|score|eligible|eligibilityReason for each
+        (e.candidates || []).map(c =>
+          `${c.strategyType}:${c.signal}:${Number(c.score).toFixed(1)}:${c.eligible ? 'ok' : 'blocked'}${c.eligibilityReason ? '(' + c.eligibilityReason + ')' : ''}`
+        ).join(' | '),
+        e.positionState || '', e.desiredSide || '', e.action || '', e.exitReason || '',
+        e.selectedTradingSymbol || '', e.selectedOptionType || '',
+        e.selectedStrike ?? '', e.selectedExpiry || '',
+        n2(e.entryPrice), n2(e.exitPrice), e.barsInTrade ?? '',
+        n2(e.unrealizedPnl), n2(e.realizedPnl), n2(e.totalPnl), n2(e.capital),
+        (e.optionTime || '').slice(0, 19),
+        n2(e.optionOpen), n2(e.optionHigh), n2(e.optionLow), n2(e.optionClose),
+        e.optionVolume ?? '',
+      )));
+
+      // ── Per-Candidate Pipeline Breakdown (separate section per strategy) ──
+      const strategyTypes = [...new Set(
+        feed.flatMap(e => (e.candidates || []).map(c => c.strategyType))
+      )];
+      if (strategyTypes.length > 0) {
+        lines.push(blank);
+        lines.push(row('=== Candidate Score Pipeline Breakdown ==='));
+        lines.push(row(
+          'Time', 'Strategy', 'Signal',
+          'Base Score', 'Trend', 'Volatility', 'Momentum', 'Confidence',
+          'Pen Reversal', 'Pen Overextension', 'Pen SameColor', 'Pen Mismatch', 'Pen VolatileOpt',
+          'Total Penalty', 'Final Score', 'Eligible', 'Eligibility Reason',
+        ));
+        feed.forEach(e => {
+          (e.candidates || []).forEach(c => {
+            lines.push(row(
+              (e.niftyTime || '').slice(0, 19),
+              c.strategyType, c.signal,
+              n2(c.baseScore),
+              n2(c.trendComponent), n2(c.volatilityComponent),
+              n2(c.momentumComponent), n2(c.confidenceComponent),
+              n2(c.penaltyReversal), n2(c.penaltyOverextension), n2(c.penaltySameColor),
+              n2(c.penaltyMismatch), n2(c.penaltyVolatileOption),
+              n2(c.totalPenalty), n2(c.score),
+              c.eligible ? 'Yes' : 'No', c.eligibilityReason || '',
+            ));
+          });
+        });
+      }
+    }
+
+    const csv  = lines.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url;
+    a.download = `options_replay_${nifty.symbol || 'data'}_${(fromDate || '').slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    if (status === 'running') { stop(); return; }
+
+    setFeed([]); setSummary(null); setInitInfo(null); setError(''); setStatus('running');
+
+    // Save to recent dates whenever from == to (single-day replay)
+    const fromDay = (fromDate || '').slice(0, 10);
+    const toDay   = (toDate   || '').slice(0, 10);
+    if (fromDay && fromDay === toDay) saveRecentDate(fromDay);
+
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
+    const enabledStrats = strategies
+      .filter(s => s.enabled)
+      .map(s => ({ strategyType: s.strategyType, parameters: s.parameters }));
+
+    const payload = {
+      userId:    session.userId,
+      brokerName: session.brokerName,
+      niftyInstrumentToken: nifty.instrumentToken ? parseInt(nifty.instrumentToken, 10) : undefined,
+      niftySymbol:   nifty.symbol   || 'NIFTY 50',
+      niftyExchange: nifty.exchange || 'NSE',
+      interval,
+      fromDate: fromDate ? `${fromDate}:00` : undefined,
+      toDate:   toDate   ? `${toDate}:00`   : undefined,
+      warmupDays: parseInt(warmupDays, 10) || 5,
+      quantity:   parseInt(quantity,  10) || 0,
+      initialCapital: parseFloat(capital) || 100000,
+      ceOptions: cePool.filter(i => i.instrumentToken).map(i => ({
+        instrumentToken: parseInt(i.instrumentToken, 10),
+        tradingSymbol: i.symbol,
+        exchange: i.exchange,
+      })),
+      peOptions: pePool.filter(i => i.instrumentToken).map(i => ({
+        instrumentToken: parseInt(i.instrumentToken, 10),
+        tradingSymbol: i.symbol,
+        exchange: i.exchange,
+      })),
+      strategies: enabledStrats,
+      decisionConfig: {
+        minScore:          parseFloat(decisionCfg.minScore)          || 40,
+        minScoreGap:       parseFloat(decisionCfg.minScoreGap)       || 8,
+        maxRecentMove3:    parseFloat(decisionCfg.maxRecentMove3)     || 1.5,
+        maxRecentMove5:    parseFloat(decisionCfg.maxRecentMove5)     || 2.5,
+        maxAbsVwapDist:    parseFloat(decisionCfg.maxAbsVwapDist)     || 1.5,
+        minBarsSinceTrade: parseInt(decisionCfg.minBarsSinceTrade, 10) || 3,
+        chopFilter:        decisionCfg.chopFilter,
+        chopLookback:      parseInt(decisionCfg.chopLookback, 10)      || 8,
+      },
+      selectionConfig: {
+        minPremium: parseFloat(selectionCfg.minPremium) || 50,
+        maxPremium: parseFloat(selectionCfg.maxPremium) || 300,
+      },
+      switchConfig: {
+        switchConfirmationCandles: parseInt(switchCfg.switchConfirmationCandles, 10) || 2,
+        maxSwitchesPerDay:         parseInt(switchCfg.maxSwitchesPerDay, 10)         || 3,
+      },
+      regimeConfig: optsRegimeCfg.enabled ? {
+        enabled:            true,
+        adxPeriod:          parseInt(optsRegimeCfg.adxPeriod, 10)         || 14,
+        atrPeriod:          parseInt(optsRegimeCfg.atrPeriod, 10)         || 14,
+        adxTrendThreshold:  parseFloat(optsRegimeCfg.adxTrendThreshold)   || 25,
+        atrVolatilePct:     parseFloat(optsRegimeCfg.atrVolatilePct)      || 2.0,
+        atrCompressionPct:  parseFloat(optsRegimeCfg.atrCompressionPct)   || 0.5,
+      } : { enabled: false },
+      regimeRules: {
+        enabled:               regimeRules.enabled,
+        rangingMinScore:       parseFloat(regimeRules.rangingMinScore)       || 35,
+        rangingMinScoreGap:    parseFloat(regimeRules.rangingMinScoreGap)    || 6,
+        trendingMinScore:      parseFloat(regimeRules.trendingMinScore)      || 25,
+        trendingMinScoreGap:   parseFloat(regimeRules.trendingMinScoreGap)   || 3,
+        compressionMinScore:   parseFloat(regimeRules.compressionMinScore)   || 25,
+        compressionMinScoreGap: parseFloat(regimeRules.compressionMinScoreGap) || 3,
+      },
+      chopRules: {
+        enabled: chopRules.enabled,
+        ...Object.fromEntries(['ranging','trending','compression','volatile'].map(rk => [
+          rk === 'volatile' ? 'volatileRegime' : rk,
+          { filterEnabled: chopRules[rk].filterEnabled, flipRatio: parseFloat(chopRules[rk].flipRatio) || 0.65 },
+        ])),
+      },
+      tradingRules: {
+        enabled:               tradingRules.enabled,
+        rangingNoTrade:        tradingRules.rangingNoTrade,
+        volatileNoTrade:       tradingRules.volatileNoTrade,
+        noSameCandleReversal:  tradingRules.noSameCandleReversal,
+      },
+      regimeStrategyRules: {
+        enabled: regimeStrategyRules.enabled,
+        ranging:        regimeStrategyRules.ranging.enabled     ? regimeStrategyRules.ranging.allowed     : [],
+        trending:       regimeStrategyRules.trending.enabled    ? regimeStrategyRules.trending.allowed    : [],
+        compression:    regimeStrategyRules.compression.enabled ? regimeStrategyRules.compression.allowed : [],
+        volatileRegime: regimeStrategyRules.volatile.enabled    ? regimeStrategyRules.volatile.allowed    : [],
+      },
+      riskConfig: optsRisk.enabled ? {
+        enabled:            true,
+        stopLossPct:        parseFloat(optsRisk.stopLossPct)        || 0,
+        takeProfitPct:      parseFloat(optsRisk.takeProfitPct)      || 0,
+        maxRiskPerTradePct: parseFloat(optsRisk.maxRiskPerTradePct) || 0,
+        dailyLossCapPct:    parseFloat(optsRisk.dailyLossCapPct)    || 0,
+        cooldownCandles:    parseInt(optsRisk.cooldownCandles, 10)  || 0,
+      } : { enabled: false },
+      rangeQualityConfig: rangeQuality.enabled ? {
+        enabled:                       true,
+        lookbackBars:                  parseInt(rangeQuality.lookbackBars, 10)               || 10,
+        minUpperTouches:               parseInt(rangeQuality.minUpperTouches, 10)            || 2,
+        minLowerTouches:               parseInt(rangeQuality.minLowerTouches, 10)            || 2,
+        bandTouchTolerancePct:         parseFloat(rangeQuality.bandTouchTolerancePct)        || 0.15,
+        minRangeWidthPct:              parseFloat(rangeQuality.minRangeWidthPct)             || 0.4,
+        maxRangeWidthPct:              parseFloat(rangeQuality.maxRangeWidthPct)             || 2.0,
+        maxDirectionalDriftPctOfRange: parseFloat(rangeQuality.maxDirectionalDriftPctOfRange) || 0.6,
+        chopFlipRatioLimit:            parseFloat(rangeQuality.chopFlipRatioLimit)           || 0.65,
+        enableChopCheck:               rangeQuality.enableChopCheck,
+      } : { enabled: false },
+      speedMultiplier: parseInt(speed, 10) || 1,
+      persist: true,
+    };
+
+    try {
+      const response = await startOptionsReplayEval(payload, ctrl.signal);
+      if (!response.body) throw new Error('No response body');
+      const reader  = response.body.getReader();
+      readerRef.current = reader;
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop();
+        for (const part of parts) {
+          let evtName = null, data = null;
+          for (const line of part.split('\n')) {
+            if (line.startsWith('event:')) evtName = line.slice(6).trim();
+            else if (line.startsWith('data:')) data = line.slice(5).trim();
+          }
+          if (!evtName || !data) continue;
+          if (evtName === 'error') {
+            setError(data.replace(/^"|"$/g, ''));
+            setStatus('error');
+            return;
+          }
+          try {
+            const parsed = JSON.parse(data);
+            if (evtName === 'init') {
+              setInitInfo(parsed);
+            } else if (evtName === 'candle') {
+              setFeed(prev => [...prev.slice(-499), parsed]);
+            } else if (evtName === 'summary') {
+              setSummary(parsed);
+            }
+          } catch {}
+        }
+      }
+      setStatus('completed');
+    } catch (err) {
+      if (err.name === 'AbortError') { setStatus('idle'); return; }
+      setError(err.message);
+      setStatus('error');
+    }
+  }
+
+  if (!isActive) return (
+    <div className="bt-empty-state">
+      <p>Activate a broker session to use Options Replay Test.</p>
+    </div>
+  );
+
+  const isRunning   = status === 'running';
+  const canRun      = nifty.instrumentToken &&
+    (cePool.some(i => i.instrumentToken) || pePool.some(i => i.instrumentToken));
+  const lastEvt     = feed[feed.length - 1];
+  const closedTrades = lastEvt?.closedTrades || summary?.closedTrades || [];
+
+  return (
+    <div>
+      {/* ── Results panel (always visible at top) ── */}
+      <div className="card bt-opts-card" style={{ marginBottom: 16 }}>
+        <div className="bt-live-right-tabs" style={{ marginBottom: 14 }}>
+          {[['feed','Feed'],['pnl','P&L'],['portfolio','Portfolio'],['details','Details']].map(([k, l]) => (
+            <button key={k} className={`bt-live-tab-btn ${rightTab === k ? 'active' : ''}`} onClick={() => setRightTab(k)}>{l}</button>
+          ))}
+          {feed.length > 0 && (
+            <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-secondary)' }}>
+              {feed.length} candles · {closedTrades.length} trades
+            </span>
+          )}
+        </div>
+
+        {/* ── Persistent P&L strip (visible on all tabs) ── */}
+        {(lastEvt || summary) && (() => {
+          const totalPnl    = lastEvt?.totalPnl    ?? summary?.totalPnl;
+          const realizedPnl = lastEvt?.realizedPnl ?? summary?.realizedPnl;
+          const unrealPnl   = lastEvt?.unrealizedPnl;
+          const capital     = lastEvt?.capital     ?? summary?.finalCapital;
+          const trades      = closedTrades.length;
+          const wins        = closedTrades.filter(t => t.pnl > 0).length;
+          const losses      = closedTrades.filter(t => t.pnl < 0).length;
+          const winRate     = trades > 0 ? (wins / trades * 100).toFixed(1) + '%' : '—';
+          return (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 12px', marginBottom: 12, padding: '8px 12px', background: 'var(--bg-secondary)', borderRadius: 6, borderLeft: '3px solid ' + (totalPnl > 0 ? '#22c55e' : totalPnl < 0 ? '#ef4444' : 'var(--border)') }}>
+              {[
+                ['Total P&L',  totalPnl,    true,  true],
+                ['Realized',   realizedPnl, true,  false],
+                ['Unrealized', unrealPnl,   true,  false],
+                ['Capital',    capital,     false, false],
+                ['Trades',     trades,      false, false],
+                ['W/L',        `${wins}/${losses}`, false, false],
+                ['Win Rate',   winRate,     false, false],
+              ].map(([lbl, val, isPnl, bold]) => (
+                <div key={lbl} style={{ fontSize: 11 }}>
+                  <div style={{ color: 'var(--text-muted)', marginBottom: 1 }}>{lbl}</div>
+                  <div style={{ fontWeight: bold ? 800 : 700, fontSize: bold ? 13 : 11, ...(isPnl && val != null ? pnlStyle(val) : {}) }}>
+                    {val != null ? (typeof val === 'number' ? fmt2(val) : val) : '—'}
+                  </div>
+                </div>
+              ))}
+            </div>
+          );
+        })()}
+
+        {/* ── Feed ── */}
+        {rightTab === 'feed' && (
+          <>
+            {lastEvt && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 18px', marginBottom: 14, padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 6 }}>
+                {[
+                  ['Position', lastEvt.positionState, lastEvt.positionState === 'LONG_CALL' ? '#22c55e' : lastEvt.positionState === 'LONG_PUT' ? '#ef4444' : undefined],
+                  ['Bias', lastEvt.niftyBias, lastEvt.niftyBias === 'BULLISH' ? '#22c55e' : lastEvt.niftyBias === 'BEARISH' ? '#ef4444' : undefined],
+                  ['Conf Bias', lastEvt.confirmedBias, lastEvt.confirmedBias === 'BULLISH' ? '#22c55e' : lastEvt.confirmedBias === 'BEARISH' ? '#ef4444' : undefined],
+                  ['Action', lastEvt.action, lastEvt.action === 'ENTERED' ? '#22c55e' : lastEvt.action === 'EXITED' || lastEvt.action === 'FORCE_CLOSED' ? '#f97316' : undefined],
+                  ['Winner', lastEvt.winnerStrategy || lastEvt.shadowWinner && `(${lastEvt.shadowWinner})`, undefined],
+                  ['Score', fmt2(lastEvt.winnerScore || lastEvt.shadowWinnerScore), undefined],
+                  ['2nd', lastEvt.secondStrategy ? `${lastEvt.secondStrategy} ${fmt2(lastEvt.secondScore)}` : '—', undefined],
+                  ['Gap', fmt2(lastEvt.scoreGap), undefined],
+                  ['NeutralReason', lastEvt.neutralReason || '—', lastEvt.neutralReason ? '#f59e0b' : undefined],
+                  ['Shadow', lastEvt.shadowWinner ? `${lastEvt.shadowWinner} ${fmt2(lastEvt.shadowWinnerScore)}` : '—', lastEvt.shadowWinner ? '#8b5cf6' : undefined],
+                  ['uPnL', fmt2(lastEvt.unrealizedPnl), lastEvt.unrealizedPnl > 0 ? '#22c55e' : lastEvt.unrealizedPnl < 0 ? '#ef4444' : undefined],
+                  ['rPnL', fmt2(lastEvt.realizedPnl), lastEvt.realizedPnl > 0 ? '#22c55e' : lastEvt.realizedPnl < 0 ? '#ef4444' : undefined],
+                  ['Capital', fmt2(lastEvt.capital), undefined],
+                  ['Block', lastEvt.blockReason || '—', lastEvt.blockReason ? '#ef4444' : undefined],
+                ].map(([lbl, val, color]) => (
+                  <div key={lbl} style={{ fontSize: 11 }}>
+                    <div style={{ color: 'var(--text-secondary)' }}>{lbl}</div>
+                    <div style={{ fontWeight: 700, color }}>{val || '—'}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {/* ── Active Config Summary ── */}
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 10 }}>
+            <button type="button" className="btn-secondary btn-xs" style={{ flexShrink: 0, marginTop: 1 }}
+              onClick={() => {
+                // ── Config line ──
+                const ceSymbols = cePool.filter(i => i.symbol).map(i => i.symbol).join(', ');
+                const peSymbols = pePool.filter(i => i.symbol).map(i => i.symbol).join(', ');
+                let text = `Run: ${nifty.symbol || '—'} ${interval} ${(fromDate || '').slice(0, 10)} → ${(toDate || '').slice(0, 10)}`;
+                if (ceSymbols) text += ` CE=[${ceSymbols}]`;
+                if (peSymbols) text += ` PE=[${peSymbols}]`;
+                text += '\nConfig: ';
+                text += `minScore=${decisionCfg.minScore} gap=${decisionCfg.minScoreGap} move3=${decisionCfg.maxRecentMove3}% move5=${decisionCfg.maxRecentMove5}% vwapDist=${decisionCfg.maxAbsVwapDist}% minBars=${decisionCfg.minBarsSinceTrade} chop=${decisionCfg.chopFilter ? `ON(${decisionCfg.chopLookback})` : 'OFF'} switchConf=${switchCfg.switchConfirmationCandles} maxSwitch=${switchCfg.maxSwitchesPerDay} prem=${selectionCfg.minPremium}–${selectionCfg.maxPremium}`;
+                if (regimeRules.enabled) {
+                  text += ` | RANGING ${regimeRules.rangingMinScore}/${regimeRules.rangingMinScoreGap} TRENDING ${regimeRules.trendingMinScore}/${regimeRules.trendingMinScoreGap} COMPRESSION ${regimeRules.compressionMinScore}/${regimeRules.compressionMinScoreGap}`;
+                }
+                if (tradingRules.enabled) {
+                  const active = [
+                    tradingRules.rangingNoTrade       && 'No RANGING',
+                    tradingRules.volatileNoTrade      && 'No VOLATILE',
+                    tradingRules.noSameCandleReversal && 'No Reversal',
+                  ].filter(Boolean);
+                  if (active.length) text += ' | Rules: ' + active.join(', ');
+                }
+                if (regimeStrategyRules.enabled) {
+                  const parts = [
+                    { key: 'ranging', label: 'RANGING' }, { key: 'trending', label: 'TRENDING' },
+                    { key: 'compression', label: 'COMPRESSION' }, { key: 'volatile', label: 'VOLATILE' },
+                  ].filter(({ key: rk }) => regimeStrategyRules[rk].enabled)
+                   .map(({ key: rk, label }) => `${label}[${regimeStrategyRules[rk].allowed.join(',') || 'none'}]`);
+                  if (parts.length) text += ' | StratRules: ' + parts.join(' ');
+                }
+                if (rangeQuality.enabled) {
+                  text += ` | RngQ: lbk=${rangeQuality.lookbackBars} ut>=${rangeQuality.minUpperTouches} lt>=${rangeQuality.minLowerTouches} W=${rangeQuality.minRangeWidthPct}-${rangeQuality.maxRangeWidthPct}% drift<=${rangeQuality.maxDirectionalDriftPctOfRange} chop<=${rangeQuality.chopFlipRatioLimit}`;
+                }
+                if (optsRisk.enabled) {
+                  text += ` | Risk: SL=${optsRisk.stopLossPct}% TP=${optsRisk.takeProfitPct}% MaxRisk=${optsRisk.maxRiskPerTradePct}% DailyCap=${optsRisk.dailyLossCapPct}% Cooldown=${optsRisk.cooldownCandles}`;
+                }
+                text += '\n\n';
+
+                // ── Feed header ──
+                const headers = ['Time','NIFTY','Regime','Bias','ConfBias','Winner','Score','2nd','Gap','Shadow','NeutralReason','State','Action','Option','OptPx','uPnL','rPnL','Block'];
+                text += headers.join('\t') + '\n';
+
+                // ── Feed rows (chronological order) ──
+                [...feed].reverse().forEach(evt => {
+                  text += [
+                    (evt.niftyTime || '').slice(0, 16),
+                    evt.niftyClose != null ? Number(evt.niftyClose).toFixed(2) : '',
+                    evt.regime || '',
+                    evt.niftyBias || '',
+                    evt.confirmedBias || '',
+                    evt.winnerStrategy || '',
+                    evt.winnerScore != null ? Number(evt.winnerScore).toFixed(2) : '',
+                    evt.secondStrategy ? `${evt.secondStrategy} ${Number(evt.secondScore).toFixed(2)}` : '',
+                    evt.scoreGap != null ? Number(evt.scoreGap).toFixed(2) : '',
+                    evt.shadowWinner ? `${evt.shadowWinner} ${Number(evt.shadowWinnerScore).toFixed(2)}` : '',
+                    evt.neutralReason || '',
+                    evt.positionState || '',
+                    evt.action || '',
+                    evt.selectedTradingSymbol || '',
+                    evt.optionClose != null ? Number(evt.optionClose).toFixed(2) : '',
+                    evt.unrealizedPnl != null ? Number(evt.unrealizedPnl).toFixed(2) : '',
+                    evt.realizedPnl  != null ? Number(evt.realizedPnl).toFixed(2)  : '',
+                    evt.blockReason || '',
+                  ].join('\t') + '\n';
+                });
+
+                navigator.clipboard.writeText(text).catch(() => {});
+              }}>
+              Copy
+            </button>
+            <button type="button" className="btn-secondary btn-xs" style={{ flexShrink: 0, marginTop: 1 }}
+              onClick={downloadCSV}>
+              Download CSV
+            </button>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 0', fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+              {/* ── Instrument / Date / Interval ── */}
+              <span style={{ marginRight: 10, fontWeight: 700, color: 'var(--text-primary)' }}>Run:</span>
+              <span style={{ marginRight: 14 }}><b style={{ color: 'var(--text-primary)' }}>{nifty.symbol || '—'}</b></span>
+              <span style={{ marginRight: 14 }}><b style={{ color: 'var(--text-primary)' }}>{interval}</b></span>
+              <span style={{ marginRight: 14 }}>{(fromDate || '').slice(0, 10)}<b style={{ color: 'var(--text-muted)', margin: '0 4px' }}>→</b>{(toDate || '').slice(0, 10)}</span>
+              {cePool.some(i => i.symbol) && (
+                <span style={{ marginRight: 14 }}>CE=<b style={{ color: '#22c55e' }}>{cePool.filter(i => i.symbol).map(i => i.symbol).join(', ')}</b></span>
+              )}
+              {pePool.some(i => i.symbol) && (
+                <span style={{ marginRight: 14 }}>PE=<b style={{ color: '#ef4444' }}>{pePool.filter(i => i.symbol).map(i => i.symbol).join(', ')}</b></span>
+              )}
+              <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+              <span style={{ marginRight: 10, fontWeight: 700, color: 'var(--text-primary)' }}>Config:</span>
+              <span style={{ marginRight: 14 }}>minScore=<b style={{ color: 'var(--text-primary)' }}>{decisionCfg.minScore}</b></span>
+              <span style={{ marginRight: 14 }}>gap=<b style={{ color: 'var(--text-primary)' }}>{decisionCfg.minScoreGap}</b></span>
+              <span style={{ marginRight: 14 }}>move3=<b style={{ color: 'var(--text-primary)' }}>{decisionCfg.maxRecentMove3}%</b></span>
+              <span style={{ marginRight: 14 }}>move5=<b style={{ color: 'var(--text-primary)' }}>{decisionCfg.maxRecentMove5}%</b></span>
+              <span style={{ marginRight: 14 }}>vwapDist=<b style={{ color: 'var(--text-primary)' }}>{decisionCfg.maxAbsVwapDist}%</b></span>
+              <span style={{ marginRight: 14 }}>minBars=<b style={{ color: 'var(--text-primary)' }}>{decisionCfg.minBarsSinceTrade}</b></span>
+              <span style={{ marginRight: 14 }}>chop=<b style={{ color: 'var(--text-primary)' }}>{decisionCfg.chopFilter ? `ON(${decisionCfg.chopLookback})` : 'OFF'}</b></span>
+              <span style={{ marginRight: 14 }}>switchConf=<b style={{ color: 'var(--text-primary)' }}>{switchCfg.switchConfirmationCandles}</b></span>
+              <span style={{ marginRight: 14 }}>maxSwitch=<b style={{ color: 'var(--text-primary)' }}>{switchCfg.maxSwitchesPerDay}</b></span>
+              <span style={{ marginRight: 14 }}>prem=<b style={{ color: 'var(--text-primary)' }}>{selectionCfg.minPremium}–{selectionCfg.maxPremium}</b></span>
+              {regimeRules.enabled && (
+                <>
+                  <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+                  <span style={{ marginRight: 6, fontWeight: 700, color: '#f59e0b' }}>RANGING</span>
+                  <span style={{ marginRight: 14, color: '#f59e0b' }}>{regimeRules.rangingMinScore}/{regimeRules.rangingMinScoreGap}</span>
+                  <span style={{ marginRight: 6, fontWeight: 700, color: '#22c55e' }}>TRENDING</span>
+                  <span style={{ marginRight: 14, color: '#22c55e' }}>{regimeRules.trendingMinScore}/{regimeRules.trendingMinScoreGap}</span>
+                  <span style={{ marginRight: 6, fontWeight: 700, color: '#0ea5e9' }}>COMPRESSION</span>
+                  <span style={{ color: '#0ea5e9' }}>{regimeRules.compressionMinScore}/{regimeRules.compressionMinScoreGap}</span>
+                </>
+              )}
+              {chopRules.enabled && (() => {
+                const parts = [
+                  { key: 'ranging', label: 'RAN', color: '#f59e0b' },
+                  { key: 'trending', label: 'TRE', color: '#22c55e' },
+                  { key: 'compression', label: 'COM', color: '#0ea5e9' },
+                  { key: 'volatile', label: 'VOL', color: '#ef4444' },
+                ].map(({ key: rk, label, color }) => {
+                  const c = chopRules[rk];
+                  return (
+                    <span key={rk} style={{ marginRight: 10 }}>
+                      <b style={{ color }}>{label}</b>
+                      <span style={{ color: 'var(--text-muted)', marginLeft: 3 }}>{c.filterEnabled ? c.flipRatio : 'OFF'}</span>
+                    </span>
+                  );
+                });
+                return (
+                  <>
+                    <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+                    <span style={{ marginRight: 8, fontWeight: 700, color: 'var(--text-primary)' }}>Chop:</span>
+                    {parts}
+                  </>
+                );
+              })()}
+              {optsRegimeCfg.enabled && (
+                <>
+                  <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+                  <span style={{ marginRight: 6, fontWeight: 700, color: 'var(--text-primary)' }}>Regime:</span>
+                  <span style={{ marginRight: 14 }}>ADX(<b style={{ color: 'var(--text-primary)' }}>{optsRegimeCfg.adxPeriod}</b>)&gt;<b style={{ color: 'var(--text-primary)' }}>{optsRegimeCfg.adxTrendThreshold}</b></span>
+                  <span style={{ marginRight: 14 }}>ATR(<b style={{ color: 'var(--text-primary)' }}>{optsRegimeCfg.atrPeriod}</b>) V&gt;<b style={{ color: 'var(--text-primary)' }}>{optsRegimeCfg.atrVolatilePct}%</b> C&lt;<b style={{ color: 'var(--text-primary)' }}>{optsRegimeCfg.atrCompressionPct}%</b></span>
+                </>
+              )}
+              {tradingRules.enabled && (() => {
+                const active = [
+                  tradingRules.rangingNoTrade       && 'No RANGING',
+                  tradingRules.volatileNoTrade      && 'No VOLATILE',
+                  tradingRules.noSameCandleReversal && 'No Reversal',
+                ].filter(Boolean);
+                return active.length > 0 ? (
+                  <>
+                    <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+                    <span style={{ marginRight: 6, fontWeight: 700, color: 'var(--text-primary)' }}>Rules:</span>
+                    {active.map(r => (
+                      <span key={r} style={{ marginRight: 10, color: '#ef4444', fontWeight: 600 }}>{r}</span>
+                    ))}
+                  </>
+                ) : null;
+              })()}
+              {regimeStrategyRules.enabled && (
+                <>
+                  <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+                  <span style={{ marginRight: 8, fontWeight: 700, color: 'var(--text-primary)' }}>StratRules:</span>
+                  {[
+                    { key: 'ranging',     label: 'RANGING',     color: '#f59e0b' },
+                    { key: 'trending',    label: 'TRENDING',    color: '#22c55e' },
+                    { key: 'compression', label: 'COMPRESSION', color: '#0ea5e9' },
+                    { key: 'volatile',    label: 'VOLATILE',    color: '#ef4444' },
+                  ].map(({ key: rk, label, color }) => {
+                    const cfg = regimeStrategyRules[rk];
+                    if (!cfg.enabled) return null;
+                    const list = cfg.allowed.length > 0 ? cfg.allowed.map(s => s.replace(/_/g, ' ')).join(', ') : 'none';
+                    return (
+                      <span key={rk} style={{ marginRight: 14 }}>
+                        <b style={{ color }}>{label}</b>
+                        <span style={{ color: 'var(--text-muted)', marginLeft: 4 }}>[{list}]</span>
+                      </span>
+                    );
+                  })}
+                </>
+              )}
+              {rangeQuality.enabled && (
+                <>
+                  <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+                  <span style={{ marginRight: 6, fontWeight: 700, color: '#f59e0b' }}>RngQ:</span>
+                  <span style={{ marginRight: 10 }}>lbk=<b style={{ color: 'var(--text-primary)' }}>{rangeQuality.lookbackBars}</b></span>
+                  <span style={{ marginRight: 10 }}>ut≥<b style={{ color: 'var(--text-primary)' }}>{rangeQuality.minUpperTouches}</b> lt≥<b style={{ color: 'var(--text-primary)' }}>{rangeQuality.minLowerTouches}</b></span>
+                  <span style={{ marginRight: 10 }}>W=<b style={{ color: 'var(--text-primary)' }}>{rangeQuality.minRangeWidthPct}–{rangeQuality.maxRangeWidthPct}%</b></span>
+                  <span style={{ marginRight: 10 }}>drift≤<b style={{ color: 'var(--text-primary)' }}>{rangeQuality.maxDirectionalDriftPctOfRange}</b></span>
+                  {rangeQuality.enableChopCheck && <span style={{ marginRight: 10 }}>chop≤<b style={{ color: 'var(--text-primary)' }}>{rangeQuality.chopFlipRatioLimit}</b></span>}
+                </>
+              )}
+              {optsRisk.enabled && (
+                <>
+                  <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+                  <span style={{ marginRight: 8, fontWeight: 700, color: 'var(--text-primary)' }}>Risk:</span>
+                  {optsRisk.stopLossPct     && <span style={{ marginRight: 10 }}>SL=<b style={{ color: '#ef4444' }}>{optsRisk.stopLossPct}%</b></span>}
+                  {optsRisk.takeProfitPct   && <span style={{ marginRight: 10 }}>TP=<b style={{ color: '#22c55e' }}>{optsRisk.takeProfitPct}%</b></span>}
+                  {optsRisk.maxRiskPerTradePct && <span style={{ marginRight: 10 }}>MaxRisk=<b style={{ color: 'var(--text-primary)' }}>{optsRisk.maxRiskPerTradePct}%</b></span>}
+                  {optsRisk.dailyLossCapPct && <span style={{ marginRight: 10 }}>DailyCap=<b style={{ color: 'var(--text-primary)' }}>{optsRisk.dailyLossCapPct}%</b></span>}
+                  {optsRisk.cooldownCandles && <span style={{ marginRight: 10 }}>Cooldown=<b style={{ color: 'var(--text-primary)' }}>{optsRisk.cooldownCandles}</b></span>}
+                </>
+              )}
+            </div>
+            </div>
+
+            {feed.length === 0
+              ? <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 32 }}>Feed will appear once the replay starts.</div>
+              : (
+                <div className="bt-opts-feed-wrap">
+                  <table className="bt-opts-feed-table">
+                    <thead>
+                      <tr>
+                        <th>Time</th><th>NIFTY</th><th>Regime</th><th>Bias</th><th>Conf</th>
+                        <th>Winner</th><th>Score</th><th>2nd</th><th>Gap</th>
+                        <th>Shadow</th><th>NeutralReason</th>
+                        <th>State</th><th>Action</th>
+                        <th>Option</th><th>Opt Px</th><th>uPnL</th><th>rPnL</th><th>Block</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...feed].reverse().map((evt, i) => (
+                        <tr key={i}>
+                          <td className="de-mono">{(evt.niftyTime || '').slice(0, 16)}</td>
+                          <td>{fmt2(evt.niftyClose)}</td>
+                          <td>{evt.regime || '—'}</td>
+                          <td style={{ color: evt.niftyBias === 'BULLISH' ? '#22c55e' : evt.niftyBias === 'BEARISH' ? '#ef4444' : undefined }}>{evt.niftyBias || '—'}</td>
+                          <td style={{ color: evt.confirmedBias === 'BULLISH' ? '#22c55e' : evt.confirmedBias === 'BEARISH' ? '#ef4444' : undefined }}>{evt.confirmedBias || '—'}</td>
+                          <td>{evt.winnerStrategy || '—'}</td>
+                          <td>{fmt2(evt.winnerScore)}</td>
+                          <td style={{ fontSize: 10, color: 'var(--text-secondary)' }}>{evt.secondStrategy ? `${evt.secondStrategy} ${fmt2(evt.secondScore)}` : '—'}</td>
+                          <td>{fmt2(evt.scoreGap)}</td>
+                          <td style={{ fontSize: 10, color: '#8b5cf6' }}>{evt.shadowWinner ? `${evt.shadowWinner} ${fmt2(evt.shadowWinnerScore)}` : '—'}</td>
+                          <td style={{ fontSize: 10, color: evt.neutralReason ? '#f59e0b' : undefined }}>{evt.neutralReason || '—'}</td>
+                          <td style={{ fontWeight: 600 }}>{evt.positionState || '—'}</td>
+                          <td style={{ color: evt.action === 'ENTERED' ? '#22c55e' : evt.action === 'EXITED' || evt.action === 'FORCE_CLOSED' ? '#f97316' : undefined }}>{evt.action || '—'}</td>
+                          <td className="de-mono">{evt.selectedTradingSymbol || '—'}</td>
+                          <td>{fmt2(evt.optionClose)}</td>
+                          <td style={pnlStyle(evt.unrealizedPnl)}>{fmt2(evt.unrealizedPnl)}</td>
+                          <td style={pnlStyle(evt.realizedPnl)}>{fmt2(evt.realizedPnl)}</td>
+                          <td style={{ color: evt.blockReason ? '#ef4444' : undefined, fontSize: 10 }}>{evt.blockReason || ''}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <div className="bt-opts-feed-count">{feed.length} candles received</div>
+                </div>
+              )
+            }
+          </>
+        )}
+
+        {/* ── P&L ── */}
+        {rightTab === 'pnl' && (
+          <>
+            {!summary && !lastEvt
+              ? <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 32 }}>P&L data will appear after the replay completes.</div>
+              : (
+                <>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: '10px 20px', marginBottom: 20 }}>
+                    {[
+                      ['Total P&L', lastEvt?.totalPnl ?? summary?.totalPnl, true],
+                      ['Realized P&L', lastEvt?.realizedPnl ?? summary?.realizedPnl, true],
+                      ['Unrealized P&L', lastEvt?.unrealizedPnl, true],
+                      ['Capital', lastEvt?.capital ?? summary?.finalCapital, false],
+                      ['Trades', closedTrades.length, false],
+                      ['Wins', closedTrades.filter(t => t.pnl > 0).length, false],
+                      ['Losses', closedTrades.filter(t => t.pnl < 0).length, false],
+                      ['Win Rate', closedTrades.length > 0 ? `${(closedTrades.filter(t => t.pnl > 0).length / closedTrades.length * 100).toFixed(1)}%` : '—', false],
+                    ].map(([lbl, val, isPnl]) => (
+                      <div key={lbl} style={{ padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 6 }}>
+                        <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 }}>{lbl}</div>
+                        <div style={{ fontSize: 16, fontWeight: 700, ...(isPnl && val != null ? pnlStyle(val) : {}) }}>
+                          {val != null ? (typeof val === 'number' ? fmt2(val) : val) : '—'}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {summary?.diagnostics && (() => {
+                    const d = summary.diagnostics;
+                    const neutralBreakdown = d.neutralReasonCounts || {};
+                    return (
+                      <div style={{ marginTop: 20 }}>
+                        <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-secondary)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: 1 }}>Replay Diagnostics</div>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '6px 16px', marginBottom: 14 }}>
+                          {[
+                            ['Total Candles', d.totalCandles],
+                            ['With Buy Candidate', d.candlesWithBuyCandidate],
+                            ['With Sell Candidate', d.candlesWithSellCandidate],
+                            ['With Eligible Candidate (≥minScore)', d.candlesWithEligibleCandidate],
+                            ['Winner Selected', d.candlesWithWinner],
+                            ['Stayed Neutral', d.candlesNeutral],
+                            ['— No Signals (all HOLD)', d.candlesNoSignals],
+                            ['— Below Score Threshold', d.candlesBlockedByScore],
+                            ['— Score Gap Too Small', d.candlesBlockedByScoreGap],
+                            ['Blocked by Recent Move', d.candlesBlockedByRecentMove],
+                            ['Blocked by VWAP Dist', d.candlesBlockedByVwap],
+                            ['Blocked by Chop Filter', d.candlesBlockedByChop],
+                          ].map(([lbl, val]) => (
+                            <div key={lbl} style={{ fontSize: 12, padding: '6px 10px', background: 'var(--bg-secondary)', borderRadius: 5 }}>
+                              <span style={{ color: 'var(--text-secondary)' }}>{lbl}: </span>
+                              <span style={{ fontWeight: 700 }}>{val ?? 0}</span>
+                            </div>
+                          ))}
+                        </div>
+                        {Object.keys(neutralBreakdown).length > 0 && (
+                          <>
+                            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6 }}>Neutral reason breakdown:</div>
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                              {Object.entries(neutralBreakdown).map(([reason, count]) => (
+                                <span key={reason} style={{ fontSize: 11, padding: '3px 8px', background: 'var(--bg-tertiary)', borderRadius: 4, color: '#f59e0b' }}>
+                                  {reason}: <strong>{count}</strong>
+                                </span>
+                              ))}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })()}
+                </>
+              )
+            }
+          </>
+        )}
+
+        {/* ── Portfolio ── */}
+        {rightTab === 'portfolio' && (
+          <>
+            {!lastEvt
+              ? <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 32 }}>Position data will appear once the replay starts.</div>
+              : (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: '10px 20px' }}>
+                  {[
+                    ['Position State', lastEvt.positionState],
+                    ['Desired Side', lastEvt.desiredSide],
+                    ['Selected Option', lastEvt.selectedTradingSymbol],
+                    ['Option Type', lastEvt.selectedOptionType],
+                    ['Strike', lastEvt.selectedStrike],
+                    ['Expiry', lastEvt.selectedExpiry],
+                    ['Entry Price', fmt2(lastEvt.entryPrice)],
+                    ['Current Price', fmt2(lastEvt.optionClose)],
+                    ['Bars in Trade', lastEvt.barsInTrade],
+                    ['Unrealized P&L', fmt2(lastEvt.unrealizedPnl)],
+                    ['Realized P&L', fmt2(lastEvt.realizedPnl)],
+                    ['Total P&L', fmt2(lastEvt.totalPnl)],
+                    ['Capital', fmt2(lastEvt.capital)],
+                    ['Bars Since Trade', lastEvt.barsSinceLastTrade],
+                    ['Switch Count Today', lastEvt.switchCountToday],
+                    ['Regime', lastEvt.regime],
+                    ['NIFTY Bias', lastEvt.niftyBias],
+                    ['Confirmed Bias', lastEvt.confirmedBias],
+                    ['VWAP Dist %', fmt2(lastEvt.distanceFromVwap)],
+                  ].map(([lbl, val]) => (
+                    <div key={lbl} style={{ padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 6 }}>
+                      <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 3 }}>{lbl}</div>
+                      <div style={{ fontWeight: 700, fontSize: 13 }}>{val ?? '—'}</div>
+                    </div>
+                  ))}
+                </div>
+              )
+            }
+          </>
+        )}
+
+        {/* ── Details (Closed Trades) ── */}
+        {rightTab === 'details' && (
+          <>
+            {feed.length > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+                <button type="button" className="btn-secondary btn-xs" onClick={downloadCSV}>Download CSV</button>
+                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{closedTrades.length} trades · {feed.length} candles</span>
+              </div>
+            )}
+            {closedTrades.length === 0
+              ? <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 32 }}>Closed trades will appear here as the replay runs.</div>
+              : (
+                <div className="bt-opts-feed-wrap">
+                  <table className="bt-opts-feed-table">
+                    <thead>
+                      <tr>
+                        <th>Entry Time</th><th>Exit Time</th><th>Type</th><th>Symbol</th>
+                        <th>Strike</th><th>Expiry</th><th>Entry Px</th><th>Exit Px</th>
+                        <th>Qty</th><th>P&L</th><th>P&L %</th><th>Bars</th><th>Exit Reason</th><th>Capital After</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {closedTrades.map((t, i) => (
+                        <tr key={i}>
+                          <td className="de-mono">{(t.entryTime || '').slice(0, 16)}</td>
+                          <td className="de-mono">{(t.exitTime  || '').slice(0, 16)}</td>
+                          <td style={{ color: t.optionType === 'CE' ? '#22c55e' : '#ef4444', fontWeight: 700 }}>{t.optionType}</td>
+                          <td className="de-mono">{t.tradingSymbol}</td>
+                          <td>{t.strike}</td>
+                          <td>{t.expiry}</td>
+                          <td>{fmt2(t.entryPrice)}</td>
+                          <td>{fmt2(t.exitPrice)}</td>
+                          <td>{t.quantity}</td>
+                          <td style={pnlStyle(t.pnl)}>{fmt2(t.pnl)}</td>
+                          <td style={pnlStyle(t.pnlPct)}>{t.pnlPct != null ? `${Number(t.pnlPct).toFixed(1)}%` : '—'}</td>
+                          <td>{t.barsInTrade}</td>
+                          <td style={{ fontSize: 10 }}>{t.exitReason}</td>
+                          <td>{fmt2(t.capitalAfter)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )
+            }
+          </>
+        )}
+      </div>
+
+      <form onSubmit={handleSubmit}>
+
+        {/* ── Actions ── */}
+        {initInfo && (
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8, padding: '6px 10px', background: 'var(--bg-secondary)', borderRadius: 4 }}>
+            Data loaded — <strong>{initInfo.warmupCandles}</strong> warmup candles + <strong>{initInfo.totalCandles}</strong> replay candles
+            {initInfo.totalCandles === 0 && <span style={{ color: '#ef4444', marginLeft: 8 }}>No replay data found for the selected date range.</span>}
+          </div>
+        )}
+        {error && <div className="error-msg" style={{ marginBottom: 12 }}>{error}</div>}
+        <div className="form-actions" style={{ marginBottom: 16 }}>
+          <button type="submit" className="btn-primary" disabled={!canRun && !isRunning}>
+            {isRunning ? 'Stop Replay' : 'Start Options Replay'}
+          </button>
+          <button type="button" className="btn-secondary" onClick={() => {
+            setFeed([]); setSummary(null); setError(''); setStatus('idle');
+            setNifty({ symbol: '', exchange: 'NSE', instrumentToken: '' });
+            setCePool([EMPTY_OPTION_INST()]); setPePool([EMPTY_OPTION_INST()]);
+            setStrategies(defaultStrategies());
+            setDecisionCfg(DEFAULT_DECISION); setSelectionCfg(DEFAULT_SELECTION); setSwitchCfg(DEFAULT_SWITCH);
+            setOptsRegimeCfg(DEFAULT_OPTS_REGIME_CONFIG); setChopRules(DEFAULT_CHOP_RULES); setTradingRules(DEFAULT_TRADING_RULES); setRegimeRules(DEFAULT_REGIME_RULES); setRegimeStrategyRules(DEFAULT_REGIME_STRATEGY_RULES); setOptsRisk(DEFAULT_OPTS_RISK); setRangeQuality(DEFAULT_RANGE_QUALITY);
+            setInterval('MINUTE_5'); setFromDate(''); setToDate(''); setWarmupDays('5'); setSpeed('1'); setQuantity('0'); setCapital('100000');
+            ['sma_opts_nifty','sma_opts_ce_pool','sma_opts_pe_pool','sma_opts_interval','sma_opts_from','sma_opts_to',
+             'sma_opts_warmup','sma_opts_speed','sma_opts_qty','sma_opts_capital','sma_opts_strategies',
+             'sma_opts_decision','sma_opts_selection','sma_opts_switch','sma_opts_regime_cfg',
+             'sma_opts_chop_rules','sma_opts_trading_rules','sma_opts_regime_rules',
+             'sma_opts_regime_strat_rules','sma_opts_risk','sma_opts_range_quality'].forEach(k => localStorage.removeItem(k));
+          }} disabled={isRunning}>
+            Reset
+          </button>
+          {status === 'completed' && <span className="badge badge-success">Completed</span>}
+          {status === 'error'     && <span className="badge badge-danger">Error</span>}
+          {feed.length > 0 && (
+            <span style={{ fontSize: 12, color: 'var(--text-secondary)', marginLeft: 8 }}>
+              {feed.length} candles · {closedTrades.length} trades
+            </span>
+          )}
+        </div>
+
+        {/* ── Replay Settings ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Replay Settings</span>
+          <div className="bt-form-grid" style={{ marginTop: 12 }}>
+            <div className="form-group">
+              <label>Interval</label>
+              <select value={interval} onChange={e => setInterval(e.target.value)} disabled={isRunning}>
+                {OPT_INTERVALS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+              </select>
+            </div>
+            <div className="form-group">
+              <label>From Date *</label>
+              <input type="date" value={fromDate.split('T')[0] || ''} required disabled={isRunning}
+                onChange={e => setFromDate(`${e.target.value}T09:15`)} />
+            </div>
+            <div className="form-group">
+              <label>To Date *</label>
+              <input type="date" value={toDate.split('T')[0] || ''} required disabled={isRunning}
+                onChange={e => setToDate(`${e.target.value}T15:30`)} />
+            </div>
+          </div>
+          {recentDates.length > 0 && (
+            <div style={{ marginTop: 10, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6 }}>
+              <span style={{ fontSize: 11, color: 'var(--text-muted)', marginRight: 2 }}>Recent:</span>
+              {recentDates.map(d => (
+                <button key={d} type="button" disabled={isRunning}
+                  className={fromDate.startsWith(d) && toDate.startsWith(d) ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
+                  onClick={() => { setFromDate(`${d}T09:15`); setToDate(`${d}T15:30`); }}>
+                  {d}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="bt-form-grid" style={{ marginTop: 12 }}>
+            <div className="form-group">
+              <label>Warmup Days</label>
+              <input type="number" min="1" max="30" value={warmupDays} onChange={e => setWarmupDays(e.target.value)} disabled={isRunning} />
+            </div>
+            <div className="form-group">
+              <label>Speed (candles/sec)</label>
+              <input type="number" min="1" max="1000" value={speed} onChange={e => setSpeed(e.target.value)} disabled={isRunning} />
+            </div>
+            <div className="form-group">
+              <label>Quantity (lots)</label>
+              <input type="number" min="0" value={quantity} onChange={e => setQuantity(e.target.value)} disabled={isRunning} />
+            </div>
+            <div className="form-group">
+              <label>Initial Capital (₹)</label>
+              <input type="number" min="0" value={capital} onChange={e => setCapital(e.target.value)} disabled={isRunning} />
+            </div>
+          </div>
+        </div>
+
+        {/* ── NIFTY Source ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">NIFTY Instrument (Decision Source)</span>
+          <p className="bt-section-sub" style={{ marginBottom: 10 }}>
+            Strategies run exclusively on NIFTY candles. Options are only used for execution pricing.
+          </p>
+          <InstrumentPicker
+            session={session}
+            symbol={nifty.symbol}
+            exchange={nifty.exchange}
+            instrumentToken={nifty.instrumentToken}
+            onSelect={r => { setNifty({ symbol: r.tradingSymbol, exchange: r.exchange, instrumentToken: String(r.instrumentToken) }); saveRecentInstrument(r); }}
+            onChange={patch => setNifty(p => ({ ...p, ...patch }))}
+            disabled={isRunning}
+          />
+        </div>
+
+        {/* ── Option Pools ── */}
+        {[
+          { label: 'CE Pool', pool: cePool, setPool: setCePool, tag: 'CE' },
+          { label: 'PE Pool', pool: pePool, setPool: setPePool, tag: 'PE' },
+        ].map(({ label, pool, setPool, tag }) => (
+          <div key={tag} className="card bt-opts-card">
+            <div className="bt-opts-legs-header">
+              <span className="bt-section-title">{label}</span>
+              <button type="button" className="btn-secondary btn-sm" onClick={() => addPoolInst(setPool)} disabled={isRunning}>
+                + Add
+              </button>
+            </div>
+            <p className="bt-section-sub" style={{ marginBottom: 10 }}>
+              Add {tag} contracts to select from. The engine picks the best-fit instrument each candle based on premium and ATM proximity.
+            </p>
+            {pool.map((inst) => (
+              <div key={inst.id} className="bt-opts-leg-block">
+                <div className="bt-opts-leg-topbar">
+                  <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)' }}>{tag}</span>
+                  {pool.length > 1 && (
+                    <button type="button" className="btn-danger btn-sm" onClick={() => removePoolInst(pool, setPool, inst.id)} disabled={isRunning}>✕</button>
+                  )}
+                </div>
+                <InstrumentPicker
+                  session={session}
+                  symbol={inst.symbol}
+                  exchange={inst.exchange}
+                  instrumentToken={inst.instrumentToken}
+                  onSelect={r => { updatePoolInst(pool, setPool, inst.id, { symbol: r.tradingSymbol, exchange: r.exchange, instrumentToken: String(r.instrumentToken) }); saveRecentInstrument(r); }}
+                  onChange={patch => updatePoolInst(pool, setPool, inst.id, patch)}
+                  disabled={isRunning}
+                />
+              </div>
+            ))}
+          </div>
+        ))}
+
+        {/* ── Decision Config ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Decision Config</span>
+          <p className="bt-section-sub" style={{ marginBottom: 10 }}>
+            Thresholds for bias confirmation. Entry is blocked when any filter triggers.
+          </p>
+          <div className="bt-form-grid" style={{ marginTop: 8 }}>
+            {[
+              ['minScore',          'Min Score',          'Minimum winning strategy score (0–100)'],
+              ['minScoreGap',       'Min Score Gap',      'Gap between top-2 strategies required'],
+              ['maxRecentMove3',    'Max 3-bar Move %',   'Block if NIFTY moved > X% in last 3 bars'],
+              ['maxRecentMove5',    'Max 5-bar Move %',   'Block if NIFTY moved > X% in last 5 bars'],
+              ['maxAbsVwapDist',    'Max VWAP Dist %',    'Block if NIFTY is > X% away from intraday VWAP'],
+              ['minBarsSinceTrade', 'Min Bars Since Trade','Cooldown after last trade (bars)'],
+              ['chopLookback',      'Chop Lookback',      'Bars used for chop detection (if enabled)'],
+            ].map(([key, lbl, hint]) => (
+              <div key={key} className="form-group" title={hint}>
+                <label>{lbl}</label>
+                <input type="number" step="any" value={decisionCfg[key]} onChange={e => setDecisionCfg(p => ({ ...p, [key]: e.target.value }))} disabled={isRunning} />
+              </div>
+            ))}
+            <div className="form-group">
+              <label>Chop Filter</label>
+              <select value={decisionCfg.chopFilter ? 'on' : 'off'} onChange={e => setDecisionCfg(p => ({ ...p, chopFilter: e.target.value === 'on' }))} disabled={isRunning}>
+                <option value="on">ON</option>
+                <option value="off">OFF</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        {/* ── Chop Filter Regime Rules ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Chop Filter Regime Rules</span>
+            <button type="button"
+              className={`btn-sm ${chopRules.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setChopRules(p => ({ ...p, enabled: !p.enabled }))}
+              disabled={isRunning}>
+              {chopRules.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <p className="bt-section-sub" style={{ marginBottom: chopRules.enabled ? 12 : 0 }}>
+            Override the global chop filter per regime. Disable it in TRENDING (trending markets oscillate naturally), or raise the flip ratio to soften it (higher = less sensitive).
+          </p>
+          {chopRules.enabled && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 12 }}>
+              {[
+                { key: 'ranging',     label: 'RANGING',     color: '#f59e0b' },
+                { key: 'trending',    label: 'TRENDING',    color: '#22c55e' },
+                { key: 'compression', label: 'COMPRESSION', color: '#0ea5e9' },
+                { key: 'volatile',    label: 'VOLATILE',    color: '#ef4444' },
+              ].map(({ key: rk, label, color }) => (
+                <div key={rk} style={{ padding: '10px 14px', background: 'var(--bg-secondary)', borderRadius: 7, borderLeft: `3px solid ${color}` }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color, textTransform: 'uppercase', letterSpacing: 1 }}>{label}</span>
+                    <button type="button" disabled={isRunning}
+                      className={`btn-xs ${chopRules[rk].filterEnabled ? 'btn-primary' : 'btn-secondary'}`}
+                      onClick={() => setChopRules(p => ({ ...p, [rk]: { ...p[rk], filterEnabled: !p[rk].filterEnabled } }))}>
+                      {chopRules[rk].filterEnabled ? 'Filter ON' : 'Disabled'}
+                    </button>
+                  </div>
+                  {chopRules[rk].filterEnabled && (
+                    <div className="form-group" style={{ marginBottom: 0 }}>
+                      <label>Flip Ratio <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>(0.5 strict · 0.65 normal · 0.8+ soft)</span></label>
+                      <input type="number" min="0.1" max="1.0" step="0.05" disabled={isRunning}
+                        value={chopRules[rk].flipRatio}
+                        onChange={e => setChopRules(p => ({ ...p, [rk]: { ...p[rk], flipRatio: e.target.value } }))} />
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Market Regime Detection ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Market Regime Detection</span>
+            <button type="button"
+              className={`btn-sm ${optsRegimeCfg.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setOptsRegimeCfg(p => ({ ...p, enabled: !p.enabled }))}
+              disabled={isRunning}>
+              {optsRegimeCfg.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <p className="bt-section-sub" style={{ marginBottom: optsRegimeCfg.enabled ? 12 : 0 }}>
+            {optsRegimeCfg.enabled
+              ? `ADX(${optsRegimeCfg.adxPeriod}) trend >${optsRegimeCfg.adxTrendThreshold} · ATR(${optsRegimeCfg.atrPeriod}) volatile >${optsRegimeCfg.atrVolatilePct}% compress <${optsRegimeCfg.atrCompressionPct}%`
+              : 'OFF — every candle is RANGING. Enable to classify candles as TRENDING / VOLATILE / COMPRESSION / RANGING.'}
+          </p>
+          {optsRegimeCfg.enabled && (
+            <>
+              <div className="bt-form-grid">
+                {[
+                  ['adxPeriod',          'ADX Period',           2,    null, 1,    'Lookback for ADX indicator'],
+                  ['atrPeriod',          'ATR Period',           2,    null, 1,    'Lookback for ATR indicator'],
+                  ['adxTrendThreshold',  'ADX Trend Threshold',  1,    100,  0.5,  'ADX above this → TRENDING'],
+                  ['atrVolatilePct',     'ATR Volatile %',       0,    null, 0.1,  'ATR/close% above this → VOLATILE'],
+                  ['atrCompressionPct',  'ATR Compression %',    0,    null, 0.05, 'ATR/close% below this → COMPRESSION'],
+                ].map(([key, lbl, min, max, step, hint]) => (
+                  <div key={key} className="form-group" title={hint}>
+                    <label>{lbl}</label>
+                    <input type="number" min={min} max={max ?? undefined} step={step}
+                      value={optsRegimeCfg[key]}
+                      onChange={e => setOptsRegimeCfg(p => ({ ...p, [key]: e.target.value }))}
+                      disabled={isRunning} />
+                    <small className="bt-risk-hint">{hint}</small>
+                  </div>
+                ))}
+              </div>
+              <div style={{ marginTop: 10, fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.7 }}>
+                <b style={{ color: 'var(--text-secondary)' }}>TRENDING</b> — strong directional move (ADX high) &nbsp;·&nbsp;
+                <b style={{ color: 'var(--text-secondary)' }}>VOLATILE</b> — large swings, no clear direction (ATR% high) &nbsp;·&nbsp;
+                <b style={{ color: 'var(--text-secondary)' }}>COMPRESSION</b> — tight range / squeeze (ATR% low) &nbsp;·&nbsp;
+                <b style={{ color: 'var(--text-secondary)' }}>RANGING</b> — everything else
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* ── Selection Config ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Option Selection Config</span>
+          <p className="bt-section-sub" style={{ marginBottom: 10 }}>
+            Premium band filter applied each candle when selecting from CE/PE pool.
+          </p>
+          <div className="bt-form-grid" style={{ marginTop: 8 }}>
+            <div className="form-group">
+              <label>Min Premium (₹)</label>
+              <input type="number" step="any" value={selectionCfg.minPremium} onChange={e => setSelectionCfg(p => ({ ...p, minPremium: e.target.value }))} disabled={isRunning} />
+            </div>
+            <div className="form-group">
+              <label>Max Premium (₹)</label>
+              <input type="number" step="any" value={selectionCfg.maxPremium} onChange={e => setSelectionCfg(p => ({ ...p, maxPremium: e.target.value }))} disabled={isRunning} />
+            </div>
+          </div>
+        </div>
+
+        {/* ── Switch Config ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Switch Config</span>
+          <p className="bt-section-sub" style={{ marginBottom: 10 }}>
+            Controls CE→PE or PE→CE switching. A switch requires N consecutive confirming candles.
+          </p>
+          <div className="bt-form-grid" style={{ marginTop: 8 }}>
+            <div className="form-group">
+              <label>Confirmation Candles</label>
+              <input type="number" min="1" max="20" value={switchCfg.switchConfirmationCandles} onChange={e => setSwitchCfg(p => ({ ...p, switchConfirmationCandles: e.target.value }))} disabled={isRunning} />
+            </div>
+            <div className="form-group">
+              <label>Max Switches / Day</label>
+              <input type="number" min="0" max="20" value={switchCfg.maxSwitchesPerDay} onChange={e => setSwitchCfg(p => ({ ...p, maxSwitchesPerDay: e.target.value }))} disabled={isRunning} />
+            </div>
+          </div>
+        </div>
+
+        {/* ── Trading Rules ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Trading Rules</span>
+            <button type="button"
+              className={`btn-sm ${tradingRules.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setTradingRules(p => ({ ...p, enabled: !p.enabled }))}
+              disabled={isRunning}>
+              {tradingRules.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <p className="bt-section-sub" style={{ marginBottom: tradingRules.enabled ? 10 : 0 }}>
+            Hard rules applied after the decision engine — block entries regardless of score.
+          </p>
+          {tradingRules.enabled && (
+            <>
+              {[
+                ['rangingNoTrade',       'No trade in RANGING regime'],
+                ['volatileNoTrade',      'No trade in VOLATILE regime'],
+                ['noSameCandleReversal', 'No same-candle reversal (CE→PE or PE→CE in one bar)'],
+              ].map(([key, lbl]) => (
+                <div key={key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 0', borderBottom: '1px solid var(--border)' }}>
+                  <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1, paddingRight: 12 }}>{lbl}</span>
+                  <button type="button" disabled={isRunning}
+                    className={tradingRules[key] ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
+                    style={{ minWidth: 36 }}
+                    onClick={() => setTradingRules(p => ({ ...p, [key]: !p[key] }))}>
+                    {tradingRules[key] ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+
+        {/* ── Regime Score Rules ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Regime Score Rules</span>
+            <button type="button"
+              className={`btn-sm ${regimeRules.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setRegimeRules(p => ({ ...p, enabled: !p.enabled }))}
+              disabled={isRunning}>
+              {regimeRules.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <p className="bt-section-sub" style={{ marginBottom: 12 }}>
+            Override <code>minScore</code> and <code>minScoreGap</code> per regime. In TRENDING / COMPRESSION the engine needs less certainty to fire; in RANGING it stays slightly selective. Falls back to Decision Config values for VOLATILE.
+          </p>
+          {regimeRules.enabled && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 12 }}>
+              {[
+                { regime: 'RANGING',     scoreKey: 'rangingMinScore',     gapKey: 'rangingMinScoreGap',     color: '#f59e0b' },
+                { regime: 'TRENDING',    scoreKey: 'trendingMinScore',    gapKey: 'trendingMinScoreGap',    color: '#22c55e' },
+                { regime: 'COMPRESSION', scoreKey: 'compressionMinScore', gapKey: 'compressionMinScoreGap', color: '#0ea5e9' },
+              ].map(({ regime: r, scoreKey, gapKey, color }) => (
+                <div key={r} style={{ padding: '10px 14px', background: 'var(--bg-secondary)', borderRadius: 7, borderLeft: `3px solid ${color}` }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 1 }}>{r}</div>
+                  <div style={{ display: 'flex', gap: 12 }}>
+                    <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
+                      <label>Min Score</label>
+                      <input type="number" step="1" min="0" max="100"
+                        value={regimeRules[scoreKey]}
+                        onChange={e => setRegimeRules(p => ({ ...p, [scoreKey]: e.target.value }))}
+                        disabled={isRunning} />
+                    </div>
+                    <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
+                      <label>Min Score Gap</label>
+                      <input type="number" step="1" min="0" max="50"
+                        value={regimeRules[gapKey]}
+                        onChange={e => setRegimeRules(p => ({ ...p, [gapKey]: e.target.value }))}
+                        disabled={isRunning} />
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Regime Strategy Rules ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Regime Strategy Rules</span>
+            <button type="button"
+              className={`btn-sm ${regimeStrategyRules.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setRegimeStrategyRules(p => ({ ...p, enabled: !p.enabled }))}
+              disabled={isRunning}>
+              {regimeStrategyRules.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <p className="bt-section-sub" style={{ marginBottom: 12 }}>
+            Restrict which strategies can fire signals in each regime. Unchecked strategies are silenced for that regime. Disabled regime = all strategies allowed.
+          </p>
+          {regimeStrategyRules.enabled && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 12 }}>
+              {[
+                { key: 'ranging',     label: 'RANGING',     color: '#f59e0b' },
+                { key: 'trending',    label: 'TRENDING',    color: '#22c55e' },
+                { key: 'compression', label: 'COMPRESSION', color: '#0ea5e9' },
+                { key: 'volatile',    label: 'VOLATILE',    color: '#ef4444' },
+              ].map(({ key: rk, label, color }) => (
+                <div key={rk} style={{ padding: '10px 14px', background: 'var(--bg-secondary)', borderRadius: 7, borderLeft: `3px solid ${color}` }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color, textTransform: 'uppercase', letterSpacing: 1 }}>{label}</span>
+                    <button type="button"
+                      className={`btn-xs ${regimeStrategyRules[rk].enabled ? 'btn-primary' : 'btn-secondary'}`}
+                      onClick={() => setRegimeStrategyRules(p => ({ ...p, [rk]: { ...p[rk], enabled: !p[rk].enabled } }))}
+                      disabled={isRunning}>
+                      {regimeStrategyRules[rk].enabled ? 'Filter ON' : 'All allowed'}
+                    </button>
+                  </div>
+                  {regimeStrategyRules[rk].enabled && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                      {ALL_STRATEGY_TYPES.map(st => {
+                        const checked = regimeStrategyRules[rk].allowed.includes(st);
+                        return (
+                          <label key={st} style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 11, cursor: isRunning ? 'default' : 'pointer', color: checked ? 'var(--text-primary)' : 'var(--text-muted)' }}>
+                            <input type="checkbox" checked={checked} disabled={isRunning}
+                              onChange={() => setRegimeStrategyRules(p => {
+                                const prev = p[rk].allowed;
+                                const next = prev.includes(st) ? prev.filter(x => x !== st) : [...prev, st];
+                                return { ...p, [rk]: { ...p[rk], allowed: next } };
+                              })} />
+                            {st}
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Range Quality Filter ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Range Quality Filter</span>
+            <button type="button"
+              className={`btn-sm ${rangeQuality.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updateRangeQuality('enabled', !rangeQuality.enabled)}
+              disabled={isRunning}>
+              {rangeQuality.enabled ? 'ON' : 'OFF'}
+            </button>
+            <span style={{ fontSize: 11, color: '#f59e0b', fontWeight: 600 }}>RANGING only</span>
+          </div>
+          <p className="bt-section-sub" style={{ marginBottom: rangeQuality.enabled ? 12 : 0 }}>
+            {rangeQuality.enabled
+              ? `lbk=${rangeQuality.lookbackBars} · ut≥${rangeQuality.minUpperTouches} lt≥${rangeQuality.minLowerTouches} · W=${rangeQuality.minRangeWidthPct}–${rangeQuality.maxRangeWidthPct}% · drift≤${rangeQuality.maxDirectionalDriftPctOfRange} · chop≤${rangeQuality.chopFlipRatioLimit}`
+              : 'Block RANGING entries when Bollinger bands show no clean range structure (poor touches, drift, chop, or wrong width).'}
+          </p>
+          {rangeQuality.enabled && (
+            <>
+              <div className="bt-form-grid" style={{ marginTop: 4 }}>
+                {[
+                  ['Lookback Bars',       'lookbackBars',                  '1',   null],
+                  ['Min Upper Touches',   'minUpperTouches',               '1',   null],
+                  ['Min Lower Touches',   'minLowerTouches',               '1',   null],
+                  ['Band Touch Tol %',    'bandTouchTolerancePct',         '0.01','100'],
+                  ['Min Range Width %',   'minRangeWidthPct',              '0.01','100'],
+                  ['Max Range Width %',   'maxRangeWidthPct',              '0.01','100'],
+                  ['Max Drift Ratio',     'maxDirectionalDriftPctOfRange', '0.01','1'  ],
+                  ['Chop Flip Limit',     'chopFlipRatioLimit',            '0.01','1'  ],
+                ].map(([label, key, step, max]) => (
+                  <div className="form-group" key={key}>
+                    <label>{label}</label>
+                    <input type="number" min="0" max={max || undefined} step={step}
+                      value={rangeQuality[key]} disabled={isRunning}
+                      onChange={e => updateRangeQuality(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginTop: 8, cursor: isRunning ? 'default' : 'pointer' }}>
+                <input type="checkbox" checked={rangeQuality.enableChopCheck} disabled={isRunning}
+                  onChange={e => updateRangeQuality('enableChopCheck', e.target.checked)} />
+                Enable chop flip check
+              </label>
+            </>
+          )}
+        </div>
+
+        {/* ── Risk Management ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Risk Management</span>
+            <button type="button"
+              className={`btn-sm ${optsRisk.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updateOptsRisk('enabled', !optsRisk.enabled)}
+              disabled={isRunning}>
+              {optsRisk.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <p className="bt-section-sub" style={{ marginBottom: optsRisk.enabled ? 12 : 0 }}>
+            {optsRisk.enabled
+              ? `SL ${optsRisk.stopLossPct}% · TP ${optsRisk.takeProfitPct}% · max risk ${optsRisk.maxRiskPerTradePct}%/trade · daily cap ${optsRisk.dailyLossCapPct}% · cooldown ${optsRisk.cooldownCandles} bars`
+              : 'Stop-loss, take-profit, position sizing, daily loss cap and cooldown after losing trades.'}
+          </p>
+          {optsRisk.enabled && (
+            <div className="bt-form-grid" style={{ marginTop: 4 }}>
+              {[
+                ['Stop Loss %',         'stopLossPct',        '0.1', '100'],
+                ['Take Profit %',       'takeProfitPct',      '0.1', null ],
+                ['Max Risk / Trade %',  'maxRiskPerTradePct', '0.1', '100'],
+                ['Daily Loss Cap %',    'dailyLossCapPct',    '0.1', '100'],
+                ['Cooldown Candles',    'cooldownCandles',    '1',   null ],
+              ].map(([label, key, step, max]) => (
+                <div className="form-group" key={key}>
+                  <label>{label}</label>
+                  <input type="number" min="0" max={max || undefined} step={step}
+                    value={optsRisk[key]} disabled={isRunning}
+                    onChange={e => updateOptsRisk(key, e.target.value)} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Strategy Selector ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Strategies (on NIFTY)</span>
+          <p className="bt-section-sub" style={{ marginBottom: 12 }}>
+            All enabled strategies compete each NIFTY candle. The highest-scoring bias wins.
+          </p>
+          <div className="bt-variants-grid">
+            {strategies.map((s, idx) => {
+              const color = STRATEGY_COLORS[s.strategyType] || '#6366f1';
+              const paramDefs = PARAM_DEFS[s.strategyType] || [];
+              return (
+                <div key={s.strategyType} className={`bt-variant-card ${!s.enabled ? 'bt-variant-disabled' : ''}`} style={{ '--variant-color': color }}>
+                  <div className="bt-variant-header">
+                    <label className="bt-variant-toggle">
+                      <input type="checkbox" checked={s.enabled} onChange={e => updateStrategy(idx, { enabled: e.target.checked })} disabled={isRunning} />
+                      <span className="bt-variant-index" style={{ background: color }}>{s.strategyType.replace(/_/g, ' ')}</span>
+                    </label>
+                  </div>
+                  {s.enabled && paramDefs.length > 0 && (
+                    <div className="bt-params-block">
+                      {paramDefs.map(def => (
+                        <div key={def.key} className="bt-param-row">
+                          <label className="bt-param-label" title={def.hint}>{def.label}</label>
+                          <input type="number" className="bt-param-input" value={s.parameters[def.key] || ''} onChange={e => updateStratParam(idx, def.key, e.target.value)} placeholder={def.placeholder} disabled={isRunning} />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+      </form>
+    </div>
+  );
+}
+
