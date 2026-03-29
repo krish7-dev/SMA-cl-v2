@@ -307,3 +307,29 @@ export async function getPositions(userId, brokerName) {
 export async function getMargins(userId, brokerName) {
   return request(`${BROKER}/api/v1/broker/portfolio/margins?userId=${encodeURIComponent(userId)}&brokerName=${encodeURIComponent(brokerName)}`);
 }
+
+// ─── Strategy Engine — Options Replay Eval ────────────────────────────────────
+
+/**
+ * Starts a server-side options replay evaluation stream.
+ *
+ * Returns a fetch Response whose body is a text/event-stream.
+ * Events: "init" (config echo), "candle" (OptionsReplayCandleEvent JSON), "summary" (final P&L).
+ */
+export async function startOptionsReplayEval(config, signal) {
+  const res = await fetch(`${STRATEGY_API}/api/v1/strategy/options-replay/evaluate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify(config),
+    signal,
+  });
+  if (!res.ok) {
+    let errorMsg = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      errorMsg = err.message || err.error || errorMsg;
+    } catch (_) {}
+    throw new Error(errorMsg);
+  }
+  return res;
+}

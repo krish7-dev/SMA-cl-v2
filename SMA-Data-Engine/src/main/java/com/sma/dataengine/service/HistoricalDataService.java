@@ -10,7 +10,11 @@ import com.sma.dataengine.model.request.HistoricalDataRequest;
 import com.sma.dataengine.repository.CandleRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
@@ -37,6 +41,12 @@ public class HistoricalDataService {
     private final MarketDataAdapterRegistry adapterRegistry;
     private final CandleRepository          candleRepository;
     private final BrokerEngineClient        brokerEngineClient;
+
+    // Self-injection to route persistCandles() through the Spring proxy so that
+    // REQUIRES_NEW creates a real nested transaction (self-invocation bypasses AOP).
+    @Lazy
+    @Autowired
+    private HistoricalDataService self;
 
     // ─── Public API ───────────────────────────────────────────────────────────
 
@@ -75,8 +85,16 @@ public class HistoricalDataService {
 
         if (request.isPersist() && !candles.isEmpty()) {
             // Merge new candles into DB (dedup prevents duplicate inserts).
+            // Runs in REQUIRES_NEW so a concurrent duplicate-key violation rolls back
+            // only the inner transaction and does not poison this one.
+            try {
+                self.persistCandles(candles, request.getBrokerName());
+            } catch (DataIntegrityViolationException e) {
+                log.warn("Concurrent candle insert detected — candles already persisted by another request " +
+                         "(provider={}, token={}): {}", request.getBrokerName(),
+                         request.getInstrumentToken(), e.getMessage());
+            }
             // Load from DB afterwards to include any previously cached candles.
-            persistCandles(candles, request.getBrokerName());
             return loadFromDb(request);
         }
 
@@ -107,7 +125,7 @@ public class HistoricalDataService {
         return records.stream().map(this::toCandle).toList();
     }
 
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void persistCandles(List<CandleData> candles, String provider) {
         if (candles.isEmpty()) return;
 

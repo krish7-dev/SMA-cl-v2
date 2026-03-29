@@ -924,3 +924,95 @@
   font-size: 12px;
   cursor: pointer;
 }
+
+/* ─── Options Replay Test ────────────────────────────────────────────────── */
+
+.bt-opts-card {
+  margin-bottom: 16px;
+}
+
+.bt-opts-legs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.bt-opts-leg-block {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  background: var(--bg-primary);
+}
+
+.bt-opts-leg-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  gap: 8px;
+}
+
+.bt-opts-leg-label-input {
+  font-size: 12px;
+  font-weight: 700;
+  background: transparent;
+  border: none;
+  border-bottom: 1px dashed var(--border);
+  color: var(--text-primary);
+  width: 120px;
+  padding: 2px 0;
+  outline: none;
+}
+
+.bt-opts-feed-wrap {
+  margin-top: 10px;
+  overflow-x: auto;
+  overflow-y: auto;
+  max-height: 420px;
+}
+
+.bt-opts-feed-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-primary);
+  z-index: 1;
+}
+
+.bt-opts-feed-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.bt-opts-feed-table th,
+.bt-opts-feed-table td {
+  padding: 3px 8px;
+  text-align: right;
+  border-bottom: 1px solid var(--border);
+}
+
+.bt-opts-feed-table th {
+  color: var(--text-secondary);
+  font-weight: 600;
+  text-align: right;
+}
+
+.bt-opts-feed-table td:first-child,
+.bt-opts-feed-table th:first-child {
+  text-align: left;
+}
+
+.bt-opts-feed-count {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+  text-align: right;
+}
+
+.bt-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+}

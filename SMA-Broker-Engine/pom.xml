@@ -116,6 +116,7 @@
                             <artifactId>lombok</artifactId>
                         </exclude>
                     </excludes>
+                    <jvmArguments>-Dcom.sun.management.jmxremote=false</jvmArguments>
                 </configuration>
             </plugin>
         </plugins>

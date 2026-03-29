@@ -19,45 +19,56 @@ import java.util.stream.Collectors;
 public class GlobalExceptionHandler {
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ResponseEntity<ApiResponse<Void>> handleValidation(MethodArgumentNotValidException ex) {
+    public ResponseEntity<?> handleValidation(MethodArgumentNotValidException ex,
+                                              HttpServletRequest request) {
         String message = ex.getBindingResult().getFieldErrors().stream()
                 .map(fe -> fe.getField() + ": " + fe.getDefaultMessage())
                 .collect(Collectors.joining("; "));
-        return ResponseEntity.badRequest().body(ApiResponse.error("Validation failed: " + message));
+        return respond(HttpStatus.BAD_REQUEST, "Validation failed: " + message, request);
     }
 
     @ExceptionHandler(ConstraintViolationException.class)
-    public ResponseEntity<ApiResponse<Void>> handleConstraint(ConstraintViolationException ex) {
-        return ResponseEntity.badRequest().body(ApiResponse.error("Validation failed: " + ex.getMessage()));
+    public ResponseEntity<?> handleConstraint(ConstraintViolationException ex,
+                                              HttpServletRequest request) {
+        return respond(HttpStatus.BAD_REQUEST, "Validation failed: " + ex.getMessage(), request);
     }
 
     @ExceptionHandler(IllegalArgumentException.class)
-    public ResponseEntity<ApiResponse<Void>> handleIllegalArgument(IllegalArgumentException ex) {
-        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(ApiResponse.error(ex.getMessage()));
+    public ResponseEntity<?> handleIllegalArgument(IllegalArgumentException ex,
+                                                   HttpServletRequest request) {
+        return respond(HttpStatus.NOT_FOUND, ex.getMessage(), request);
     }
 
     @ExceptionHandler(IllegalStateException.class)
-    public ResponseEntity<ApiResponse<Void>> handleIllegalState(IllegalStateException ex) {
-        return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResponse.error(ex.getMessage()));
+    public ResponseEntity<?> handleIllegalState(IllegalStateException ex,
+                                                HttpServletRequest request) {
+        return respond(HttpStatus.CONFLICT, ex.getMessage(), request);
     }
 
     @ExceptionHandler(DataEngineException.class)
-    public ResponseEntity<ApiResponse<Void>> handleDataEngine(DataEngineException ex) {
+    public ResponseEntity<?> handleDataEngine(DataEngineException ex,
+                                              HttpServletRequest request) {
         log.error("Data Engine error: {}", ex.getMessage());
-        return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
-                .body(ApiResponse.error(ex.getMessage()));
+        return respond(HttpStatus.BAD_GATEWAY, ex.getMessage(), request);
     }
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<?> handleGeneral(Exception ex, HttpServletRequest request) {
         log.error("Unhandled exception: {}", ex.getMessage(), ex);
-        // SSE endpoints declare Accept: text/event-stream — returning JSON would cause
-        // HttpMediaTypeNotAcceptableException, so skip the body for those requests.
+        return respond(HttpStatus.INTERNAL_SERVER_ERROR,
+                "Internal server error: " + ex.getMessage(), request);
+    }
+
+    /**
+     * For SSE endpoints (Accept: text/event-stream) returning a JSON body would cause
+     * HttpMediaTypeNotAcceptableException. Return a bodyless response instead so the
+     * SSE emitter can cleanWithError on its own.
+     */
+    private ResponseEntity<?> respond(HttpStatus status, String message, HttpServletRequest request) {
         String accept = request.getHeader("Accept");
         if (accept != null && accept.contains(MediaType.TEXT_EVENT_STREAM_VALUE)) {
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+            return ResponseEntity.status(status).build();
         }
-        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                .body(ApiResponse.error("Internal server error: " + ex.getMessage()));
+        return ResponseEntity.status(status).body(ApiResponse.error(message));
     }
 }
