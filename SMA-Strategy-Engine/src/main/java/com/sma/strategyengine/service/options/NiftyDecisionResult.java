@@ -27,6 +27,11 @@ public class NiftyDecisionResult {
 
     private boolean entryAllowed;
     private String  blockReason;
+    /** Winner score after entry penalties subtracted. Equal to winnerScore when no penalties fired. */
+    private double  penalizedScore;
+
+    /** Trade quality tier: STRONG / NORMAL / WEAK / NONE */
+    private String  tradeStrength;
 
     /** Explains exactly why rawBias is NEUTRAL — more specific than blockReason. */
     private String  neutralReason;   // NO_SIGNALS | ALL_SIGNALS_BELOW_SCORE | SCORE_GAP_TOO_SMALL

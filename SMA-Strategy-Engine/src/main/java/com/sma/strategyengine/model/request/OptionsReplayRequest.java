@@ -57,6 +57,8 @@ public class OptionsReplayRequest {
         private int     minBarsSinceTrade = 3;
         private boolean chopFilter        = true;
         private int     chopLookback      = 8;
+        /** Floor for winner score after entry penalties are applied. Trades below this are blocked. */
+        private double  penaltyMinScore   = 25.0;
     }
 
     // Option selection
@@ -73,8 +75,13 @@ public class OptionsReplayRequest {
 
     @Data
     public static class SwitchConfig {
-        private int switchConfirmationCandles = 2;
-        private int maxSwitchesPerDay         = 3;
+        private int    switchConfirmationCandles   = 2;
+        private int    maxSwitchesPerDay           = 3;
+        /**
+         * Require the new winner score to exceed the score that locked in the current
+         * confirmed bias by at least this amount.  0 = disabled.
+         */
+        private double minScoreImprovementForSwitch = 0.0;
     }
 
     // Regime-aware score rules (override minScore / minScoreGap per regime)
@@ -154,6 +161,24 @@ public class OptionsReplayRequest {
         private boolean enableChopCheck              = true;
     }
 
+    // Minimum hold period after entry (prevents premature exits on transient neutral/no-signal)
+    private HoldConfig holdConfig = new HoldConfig();
+
+    @Data
+    public static class HoldConfig {
+        private boolean enabled             = true;
+        /** Default minimum bars to hold before bias-based exit is allowed. */
+        private int     defaultMinHoldBars  = 3;
+        /** RANGING: signal is noisier — hold longer. */
+        private int     rangingMinHoldBars  = 4;
+        /** TRENDING: signal is cleaner — hold shorter. */
+        private int     trendingMinHoldBars = 2;
+        /** Score threshold for the opposite bias to force an early exit inside the hold window. */
+        private double  strongOppositeScore = 35.0;
+        /** After hold window: how many consecutive non-favourable bars needed to exit. */
+        private int     persistentExitBars  = 2;
+    }
+
     // Risk management
     private RiskConfig riskConfig = new RiskConfig();
 
@@ -165,6 +190,61 @@ public class OptionsReplayRequest {
         private double  maxRiskPerTradePct = 1.0;
         private double  dailyLossCapPct    = 5.0;
         private int     cooldownCandles    = 3;
+    }
+
+    // Trade quality filter (score tiers, regime-based confirmation, weak trade rules)
+    private TradeQualityConfig tradeQualityConfig = new TradeQualityConfig();
+
+    // Trending entry structure validator
+    private TrendEntryConfig trendEntryConfig = new TrendEntryConfig();
+
+    @Data
+    public static class TrendEntryConfig {
+        private boolean enabled          = false;
+        /** Candles to look back for breakout high/low (excluding current). */
+        private int     breakoutLookback = 5;
+        /** Minimum body % of full range to qualify as a "strong candle". */
+        private double  minBodyPct       = 60.0;
+        /** Body % below this → hard block (weak candle). */
+        private double  weakBodyPct      = 30.0;
+        /** EMA period used for momentum slope check. */
+        private int     ema9Period       = 9;
+    }
+
+    // Compression entry structure validator (mean reversion at extremes)
+    private CompressionEntryConfig compressionEntryConfig = new CompressionEntryConfig();
+
+    @Data
+    public static class CompressionEntryConfig {
+        private boolean enabled              = false;
+        /** Candles to look back for range definition (excluding current). */
+        private int     rangeLookback        = 10;
+        /** rangePos ≤ this for BULLISH entry (near bottom). */
+        private double  longZoneMax          = 0.2;
+        /** rangePos ≥ this for BEARISH entry (near top). */
+        private double  shortZoneMin         = 0.8;
+        /** Block entry if rangePos is in [noTradeZoneMin, noTradeZoneMax]. */
+        private double  noTradeZoneMin       = 0.4;
+        private double  noTradeZoneMax       = 0.6;
+        /** Block if current candle breaks the defined range. */
+        private boolean rejectBreakoutCandle = true;
+    }
+
+    @Data
+    public static class TradeQualityConfig {
+        private boolean enabled                = false;
+        /** penalizedScore >= this → STRONG */
+        private double  strongScoreThreshold   = 40.0;
+        /** penalizedScore >= this (and < strong) → NORMAL */
+        private double  normalScoreThreshold   = 32.0;
+        /** Block WEAK trades for this many candles after a loss */
+        private int     weakTradeLossCooldown  = 5;
+        /** Block WEAK trades in RANGING regime */
+        private boolean blockWeakInRanging     = true;
+        /** Confirmation candles required in RANGING regime */
+        private int     rangingConfirmCandles  = 3;
+        /** Confirmation candles required in TRENDING/COMPRESSION regime */
+        private int     trendingConfirmCandles = 2;
     }
 
     private int     speedMultiplier = 1;
