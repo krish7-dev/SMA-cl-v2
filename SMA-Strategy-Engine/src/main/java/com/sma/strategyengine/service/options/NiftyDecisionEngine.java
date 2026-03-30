@@ -39,6 +39,12 @@ public class NiftyDecisionEngine {
     private final OptionsReplayRequest.RegimeStrategyRules  rsr;
     private final OptionsReplayRequest.ChopRules            cr;
     private final RangeQualityFilter                        rqf;
+    private final OptionsReplayRequest.TradeQualityConfig   tqc;
+    private final TrendEntryValidator                       tev;
+    private final CompressionEntryValidator                 cev;
+
+    // Score that was active when current confirmedBias was locked in (for switch improvement check)
+    private double confirmedBiasScore = 0.0;
 
     // One scorer per strategy config (StrategyScorer is not Spring-managed)
     private final Map<String, StrategyScorer> scorers = new LinkedHashMap<>();
@@ -75,7 +81,10 @@ public class NiftyDecisionEngine {
                                OptionsReplayRequest.RegimeRules regimeRules,
                                OptionsReplayRequest.RegimeStrategyRules regimeStrategyRules,
                                OptionsReplayRequest.ChopRules chopRules,
-                               OptionsReplayRequest.RangeQualityConfig rangeQualityConfig) {
+                               OptionsReplayRequest.RangeQualityConfig rangeQualityConfig,
+                               OptionsReplayRequest.TradeQualityConfig tradeQualityConfig,
+                               OptionsReplayRequest.TrendEntryConfig trendEntryConfig,
+                               OptionsReplayRequest.CompressionEntryConfig compressionEntryConfig) {
         this.registry   = registry;
         this.strategies = strategies;
         this.dc         = decisionConfig;
@@ -84,6 +93,9 @@ public class NiftyDecisionEngine {
         this.rsr        = regimeStrategyRules != null ? regimeStrategyRules : new OptionsReplayRequest.RegimeStrategyRules();
         this.cr         = chopRules != null ? chopRules : new OptionsReplayRequest.ChopRules();
         this.rqf        = new RangeQualityFilter(rangeQualityConfig);
+        this.tqc        = tradeQualityConfig != null ? tradeQualityConfig : new OptionsReplayRequest.TradeQualityConfig();
+        this.tev        = new TrendEntryValidator(trendEntryConfig);
+        this.cev        = new CompressionEntryValidator(compressionEntryConfig);
 
         for (BacktestRequest.StrategyConfig cfg : strategies) {
             String id = "nifty-opts-" + cfg.getStrategyType() + "-" + System.nanoTime() + "-" + cfg.hashCode();
@@ -251,13 +263,79 @@ public class NiftyDecisionEngine {
             shadowWinnerReasonNotTaken = "all strategies returned HOLD";
         }
 
-        // ── Entry filters ─────────────────────────────────────────────────────
-        double move3    = recentMovePct(3);
-        double move5    = recentMovePct(5);
-        String block    = entryFilter(rawBias, move3, move5, Math.abs(vwapDist), regime);
-        boolean canEnter = block == null;
+        // ── Entry decision with penalty system ───────────────────────────────
+        double move3 = recentMovePct(3);
+        double move5 = recentMovePct(5);
+
+        String  block          = null;
+        boolean canEnter       = false;
+        double  penalizedScore = winnerScore;
+
+        if (rawBias == NiftyDecisionResult.Bias.NEUTRAL || winnerScore <= 0) {
+            // Absolute block: no directional signal
+            block    = "no directional signal";
+            canEnter = false;
+        } else if (winnerScore < 15) {
+            // Absolute block: score below floor
+            block    = String.format("score %.1f below absolute floor (15)", winnerScore);
+            canEnter = false;
+        } else {
+            EntryPenalties ep = computeEntryPenalties(move3, move5, Math.abs(vwapDist), regime);
+            penalizedScore = winnerScore + ep.total; // total is <= 0
+            if (penalizedScore >= dc.getPenaltyMinScore()) {
+                canEnter = true;
+                if (!ep.breakdown.isEmpty()) {
+                    log.debug("entry ok — {}", ep.logLine(penalizedScore));
+                }
+            } else {
+                canEnter = false;
+                block    = ep.blockReason(penalizedScore, dc.getPenaltyMinScore());
+            }
+        }
+
+        // ── Structure validation (TRENDING / COMPRESSION) ────────────────────
+        if (canEnter) {
+            List<CandleDto> histList = new ArrayList<>(history);
+            if ("TRENDING".equals(regime)) {
+                TrendEntryValidator.Result tr = tev.validate(histList, rawBias);
+                if (!tr.isAllowed()) {
+                    canEnter = false;
+                    block    = "TREND:" + tr.getReason();
+                }
+            } else if ("COMPRESSION".equals(regime)) {
+                CompressionEntryValidator.Result cvr = cev.validate(histList, rawBias);
+                if (!cvr.isAllowed()) {
+                    canEnter = false;
+                    block    = "COMPRESSION:" + cvr.getReason();
+                }
+            }
+        }
+
+        // ── Trade quality tier ────────────────────────────────────────────────
+        String tradeStrength;
+        if (rawBias == NiftyDecisionResult.Bias.NEUTRAL || winnerScore <= 0 || !canEnter) {
+            tradeStrength = "NONE";
+        } else if (penalizedScore >= tqc.getStrongScoreThreshold()) {
+            tradeStrength = "STRONG";
+        } else if (penalizedScore >= tqc.getNormalScoreThreshold()) {
+            tradeStrength = "NORMAL";
+        } else if (penalizedScore >= dc.getPenaltyMinScore()) {
+            tradeStrength = "WEAK";
+        } else {
+            tradeStrength = "NONE";
+        }
 
         // ── Switch / confirmation ─────────────────────────────────────────────
+        // Regime-based confirmation candles: RANGING needs more conviction
+        int confirmRequired = sc.getSwitchConfirmationCandles();
+        if (tqc.isEnabled()) {
+            if ("RANGING".equals(regime)) {
+                confirmRequired = tqc.getRangingConfirmCandles();
+            } else if ("TRENDING".equals(regime) || "COMPRESSION".equals(regime)) {
+                confirmRequired = tqc.getTrendingConfirmCandles();
+            }
+        }
+
         boolean switchRequested = rawBias != NiftyDecisionResult.Bias.NEUTRAL
                 && rawBias != confirmedBias;
         boolean switchConfirmed = false;
@@ -273,14 +351,15 @@ public class NiftyDecisionEngine {
                 pendingBias  = NiftyDecisionResult.Bias.NEUTRAL;
                 confirmCount = 1;
             }
-            if (confirmCount >= sc.getSwitchConfirmationCandles()
+            if (confirmCount >= confirmRequired
                     && confirmedBias != NiftyDecisionResult.Bias.NEUTRAL) {
-                switchConfirmed = true;
-                switchReason    = "neutral confirmed — bias invalidated";
-                previousBias    = confirmedBias;
-                confirmedBias   = NiftyDecisionResult.Bias.NEUTRAL;
-                pendingBias     = null;
-                confirmCount    = 0;
+                switchConfirmed      = true;
+                switchReason         = "neutral confirmed — bias invalidated";
+                previousBias         = confirmedBias;
+                confirmedBias        = NiftyDecisionResult.Bias.NEUTRAL;
+                confirmedBiasScore   = 0.0;
+                pendingBias          = null;
+                confirmCount         = 0;
             }
         } else {
             if (pendingBias == rawBias) {
@@ -289,15 +368,20 @@ public class NiftyDecisionEngine {
                 pendingBias  = rawBias;
                 confirmCount = 1;
             }
-            if (confirmCount >= sc.getSwitchConfirmationCandles()
+            // Require score to have improved over the score that locked in the prior bias
+            boolean scoreImprovementOk = sc.getMinScoreImprovementForSwitch() <= 0
+                    || winnerScore >= confirmedBiasScore + sc.getMinScoreImprovementForSwitch();
+            if (confirmCount >= confirmRequired
                     && winnerScore >= effMinScore
-                    && scoreGap >= effMinScoreGap) {
-                switchConfirmed = true;
-                switchReason    = "bias confirmed for " + confirmCount + " candles";
-                previousBias    = confirmedBias;
-                confirmedBias   = rawBias;
-                pendingBias     = null;
-                confirmCount    = 0;
+                    && scoreGap >= effMinScoreGap
+                    && scoreImprovementOk) {
+                switchConfirmed      = true;
+                switchReason         = "bias confirmed for " + confirmCount + " candles";
+                previousBias         = confirmedBias;
+                confirmedBias        = rawBias;
+                confirmedBiasScore   = winnerScore;
+                pendingBias          = null;
+                confirmCount         = 0;
             }
         }
 
@@ -323,6 +407,8 @@ public class NiftyDecisionEngine {
                 .vwap(vwap)
                 .entryAllowed(canEnter)
                 .blockReason(block)
+                .penalizedScore(penalizedScore)
+                .tradeStrength(tradeStrength)
                 .neutralReason(neutralReason)
                 .effectiveMinScore(effMinScore)
                 .effectiveMinScoreGap(effMinScoreGap)
@@ -482,14 +568,14 @@ public class NiftyDecisionEngine {
                 diagnostics.neutralReasonCounts.merge(neutralReason, 1, Integer::sum);
         }
 
-        // Entry-filter block tracking (only for non-neutral bias that got blocked)
+        // Entry-block tracking (non-neutral bias that got blocked)
         if (block != null && rawBias != NiftyDecisionResult.Bias.NEUTRAL) {
-            if (block.contains("recent-3") || block.contains("recent-5"))
-                diagnostics.candlesBlockedByRecentMove++;
-            else if (block.contains("VWAP dist"))
-                diagnostics.candlesBlockedByVwap++;
-            else if (block.contains("chop filter"))
-                diagnostics.candlesBlockedByChop++;
+            if (block.contains("move=-5"))         diagnostics.candlesBlockedByRecentMove++;
+            if (block.contains("vwap=-5"))         diagnostics.candlesBlockedByVwap++;
+            if (block.contains("chop=-8"))         diagnostics.candlesBlockedByChop++;
+            if (block.contains("after penalties")) diagnostics.candlesBlockedByPenalty++;
+            if (block.startsWith("TREND:"))        diagnostics.candlesBlockedByTrendStructure++;
+            if (block.startsWith("COMPRESSION:")) diagnostics.candlesBlockedByCompressionStructure++;
         }
 
         // Score-level blocking (captured via neutralReason)
@@ -548,22 +634,41 @@ public class NiftyDecisionEngine {
                 .build();
     }
 
-    private String entryFilter(NiftyDecisionResult.Bias bias, double m3, double m5, double absVwap, String regime) {
-        if (bias == NiftyDecisionResult.Bias.NEUTRAL)   return "no strong bias";
-        if (m3 > dc.getMaxRecentMove3())
-            return String.format("recent-3 move %.1f%% > max %.1f%%", m3, dc.getMaxRecentMove3());
-        if (m5 > dc.getMaxRecentMove5())
-            return String.format("recent-5 move %.1f%% > max %.1f%%", m5, dc.getMaxRecentMove5());
+    /**
+     * Compute entry penalties for all soft filter conditions.
+     * Hard blocks (NEUTRAL bias, score < 15) are handled upstream.
+     */
+    private EntryPenalties computeEntryPenalties(double m3, double m5, double absVwap, String regime) {
+        EntryPenalties ep = new EntryPenalties();
+
+        // Weak bias / over-extension penalty (-5): recent move exceeded threshold
+        if (m3 > dc.getMaxRecentMove3() || m5 > dc.getMaxRecentMove5())
+            ep.add("move", -5);
+
+        // VWAP distance penalty (-5)
         if (absVwap > dc.getMaxAbsVwapDist())
-            return String.format("VWAP dist %.1f%% > max %.1f%%", absVwap, dc.getMaxAbsVwapDist());
+            ep.add("vwap", -5);
+
+        // Chop penalty (-8)
         if (dc.isChopFilter() && isChopFilterActiveForRegime(regime)
                 && isChoppy(chopFlipRatioForRegime(regime)))
-            return "chop filter: oscillating price";
+            ep.add("chop", -8);
+
+        // Range quality penalties (RANGING only)
         if ("RANGING".equals(regime)) {
             RangeQualityFilter.Result rq = rqf.evaluate(history);
-            if (!rq.isAllowed()) return rq.getReason();
+            if (!rq.isAllowed()) {
+                String reason = rq.getReason();
+                double penalty = reason.startsWith("RANGE_DRIFTING")       ? -10
+                               : reason.startsWith("RANGE_POOR_STRUCTURE") ? -8
+                               : reason.startsWith("RANGE_CHOPPY")         ? -8
+                               : -5; // TOO_NARROW, TOO_WIDE
+                String label = reason.contains(":") ? reason.substring(0, reason.indexOf(':')) : reason;
+                ep.add(label.toLowerCase().replace("range_", ""), penalty);
+            }
         }
-        return null;
+
+        return ep;
     }
 
     /** Returns false if the per-regime chop rule disables the filter for this regime. */
@@ -622,6 +727,29 @@ public class NiftyDecisionEngine {
 
     // ── Inner types ───────────────────────────────────────────────────────────
 
+    /** Accumulates score penalties for soft entry conditions. */
+    private static class EntryPenalties {
+        double total = 0;
+        final List<String> breakdown = new ArrayList<>();
+
+        void add(String label, double penalty) {
+            total += penalty;
+            breakdown.add(label + "=" + (int) penalty);
+        }
+
+        /** Log line: "penalties: chop=-8, drift=-10 → finalScore=27.0" */
+        String logLine(double finalScore) {
+            return "penalties: " + String.join(", ", breakdown)
+                    + " → finalScore=" + String.format("%.1f", finalScore);
+        }
+
+        /** Block reason shown in the feed. */
+        String blockReason(double finalScore, double threshold) {
+            return String.format("score %.1f after penalties [%s] < threshold %.1f",
+                    finalScore, String.join(", ", breakdown), threshold);
+        }
+    }
+
     private static class ScoredCandidate {
         final String strategyType;
         final StrategyResult.Signal signal;
@@ -647,9 +775,12 @@ public class NiftyDecisionEngine {
         int candlesNoSignals;               // all strategies held
         int candlesBlockedByScore;          // ALL_SIGNALS_BELOW_SCORE
         int candlesBlockedByScoreGap;       // SCORE_GAP_TOO_SMALL
-        int candlesBlockedByRecentMove;     // recent-move filter (non-neutral bias)
-        int candlesBlockedByVwap;           // VWAP-distance filter
-        int candlesBlockedByChop;           // chop filter
+        int candlesBlockedByRecentMove;           // move penalty contributed to penalty block
+        int candlesBlockedByVwap;                 // VWAP penalty contributed to penalty block
+        int candlesBlockedByChop;                 // chop penalty contributed to penalty block
+        int candlesBlockedByPenalty;              // total penalty blocks (penalized score < threshold)
+        int candlesBlockedByTrendStructure;       // TRENDING regime structure validator blocked
+        int candlesBlockedByCompressionStructure; // COMPRESSION regime structure validator blocked
         /** How many candles fell into each neutral-reason bucket. */
         Map<String, Integer> neutralReasonCounts = new LinkedHashMap<>();
     }

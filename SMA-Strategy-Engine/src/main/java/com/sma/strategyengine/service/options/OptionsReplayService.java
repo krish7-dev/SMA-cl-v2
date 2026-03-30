@@ -154,7 +154,13 @@ public class OptionsReplayService {
                 .orElse(new OptionsReplayRequest.ChopRules());
         OptionsReplayRequest.RangeQualityConfig rqc = Optional.ofNullable(req.getRangeQualityConfig())
                 .orElse(new OptionsReplayRequest.RangeQualityConfig());
-        NiftyDecisionEngine  decisionEngine  = new NiftyDecisionEngine(strategyRegistry, req.getStrategies(), dc, sc, rr, rsr, cr, rqc);
+        OptionsReplayRequest.TradeQualityConfig tqc = Optional.ofNullable(req.getTradeQualityConfig())
+                .orElse(new OptionsReplayRequest.TradeQualityConfig());
+        OptionsReplayRequest.TrendEntryConfig tec = Optional.ofNullable(req.getTrendEntryConfig())
+                .orElse(new OptionsReplayRequest.TrendEntryConfig());
+        OptionsReplayRequest.CompressionEntryConfig cec = Optional.ofNullable(req.getCompressionEntryConfig())
+                .orElse(new OptionsReplayRequest.CompressionEntryConfig());
+        NiftyDecisionEngine  decisionEngine  = new NiftyDecisionEngine(strategyRegistry, req.getStrategies(), dc, sc, rr, rsr, cr, rqc, tqc, tec, cec);
         OptionSelectorService selectorService = new OptionSelectorService(sel, optionCandleMap);
         OptionExecutionEngine execEngine      = new OptionExecutionEngine(req);
 
@@ -183,6 +189,9 @@ public class OptionsReplayService {
 
             // Apply trading rules (post-process: override entryAllowed / blockReason)
             applyTradingRules(decision, regime, req.getTradingRules());
+
+            // Apply score-tier rules (block WEAK trades after loss or in RANGING)
+            applyScoreTierRules(decision, regime, tqc, execEngine.getBarsSinceLastLoss());
 
             // b. Execution
             double niftyClose = niftyCandle.close().doubleValue();
@@ -223,6 +232,36 @@ public class OptionsReplayService {
         emitter.complete();
         log.info("Options replay complete: {} candles, {} trades, pnl={}",
                 total, execEngine.getClosedTrades().size(), execEngine.getRealizedPnl());
+    }
+
+    // ── Score tier rules ──────────────────────────────────────────────────────
+
+    private void applyScoreTierRules(NiftyDecisionResult decision,
+                                     String regime,
+                                     OptionsReplayRequest.TradeQualityConfig tqc,
+                                     int barsSinceLastLoss) {
+        if (tqc == null || !tqc.isEnabled()) return;
+        if (!decision.isEntryAllowed()) return; // already blocked — don't overwrite
+
+        String strength = decision.getTradeStrength();
+        if (!"WEAK".equals(strength)) return; // STRONG / NORMAL always pass
+
+        // Block WEAK trades within loss cooldown window
+        if (tqc.getWeakTradeLossCooldown() > 0
+                && barsSinceLastLoss < tqc.getWeakTradeLossCooldown()) {
+            decision.setEntryAllowed(false);
+            decision.setBlockReason("WEAK trade blocked: barsSinceLastLoss=" + barsSinceLastLoss
+                    + " < cooldown=" + tqc.getWeakTradeLossCooldown());
+            decision.setTradeStrength("NONE");
+            return;
+        }
+
+        // Block WEAK trades in RANGING regime
+        if (tqc.isBlockWeakInRanging() && "RANGING".equals(regime)) {
+            decision.setEntryAllowed(false);
+            decision.setBlockReason("WEAK trade blocked in RANGING regime");
+            decision.setTradeStrength("NONE");
+        }
     }
 
     // ── Trading rules ─────────────────────────────────────────────────────────
@@ -280,6 +319,8 @@ public class OptionsReplayService {
                 .barsSinceLastTrade(exec.getBarsSinceLastTrade())
                 .entryAllowed(decision.isEntryAllowed())
                 .blockReason(decision.getBlockReason())
+                .penalizedScore(decision.getPenalizedScore())
+                .tradeStrength(decision.getTradeStrength())
                 .neutralReason(decision.getNeutralReason())
                 .effectiveMinScore(decision.getEffectiveMinScore())
                 .effectiveMinScoreGap(decision.getEffectiveMinScoreGap())
@@ -297,6 +338,10 @@ public class OptionsReplayService {
                 .positionState(exec.getState().name())
                 .desiredSide(exec.getDesiredSide().name())
                 .action(action)
+                .exitReason(exec.getLastExitReason())
+                .entryRegime(exec.getEntryRegime())
+                .appliedMinHold(exec.getAppliedMinHold())
+                .holdActive(exec.isHoldActive())
                 .selectedToken(exec.getActiveToken())
                 .selectedOptionType(exec.getActiveOptionType())
                 .selectedStrike(exec.getActiveStrike())

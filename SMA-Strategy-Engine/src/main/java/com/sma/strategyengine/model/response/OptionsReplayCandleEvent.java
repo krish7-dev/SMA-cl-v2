@@ -32,6 +32,10 @@ public class OptionsReplayCandleEvent {
     private int     barsSinceLastTrade;
     private boolean entryAllowed;
     private String  blockReason;
+    private double  penalizedScore;
+
+    /** Trade quality tier: STRONG / NORMAL / WEAK / NONE */
+    private String  tradeStrength;
 
     /** Why rawBias is NEUTRAL: NO_SIGNALS | ALL_SIGNALS_BELOW_SCORE | SCORE_GAP_TOO_SMALL */
     private String  neutralReason;
@@ -62,6 +66,11 @@ public class OptionsReplayCandleEvent {
     private String desiredSide;          // NONE / CE / PE
     private String action;               // ENTERED / EXITED / HELD / FORCE_CLOSED / WAITING
     private String exitReason;
+
+    // Hold debug fields
+    private String  entryRegime;         // regime at time of entry
+    private int     appliedMinHold;      // minHold bars used this candle
+    private boolean holdActive;          // true if inside the hold window
 
     // Selected option
     private String selectedOptionType;

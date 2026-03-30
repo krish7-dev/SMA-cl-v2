@@ -6655,9 +6655,10 @@ const OPT_INTERVALS = [
 const DEFAULT_DECISION = {
   minScore: '40', minScoreGap: '8', maxRecentMove3: '1.5', maxRecentMove5: '2.5',
   maxAbsVwapDist: '1.5', minBarsSinceTrade: '3', chopFilter: true, chopLookback: '8',
+  penaltyMinScore: '25',
 };
 const DEFAULT_SELECTION = { minPremium: '50', maxPremium: '300' };
-const DEFAULT_SWITCH    = { switchConfirmationCandles: '2', maxSwitchesPerDay: '3' };
+const DEFAULT_SWITCH    = { switchConfirmationCandles: '2', maxSwitchesPerDay: '3', minScoreImprovementForSwitch: '0' };
 const DEFAULT_REGIME_RULES = {
   enabled: true,
   rangingMinScore: '35',    rangingMinScoreGap: '6',
@@ -6712,10 +6713,397 @@ const DEFAULT_RANGE_QUALITY = {
   chopFlipRatioLimit:            '0.65',
   enableChopCheck:               true,
 };
+const DEFAULT_TRADE_QUALITY = {
+  enabled: false,
+  strongScoreThreshold:  '40',
+  normalScoreThreshold:  '32',
+  weakTradeLossCooldown: '5',
+  blockWeakInRanging:    true,
+  rangingConfirmCandles: '3',
+  trendingConfirmCandles:'2',
+};
+const DEFAULT_TREND_ENTRY = {
+  enabled:         false,
+  breakoutLookback:'5',
+  minBodyPct:      '60',
+  weakBodyPct:     '30',
+  ema9Period:      '9',
+};
+const DEFAULT_COMPRESSION_ENTRY = {
+  enabled:              false,
+  rangeLookback:        '10',
+  longZoneMax:          '0.2',
+  shortZoneMin:         '0.8',
+  noTradeZoneMin:       '0.4',
+  noTradeZoneMax:       '0.6',
+  rejectBreakoutCandle: true,
+};
+const DEFAULT_HOLD = {
+  enabled:             true,
+  defaultMinHoldBars:  '3',
+  rangingMinHoldBars:  '4',
+  trendingMinHoldBars: '2',
+  strongOppositeScore: '35',
+  persistentExitBars:  '2',
+};
 
 function fmt2(v) { return v != null ? Number(v).toFixed(2) : '—'; }
 function pnlStyle(v) { return { color: v > 0 ? '#22c55e' : v < 0 ? '#ef4444' : undefined, fontWeight: 600 }; }
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function computeEma(closes, period) {
+  if (!closes.length || period < 1) return [];
+  const k = 2 / (period + 1);
+  const out = new Array(closes.length);
+  out[0] = closes[0];
+  for (let i = 1; i < closes.length; i++) out[i] = closes[i] * k + out[i - 1] * (1 - k);
+  return out;
+}
+
+// ─── ReplayChart component ────────────────────────────────────────────────────
+//
+// Plots NIFTY price data from the SSE feed with:
+//   • Candlestick series
+//   • EMA 9 / EMA 21 lines
+//   • VWAP line (reconstructed from distanceFromVwap + close)
+//   • Regime background shading via colored area bands
+//   • Bias-change markers (arrow when confirmedBias switches)
+//   • CE/PE trade entry ▲ / exit ▼ markers, coloured by win/loss
+//   • Trade entry/exit price lines for active (selected) trade
+//
+function ReplayChart({ feed, closedTrades }) {
+  const containerRef = useRef(null);
+  const chartRef     = useRef(null);
+  const candleRef    = useRef(null);
+  const ema9Ref      = useRef(null);
+  const ema21Ref     = useRef(null);
+  const vwapRef      = useRef(null);
+  const regimeBandRefs = useRef([]);
+  const markersRef   = useRef(null);
+  const tradeLinesRef = useRef([]);
+
+  const [showEma9,   setShowEma9]   = useState(true);
+  const [showEma21,  setShowEma21]  = useState(true);
+  const [showVwap,   setShowVwap]   = useState(true);
+  const [showRegime, setShowRegime] = useState(true);
+  const [selectedTradeIdx, setSelectedTradeIdx] = useState(null);
+
+  const REGIME_LINE_COLORS = {
+    RANGING:     '#f59e0b',
+    TRENDING:    '#22c55e',
+    COMPRESSION: '#8b5cf6',
+    VOLATILE:    '#ef4444',
+  };
+
+  // ── Create chart once ─────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const chart = createChart(containerRef.current, {
+      height: 520,
+      layout: { background: { color: '#0d0d1a' }, textColor: '#9ca3af' },
+      grid:   { vertLines: { color: '#1a1a2e' }, horzLines: { color: '#1a1a2e' } },
+      crosshair: { mode: CrosshairMode.Normal },
+      rightPriceScale: { borderColor: '#2d2d4e' },
+      timeScale: { borderColor: '#2d2d4e', timeVisible: true, secondsVisible: false },
+    });
+
+    candleRef.current = chart.addSeries(CandlestickSeries, {
+      upColor: '#22c55e', downColor: '#ef4444',
+      borderUpColor: '#22c55e', borderDownColor: '#ef4444',
+      wickUpColor: '#22c55e', wickDownColor: '#ef4444',
+    });
+
+    ema9Ref.current = chart.addSeries(LineSeries, {
+      color: '#f59e0b', lineWidth: 1,
+      priceLineVisible: false, lastValueVisible: false,
+      title: 'EMA9',
+    });
+    ema21Ref.current = chart.addSeries(LineSeries, {
+      color: '#8b5cf6', lineWidth: 1,
+      priceLineVisible: false, lastValueVisible: false,
+      title: 'EMA21',
+    });
+    vwapRef.current = chart.addSeries(LineSeries, {
+      color: '#06b6d4', lineWidth: 1, lineStyle: LineStyle.Dashed,
+      priceLineVisible: false, lastValueVisible: false,
+      title: 'VWAP',
+    });
+
+    chartRef.current = chart;
+
+    const onResize = () => {
+      if (containerRef.current)
+        chart.applyOptions({ width: containerRef.current.clientWidth });
+    };
+    window.addEventListener('resize', onResize);
+    return () => { window.removeEventListener('resize', onResize); chart.remove(); };
+  }, []);
+
+  // ── Toggle indicator visibility ───────────────────────────────────────────
+  useEffect(() => { ema9Ref.current?.applyOptions({ visible: showEma9 }); },  [showEma9]);
+  useEffect(() => { ema21Ref.current?.applyOptions({ visible: showEma21 }); }, [showEma21]);
+  useEffect(() => { vwapRef.current?.applyOptions({ visible: showVwap }); },   [showVwap]);
+
+  // ── Update data when feed changes ─────────────────────────────────────────
+  useEffect(() => {
+    if (!candleRef.current || !feed?.length) return;
+    const chart = chartRef.current;
+
+    // ── Candles ──
+    const candleData = feed.map(e => ({
+      time:  toUtcSec(e.niftyTime),
+      open:  e.niftyOpen,
+      high:  e.niftyHigh,
+      low:   e.niftyLow,
+      close: e.niftyClose,
+    })).filter(d => d.time > 0).sort((a, b) => a.time - b.time);
+    candleRef.current.setData(candleData);
+
+    const times  = candleData.map(d => d.time);
+    const closes = candleData.map(d => d.close);
+
+    // ── EMA 9 ──
+    const ema9vals  = computeEma(closes, 9);
+    ema9Ref.current.setData(times.map((t, i) => ({ time: t, value: ema9vals[i] })));
+
+    // ── EMA 21 ──
+    const ema21vals = computeEma(closes, 21);
+    ema21Ref.current.setData(times.map((t, i) => ({ time: t, value: ema21vals[i] })));
+
+    // ── VWAP (reconstruct from distanceFromVwap: dist% = (close-vwap)/vwap*100) ──
+    const vwapData = feed
+      .filter(e => e.distanceFromVwap != null && e.niftyClose != null && toUtcSec(e.niftyTime) > 0)
+      .map(e => {
+        const d = e.distanceFromVwap / 100;        // decimal fraction
+        const vwap = e.niftyClose / (1 + d);       // close = vwap*(1+d)
+        return { time: toUtcSec(e.niftyTime), value: vwap };
+      })
+      .sort((a, b) => a.time - b.time);
+    vwapRef.current.setData(vwapData);
+
+    // ── Regime bands (background shading) ─────────────────────────────────
+    // Remove old bands
+    regimeBandRefs.current.forEach(s => { try { chart.removeSeries(s); } catch {} });
+    regimeBandRefs.current = [];
+
+    if (showRegime && feed.length > 1) {
+      // Group consecutive candles by regime → build segments
+      const segments = [];
+      let seg = { regime: feed[0].regime, start: 0, end: 0 };
+      for (let i = 1; i < feed.length; i++) {
+        if (feed[i].regime === seg.regime) {
+          seg.end = i;
+        } else {
+          segments.push({ ...seg });
+          seg = { regime: feed[i].regime, start: i, end: i };
+        }
+      }
+      segments.push(seg);
+
+      // For each segment paint a thin colored line at the bottom of price range
+      // (using an area series is not supported per-segment; use a LineSeries at low price)
+      const priceMin = Math.min(...candleData.map(d => d.low));
+      const priceMax = Math.max(...candleData.map(d => d.high));
+      const bandH    = (priceMax - priceMin) * 0.015; // 1.5% height strip
+
+      segments.forEach(seg => {
+        const color = REGIME_LINE_COLORS[seg.regime] || '#9ca3af';
+        const s = chart.addSeries(LineSeries, {
+          color,
+          lineWidth: 3,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+        });
+        const pts = [];
+        for (let i = seg.start; i <= seg.end; i++) {
+          pts.push({ time: times[i], value: priceMin - bandH });
+        }
+        if (pts.length) s.setData(pts);
+        regimeBandRefs.current.push(s);
+      });
+    }
+
+    // ── Bias + trade markers ───────────────────────────────────────────────
+    if (markersRef.current) { markersRef.current.setMarkers([]); markersRef.current = null; }
+
+    const markers = [];
+
+    // Bias-switch markers
+    let prevConfirmed = null;
+    feed.forEach(e => {
+      const t = toUtcSec(e.niftyTime);
+      if (!t) return;
+      if (e.confirmedBias !== prevConfirmed && e.switchConfirmed) {
+        if (e.confirmedBias === 'BULLISH') {
+          markers.push({ time: t, position: 'belowBar', color: '#22c55e', shape: 'arrowUp', text: '▲BULL', size: 1 });
+        } else if (e.confirmedBias === 'BEARISH') {
+          markers.push({ time: t, position: 'aboveBar', color: '#ef4444', shape: 'arrowDown', text: '▼BEAR', size: 1 });
+        } else {
+          markers.push({ time: t, position: 'aboveBar', color: '#9ca3af', shape: 'circle', text: 'N', size: 1 });
+        }
+      }
+      prevConfirmed = e.confirmedBias;
+
+      // Trade action markers
+      if (e.action === 'ENTERED') {
+        const isCE = e.selectedOptionType === 'CE';
+        markers.push({
+          time: t, position: 'belowBar',
+          color: isCE ? '#22c55e' : '#ef4444',
+          shape: 'arrowUp',
+          text: isCE ? 'CE' : 'PE',
+          size: 2,
+        });
+      }
+      if (e.action === 'EXITED' || e.action === 'FORCE_CLOSED') {
+        // Look up the corresponding closed trade for P&L colour
+        const trade = closedTrades.find(ct =>
+          ct.exitTime && Math.abs(toUtcSec(ct.exitTime) - t) < 310
+        );
+        const win = trade ? trade.pnl >= 0 : null;
+        const color = win === true ? '#22c55e' : win === false ? '#ef4444' : '#f59e0b';
+        const pnlTxt = trade ? ` ${trade.pnl >= 0 ? '+' : ''}${Number(trade.pnl).toFixed(0)}` : '';
+        markers.push({
+          time: t, position: 'aboveBar',
+          color,
+          shape: 'arrowDown',
+          text: `X${pnlTxt}`,
+          size: 2,
+        });
+      }
+    });
+
+    markers.sort((a, b) => a.time - b.time);
+    markersRef.current = createSeriesMarkers(candleRef.current, markers);
+
+    chart.timeScale().fitContent();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [feed, showRegime]);
+
+  // ── Trade price lines for selected trade ─────────────────────────────────
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+
+    tradeLinesRef.current.forEach(s => { try { chart.removeSeries(s); } catch {} });
+    tradeLinesRef.current = [];
+
+    if (selectedTradeIdx == null || !closedTrades?.[selectedTradeIdx]) return;
+    const t   = closedTrades[selectedTradeIdx];
+    const win = t.pnl >= 0;
+    const color = win ? '#22c55e' : '#ef4444';
+
+    const ivSec = feed.length >= 2
+      ? toUtcSec(feed[1].niftyTime) - toUtcSec(feed[0].niftyTime)
+      : 300;
+    const halfSpan = ivSec * 8;
+
+    function addLine(price, timeStr, style, label) {
+      if (price == null || !timeStr) return;
+      const t0 = toUtcSec(timeStr) - halfSpan;
+      const t1 = toUtcSec(timeStr) + halfSpan;
+      const s  = chart.addSeries(LineSeries, {
+        color, lineWidth: 1, lineStyle: style,
+        priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+      });
+      s.setData([{ time: t0, value: parseFloat(price) }, { time: t1, value: parseFloat(price) }]);
+      s.createPriceLine({ price: parseFloat(price), color, lineWidth: 0, lineStyle: LineStyle.Solid, axisLabelVisible: true, title: label });
+      tradeLinesRef.current.push(s);
+    }
+
+    addLine(t.entryPrice, t.entryTime, LineStyle.Dashed, `Entry ₹${Number(t.entryPrice).toFixed(0)}`);
+    addLine(t.exitPrice,  t.exitTime,  LineStyle.Dotted, `Exit  ₹${Number(t.exitPrice).toFixed(0)}`);
+
+    // Scroll to trade
+    if (t.entryTime) {
+      const from = toUtcSec(t.entryTime) - ivSec * 30;
+      const to   = toUtcSec(t.exitTime || t.entryTime) + ivSec * 15;
+      chart.timeScale().setVisibleRange({ from, to });
+    }
+  }, [selectedTradeIdx, closedTrades, feed]);
+
+  if (!feed?.length) {
+    return (
+      <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 48 }}>
+        Chart will appear once the replay starts.
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {/* ── Toolbar ── */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
+        {[
+          ['EMA 9',  showEma9,   setShowEma9,   '#f59e0b'],
+          ['EMA 21', showEma21,  setShowEma21,  '#8b5cf6'],
+          ['VWAP',   showVwap,   setShowVwap,   '#06b6d4'],
+          ['Regime', showRegime, setShowRegime, '#9ca3af'],
+        ].map(([label, on, setter, color]) => (
+          <button key={label} type="button"
+            onClick={() => setter(v => !v)}
+            style={{
+              fontSize: 11, padding: '3px 10px', borderRadius: 4, cursor: 'pointer',
+              border: `1px solid ${on ? color : 'var(--border)'}`,
+              background: on ? color + '22' : 'transparent',
+              color: on ? color : 'var(--text-muted)',
+              fontWeight: on ? 700 : 400,
+            }}>
+            {label}
+          </button>
+        ))}
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 8 }}>
+          {Object.entries(REGIME_LINE_COLORS).map(([r, c]) => (
+            <span key={r} style={{ marginRight: 10 }}>
+              <span style={{ display: 'inline-block', width: 10, height: 3, background: c, borderRadius: 2, marginRight: 4, verticalAlign: 'middle' }} />
+              {r}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Chart ── */}
+      <div ref={containerRef} style={{ width: '100%' }} />
+
+      {/* ── Trade list ── */}
+      {closedTrades?.length > 0 && (
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 6, fontWeight: 600 }}>
+            Click a trade to highlight on chart:
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {closedTrades.map((t, i) => {
+              const win = t.pnl >= 0;
+              const sel = i === selectedTradeIdx;
+              return (
+                <button key={i} type="button"
+                  onClick={() => setSelectedTradeIdx(sel ? null : i)}
+                  style={{
+                    fontSize: 11, padding: '3px 10px', borderRadius: 4, cursor: 'pointer',
+                    border: `1px solid ${win ? '#22c55e' : '#ef4444'}`,
+                    background: sel ? (win ? '#22c55e33' : '#ef444433') : 'transparent',
+                    color: win ? '#22c55e' : '#ef4444',
+                    fontWeight: sel ? 700 : 400,
+                  }}>
+                  #{i + 1} {t.optionType} {t.pnl >= 0 ? '+' : ''}{Number(t.pnl).toFixed(0)}
+                </button>
+              );
+            })}
+            {selectedTradeIdx != null && (
+              <button type="button"
+                onClick={() => setSelectedTradeIdx(null)}
+                style={{ fontSize: 11, padding: '3px 10px', borderRadius: 4, cursor: 'pointer', border: '1px solid var(--border)', color: 'var(--text-muted)', background: 'transparent' }}>
+                Clear
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function OptionsReplayTest() {
   const { session, isActive } = useSession();
@@ -6752,9 +7140,17 @@ function OptionsReplayTest() {
   const [regimeStrategyRules,  setRegimeStrategyRules]  = useState(() => ls('sma_opts_regime_strat_rules',    DEFAULT_REGIME_STRATEGY_RULES));
   const [optsRisk,             setOptsRisk]             = useState(() => ls('sma_opts_risk',                  DEFAULT_OPTS_RISK));
   const [rangeQuality,         setRangeQuality]         = useState(() => ls('sma_opts_range_quality',          DEFAULT_RANGE_QUALITY));
+  const [tradeQuality,         setTradeQuality]         = useState(() => ls('sma_opts_trade_quality',          DEFAULT_TRADE_QUALITY));
+  const [trendEntry,           setTrendEntry]           = useState(() => ls('sma_opts_trend_entry',            DEFAULT_TREND_ENTRY));
+  const [compressionEntry,     setCompressionEntry]     = useState(() => ls('sma_opts_compression_entry',      DEFAULT_COMPRESSION_ENTRY));
+  const [holdConfig,           setHoldConfig]           = useState(() => ({ ...DEFAULT_HOLD, ...ls('sma_opts_hold_config', {}) }));
 
   function updateOptsRisk(key, val) { setOptsRisk(p => ({ ...p, [key]: val })); }
   function updateRangeQuality(key, val) { setRangeQuality(p => ({ ...p, [key]: val })); }
+  function updateHoldConfig(key, val) { setHoldConfig(p => ({ ...p, [key]: val })); }
+  function updateTradeQuality(key, val) { setTradeQuality(p => ({ ...p, [key]: val })); }
+  function updateTrendEntry(key, val) { setTrendEntry(p => ({ ...p, [key]: val })); }
+  function updateCompressionEntry(key, val) { setCompressionEntry(p => ({ ...p, [key]: val })); }
 
   // ── Persist to localStorage on change
   useEffect(() => { try { localStorage.setItem('sma_opts_nifty',      JSON.stringify(nifty));        } catch {} }, [nifty]);
@@ -6778,7 +7174,7 @@ function OptionsReplayTest() {
   function saveRecentDate(dateStr) {
     if (!dateStr) return;
     setRecentDates(prev => {
-      const next = [dateStr, ...prev.filter(d => d !== dateStr)].slice(0, 8);
+      const next = [dateStr, ...prev.filter(d => d !== dateStr)].slice(0, 10);
       try { localStorage.setItem('sma_opts_recent_dates', JSON.stringify(next)); } catch {}
       return next;
     });
@@ -6791,6 +7187,10 @@ function OptionsReplayTest() {
   useEffect(() => { try { localStorage.setItem('sma_opts_regime_strat_rules', JSON.stringify(regimeStrategyRules)); } catch {} }, [regimeStrategyRules]);
   useEffect(() => { try { localStorage.setItem('sma_opts_risk',               JSON.stringify(optsRisk));            } catch {} }, [optsRisk]);
   useEffect(() => { try { localStorage.setItem('sma_opts_range_quality',      JSON.stringify(rangeQuality));        } catch {} }, [rangeQuality]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_trade_quality',      JSON.stringify(tradeQuality));        } catch {} }, [tradeQuality]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_trend_entry',        JSON.stringify(trendEntry));          } catch {} }, [trendEntry]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_compression_entry',  JSON.stringify(compressionEntry));    } catch {} }, [compressionEntry]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_hold_config',        JSON.stringify(holdConfig));          } catch {} }, [holdConfig]);
 
   // ── Run state
   const [status,   setStatus]   = useState('idle'); // idle|running|completed|error
@@ -6866,10 +7266,10 @@ function OptionsReplayTest() {
 
     // ── Decision Config ─────────────────────────────────────────────────────
     lines.push(row('=== Decision Config ==='));
-    lines.push(row('Min Score', 'Min Score Gap', 'Max Recent Move 3%', 'Max Recent Move 5%',
+    lines.push(row('Min Score', 'Penalty Min Score', 'Min Score Gap', 'Max Recent Move 3%', 'Max Recent Move 5%',
       'Max VWAP Dist%', 'Min Bars Since Trade', 'Chop Filter', 'Chop Lookback'));
     lines.push(row(
-      decisionCfg.minScore, decisionCfg.minScoreGap,
+      decisionCfg.minScore, decisionCfg.penaltyMinScore, decisionCfg.minScoreGap,
       decisionCfg.maxRecentMove3, decisionCfg.maxRecentMove5,
       decisionCfg.maxAbsVwapDist, decisionCfg.minBarsSinceTrade,
       decisionCfg.chopFilter ? 'Yes' : 'No', decisionCfg.chopLookback,
@@ -6973,6 +7373,47 @@ function OptionsReplayTest() {
     ));
     lines.push(blank);
 
+    // ── Trade Quality ────────────────────────────────────────────────────────
+    lines.push(row('=== Trade Quality ==='));
+    lines.push(row('Enabled', 'Strong Score ≥', 'Normal Score ≥', 'Weak Loss Cooldown', 'Block Weak in RANGING', 'RANGING Confirm', 'TRENDING Confirm'));
+    lines.push(row(
+      tradeQuality.enabled ? 'Yes' : 'No',
+      tradeQuality.strongScoreThreshold, tradeQuality.normalScoreThreshold,
+      tradeQuality.weakTradeLossCooldown, tradeQuality.blockWeakInRanging ? 'Yes' : 'No',
+      tradeQuality.rangingConfirmCandles, tradeQuality.trendingConfirmCandles,
+    ));
+    lines.push(blank);
+
+    // ── Trending Entry Structure ─────────────────────────────────────────────
+    lines.push(row('=== Trending Entry Structure (TRENDING only) ==='));
+    lines.push(row('Enabled', 'Breakout Lookback', 'Min Body %', 'Weak Body %', 'EMA Period'));
+    lines.push(row(
+      trendEntry.enabled ? 'Yes' : 'No',
+      trendEntry.breakoutLookback, trendEntry.minBodyPct, trendEntry.weakBodyPct, trendEntry.ema9Period,
+    ));
+    lines.push(blank);
+
+    // ── Compression Entry Structure ──────────────────────────────────────────
+    lines.push(row('=== Compression Entry Structure (COMPRESSION only) ==='));
+    lines.push(row('Enabled', 'Range Lookback', 'Long Zone Max', 'Short Zone Min', 'No-Trade Min', 'No-Trade Max', 'Reject Breakout'));
+    lines.push(row(
+      compressionEntry.enabled ? 'Yes' : 'No',
+      compressionEntry.rangeLookback, compressionEntry.longZoneMax, compressionEntry.shortZoneMin,
+      compressionEntry.noTradeZoneMin, compressionEntry.noTradeZoneMax,
+      compressionEntry.rejectBreakoutCandle ? 'Yes' : 'No',
+    ));
+    lines.push(blank);
+
+    // ── Hold Config ─────────────────────────────────────────────────────────
+    lines.push(row('=== Minimum Hold Period ==='));
+    lines.push(row('Enabled', 'Default Min Hold', 'RANGING Min Hold', 'TRENDING Min Hold', 'Strong Opp Score', 'Persistent Exit Bars'));
+    lines.push(row(
+      holdConfig.enabled ? 'Yes' : 'No',
+      holdConfig.defaultMinHoldBars, holdConfig.rangingMinHoldBars, holdConfig.trendingMinHoldBars,
+      holdConfig.strongOppositeScore, holdConfig.persistentExitBars,
+    ));
+    lines.push(blank);
+
     // ── Summary ─────────────────────────────────────────────────────────────
     if (summary) {
       lines.push(row('=== Summary ==='));
@@ -7046,6 +7487,7 @@ function OptionsReplayTest() {
         'Candidates',
         // Execution
         'Position State', 'Desired Side', 'Action', 'Exit Reason',
+        'Entry Regime', 'Applied Min Hold', 'Hold Active',
         'Selected Symbol', 'Option Type', 'Strike', 'Expiry',
         'Entry Price', 'Exit Price', 'Bars In Trade',
         'uPnL', 'rPnL', 'Total PnL', 'Capital',
@@ -7074,6 +7516,7 @@ function OptionsReplayTest() {
           `${c.strategyType}:${c.signal}:${Number(c.score).toFixed(1)}:${c.eligible ? 'ok' : 'blocked'}${c.eligibilityReason ? '(' + c.eligibilityReason + ')' : ''}`
         ).join(' | '),
         e.positionState || '', e.desiredSide || '', e.action || '', e.exitReason || '',
+        e.entryRegime || '', e.appliedMinHold ?? '', e.holdActive ? 'Yes' : 'No',
         e.selectedTradingSymbol || '', e.selectedOptionType || '',
         e.selectedStrike ?? '', e.selectedExpiry || '',
         n2(e.entryPrice), n2(e.exitPrice), e.barsInTrade ?? '',
@@ -7174,14 +7617,16 @@ function OptionsReplayTest() {
         minBarsSinceTrade: parseInt(decisionCfg.minBarsSinceTrade, 10) || 3,
         chopFilter:        decisionCfg.chopFilter,
         chopLookback:      parseInt(decisionCfg.chopLookback, 10)      || 8,
+        penaltyMinScore:   parseFloat(decisionCfg.penaltyMinScore)    || 25,
       },
       selectionConfig: {
         minPremium: parseFloat(selectionCfg.minPremium) || 50,
         maxPremium: parseFloat(selectionCfg.maxPremium) || 300,
       },
       switchConfig: {
-        switchConfirmationCandles: parseInt(switchCfg.switchConfirmationCandles, 10) || 2,
-        maxSwitchesPerDay:         parseInt(switchCfg.maxSwitchesPerDay, 10)         || 3,
+        switchConfirmationCandles:   parseInt(switchCfg.switchConfirmationCandles, 10)    || 2,
+        maxSwitchesPerDay:           parseInt(switchCfg.maxSwitchesPerDay, 10)            || 3,
+        minScoreImprovementForSwitch:parseFloat(switchCfg.minScoreImprovementForSwitch)  || 0,
       },
       regimeConfig: optsRegimeCfg.enabled ? {
         enabled:            true,
@@ -7240,6 +7685,39 @@ function OptionsReplayTest() {
         chopFlipRatioLimit:            parseFloat(rangeQuality.chopFlipRatioLimit)           || 0.65,
         enableChopCheck:               rangeQuality.enableChopCheck,
       } : { enabled: false },
+      tradeQualityConfig: tradeQuality.enabled ? {
+        enabled:                true,
+        strongScoreThreshold:   parseFloat(tradeQuality.strongScoreThreshold)   || 40,
+        normalScoreThreshold:   parseFloat(tradeQuality.normalScoreThreshold)   || 32,
+        weakTradeLossCooldown:  parseInt(tradeQuality.weakTradeLossCooldown, 10) || 5,
+        blockWeakInRanging:     tradeQuality.blockWeakInRanging,
+        rangingConfirmCandles:  parseInt(tradeQuality.rangingConfirmCandles, 10) || 3,
+        trendingConfirmCandles: parseInt(tradeQuality.trendingConfirmCandles, 10) || 2,
+      } : { enabled: false },
+      trendEntryConfig: trendEntry.enabled ? {
+        enabled:         true,
+        breakoutLookback:parseInt(trendEntry.breakoutLookback, 10) || 5,
+        minBodyPct:      parseFloat(trendEntry.minBodyPct)         || 60,
+        weakBodyPct:     parseFloat(trendEntry.weakBodyPct)        || 30,
+        ema9Period:      parseInt(trendEntry.ema9Period, 10)       || 9,
+      } : { enabled: false },
+      compressionEntryConfig: compressionEntry.enabled ? {
+        enabled:              true,
+        rangeLookback:        parseInt(compressionEntry.rangeLookback, 10)  || 10,
+        longZoneMax:          parseFloat(compressionEntry.longZoneMax)       || 0.2,
+        shortZoneMin:         parseFloat(compressionEntry.shortZoneMin)      || 0.8,
+        noTradeZoneMin:       parseFloat(compressionEntry.noTradeZoneMin)    || 0.4,
+        noTradeZoneMax:       parseFloat(compressionEntry.noTradeZoneMax)    || 0.6,
+        rejectBreakoutCandle: compressionEntry.rejectBreakoutCandle,
+      } : { enabled: false },
+      holdConfig: {
+        enabled:             holdConfig.enabled,
+        defaultMinHoldBars:  parseInt(holdConfig.defaultMinHoldBars, 10)  || 3,
+        rangingMinHoldBars:  parseInt(holdConfig.rangingMinHoldBars, 10)  || 4,
+        trendingMinHoldBars: parseInt(holdConfig.trendingMinHoldBars, 10) || 2,
+        strongOppositeScore: parseFloat(holdConfig.strongOppositeScore)   || 35,
+        persistentExitBars:  parseInt(holdConfig.persistentExitBars, 10)  || 2,
+      },
       speedMultiplier: parseInt(speed, 10) || 1,
       persist: true,
     };
@@ -7306,7 +7784,7 @@ function OptionsReplayTest() {
       {/* ── Results panel (always visible at top) ── */}
       <div className="card bt-opts-card" style={{ marginBottom: 16 }}>
         <div className="bt-live-right-tabs" style={{ marginBottom: 14 }}>
-          {[['feed','Feed'],['pnl','P&L'],['portfolio','Portfolio'],['details','Details']].map(([k, l]) => (
+          {[['feed','Feed'],['chart','Chart'],['pnl','P&L'],['portfolio','Portfolio'],['details','Details']].map(([k, l]) => (
             <button key={k} className={`bt-live-tab-btn ${rightTab === k ? 'active' : ''}`} onClick={() => setRightTab(k)}>{l}</button>
           ))}
           {feed.length > 0 && (
@@ -7413,10 +7891,19 @@ function OptionsReplayTest() {
                 if (optsRisk.enabled) {
                   text += ` | Risk: SL=${optsRisk.stopLossPct}% TP=${optsRisk.takeProfitPct}% MaxRisk=${optsRisk.maxRiskPerTradePct}% DailyCap=${optsRisk.dailyLossCapPct}% Cooldown=${optsRisk.cooldownCandles}`;
                 }
+                if (tradeQuality.enabled) {
+                  text += ` | TQ: S>=${tradeQuality.strongScoreThreshold} N>=${tradeQuality.normalScoreThreshold} wkCooldown=${tradeQuality.weakTradeLossCooldown} blockWkRng=${tradeQuality.blockWeakInRanging} rngConf=${tradeQuality.rangingConfirmCandles} trdConf=${tradeQuality.trendingConfirmCandles}`;
+                }
+                if (trendEntry.enabled) {
+                  text += ` | TrendEntry: brkLbk=${trendEntry.breakoutLookback} body>=${trendEntry.minBodyPct}% weak<${trendEntry.weakBodyPct}% EMA${trendEntry.ema9Period}`;
+                }
+                if (compressionEntry.enabled) {
+                  text += ` | CmpEntry: lbk=${compressionEntry.rangeLookback} long<=${compressionEntry.longZoneMax} short>=${compressionEntry.shortZoneMin} noTrade=[${compressionEntry.noTradeZoneMin}-${compressionEntry.noTradeZoneMax}]`;
+                }
                 text += '\n\n';
 
                 // ── Feed header ──
-                const headers = ['Time','NIFTY','Regime','Bias','ConfBias','Winner','Score','2nd','Gap','Shadow','NeutralReason','State','Action','Option','OptPx','uPnL','rPnL','Block'];
+                const headers = ['Time','NIFTY','Regime','Bias','ConfBias','Winner','Score','PenScore','Str','2nd','Gap','Shadow','NeutralReason','State','Bars','Hold','Action','ExitRsn','Option','OptPx','uPnL','rPnL','Block'];
                 text += headers.join('\t') + '\n';
 
                 // ── Feed rows (chronological order) ──
@@ -7429,12 +7916,17 @@ function OptionsReplayTest() {
                     evt.confirmedBias || '',
                     evt.winnerStrategy || '',
                     evt.winnerScore != null ? Number(evt.winnerScore).toFixed(2) : '',
+                    evt.penalizedScore != null && evt.penalizedScore !== evt.winnerScore ? Number(evt.penalizedScore).toFixed(2) : '',
+                    evt.tradeStrength && evt.tradeStrength !== 'NONE' ? evt.tradeStrength : '',
                     evt.secondStrategy ? `${evt.secondStrategy} ${Number(evt.secondScore).toFixed(2)}` : '',
                     evt.scoreGap != null ? Number(evt.scoreGap).toFixed(2) : '',
                     evt.shadowWinner ? `${evt.shadowWinner} ${Number(evt.shadowWinnerScore).toFixed(2)}` : '',
                     evt.neutralReason || '',
                     evt.positionState || '',
+                    evt.barsInTrade ?? '',
+                    evt.holdActive ? `LOCK(${evt.barsInTrade}/${evt.appliedMinHold})` : '',
                     evt.action || '',
+                    evt.exitReason || '',
                     evt.selectedTradingSymbol || '',
                     evt.optionClose != null ? Number(evt.optionClose).toFixed(2) : '',
                     evt.unrealizedPnl != null ? Number(evt.unrealizedPnl).toFixed(2) : '',
@@ -7466,6 +7958,7 @@ function OptionsReplayTest() {
               <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
               <span style={{ marginRight: 10, fontWeight: 700, color: 'var(--text-primary)' }}>Config:</span>
               <span style={{ marginRight: 14 }}>minScore=<b style={{ color: 'var(--text-primary)' }}>{decisionCfg.minScore}</b></span>
+              <span style={{ marginRight: 14 }}>penFloor=<b style={{ color: '#f59e0b' }}>{decisionCfg.penaltyMinScore}</b></span>
               <span style={{ marginRight: 14 }}>gap=<b style={{ color: 'var(--text-primary)' }}>{decisionCfg.minScoreGap}</b></span>
               <span style={{ marginRight: 14 }}>move3=<b style={{ color: 'var(--text-primary)' }}>{decisionCfg.maxRecentMove3}%</b></span>
               <span style={{ marginRight: 14 }}>move5=<b style={{ color: 'var(--text-primary)' }}>{decisionCfg.maxRecentMove5}%</b></span>
@@ -7577,6 +8070,46 @@ function OptionsReplayTest() {
                   {optsRisk.cooldownCandles && <span style={{ marginRight: 10 }}>Cooldown=<b style={{ color: 'var(--text-primary)' }}>{optsRisk.cooldownCandles}</b></span>}
                 </>
               )}
+              {tradeQuality.enabled && (
+                <>
+                  <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+                  <span style={{ marginRight: 8, fontWeight: 700, color: '#22c55e' }}>TQ:</span>
+                  <span style={{ marginRight: 10 }}>S≥<b style={{ color: '#22c55e' }}>{tradeQuality.strongScoreThreshold}</b></span>
+                  <span style={{ marginRight: 10 }}>N≥<b style={{ color: '#0ea5e9' }}>{tradeQuality.normalScoreThreshold}</b></span>
+                  <span style={{ marginRight: 10 }}>wkCool=<b style={{ color: 'var(--text-primary)' }}>{tradeQuality.weakTradeLossCooldown}</b></span>
+                  <span style={{ marginRight: 10 }}>rngConf=<b style={{ color: 'var(--text-primary)' }}>{tradeQuality.rangingConfirmCandles}</b></span>
+                  <span style={{ marginRight: 10 }}>trdConf=<b style={{ color: 'var(--text-primary)' }}>{tradeQuality.trendingConfirmCandles}</b></span>
+                </>
+              )}
+              {trendEntry.enabled && (
+                <>
+                  <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+                  <span style={{ marginRight: 8, fontWeight: 700, color: '#0ea5e9' }}>TrendEntry:</span>
+                  <span style={{ marginRight: 10 }}>brkLbk=<b style={{ color: 'var(--text-primary)' }}>{trendEntry.breakoutLookback}</b></span>
+                  <span style={{ marginRight: 10 }}>body≥<b style={{ color: 'var(--text-primary)' }}>{trendEntry.minBodyPct}%</b></span>
+                  <span style={{ marginRight: 10 }}>weak&lt;<b style={{ color: '#ef4444' }}>{trendEntry.weakBodyPct}%</b></span>
+                  <span style={{ marginRight: 10 }}>EMA<b style={{ color: 'var(--text-primary)' }}>{trendEntry.ema9Period}</b></span>
+                </>
+              )}
+              {compressionEntry.enabled && (
+                <>
+                  <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+                  <span style={{ marginRight: 8, fontWeight: 700, color: '#8b5cf6' }}>CmpEntry:</span>
+                  <span style={{ marginRight: 10 }}>long≤<b style={{ color: 'var(--text-primary)' }}>{compressionEntry.longZoneMax}</b></span>
+                  <span style={{ marginRight: 10 }}>short≥<b style={{ color: 'var(--text-primary)' }}>{compressionEntry.shortZoneMin}</b></span>
+                  <span style={{ marginRight: 10 }}>noTrade[<b style={{ color: '#f59e0b' }}>{compressionEntry.noTradeZoneMin}–{compressionEntry.noTradeZoneMax}</b>]</span>
+                </>
+              )}
+              {holdConfig.enabled && (
+                <>
+                  <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+                  <span style={{ marginRight: 8, fontWeight: 700, color: '#14b8a6' }}>Hold:</span>
+                  <span style={{ marginRight: 10 }}>def=<b style={{ color: 'var(--text-primary)' }}>{holdConfig.defaultMinHoldBars}</b></span>
+                  <span style={{ marginRight: 10 }}>rng=<b style={{ color: 'var(--text-primary)' }}>{holdConfig.rangingMinHoldBars}</b></span>
+                  <span style={{ marginRight: 10 }}>trd=<b style={{ color: 'var(--text-primary)' }}>{holdConfig.trendingMinHoldBars}</b></span>
+                  <span style={{ marginRight: 10 }}>persist=<b style={{ color: 'var(--text-primary)' }}>{holdConfig.persistentExitBars}</b></span>
+                </>
+              )}
             </div>
             </div>
 
@@ -7588,9 +8121,9 @@ function OptionsReplayTest() {
                     <thead>
                       <tr>
                         <th>Time</th><th>NIFTY</th><th>Regime</th><th>Bias</th><th>Conf</th>
-                        <th>Winner</th><th>Score</th><th>2nd</th><th>Gap</th>
+                        <th>Winner</th><th>Score</th><th>PenScore</th><th>Str</th><th>2nd</th><th>Gap</th>
                         <th>Shadow</th><th>NeutralReason</th>
-                        <th>State</th><th>Action</th>
+                        <th>State</th><th>Bars</th><th>Hold</th><th>Action</th><th>ExitRsn</th>
                         <th>Option</th><th>Opt Px</th><th>uPnL</th><th>rPnL</th><th>Block</th>
                       </tr>
                     </thead>
@@ -7604,12 +8137,17 @@ function OptionsReplayTest() {
                           <td style={{ color: evt.confirmedBias === 'BULLISH' ? '#22c55e' : evt.confirmedBias === 'BEARISH' ? '#ef4444' : undefined }}>{evt.confirmedBias || '—'}</td>
                           <td>{evt.winnerStrategy || '—'}</td>
                           <td>{fmt2(evt.winnerScore)}</td>
+                          <td style={{ color: evt.penalizedScore != null && evt.penalizedScore < evt.winnerScore ? '#f59e0b' : undefined }}>{evt.penalizedScore != null && evt.penalizedScore !== evt.winnerScore ? fmt2(evt.penalizedScore) : '—'}</td>
+                          <td style={{ fontSize: 11, fontWeight: 600, color: evt.tradeStrength === 'STRONG' ? '#22c55e' : evt.tradeStrength === 'NORMAL' ? '#0ea5e9' : evt.tradeStrength === 'WEAK' ? '#f59e0b' : undefined }}>{evt.tradeStrength && evt.tradeStrength !== 'NONE' ? evt.tradeStrength : '—'}</td>
                           <td style={{ fontSize: 10, color: 'var(--text-secondary)' }}>{evt.secondStrategy ? `${evt.secondStrategy} ${fmt2(evt.secondScore)}` : '—'}</td>
                           <td>{fmt2(evt.scoreGap)}</td>
                           <td style={{ fontSize: 10, color: '#8b5cf6' }}>{evt.shadowWinner ? `${evt.shadowWinner} ${fmt2(evt.shadowWinnerScore)}` : '—'}</td>
                           <td style={{ fontSize: 10, color: evt.neutralReason ? '#f59e0b' : undefined }}>{evt.neutralReason || '—'}</td>
                           <td style={{ fontWeight: 600 }}>{evt.positionState || '—'}</td>
+                          <td style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{evt.positionState !== 'FLAT' ? (evt.barsInTrade ?? '—') : ''}</td>
+                          <td style={{ fontSize: 11, fontWeight: 600, color: '#14b8a6' }}>{evt.holdActive ? `🔒${evt.barsInTrade}/${evt.appliedMinHold}` : ''}</td>
                           <td style={{ color: evt.action === 'ENTERED' ? '#22c55e' : evt.action === 'EXITED' || evt.action === 'FORCE_CLOSED' ? '#f97316' : undefined }}>{evt.action || '—'}</td>
+                          <td style={{ fontSize: 10, color: '#f97316' }}>{evt.exitReason || ''}</td>
                           <td className="de-mono">{evt.selectedTradingSymbol || '—'}</td>
                           <td>{fmt2(evt.optionClose)}</td>
                           <td style={pnlStyle(evt.unrealizedPnl)}>{fmt2(evt.unrealizedPnl)}</td>
@@ -7624,6 +8162,11 @@ function OptionsReplayTest() {
               )
             }
           </>
+        )}
+
+        {/* ── Chart ── */}
+        {rightTab === 'chart' && (
+          <ReplayChart feed={feed} closedTrades={closedTrades} />
         )}
 
         {/* ── P&L ── */}
@@ -7672,6 +8215,9 @@ function OptionsReplayTest() {
                             ['Blocked by Recent Move', d.candlesBlockedByRecentMove],
                             ['Blocked by VWAP Dist', d.candlesBlockedByVwap],
                             ['Blocked by Chop Filter', d.candlesBlockedByChop],
+                            ['Blocked by Penalty Score', d.candlesBlockedByPenalty],
+                            ['Blocked by Trend Structure', d.candlesBlockedByTrendStructure],
+                            ['Blocked by Compression Structure', d.candlesBlockedByCompressionStructure],
                           ].map(([lbl, val]) => (
                             <div key={lbl} style={{ fontSize: 12, padding: '6px 10px', background: 'var(--bg-secondary)', borderRadius: 5 }}>
                               <span style={{ color: 'var(--text-secondary)' }}>{lbl}: </span>
@@ -7809,12 +8355,14 @@ function OptionsReplayTest() {
             setStrategies(defaultStrategies());
             setDecisionCfg(DEFAULT_DECISION); setSelectionCfg(DEFAULT_SELECTION); setSwitchCfg(DEFAULT_SWITCH);
             setOptsRegimeCfg(DEFAULT_OPTS_REGIME_CONFIG); setChopRules(DEFAULT_CHOP_RULES); setTradingRules(DEFAULT_TRADING_RULES); setRegimeRules(DEFAULT_REGIME_RULES); setRegimeStrategyRules(DEFAULT_REGIME_STRATEGY_RULES); setOptsRisk(DEFAULT_OPTS_RISK); setRangeQuality(DEFAULT_RANGE_QUALITY);
+            setTradeQuality(DEFAULT_TRADE_QUALITY); setTrendEntry(DEFAULT_TREND_ENTRY); setCompressionEntry(DEFAULT_COMPRESSION_ENTRY); setHoldConfig(DEFAULT_HOLD);
             setInterval('MINUTE_5'); setFromDate(''); setToDate(''); setWarmupDays('5'); setSpeed('1'); setQuantity('0'); setCapital('100000');
             ['sma_opts_nifty','sma_opts_ce_pool','sma_opts_pe_pool','sma_opts_interval','sma_opts_from','sma_opts_to',
              'sma_opts_warmup','sma_opts_speed','sma_opts_qty','sma_opts_capital','sma_opts_strategies',
              'sma_opts_decision','sma_opts_selection','sma_opts_switch','sma_opts_regime_cfg',
              'sma_opts_chop_rules','sma_opts_trading_rules','sma_opts_regime_rules',
-             'sma_opts_regime_strat_rules','sma_opts_risk','sma_opts_range_quality'].forEach(k => localStorage.removeItem(k));
+             'sma_opts_regime_strat_rules','sma_opts_risk','sma_opts_range_quality','sma_opts_trade_quality',
+             'sma_opts_trend_entry','sma_opts_compression_entry','sma_opts_hold_config'].forEach(k => localStorage.removeItem(k));
           }} disabled={isRunning}>
             Reset
           </button>
@@ -7938,17 +8486,18 @@ function OptionsReplayTest() {
         <div className="card bt-opts-card">
           <span className="bt-section-title">Decision Config</span>
           <p className="bt-section-sub" style={{ marginBottom: 10 }}>
-            Thresholds for bias confirmation. Entry is blocked when any filter triggers.
+            Filters apply penalties to the winner score. Only no-signal and score&lt;15 are hard blocks. Trade allowed if penalized score ≥ Penalty Min Score.
           </p>
           <div className="bt-form-grid" style={{ marginTop: 8 }}>
             {[
-              ['minScore',          'Min Score',          'Minimum winning strategy score (0–100)'],
+              ['minScore',          'Min Score',          'Minimum winning strategy score to select a winner (0–100)'],
               ['minScoreGap',       'Min Score Gap',      'Gap between top-2 strategies required'],
-              ['maxRecentMove3',    'Max 3-bar Move %',   'Block if NIFTY moved > X% in last 3 bars'],
-              ['maxRecentMove5',    'Max 5-bar Move %',   'Block if NIFTY moved > X% in last 5 bars'],
-              ['maxAbsVwapDist',    'Max VWAP Dist %',    'Block if NIFTY is > X% away from intraday VWAP'],
+              ['penaltyMinScore',   'Penalty Min Score',  'Floor after penalties applied. Trade allowed if penalized score ≥ this (move=-5, vwap=-5, chop=-8, drift=-10)'],
+              ['maxRecentMove3',    'Max 3-bar Move %',   'Penalty -5 if NIFTY moved > X% in last 3 bars'],
+              ['maxRecentMove5',    'Max 5-bar Move %',   'Penalty -5 if NIFTY moved > X% in last 5 bars'],
+              ['maxAbsVwapDist',    'Max VWAP Dist %',    'Penalty -5 if NIFTY is > X% away from intraday VWAP'],
               ['minBarsSinceTrade', 'Min Bars Since Trade','Cooldown after last trade (bars)'],
-              ['chopLookback',      'Chop Lookback',      'Bars used for chop detection (if enabled)'],
+              ['chopLookback',      'Chop Lookback',      'Bars used for chop detection (penalty -8 if choppy)'],
             ].map(([key, lbl, hint]) => (
               <div key={key} className="form-group" title={hint}>
                 <label>{lbl}</label>
@@ -8088,6 +8637,10 @@ function OptionsReplayTest() {
             <div className="form-group">
               <label>Max Switches / Day</label>
               <input type="number" min="0" max="20" value={switchCfg.maxSwitchesPerDay} onChange={e => setSwitchCfg(p => ({ ...p, maxSwitchesPerDay: e.target.value }))} disabled={isRunning} />
+            </div>
+            <div className="form-group">
+              <label title="New winner score must exceed the score at prior confirmation by this amount. 0 = disabled.">Min Score Improvement for Switch</label>
+              <input type="number" min="0" max="50" step="1" value={switchCfg.minScoreImprovementForSwitch} onChange={e => setSwitchCfg(p => ({ ...p, minScoreImprovementForSwitch: e.target.value }))} disabled={isRunning} />
             </div>
           </div>
         </div>
@@ -8305,6 +8858,165 @@ function OptionsReplayTest() {
                   <input type="number" min="0" max={max || undefined} step={step}
                     value={optsRisk[key]} disabled={isRunning}
                     onChange={e => updateOptsRisk(key, e.target.value)} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Trade Quality ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Trade Quality</span>
+            <button type="button"
+              className={`btn-sm ${tradeQuality.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updateTradeQuality('enabled', !tradeQuality.enabled)}
+              disabled={isRunning}>
+              {tradeQuality.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <p className="bt-section-sub" style={{ marginBottom: tradeQuality.enabled ? 12 : 0 }}>
+            {tradeQuality.enabled
+              ? `STRONG≥${tradeQuality.strongScoreThreshold} · NORMAL≥${tradeQuality.normalScoreThreshold} · WEAK cooldown ${tradeQuality.weakTradeLossCooldown} bars · rngConf=${tradeQuality.rangingConfirmCandles} trdConf=${tradeQuality.trendingConfirmCandles}`
+              : 'Score tiers (STRONG/NORMAL/WEAK), block WEAK trades after losses or in RANGING, regime-based confirmation candles.'}
+          </p>
+          {tradeQuality.enabled && (
+            <>
+              <div className="bt-form-grid" style={{ marginTop: 4 }}>
+                {[
+                  ['Strong Score ≥',         'strongScoreThreshold',  '1', null],
+                  ['Normal Score ≥',         'normalScoreThreshold',  '1', null],
+                  ['Weak Loss Cooldown',      'weakTradeLossCooldown', '1', null],
+                  ['RANGING Confirm Candles', 'rangingConfirmCandles', '1', null],
+                  ['TRENDING Confirm Candles','trendingConfirmCandles','1', null],
+                ].map(([label, key, step]) => (
+                  <div className="form-group" key={key}>
+                    <label>{label}</label>
+                    <input type="number" min="0" step={step}
+                      value={tradeQuality[key]} disabled={isRunning}
+                      onChange={e => updateTradeQuality(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginTop: 8, cursor: isRunning ? 'default' : 'pointer' }}>
+                <input type="checkbox" checked={tradeQuality.blockWeakInRanging} disabled={isRunning}
+                  onChange={e => updateTradeQuality('blockWeakInRanging', e.target.checked)} />
+                Block WEAK trades in RANGING regime
+              </label>
+            </>
+          )}
+        </div>
+
+        {/* ── Trending Entry Structure ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Trending Entry Structure</span>
+            <button type="button"
+              className={`btn-sm ${trendEntry.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updateTrendEntry('enabled', !trendEntry.enabled)}
+              disabled={isRunning}>
+              {trendEntry.enabled ? 'ON' : 'OFF'}
+            </button>
+            <span style={{ fontSize: 11, color: '#0ea5e9', fontWeight: 600 }}>TRENDING only</span>
+          </div>
+          <p className="bt-section-sub" style={{ marginBottom: trendEntry.enabled ? 12 : 0 }}>
+            {trendEntry.enabled
+              ? `Breakout lbk=${trendEntry.breakoutLookback} · body≥${trendEntry.minBodyPct}% (weak<${trendEntry.weakBodyPct}%) · EMA${trendEntry.ema9Period} slope`
+              : 'Block TRENDING entries without a breakout, strong candle, or momentum + EMA slope confirmation.'}
+          </p>
+          {trendEntry.enabled && (
+            <div className="bt-form-grid" style={{ marginTop: 4 }}>
+              {[
+                ['Breakout Lookback',  'breakoutLookback', '1', null ],
+                ['Min Body %',         'minBodyPct',       '1', '100'],
+                ['Weak Body % (block)','weakBodyPct',      '1', '100'],
+                ['EMA Period',         'ema9Period',       '1', null ],
+              ].map(([label, key, step, max]) => (
+                <div className="form-group" key={key}>
+                  <label>{label}</label>
+                  <input type="number" min="0" max={max || undefined} step={step}
+                    value={trendEntry[key]} disabled={isRunning}
+                    onChange={e => updateTrendEntry(key, e.target.value)} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Compression Entry Structure ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Compression Entry Structure</span>
+            <button type="button"
+              className={`btn-sm ${compressionEntry.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updateCompressionEntry('enabled', !compressionEntry.enabled)}
+              disabled={isRunning}>
+              {compressionEntry.enabled ? 'ON' : 'OFF'}
+            </button>
+            <span style={{ fontSize: 11, color: '#8b5cf6', fontWeight: 600 }}>COMPRESSION only</span>
+          </div>
+          <p className="bt-section-sub" style={{ marginBottom: compressionEntry.enabled ? 12 : 0 }}>
+            {compressionEntry.enabled
+              ? `rangePos: long≤${compressionEntry.longZoneMax} short≥${compressionEntry.shortZoneMin} · no-trade [${compressionEntry.noTradeZoneMin}–${compressionEntry.noTradeZoneMax}] · lbk=${compressionEntry.rangeLookback}`
+              : 'Only enter COMPRESSION trades at range extremes (mean reversion). Block mid-range and breakout candles.'}
+          </p>
+          {compressionEntry.enabled && (
+            <>
+              <div className="bt-form-grid" style={{ marginTop: 4 }}>
+                {[
+                  ['Range Lookback',    'rangeLookback',  '1',    null],
+                  ['Long Zone Max',     'longZoneMax',    '0.05', '1' ],
+                  ['Short Zone Min',    'shortZoneMin',   '0.05', '1' ],
+                  ['No-Trade Zone Min', 'noTradeZoneMin', '0.05', '1' ],
+                  ['No-Trade Zone Max', 'noTradeZoneMax', '0.05', '1' ],
+                ].map(([label, key, step, max]) => (
+                  <div className="form-group" key={key}>
+                    <label>{label}</label>
+                    <input type="number" min="0" max={max || undefined} step={step}
+                      value={compressionEntry[key]} disabled={isRunning}
+                      onChange={e => updateCompressionEntry(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginTop: 8, cursor: isRunning ? 'default' : 'pointer' }}>
+                <input type="checkbox" checked={compressionEntry.rejectBreakoutCandle} disabled={isRunning}
+                  onChange={e => updateCompressionEntry('rejectBreakoutCandle', e.target.checked)} />
+                Reject breakout candles (price exceeds range boundaries)
+              </label>
+            </>
+          )}
+        </div>
+
+        {/* ── Hold Config ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Minimum Hold Period</span>
+            <button type="button"
+              className={`btn-sm ${holdConfig.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updateHoldConfig('enabled', !holdConfig.enabled)}
+              disabled={isRunning}>
+              {holdConfig.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <p className="bt-section-sub" style={{ marginBottom: holdConfig.enabled ? 12 : 0 }}>
+            {holdConfig.enabled
+              ? `Default hold=${holdConfig.defaultMinHoldBars} · RANGING=${holdConfig.rangingMinHoldBars} · TRENDING=${holdConfig.trendingMinHoldBars} · persist=${holdConfig.persistentExitBars} bars · earlyExit score≥${holdConfig.strongOppositeScore}`
+              : 'Prevent premature exits after entry. Ignore neutral signals during the hold window; only exit early on a strong opposite signal.'}
+          </p>
+          {holdConfig.enabled && (
+            <div className="bt-form-grid" style={{ marginTop: 4 }}>
+              {[
+                { key: 'defaultMinHoldBars',  label: 'Default Min Hold',    step: '1' },
+                { key: 'rangingMinHoldBars',  label: 'RANGING Min Hold',    step: '1' },
+                { key: 'trendingMinHoldBars', label: 'TRENDING Min Hold',   step: '1' },
+                { key: 'strongOppositeScore', label: 'Strong Opp Score',    step: '1' },
+                { key: 'persistentExitBars',  label: 'Persistent Exit Bars',step: '1' },
+              ].map(({ key, label, step }) => (
+                <div key={key} className="form-group">
+                  <label>{label}</label>
+                  <input type="number" min="0" step={step}
+                    value={holdConfig[key]} disabled={isRunning}
+                    onChange={e => updateHoldConfig(key, e.target.value)} />
                 </div>
               ))}
             </div>
