@@ -247,6 +247,57 @@ public class OptionsReplayRequest {
         private int     trendingConfirmCandles = 2;
     }
 
+    // Smart exit system
+    private ExitConfig exitConfig = new ExitConfig();
+
+    @Data
+    public static class ExitConfig {
+        private boolean enabled = true;
+
+        // P1 — Hard Stop Loss
+        private double hardStopPct          = 7.0;
+
+        // P2 — Profit Lock tiers (activate only after meaningful gains)
+        private double lock1TriggerPct      = 5.0;   // +5% → lock 2%
+        private double lock1FloorPct        = 2.0;
+        private double lock2TriggerPct      = 10.0;  // +10% → lock 5%
+        private double lock2FloorPct        = 5.0;
+        private double trailTriggerPct      = 10.0;  // after +10% → 50% of peak
+        private double trailFactor          = 0.50;
+
+        // P3 — First-move protection
+        private int    firstMoveBars        = 2;
+        private double firstMoveLockPct     = 0.5;
+
+        // P4 — Structure failure
+        private int    structureLookback    = 5;
+
+        // P5a — Score Collapsed: REMOVED (score drop alone is not an exit signal)
+        private double scoreDropFactor      = 0.0;   // 0 = disabled
+
+        // P5b — Score Below Floor (non-TRENDING only)
+        private double scoreAbsoluteMin     = 20.0;
+
+        // P5c — Bias exit
+        private boolean biasExitEnabled     = true;
+        /**
+         * TRENDING only: minimum winner score for the opposite bias to trigger an exit.
+         * In non-TRENDING regimes any confirmed bias flip exits immediately.
+         */
+        private double strongExitScore      = 35.0;
+
+        // P6a/P6b — Time exit (non-TRENDING only)
+        private int    maxBarsNoImprovement = 3;
+        private int    stagnationBars       = 2;
+
+        // P6c — RANGING time limit
+        private int    maxBarsRanging       = 6;
+
+        // P7 — No-hope (non-TRENDING only)
+        private double noHopeThresholdPct   = 1.5;
+        private int    noHopeBars           = 2;
+    }
+
     private int     speedMultiplier = 1;
     private boolean persist         = true;
 }

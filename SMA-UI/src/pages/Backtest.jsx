@@ -6746,6 +6746,38 @@ const DEFAULT_HOLD = {
   strongOppositeScore: '35',
   persistentExitBars:  '2',
 };
+const DEFAULT_EXIT_CONFIG = {
+  enabled:               true,
+  // P1 — Hard Stop Loss
+  hardStopPct:           '7',
+  // P2 — Profit Lock tiers (activate only after meaningful gains)
+  lock1TriggerPct:       '5',    // +5% → lock 2%
+  lock1FloorPct:         '2',
+  lock2TriggerPct:       '10',   // +10% → lock 5%
+  lock2FloorPct:         '5',
+  trailTriggerPct:       '10',   // after +10% → trail at 50% of peak
+  trailFactor:           '0.5',
+  // P3 — First-move protection
+  firstMoveBars:         '2',
+  firstMoveLockPct:      '0.5',
+  // P4 — Structure failure
+  structureLookback:     '5',
+  // P5a — Score Collapsed: REMOVED (0 = disabled)
+  scoreDropFactor:       '0',
+  // P5b — Score Below Floor (non-TRENDING only)
+  scoreAbsoluteMin:      '20',
+  // P5c — Bias exit
+  biasExitEnabled:       true,
+  strongExitScore:       '35',   // TRENDING: minimum score for opposite bias to exit
+  // P6 — Time exit (non-TRENDING only)
+  maxBarsNoImprovement:  '3',
+  stagnationBars:        '2',
+  // P6c — RANGING time limit
+  maxBarsRanging:        '6',
+  // P7 — No-hope (non-TRENDING only)
+  noHopeThresholdPct:    '1.5',
+  noHopeBars:            '2',
+};
 
 function fmt2(v) { return v != null ? Number(v).toFixed(2) : '—'; }
 function pnlStyle(v) { return { color: v > 0 ? '#22c55e' : v < 0 ? '#ef4444' : undefined, fontWeight: 600 }; }
@@ -7144,10 +7176,12 @@ function OptionsReplayTest() {
   const [trendEntry,           setTrendEntry]           = useState(() => ls('sma_opts_trend_entry',            DEFAULT_TREND_ENTRY));
   const [compressionEntry,     setCompressionEntry]     = useState(() => ls('sma_opts_compression_entry',      DEFAULT_COMPRESSION_ENTRY));
   const [holdConfig,           setHoldConfig]           = useState(() => ({ ...DEFAULT_HOLD, ...ls('sma_opts_hold_config', {}) }));
+  const [exitConfig,           setExitConfig]           = useState(() => ({ ...DEFAULT_EXIT_CONFIG, ...ls('sma_opts_exit_config', {}) }));
 
   function updateOptsRisk(key, val) { setOptsRisk(p => ({ ...p, [key]: val })); }
   function updateRangeQuality(key, val) { setRangeQuality(p => ({ ...p, [key]: val })); }
   function updateHoldConfig(key, val) { setHoldConfig(p => ({ ...p, [key]: val })); }
+  function updateExitConfig(key, val) { setExitConfig(p => ({ ...p, [key]: val })); }
   function updateTradeQuality(key, val) { setTradeQuality(p => ({ ...p, [key]: val })); }
   function updateTrendEntry(key, val) { setTrendEntry(p => ({ ...p, [key]: val })); }
   function updateCompressionEntry(key, val) { setCompressionEntry(p => ({ ...p, [key]: val })); }
@@ -7191,6 +7225,7 @@ function OptionsReplayTest() {
   useEffect(() => { try { localStorage.setItem('sma_opts_trend_entry',        JSON.stringify(trendEntry));          } catch {} }, [trendEntry]);
   useEffect(() => { try { localStorage.setItem('sma_opts_compression_entry',  JSON.stringify(compressionEntry));    } catch {} }, [compressionEntry]);
   useEffect(() => { try { localStorage.setItem('sma_opts_hold_config',        JSON.stringify(holdConfig));          } catch {} }, [holdConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_exit_config',        JSON.stringify(exitConfig));          } catch {} }, [exitConfig]);
 
   // ── Run state
   const [status,   setStatus]   = useState('idle'); // idle|running|completed|error
@@ -7414,6 +7449,32 @@ function OptionsReplayTest() {
     ));
     lines.push(blank);
 
+    // ── Exit System ──────────────────────────────────────────────────────────
+    lines.push(row('=== Exit System ==='));
+    lines.push(row('Enabled', 'Hard Stop %',
+      'Lock1 Trigger %', 'Lock1 Floor %', 'Lock2 Trigger %', 'Lock2 Floor %',
+      'Trail Trigger %', 'Trail Factor',
+      'First Move Bars', 'First Move Lock %',
+      'Structure Lookback',
+      'Score Drop Factor (0=off)', 'Score Abs Min',
+      'Bias Exit', 'Strong Exit Score (TRENDING)',
+      'Max Bars No Improvement', 'Stagnation Bars', 'Max Bars RANGING',
+      'No-Hope Threshold %', 'No-Hope Bars'));
+    lines.push(row(
+      exitConfig.enabled ? 'Yes' : 'No',
+      exitConfig.hardStopPct,
+      exitConfig.lock1TriggerPct, exitConfig.lock1FloorPct,
+      exitConfig.lock2TriggerPct, exitConfig.lock2FloorPct,
+      exitConfig.trailTriggerPct, exitConfig.trailFactor,
+      exitConfig.firstMoveBars, exitConfig.firstMoveLockPct,
+      exitConfig.structureLookback,
+      exitConfig.scoreDropFactor, exitConfig.scoreAbsoluteMin,
+      exitConfig.biasExitEnabled ? 'Yes' : 'No', exitConfig.strongExitScore,
+      exitConfig.maxBarsNoImprovement, exitConfig.stagnationBars, exitConfig.maxBarsRanging,
+      exitConfig.noHopeThresholdPct, exitConfig.noHopeBars,
+    ));
+    lines.push(blank);
+
     // ── Summary ─────────────────────────────────────────────────────────────
     if (summary) {
       lines.push(row('=== Summary ==='));
@@ -7488,6 +7549,7 @@ function OptionsReplayTest() {
         // Execution
         'Position State', 'Desired Side', 'Action', 'Exit Reason',
         'Entry Regime', 'Applied Min Hold', 'Hold Active',
+        'Peak PnL %', 'Profit Lock Floor %',
         'Selected Symbol', 'Option Type', 'Strike', 'Expiry',
         'Entry Price', 'Exit Price', 'Bars In Trade',
         'uPnL', 'rPnL', 'Total PnL', 'Capital',
@@ -7517,6 +7579,7 @@ function OptionsReplayTest() {
         ).join(' | '),
         e.positionState || '', e.desiredSide || '', e.action || '', e.exitReason || '',
         e.entryRegime || '', e.appliedMinHold ?? '', e.holdActive ? 'Yes' : 'No',
+        n2(e.peakPnlPct), n2(e.profitLockFloor),
         e.selectedTradingSymbol || '', e.selectedOptionType || '',
         e.selectedStrike ?? '', e.selectedExpiry || '',
         n2(e.entryPrice), n2(e.exitPrice), e.barsInTrade ?? '',
@@ -7718,6 +7781,28 @@ function OptionsReplayTest() {
         strongOppositeScore: parseFloat(holdConfig.strongOppositeScore)   || 35,
         persistentExitBars:  parseInt(holdConfig.persistentExitBars, 10)  || 2,
       },
+      exitConfig: {
+        enabled:              exitConfig.enabled,
+        hardStopPct:          parseFloat(exitConfig.hardStopPct)          || 7,
+        lock1TriggerPct:      parseFloat(exitConfig.lock1TriggerPct)      || 2,
+        lock1FloorPct:        parseFloat(exitConfig.lock1FloorPct)        || 1,
+        lock2TriggerPct:      parseFloat(exitConfig.lock2TriggerPct)      || 4,
+        lock2FloorPct:        parseFloat(exitConfig.lock2FloorPct)        || 2,
+        trailTriggerPct:      parseFloat(exitConfig.trailTriggerPct)      || 6,
+        trailFactor:          parseFloat(exitConfig.trailFactor)          || 0.5,
+        firstMoveBars:        parseInt(exitConfig.firstMoveBars, 10)      || 2,
+        firstMoveLockPct:     parseFloat(exitConfig.firstMoveLockPct)     || 0.5,
+        structureLookback:    parseInt(exitConfig.structureLookback, 10)  || 5,
+        scoreDropFactor:      parseFloat(exitConfig.scoreDropFactor)      || 0.6,
+        scoreAbsoluteMin:     parseFloat(exitConfig.scoreAbsoluteMin)     || 20,
+        biasExitEnabled:      exitConfig.biasExitEnabled,
+        strongExitScore:      parseFloat(exitConfig.strongExitScore)      || 35,
+        maxBarsNoImprovement: parseInt(exitConfig.maxBarsNoImprovement, 10) || 3,
+        stagnationBars:       parseInt(exitConfig.stagnationBars, 10)     || 2,
+        maxBarsRanging:       parseInt(exitConfig.maxBarsRanging, 10)     || 6,
+        noHopeThresholdPct:   parseFloat(exitConfig.noHopeThresholdPct)   || 1.5,
+        noHopeBars:           parseInt(exitConfig.noHopeBars, 10)         || 2,
+      },
       speedMultiplier: parseInt(speed, 10) || 1,
       persist: true,
     };
@@ -7903,7 +7988,7 @@ function OptionsReplayTest() {
                 text += '\n\n';
 
                 // ── Feed header ──
-                const headers = ['Time','NIFTY','Regime','Bias','ConfBias','Winner','Score','PenScore','Str','2nd','Gap','Shadow','NeutralReason','State','Bars','Hold','Action','ExitRsn','Option','OptPx','uPnL','rPnL','Block'];
+                const headers = ['Time','NIFTY','Regime','Bias','ConfBias','Winner','Score','PenScore','Str','2nd','Gap','Shadow','NeutralReason','State','Bars','Hold','Action','ExitRsn','PeakPnL%','LockFloor%','Option','OptPx','uPnL','rPnL','Block'];
                 text += headers.join('\t') + '\n';
 
                 // ── Feed rows (chronological order) ──
@@ -7927,6 +8012,8 @@ function OptionsReplayTest() {
                     evt.holdActive ? `LOCK(${evt.barsInTrade}/${evt.appliedMinHold})` : '',
                     evt.action || '',
                     evt.exitReason || '',
+                    evt.positionState !== 'FLAT' && evt.peakPnlPct != null ? Number(evt.peakPnlPct).toFixed(2) : '',
+                    evt.positionState !== 'FLAT' && evt.profitLockFloor != null && evt.profitLockFloor > -1e10 ? Number(evt.profitLockFloor).toFixed(2) : '',
                     evt.selectedTradingSymbol || '',
                     evt.optionClose != null ? Number(evt.optionClose).toFixed(2) : '',
                     evt.unrealizedPnl != null ? Number(evt.unrealizedPnl).toFixed(2) : '',
@@ -8110,6 +8197,16 @@ function OptionsReplayTest() {
                   <span style={{ marginRight: 10 }}>persist=<b style={{ color: 'var(--text-primary)' }}>{holdConfig.persistentExitBars}</b></span>
                 </>
               )}
+              {exitConfig.enabled && (
+                <>
+                  <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+                  <span style={{ marginRight: 8, fontWeight: 700, color: '#f97316' }}>Exit:</span>
+                  <span style={{ marginRight: 10 }}>SL=<b style={{ color: '#ef4444' }}>{exitConfig.hardStopPct}%</b></span>
+                  <span style={{ marginRight: 10 }}>lock1=<b style={{ color: 'var(--text-primary)' }}>{exitConfig.lock1TriggerPct}%→{exitConfig.lock1FloorPct}%</b></span>
+                  <span style={{ marginRight: 10 }}>lock2=<b style={{ color: 'var(--text-primary)' }}>{exitConfig.lock2TriggerPct}%→{exitConfig.lock2FloorPct}%</b></span>
+                  <span style={{ marginRight: 10 }}>trail=<b style={{ color: 'var(--text-primary)' }}>{exitConfig.trailTriggerPct}%@{exitConfig.trailFactor}</b></span>
+                </>
+              )}
             </div>
             </div>
 
@@ -8124,6 +8221,7 @@ function OptionsReplayTest() {
                         <th>Winner</th><th>Score</th><th>PenScore</th><th>Str</th><th>2nd</th><th>Gap</th>
                         <th>Shadow</th><th>NeutralReason</th>
                         <th>State</th><th>Bars</th><th>Hold</th><th>Action</th><th>ExitRsn</th>
+                        <th>PeakPnL%</th><th>LockFloor%</th>
                         <th>Option</th><th>Opt Px</th><th>uPnL</th><th>rPnL</th><th>Block</th>
                       </tr>
                     </thead>
@@ -8148,6 +8246,8 @@ function OptionsReplayTest() {
                           <td style={{ fontSize: 11, fontWeight: 600, color: '#14b8a6' }}>{evt.holdActive ? `🔒${evt.barsInTrade}/${evt.appliedMinHold}` : ''}</td>
                           <td style={{ color: evt.action === 'ENTERED' ? '#22c55e' : evt.action === 'EXITED' || evt.action === 'FORCE_CLOSED' ? '#f97316' : undefined }}>{evt.action || '—'}</td>
                           <td style={{ fontSize: 10, color: '#f97316' }}>{evt.exitReason || ''}</td>
+                          <td style={{ fontSize: 11, color: evt.peakPnlPct > 0 ? '#22c55e' : undefined }}>{evt.positionState !== 'FLAT' && evt.peakPnlPct != null ? fmt2(evt.peakPnlPct) : ''}</td>
+                          <td style={{ fontSize: 11, color: '#14b8a6' }}>{evt.positionState !== 'FLAT' && evt.profitLockFloor != null && evt.profitLockFloor > -1e10 ? fmt2(evt.profitLockFloor) : ''}</td>
                           <td className="de-mono">{evt.selectedTradingSymbol || '—'}</td>
                           <td>{fmt2(evt.optionClose)}</td>
                           <td style={pnlStyle(evt.unrealizedPnl)}>{fmt2(evt.unrealizedPnl)}</td>
@@ -8355,14 +8455,14 @@ function OptionsReplayTest() {
             setStrategies(defaultStrategies());
             setDecisionCfg(DEFAULT_DECISION); setSelectionCfg(DEFAULT_SELECTION); setSwitchCfg(DEFAULT_SWITCH);
             setOptsRegimeCfg(DEFAULT_OPTS_REGIME_CONFIG); setChopRules(DEFAULT_CHOP_RULES); setTradingRules(DEFAULT_TRADING_RULES); setRegimeRules(DEFAULT_REGIME_RULES); setRegimeStrategyRules(DEFAULT_REGIME_STRATEGY_RULES); setOptsRisk(DEFAULT_OPTS_RISK); setRangeQuality(DEFAULT_RANGE_QUALITY);
-            setTradeQuality(DEFAULT_TRADE_QUALITY); setTrendEntry(DEFAULT_TREND_ENTRY); setCompressionEntry(DEFAULT_COMPRESSION_ENTRY); setHoldConfig(DEFAULT_HOLD);
+            setTradeQuality(DEFAULT_TRADE_QUALITY); setTrendEntry(DEFAULT_TREND_ENTRY); setCompressionEntry(DEFAULT_COMPRESSION_ENTRY); setHoldConfig(DEFAULT_HOLD); setExitConfig(DEFAULT_EXIT_CONFIG);
             setInterval('MINUTE_5'); setFromDate(''); setToDate(''); setWarmupDays('5'); setSpeed('1'); setQuantity('0'); setCapital('100000');
             ['sma_opts_nifty','sma_opts_ce_pool','sma_opts_pe_pool','sma_opts_interval','sma_opts_from','sma_opts_to',
              'sma_opts_warmup','sma_opts_speed','sma_opts_qty','sma_opts_capital','sma_opts_strategies',
              'sma_opts_decision','sma_opts_selection','sma_opts_switch','sma_opts_regime_cfg',
              'sma_opts_chop_rules','sma_opts_trading_rules','sma_opts_regime_rules',
              'sma_opts_regime_strat_rules','sma_opts_risk','sma_opts_range_quality','sma_opts_trade_quality',
-             'sma_opts_trend_entry','sma_opts_compression_entry','sma_opts_hold_config'].forEach(k => localStorage.removeItem(k));
+             'sma_opts_trend_entry','sma_opts_compression_entry','sma_opts_hold_config','sma_opts_exit_config'].forEach(k => localStorage.removeItem(k));
           }} disabled={isRunning}>
             Reset
           </button>
@@ -9020,6 +9120,140 @@ function OptionsReplayTest() {
                 </div>
               ))}
             </div>
+          )}
+        </div>
+
+        {/* ── Exit System ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Smart Exit System</span>
+            <button type="button"
+              className={`btn-sm ${exitConfig.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updateExitConfig('enabled', !exitConfig.enabled)}
+              disabled={isRunning}>
+              {exitConfig.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <p className="bt-section-sub" style={{ marginBottom: exitConfig.enabled ? 12 : 0 }}>
+            {exitConfig.enabled
+              ? `P1 SL=${exitConfig.hardStopPct}% · P2 lock1=${exitConfig.lock1TriggerPct}%→${exitConfig.lock1FloorPct}% lock2=${exitConfig.lock2TriggerPct}%→${exitConfig.lock2FloorPct}% trail=${exitConfig.trailTriggerPct}%@${exitConfig.trailFactor} · P4 struct=${exitConfig.structureLookback} · P5 drop=${exitConfig.scoreDropFactor} abs=${exitConfig.scoreAbsoluteMin}`
+              : 'Priority-ordered exit: Hard SL → Profit Lock → First-Move → Structure → Score/Bias → Time → No-Hope.'}
+          </p>
+          {exitConfig.enabled && (
+            <>
+              {/* P1 Hard Stop */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#ef4444', marginBottom: 6, marginTop: 4 }}>P1 — Hard Stop Loss</div>
+              <div className="bt-form-grid" style={{ marginBottom: 12 }}>
+                <div className="form-group">
+                  <label>Hard Stop %</label>
+                  <input type="number" min="0" step="0.5"
+                    value={exitConfig.hardStopPct} disabled={isRunning}
+                    onChange={e => updateExitConfig('hardStopPct', e.target.value)} />
+                </div>
+              </div>
+
+              {/* P2 Profit Lock */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#22c55e', marginBottom: 6 }}>P2 — Profit Lock / Trailing</div>
+              <div className="bt-form-grid" style={{ marginBottom: 12 }}>
+                {[
+                  { key: 'lock1TriggerPct',  label: 'Lock1 Trigger %', step: '0.5' },
+                  { key: 'lock1FloorPct',    label: 'Lock1 Floor %',   step: '0.5' },
+                  { key: 'lock2TriggerPct',  label: 'Lock2 Trigger %', step: '0.5' },
+                  { key: 'lock2FloorPct',    label: 'Lock2 Floor %',   step: '0.5' },
+                  { key: 'trailTriggerPct',  label: 'Trail Trigger %', step: '0.5' },
+                  { key: 'trailFactor',      label: 'Trail Factor',    step: '0.05' },
+                ].map(({ key, label, step }) => (
+                  <div key={key} className="form-group">
+                    <label>{label}</label>
+                    <input type="number" min="0" step={step}
+                      value={exitConfig[key]} disabled={isRunning}
+                      onChange={e => updateExitConfig(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+
+              {/* P3 First-Move */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#0ea5e9', marginBottom: 6 }}>P3 — First-Move Protection</div>
+              <div className="bt-form-grid" style={{ marginBottom: 12 }}>
+                {[
+                  { key: 'firstMoveBars',    label: 'First Move Bars',    step: '1'   },
+                  { key: 'firstMoveLockPct', label: 'First Move Lock %',  step: '0.1' },
+                ].map(({ key, label, step }) => (
+                  <div key={key} className="form-group">
+                    <label>{label}</label>
+                    <input type="number" min="0" step={step}
+                      value={exitConfig[key]} disabled={isRunning}
+                      onChange={e => updateExitConfig(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+
+              {/* P4 Structure */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#f59e0b', marginBottom: 6 }}>P4 — Structure Failure (NIFTY high/low)</div>
+              <div className="bt-form-grid" style={{ marginBottom: 12 }}>
+                <div className="form-group">
+                  <label>Structure Lookback</label>
+                  <input type="number" min="2" step="1"
+                    value={exitConfig.structureLookback} disabled={isRunning}
+                    onChange={e => updateExitConfig('structureLookback', e.target.value)} />
+                </div>
+              </div>
+
+              {/* P5 Score / Bias */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#8b5cf6', marginBottom: 6 }}>P5 — Score Floor / Bias Reversal</div>
+              <div className="bt-form-grid" style={{ marginBottom: 8 }}>
+                {[
+                  { key: 'scoreDropFactor',  label: 'Score Drop Factor (0=off)', step: '0.05' },
+                  { key: 'scoreAbsoluteMin', label: 'Score Abs Min',             step: '1'    },
+                  { key: 'strongExitScore',  label: 'Strong Exit Score (TRENDING)', step: '1' },
+                ].map(({ key, label, step }) => (
+                  <div key={key} className="form-group">
+                    <label>{label}</label>
+                    <input type="number" min="0" step={step}
+                      value={exitConfig[key]} disabled={isRunning}
+                      onChange={e => updateExitConfig(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginBottom: 12, cursor: isRunning ? 'default' : 'pointer' }}>
+                <input type="checkbox" checked={exitConfig.biasExitEnabled} disabled={isRunning}
+                  onChange={e => updateExitConfig('biasExitEnabled', e.target.checked)} />
+                Bias reversal exit (P5c) — in TRENDING requires score ≥ Strong Exit Score
+              </label>
+
+              {/* P6 Time */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#06b6d4', marginBottom: 6 }}>P6 — Time / Stagnation (non-TRENDING) · RANGING Time Limit</div>
+              <div className="bt-form-grid" style={{ marginBottom: 12 }}>
+                {[
+                  { key: 'maxBarsNoImprovement', label: 'Max Bars No Improvement', step: '1' },
+                  { key: 'stagnationBars',       label: 'Stagnation Bars',         step: '1' },
+                  { key: 'maxBarsRanging',       label: 'Max Bars (RANGING)',       step: '1' },
+                ].map(({ key, label, step }) => (
+                  <div key={key} className="form-group">
+                    <label>{label}</label>
+                    <input type="number" min="0" step={step}
+                      value={exitConfig[key]} disabled={isRunning}
+                      onChange={e => updateExitConfig(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+
+              {/* P7 No-Hope */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#ec4899', marginBottom: 6 }}>P7 — No-Hope (sustained loss)</div>
+              <div className="bt-form-grid">
+                {[
+                  { key: 'noHopeThresholdPct', label: 'No-Hope Threshold %', step: '0.5' },
+                  { key: 'noHopeBars',         label: 'No-Hope Bars',        step: '1'   },
+                ].map(({ key, label, step }) => (
+                  <div key={key} className="form-group">
+                    <label>{label}</label>
+                    <input type="number" min="0" step={step}
+                      value={exitConfig[key]} disabled={isRunning}
+                      onChange={e => updateExitConfig(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+            </>
           )}
         </div>
 
