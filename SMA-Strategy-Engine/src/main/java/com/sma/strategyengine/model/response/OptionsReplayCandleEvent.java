@@ -72,6 +72,10 @@ public class OptionsReplayCandleEvent {
     private int     appliedMinHold;      // minHold bars used this candle
     private boolean holdActive;          // true if inside the hold window
 
+    // Exit evaluator debug fields
+    private double  peakPnlPct;          // highest pnl% seen since entry
+    private double  profitLockFloor;     // current profit lock floor %
+
     // Selected option
     private String selectedOptionType;
     private double selectedStrike;

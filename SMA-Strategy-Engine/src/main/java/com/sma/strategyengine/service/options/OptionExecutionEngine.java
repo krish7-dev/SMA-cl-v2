@@ -16,11 +16,14 @@ import java.util.List;
  *
  * States: FLAT -> LONG_CALL -> LONG_PUT (and back)
  *
- * Rules:
- *  - Never short options
- *  - Only one position at a time
- *  - 2-step switching: exit first, set desired side, wait for fresh confirmation
- *  - Force-close at end of replay (exitReason = END_OF_REPLAY)
+ * Exit priority (enforced by ExitEvaluator):
+ *   P1  Hard Stop Loss          (fires inside hold window)
+ *   P2  Profit Lock / Trailing  (fires inside hold window)
+ *   P3  First-Move Protection   (arms lock only)
+ *   P4  Structure Failure       (post-hold only)
+ *   P5  Score / Bias Exit       (post-hold only)
+ *   P6  Time Exit               (post-hold only)
+ *   P7  No-Hope                 (post-hold only)
  */
 @Slf4j
 public class OptionExecutionEngine {
@@ -44,7 +47,7 @@ public class OptionExecutionEngine {
 
     // Capital + P&L
     private double capital;
-    @Getter private double realizedPnl  = 0;
+    @Getter private double realizedPnl   = 0;
     @Getter private double unrealizedPnl = 0;
 
     // Cooldown
@@ -54,7 +57,7 @@ public class OptionExecutionEngine {
     @Getter private int    switchCountToday = 0;
     private String currentDate = null;
 
-    // Daily switch limit (from config)
+    // Config
     private final int maxSwitchesPerDay;
     private final int minBarsSinceTrade;
     private final int quantity0;
@@ -62,57 +65,72 @@ public class OptionExecutionEngine {
 
     // Hold management
     private final OptionsReplayRequest.HoldConfig hc;
-    /** Consecutive bars where bias is not favourable (used for post-hold persistent exit). */
     private int consecutiveWeakBars = 0;
 
-    // Per-candle debug fields (reset each process() call)
+    // Smart exit evaluator
+    private final ExitEvaluator exitEval;
+
+    // Per-candle observable fields
     @Getter private String  lastExitReason = null;
     @Getter private String  entryRegime    = null;
     @Getter private int     appliedMinHold = 0;
     @Getter private boolean holdActive     = false;
+    @Getter private double  peakPnlPct     = 0.0;
+    @Getter private double  profitLockFloor = 0.0;
 
-    // Risk management
+    // Risk management (legacy daily-loss-cap + cooldown — kept alongside ExitEvaluator)
     private final OptionsReplayRequest.RiskConfig rc;
     private double dailyRealizedPnl = 0;
-    private String dailyPnlDate     = null;
-    @Getter private int    barsSinceLastLoss = Integer.MAX_VALUE;
+    @Getter private int barsSinceLastLoss = Integer.MAX_VALUE;
 
     // Closed trades
     @Getter private final List<OptionsReplayCandleEvent.ClosedTrade> closedTrades = new ArrayList<>();
 
     public OptionExecutionEngine(OptionsReplayRequest req) {
-        this.initialCapital  = req.getInitialCapital();
-        this.capital         = initialCapital.doubleValue();
+        this.initialCapital    = req.getInitialCapital();
+        this.capital           = initialCapital.doubleValue();
         this.maxSwitchesPerDay = req.getSwitchConfig().getMaxSwitchesPerDay();
         this.minBarsSinceTrade = req.getDecisionConfig().getMinBarsSinceTrade();
         this.quantity0         = req.getQuantity();
-        this.rc = req.getRiskConfig() != null ? req.getRiskConfig() : new OptionsReplayRequest.RiskConfig();
-        this.hc = req.getHoldConfig() != null ? req.getHoldConfig() : new OptionsReplayRequest.HoldConfig();
+        this.rc  = req.getRiskConfig()  != null ? req.getRiskConfig()  : new OptionsReplayRequest.RiskConfig();
+        this.hc  = req.getHoldConfig()  != null ? req.getHoldConfig()  : new OptionsReplayRequest.HoldConfig();
+        this.exitEval = new ExitEvaluator(
+                req.getExitConfig() != null ? req.getExitConfig() : new OptionsReplayRequest.ExitConfig());
         log.info("HoldConfig: enabled={} default={} ranging={} trending={} strongOpp={} persist={}",
                 hc.isEnabled(), hc.getDefaultMinHoldBars(), hc.getRangingMinHoldBars(),
                 hc.getTrendingMinHoldBars(), hc.getStrongOppositeScore(), hc.getPersistentExitBars());
+        log.info("ExitConfig: enabled={} hardStop={}% lock1={}/{}% lock2={}/{}% trail={}/{}x firstMove={}/{} struct={} scoreDrop={} scoreMin={} noImprove={} stagnate={} noHope={}/{}",
+                req.getExitConfig() != null ? req.getExitConfig().isEnabled() : true,
+                req.getExitConfig() != null ? req.getExitConfig().getHardStopPct() : 7,
+                req.getExitConfig() != null ? req.getExitConfig().getLock1TriggerPct() : 2,
+                req.getExitConfig() != null ? req.getExitConfig().getLock1FloorPct() : 1,
+                req.getExitConfig() != null ? req.getExitConfig().getLock2TriggerPct() : 4,
+                req.getExitConfig() != null ? req.getExitConfig().getLock2FloorPct() : 2,
+                req.getExitConfig() != null ? req.getExitConfig().getTrailTriggerPct() : 6,
+                req.getExitConfig() != null ? req.getExitConfig().getTrailFactor() : 0.5,
+                req.getExitConfig() != null ? req.getExitConfig().getFirstMoveBars() : 2,
+                req.getExitConfig() != null ? req.getExitConfig().getFirstMoveLockPct() : 0.5,
+                req.getExitConfig() != null ? req.getExitConfig().getStructureLookback() : 5,
+                req.getExitConfig() != null ? req.getExitConfig().getScoreDropFactor() : 0.6,
+                req.getExitConfig() != null ? req.getExitConfig().getScoreAbsoluteMin() : 20,
+                req.getExitConfig() != null ? req.getExitConfig().getMaxBarsNoImprovement() : 3,
+                req.getExitConfig() != null ? req.getExitConfig().getStagnationBars() : 2,
+                req.getExitConfig() != null ? req.getExitConfig().getNoHopeThresholdPct() : 1.5,
+                req.getExitConfig() != null ? req.getExitConfig().getNoHopeBars() : 2);
     }
 
-    public int getBarsSinceLastTrade() { return barsSinceLastTrade; }
-    public double getCapital()          { return capital; }
+    public int    getBarsSinceLastTrade() { return barsSinceLastTrade; }
+    public double getCapital()            { return capital; }
 
-    /**
-     * Process one candle through the state machine.
-     *
-     * @param decision     NiftyDecisionResult for this candle
-     * @param selector     OptionSelectorService (for instrument selection)
-     * @param cePool       CE candidate pool
-     * @param pePool       PE candidate pool
-     * @param niftyClose   NIFTY close price for ATM calculation
-     * @param candleTime   current candle time
-     * @return action string (ENTERED / EXITED / HELD / WAITING / FORCE_CLOSED)
-     */
+    // ── Main per-candle entry point ───────────────────────────────────────────
+
     public String process(NiftyDecisionResult decision,
                           OptionSelectorService selector,
                           List<OptionsReplayRequest.OptionCandidate> cePool,
                           List<OptionsReplayRequest.OptionCandidate> pePool,
                           double niftyClose,
-                          LocalDateTime candleTime) {
+                          LocalDateTime candleTime,
+                          CandleDto niftyCandle) {
 
         // Reset daily counters
         String dateStr = candleTime != null ? candleTime.toLocalDate().toString() : null;
@@ -120,32 +138,36 @@ public class OptionExecutionEngine {
             currentDate      = dateStr;
             switchCountToday = 0;
             dailyRealizedPnl = 0;
-            dailyPnlDate     = dateStr;
         }
 
         barsSinceLastTrade++;
         if (barsSinceLastLoss < Integer.MAX_VALUE) barsSinceLastLoss++;
-        unrealizedPnl  = 0;
-        lastExitReason = null;
-        holdActive     = false;
+        unrealizedPnl   = 0;
+        lastExitReason  = null;
+        holdActive      = false;
 
-        // Update unrealized P&L if position is open
+        // Update unrealized P&L and bar count (unconditional — option candle absence does not freeze counter)
         if (state != PositionState.FLAT && activeToken != null) {
-            barsInTrade++; // always count time in trade, even if option candle is missing
+            barsInTrade++;
             CandleDto optCandle = selector.getCandle(activeToken, candleTime);
             if (optCandle != null && optCandle.close() != null) {
-                double currentPrice = optCandle.close().doubleValue();
-                unrealizedPnl = (currentPrice - entryPrice) * quantity;
+                unrealizedPnl = (optCandle.close().doubleValue() - entryPrice) * quantity;
             }
         }
 
-        // ── State machine ─────────────────────────────────────────────────────
+        // Expose latest exit-eval state for the SSE event builder
+        peakPnlPct     = exitEval.getPeakPnlPct();
+        profitLockFloor = exitEval.getProfitLockFloor() == Double.NEGATIVE_INFINITY
+                ? 0.0 : exitEval.getProfitLockFloor();
+
         return switch (state) {
-            case FLAT    -> processFlatState(decision, selector, cePool, pePool, niftyClose, candleTime);
-            case LONG_CALL -> processLongCallState(decision, selector, pePool, niftyClose, candleTime);
-            case LONG_PUT  -> processLongPutState(decision, selector, cePool, niftyClose, candleTime);
+            case FLAT      -> processFlatState(decision, selector, cePool, pePool, niftyClose, candleTime);
+            case LONG_CALL -> processHeldState(decision, selector, candleTime, niftyCandle, PositionState.LONG_CALL);
+            case LONG_PUT  -> processHeldState(decision, selector, candleTime, niftyCandle, PositionState.LONG_PUT);
         };
     }
+
+    // ── FLAT: look for entry ──────────────────────────────────────────────────
 
     private String processFlatState(NiftyDecisionResult decision,
                                     OptionSelectorService selector,
@@ -155,22 +177,19 @@ public class OptionExecutionEngine {
 
         NiftyDecisionResult.Bias bias = decision.getConfirmedBias();
 
-        // Determine which side we want
         boolean wantCE = (bias == NiftyDecisionResult.Bias.BULLISH)
                 && (desiredSide == DesiredSide.NONE || desiredSide == DesiredSide.CE);
         boolean wantPE = (bias == NiftyDecisionResult.Bias.BEARISH)
                 && (desiredSide == DesiredSide.NONE || desiredSide == DesiredSide.PE);
 
-        if (!decision.isEntryAllowed()) return "WAITING";
-        if (barsSinceLastTrade < minBarsSinceTrade) return "WAITING";
+        if (!decision.isEntryAllowed())                                          return "WAITING";
+        if (barsSinceLastTrade < minBarsSinceTrade)                              return "WAITING";
         if (switchCountToday >= maxSwitchesPerDay && desiredSide != DesiredSide.NONE) return "WAITING";
 
-        // Risk: daily loss cap
         if (rc.isEnabled() && rc.getDailyLossCapPct() > 0
                 && dailyRealizedPnl < -(initialCapital.doubleValue() * rc.getDailyLossCapPct() / 100)) {
             return "WAITING";
         }
-        // Risk: cooldown after loss
         if (rc.isEnabled() && rc.getCooldownCandles() > 0
                 && barsSinceLastLoss < rc.getCooldownCandles()) {
             return "WAITING";
@@ -181,7 +200,8 @@ public class OptionExecutionEngine {
             if (cand != null) {
                 double prem = selector.getPremium(cand.getInstrumentToken(), candleTime);
                 if (prem > 0) {
-                    enterPosition(cand, prem, PositionState.LONG_CALL, candleTime, decision.getRegime());
+                    enterPosition(cand, prem, PositionState.LONG_CALL, candleTime,
+                            decision.getRegime(), decision.getWinnerScore());
                     desiredSide = DesiredSide.NONE;
                     return "ENTERED";
                 }
@@ -191,7 +211,8 @@ public class OptionExecutionEngine {
             if (cand != null) {
                 double prem = selector.getPremium(cand.getInstrumentToken(), candleTime);
                 if (prem > 0) {
-                    enterPosition(cand, prem, PositionState.LONG_PUT, candleTime, decision.getRegime());
+                    enterPosition(cand, prem, PositionState.LONG_PUT, candleTime,
+                            decision.getRegime(), decision.getWinnerScore());
                     desiredSide = DesiredSide.NONE;
                     return "ENTERED";
                 }
@@ -201,85 +222,96 @@ public class OptionExecutionEngine {
         return "WAITING";
     }
 
-    private String processLongCallState(NiftyDecisionResult decision,
-                                        OptionSelectorService selector,
-                                        List<OptionsReplayRequest.OptionCandidate> pePool,
-                                        double niftyClose, LocalDateTime candleTime) {
+    // ── LONG_CALL / LONG_PUT: unified hold + exit logic ───────────────────────
+
+    private String processHeldState(NiftyDecisionResult decision,
+                                    OptionSelectorService selector,
+                                    LocalDateTime candleTime,
+                                    CandleDto niftyCandle,
+                                    PositionState posType) {
 
         NiftyDecisionResult.Bias confirmedBias = decision.getConfirmedBias();
 
-        // ── SL / TP always checked regardless of hold period ─────────────────
-        if (rc.isEnabled()) {
-            CandleDto optCandle = selector.getCandle(activeToken, candleTime);
-            if (optCandle != null) {
-                if (rc.getStopLossPct() > 0 && optCandle.low() != null
-                        && optCandle.low().doubleValue() <= entryPrice * (1 - rc.getStopLossPct() / 100)) {
-                    double exitPx = entryPrice * (1 - rc.getStopLossPct() / 100);
-                    closePosition(exitPx, "STOP_LOSS", candleTime);
-                    desiredSide = DesiredSide.NONE;
-                    return "EXITED";
-                }
-                if (rc.getTakeProfitPct() > 0 && optCandle.high() != null
-                        && optCandle.high().doubleValue() >= entryPrice * (1 + rc.getTakeProfitPct() / 100)) {
-                    double exitPx = entryPrice * (1 + rc.getTakeProfitPct() / 100);
-                    closePosition(exitPx, "TAKE_PROFIT", candleTime);
-                    desiredSide = DesiredSide.NONE;
-                    return "EXITED";
-                }
-            }
-        }
+        // Current option price for exit evaluator
+        CandleDto optCandle = selector.getCandle(activeToken, candleTime);
+        double currentOptPx = (optCandle != null && optCandle.close() != null)
+                ? optCandle.close().doubleValue() : entryPrice;
+
+        // ── Run exit evaluator ────────────────────────────────────────────────
+        ExitEvaluator.ExitSignal signal = exitEval.evaluate(
+                barsInTrade,
+                currentOptPx,
+                decision.getWinnerScore(),
+                confirmedBias,
+                posType,
+                niftyCandle,
+                decision.getRegime()
+        );
 
         int minHold = resolveMinHold(decision.getRegime());
         this.appliedMinHold = minHold;
+        boolean inHoldWindow = hc.isEnabled() && barsInTrade <= minHold;
+        if (inHoldWindow) this.holdActive = true;
 
-        // ── Within hold window — NO neutral/no-signal exit allowed here ───────
-        if (hc.isEnabled() && barsInTrade <= minHold) {
-            this.holdActive = true;
-            int remaining = minHold - barsInTrade;
-
-            if (confirmedBias == NiftyDecisionResult.Bias.NEUTRAL) {
-                log.debug("HOLD_IGNORE_NEUTRAL — LONG_CALL bar={}/{} regime={} remaining={} blocked exit reason='{}'",
-                        barsInTrade, minHold, decision.getRegime(), remaining, decision.getBlockReason());
-            }
-
-            // Early exit ONLY on strong opposite signal during hold window
-            if (confirmedBias == NiftyDecisionResult.Bias.BEARISH
-                    && decision.getWinnerScore() >= hc.getStrongOppositeScore()) {
-                log.debug("HOLD_EARLY_EXIT — strong bearish score={} >= {} at bar={}/{}",
-                        decision.getWinnerScore(), hc.getStrongOppositeScore(), barsInTrade, minHold);
-                CandleDto optCandle = selector.getCandle(activeToken, candleTime);
-                double exitPx = optCandle != null && optCandle.close() != null
-                        ? optCandle.close().doubleValue() : entryPrice;
-                closePosition(exitPx, "STRONG_OPPOSITE_SIGNAL", candleTime);
-                desiredSide = DesiredSide.PE;
-                switchCountToday++;
-                decision.setSwitchCountToday(switchCountToday);
+        // ── Apply exit signal ─────────────────────────────────────────────────
+        if (signal != null) {
+            // Inside hold window — only P1/P2 may fire
+            if (inHoldWindow && !signal.allowedInHold) {
+                log.debug("HOLD_BLOCKED exit={} bar={}/{} regime={}",
+                        signal.reason, barsInTrade, minHold, decision.getRegime());
+            } else {
+                // Determine desired side after exit
+                DesiredSide nextSide = DesiredSide.NONE;
+                if (signal.desiredSide == ExitEvaluator.DesiredSideHint.PE) {
+                    nextSide = DesiredSide.PE;
+                    switchCountToday++;
+                    decision.setSwitchCountToday(switchCountToday);
+                } else if (signal.desiredSide == ExitEvaluator.DesiredSideHint.CE) {
+                    nextSide = DesiredSide.CE;
+                    switchCountToday++;
+                    decision.setSwitchCountToday(switchCountToday);
+                }
+                closePosition(signal.exitPx, signal.reason, candleTime);
+                desiredSide = nextSide;
                 return "EXITED";
             }
+        }
 
-            log.debug("HOLD_ACTIVE — LONG_CALL bar={}/{} regime={} bias={} minHold={}",
-                    barsInTrade, minHold, decision.getRegime(), confirmedBias, minHold);
-            consecutiveWeakBars = 0; // reset — we're in forced hold
+        // ── Hold window: only P1 (SL) may exit — all other signals blocked ───
+        if (inHoldWindow) {
+            consecutiveWeakBars = 0;
+            log.debug("HOLD_ACTIVE bar={}/{} regime={} bias={}", barsInTrade, minHold, decision.getRegime(), confirmedBias);
             return "HELD";
         }
 
-        // ── After hold window: require persistence before exit ────────────────
-        if (confirmedBias == NiftyDecisionResult.Bias.BULLISH) {
+        // ── Post-hold: persistent exit counter (bias-based fallback) ─────────
+        // Skipped in TRENDING — ExitEvaluator P2 (trailing stop) and P5c
+        // (strong opposite bias) handle all exits in trend trades.
+        // This path fires only for non-TRENDING regimes when ExitEvaluator
+        // is disabled or its bias exit is off.
+        boolean isTrending = "TRENDING".equals(decision.getRegime());
+        if (isTrending) {
+            consecutiveWeakBars = 0;
+            return "HELD";
+        }
+
+        boolean favourable = (posType == PositionState.LONG_CALL && confirmedBias == NiftyDecisionResult.Bias.BULLISH)
+                          || (posType == PositionState.LONG_PUT  && confirmedBias == NiftyDecisionResult.Bias.BEARISH);
+
+        if (favourable) {
             consecutiveWeakBars = 0;
             return "HELD";
         }
 
         consecutiveWeakBars++;
         if (consecutiveWeakBars >= hc.getPersistentExitBars()) {
-            log.debug("EXIT_AFTER_HOLD — LONG_CALL bias={} weakBars={} >= {}", confirmedBias, consecutiveWeakBars, hc.getPersistentExitBars());
-            CandleDto optCandle = selector.getCandle(activeToken, candleTime);
-            double exitPx = optCandle != null && optCandle.close() != null
-                    ? optCandle.close().doubleValue() : entryPrice;
-            String exitReason = confirmedBias == NiftyDecisionResult.Bias.BEARISH
+            log.debug("EXIT_PERSISTENT bias={} weakBars={}/{}", confirmedBias, consecutiveWeakBars, hc.getPersistentExitBars());
+            String exitReason = (posType == PositionState.LONG_CALL && confirmedBias == NiftyDecisionResult.Bias.BEARISH)
+                    || (posType == PositionState.LONG_PUT && confirmedBias == NiftyDecisionResult.Bias.BULLISH)
                     ? "BIAS_SWITCH" : "BIAS_INVALIDATED";
-            closePosition(exitPx, exitReason, candleTime);
-            if (confirmedBias == NiftyDecisionResult.Bias.BEARISH) {
-                desiredSide = DesiredSide.PE;
+            closePosition(currentOptPx, exitReason, candleTime);
+            if ("BIAS_SWITCH".equals(exitReason)) {
+                desiredSide = posType == PositionState.LONG_CALL ? DesiredSide.PE : DesiredSide.CE;
                 switchCountToday++;
                 decision.setSwitchCountToday(switchCountToday);
             } else {
@@ -288,100 +320,11 @@ public class OptionExecutionEngine {
             return "EXITED";
         }
 
-        log.debug("HOLD_ACTIVE — LONG_CALL post-hold weakBars={}/{} bias={}", consecutiveWeakBars, hc.getPersistentExitBars(), confirmedBias);
+        log.debug("HOLD_POST_HOLD weakBars={}/{} bias={}", consecutiveWeakBars, hc.getPersistentExitBars(), confirmedBias);
         return "HELD";
     }
 
-    private String processLongPutState(NiftyDecisionResult decision,
-                                       OptionSelectorService selector,
-                                       List<OptionsReplayRequest.OptionCandidate> cePool,
-                                       double niftyClose, LocalDateTime candleTime) {
-
-        NiftyDecisionResult.Bias confirmedBias = decision.getConfirmedBias();
-
-        // ── SL / TP always checked regardless of hold period ─────────────────
-        if (rc.isEnabled()) {
-            CandleDto optCandle = selector.getCandle(activeToken, candleTime);
-            if (optCandle != null) {
-                if (rc.getStopLossPct() > 0 && optCandle.low() != null
-                        && optCandle.low().doubleValue() <= entryPrice * (1 - rc.getStopLossPct() / 100)) {
-                    double exitPx = entryPrice * (1 - rc.getStopLossPct() / 100);
-                    closePosition(exitPx, "STOP_LOSS", candleTime);
-                    desiredSide = DesiredSide.NONE;
-                    return "EXITED";
-                }
-                if (rc.getTakeProfitPct() > 0 && optCandle.high() != null
-                        && optCandle.high().doubleValue() >= entryPrice * (1 + rc.getTakeProfitPct() / 100)) {
-                    double exitPx = entryPrice * (1 + rc.getTakeProfitPct() / 100);
-                    closePosition(exitPx, "TAKE_PROFIT", candleTime);
-                    desiredSide = DesiredSide.NONE;
-                    return "EXITED";
-                }
-            }
-        }
-
-        int minHold = resolveMinHold(decision.getRegime());
-        this.appliedMinHold = minHold;
-
-        // ── Within hold window — NO neutral/no-signal exit allowed here ───────
-        if (hc.isEnabled() && barsInTrade <= minHold) {
-            this.holdActive = true;
-            int remaining = minHold - barsInTrade;
-
-            if (confirmedBias == NiftyDecisionResult.Bias.NEUTRAL) {
-                log.debug("HOLD_IGNORE_NEUTRAL — LONG_PUT bar={}/{} regime={} remaining={} blocked exit reason='{}'",
-                        barsInTrade, minHold, decision.getRegime(), remaining, decision.getBlockReason());
-            }
-
-            // Early exit ONLY on strong opposite signal during hold window
-            if (confirmedBias == NiftyDecisionResult.Bias.BULLISH
-                    && decision.getWinnerScore() >= hc.getStrongOppositeScore()) {
-                log.debug("HOLD_EARLY_EXIT — strong bullish score={} >= {} at bar={}/{}",
-                        decision.getWinnerScore(), hc.getStrongOppositeScore(), barsInTrade, minHold);
-                CandleDto optCandle = selector.getCandle(activeToken, candleTime);
-                double exitPx = optCandle != null && optCandle.close() != null
-                        ? optCandle.close().doubleValue() : entryPrice;
-                closePosition(exitPx, "STRONG_OPPOSITE_SIGNAL", candleTime);
-                desiredSide = DesiredSide.CE;
-                switchCountToday++;
-                decision.setSwitchCountToday(switchCountToday);
-                return "EXITED";
-            }
-
-            log.debug("HOLD_ACTIVE — LONG_PUT bar={}/{} regime={} bias={} minHold={}",
-                    barsInTrade, minHold, decision.getRegime(), confirmedBias, minHold);
-            consecutiveWeakBars = 0;
-            return "HELD";
-        }
-
-        // ── After hold window: require persistence before exit ────────────────
-        if (confirmedBias == NiftyDecisionResult.Bias.BEARISH) {
-            consecutiveWeakBars = 0;
-            return "HELD";
-        }
-
-        consecutiveWeakBars++;
-        if (consecutiveWeakBars >= hc.getPersistentExitBars()) {
-            log.debug("EXIT_AFTER_HOLD — LONG_PUT bias={} weakBars={} >= {}", confirmedBias, consecutiveWeakBars, hc.getPersistentExitBars());
-            CandleDto optCandle = selector.getCandle(activeToken, candleTime);
-            double exitPx = optCandle != null && optCandle.close() != null
-                    ? optCandle.close().doubleValue() : entryPrice;
-            String exitReason = confirmedBias == NiftyDecisionResult.Bias.BULLISH
-                    ? "BIAS_SWITCH" : "BIAS_INVALIDATED";
-            closePosition(exitPx, exitReason, candleTime);
-            if (confirmedBias == NiftyDecisionResult.Bias.BULLISH) {
-                desiredSide = DesiredSide.CE;
-                switchCountToday++;
-                decision.setSwitchCountToday(switchCountToday);
-            } else {
-                desiredSide = DesiredSide.NONE;
-            }
-            return "EXITED";
-        }
-
-        log.debug("HOLD_ACTIVE — LONG_PUT post-hold weakBars={}/{} bias={}", consecutiveWeakBars, hc.getPersistentExitBars(), confirmedBias);
-        return "HELD";
-    }
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private int resolveMinHold(String regime) {
         if (!hc.isEnabled()) return 0;
@@ -400,35 +343,40 @@ public class OptionExecutionEngine {
         return "FORCE_CLOSED";
     }
 
-    // ── Position helpers ──────────────────────────────────────────────────────
+    // ── Position lifecycle ────────────────────────────────────────────────────
 
     private void enterPosition(OptionsReplayRequest.OptionCandidate cand,
                                double premium, PositionState newState,
-                               LocalDateTime time, String regime) {
-        this.state              = newState;
-        this.activeToken        = cand.getInstrumentToken();
-        this.activeStrike       = cand.getStrike();
-        this.activeExpiry       = cand.getExpiry();
+                               LocalDateTime time, String regime, double winnerScore) {
+        this.state               = newState;
+        this.activeToken         = cand.getInstrumentToken();
+        this.activeStrike        = cand.getStrike();
+        this.activeExpiry        = cand.getExpiry();
         this.activeTradingSymbol = cand.getTradingSymbol();
-        this.activeOptionType   = cand.getOptionType();
-        this.entryPrice         = premium;
+        this.activeOptionType    = cand.getOptionType();
+        this.entryPrice          = premium;
+
         if (quantity0 > 0) {
             this.quantity = quantity0;
         } else if (rc.isEnabled() && rc.getMaxRiskPerTradePct() > 0 && rc.getStopLossPct() > 0) {
-            double maxLoss = capital * rc.getMaxRiskPerTradePct() / 100;
-            double lossPerLot = premium * rc.getStopLossPct() / 100 * 100; // per 100-unit lot
-            int lots = Math.max(1, (int)(maxLoss / lossPerLot));
-            this.quantity = lots * 100;
+            double maxLoss    = capital * rc.getMaxRiskPerTradePct() / 100;
+            double lossPerLot = premium * rc.getStopLossPct() / 100 * 100;
+            this.quantity     = Math.max(1, (int)(maxLoss / lossPerLot)) * 100;
         } else {
             this.quantity = Math.max(1, (int)(capital / premium / 100) * 100);
         }
-        this.barsInTrade        = 0;
-        this.barsSinceLastTrade = 0;
+
+        this.barsInTrade         = 0;
+        this.barsSinceLastTrade  = 0;
         this.consecutiveWeakBars = 0;
-        this.entryRegime        = regime;
-        this.appliedMinHold     = resolveMinHold(regime);
-        this.entryTimeStr       = time != null ? time.toString() : null;
-        log.info("Entered {} @ {} — {} qty={}", newState, premium, activeTradingSymbol, quantity);
+        this.entryRegime         = regime;
+        this.appliedMinHold      = resolveMinHold(regime);
+        this.entryTimeStr        = time != null ? time.toString() : null;
+
+        exitEval.onEntry(winnerScore, premium);
+
+        log.info("Entered {} @ {} — {} qty={} regime={} minHold={}",
+                newState, premium, activeTradingSymbol, quantity, regime, appliedMinHold);
     }
 
     private void closePosition(double exitPx, String reason, LocalDateTime time) {
@@ -437,9 +385,7 @@ public class OptionExecutionEngine {
         realizedPnl      += pnl;
         dailyRealizedPnl += pnl;
         capital          += pnl;
-        if (pnl < 0) {
-            barsSinceLastLoss = 0;
-        }
+        if (pnl < 0) barsSinceLastLoss = 0;
 
         closedTrades.add(OptionsReplayCandleEvent.ClosedTrade.builder()
                 .entryTime(entryTimeStr)
@@ -458,22 +404,22 @@ public class OptionExecutionEngine {
                 .capitalAfter(capital)
                 .build());
 
-        log.info("Closed {} — exit={} pnl={} reason={}", activeTradingSymbol, exitPx, pnl, reason);
+        log.info("Closed {} — exit={} pnl={} reason={} bars={}",
+                activeTradingSymbol, exitPx, String.format("%.2f", pnl), reason, barsInTrade);
 
-        // Reset position state
-        state              = PositionState.FLAT;
-        activeToken        = null;
-        activeStrike       = 0;
-        activeExpiry       = null;
-        activeTradingSymbol = null;
-        activeOptionType   = null;
-        entryPrice         = 0;
-        quantity           = 0;
-        barsInTrade        = 0;
-        barsSinceLastTrade = 0;
-        unrealizedPnl      = 0;
-        entryRegime        = null;
-        appliedMinHold     = 0;
-        consecutiveWeakBars = 0;
+        state                = PositionState.FLAT;
+        activeToken          = null;
+        activeStrike         = 0;
+        activeExpiry         = null;
+        activeTradingSymbol  = null;
+        activeOptionType     = null;
+        entryPrice           = 0;
+        quantity             = 0;
+        barsInTrade          = 0;
+        barsSinceLastTrade   = 0;
+        unrealizedPnl        = 0;
+        entryRegime          = null;
+        appliedMinHold       = 0;
+        consecutiveWeakBars  = 0;
     }
 }

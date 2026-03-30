@@ -196,7 +196,7 @@ public class OptionsReplayService {
             // b. Execution
             double niftyClose = niftyCandle.close().doubleValue();
             String action = execEngine.process(decision, selectorService, cePool, pePool,
-                    niftyClose, candleTime);
+                    niftyClose, candleTime, niftyCandle);
 
             // c. Build and emit event
             OptionsReplayCandleEvent event = buildEvent(i + 1, total, niftyCandle, decision,
@@ -342,6 +342,8 @@ public class OptionsReplayService {
                 .entryRegime(exec.getEntryRegime())
                 .appliedMinHold(exec.getAppliedMinHold())
                 .holdActive(exec.isHoldActive())
+                .peakPnlPct(exec.getPeakPnlPct())
+                .profitLockFloor(exec.getProfitLockFloor())
                 .selectedToken(exec.getActiveToken())
                 .selectedOptionType(exec.getActiveOptionType())
                 .selectedStrike(exec.getActiveStrike())
