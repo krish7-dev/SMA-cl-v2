@@ -32,6 +32,8 @@ public class OptionsReplayCandleEvent {
     private int     barsSinceLastTrade;
     private boolean entryAllowed;
     private String  blockReason;
+    /** Execution-layer wait reason (e.g. no option data, no premium, cooldown). Separate from decision blockReason. */
+    private String  execWaitReason;
     private double  penalizedScore;
 
     /** Trade quality tier: STRONG / NORMAL / WEAK / NONE */
@@ -57,6 +59,8 @@ public class OptionsReplayCandleEvent {
     private boolean switchConfirmed;
     private String  switchReason;
     private int     switchCountToday;
+    private int     confirmCount;
+    private int     confirmRequired;
 
     /** All strategies evaluated (including HOLD) with full score pipeline breakdown. */
     private List<CandidateScore> candidates;
@@ -75,6 +79,8 @@ public class OptionsReplayCandleEvent {
     // Exit evaluator debug fields
     private double  peakPnlPct;          // highest pnl% seen since entry
     private double  profitLockFloor;     // current profit lock floor %
+    private boolean inHoldZone;          // true = pnl < holdZonePct; only SL can exit
+    private boolean inStrongTrendMode;   // true = TRENDING + peak > strongModeThreshold
 
     // Selected option
     private String selectedOptionType;

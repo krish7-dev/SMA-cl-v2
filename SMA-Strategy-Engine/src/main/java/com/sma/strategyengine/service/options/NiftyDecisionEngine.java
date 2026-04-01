@@ -72,6 +72,9 @@ public class NiftyDecisionEngine {
     // Aggregate replay diagnostics
     private final ReplayDiagnostics diagnostics = new ReplayDiagnostics();
 
+    // Rolling winner-score history for early-entry rising-score detection (last 3 values)
+    private final Deque<Double> winnerScoreHistory = new ArrayDeque<>(4);
+
     // ─────────────────────────────────────────────────────────────────────────
 
     public NiftyDecisionEngine(StrategyRegistry registry,
@@ -282,7 +285,56 @@ public class NiftyDecisionEngine {
         } else {
             EntryPenalties ep = computeEntryPenalties(move3, move5, Math.abs(vwapDist), regime);
             penalizedScore = winnerScore + ep.total; // total is <= 0
-            if (penalizedScore >= dc.getPenaltyMinScore()) {
+
+            // 40% penalty cap: total penalties cannot reduce score below 60% of raw winnerScore
+            penalizedScore = Math.max(penalizedScore, winnerScore * 0.60);
+
+            // Score floor: if raw score ≥ scoreFloorTrigger, penalties cannot push penalized below scoreFloorMin
+            if (winnerScore >= dc.getScoreFloorTrigger() && dc.getScoreFloorMin() > 0) {
+                penalizedScore = Math.max(penalizedScore, dc.getScoreFloorMin());
+            }
+
+            // BOLLINGER bonus: if winner is BOLLINGER_REVERSION and score ≥ bollingerBonusThreshold, add bonus
+            if (winner != null
+                    && "BOLLINGER_REVERSION".equals(winner.strategyType)
+                    && winnerScore >= dc.getBollingerBonusThreshold()
+                    && dc.getBollingerBonus() != 0) {
+                penalizedScore += dc.getBollingerBonus();
+                log.debug("BOLLINGER bonus +{} applied, penalizedScore → {}",
+                        dc.getBollingerBonus(), String.format("%.1f", penalizedScore));
+            }
+
+            // Early entry: score has risen for earlyEntryRisingBars consecutive candles → allow even below threshold
+            boolean earlyEntryByRisingScore = false;
+            if (dc.getEarlyEntryRisingBars() > 0 && winnerScoreHistory.size() >= dc.getEarlyEntryRisingBars()) {
+                Double[] hist = winnerScoreHistory.toArray(new Double[0]);
+                int n = hist.length;
+                boolean allRising = true;
+                for (int idx = n - dc.getEarlyEntryRisingBars(); idx < n - 1; idx++) {
+                    if (hist[idx + 1] <= hist[idx]) { allRising = false; break; }
+                }
+                if (allRising && winnerScore > hist[n - dc.getEarlyEntryRisingBars()]) {
+                    earlyEntryByRisingScore = true;
+                    log.debug("EARLY_ENTRY rising score {} bars: {} → {}",
+                            dc.getEarlyEntryRisingBars(), hist[n - dc.getEarlyEntryRisingBars()],
+                            String.format("%.1f", winnerScore));
+                }
+            }
+
+            // Item 5 — Entry floor bypass: raw score ≥ threshold AND gap ≥ floor → allow regardless of penalized
+            boolean rawScoreBypass = dc.getRawScoreBypassThreshold() > 0
+                    && winnerScore >= dc.getRawScoreBypassThreshold()
+                    && scoreGap >= dc.getRawScoreBypassGap();
+            if (rawScoreBypass) {
+                log.debug("RAW_SCORE_BYPASS raw={} gap={} (need raw≥{} gap≥{})",
+                        String.format("%.1f", winnerScore), String.format("%.1f", scoreGap),
+                        dc.getRawScoreBypassThreshold(), dc.getRawScoreBypassGap());
+            }
+
+            // Item 7 — Safe guard: use max(rawScore, penalizedScore) vs threshold
+            double effectiveScore = Math.max(winnerScore, penalizedScore);
+
+            if (effectiveScore >= dc.getPenaltyMinScore() || earlyEntryByRisingScore || rawScoreBypass) {
                 canEnter = true;
                 if (!ep.breakdown.isEmpty()) {
                     log.debug("entry ok — {}", ep.logLine(penalizedScore));
@@ -292,6 +344,10 @@ public class NiftyDecisionEngine {
                 block    = ep.blockReason(penalizedScore, dc.getPenaltyMinScore());
             }
         }
+
+        // Track winner score history for early-entry rising-score window
+        winnerScoreHistory.addLast(winnerScore);
+        if (winnerScoreHistory.size() > 4) winnerScoreHistory.removeFirst();
 
         // ── Structure validation (TRENDING / COMPRESSION) ────────────────────
         if (canEnter) {
@@ -334,6 +390,14 @@ public class NiftyDecisionEngine {
             } else if ("TRENDING".equals(regime) || "COMPRESSION".equals(regime)) {
                 confirmRequired = tqc.getTrendingConfirmCandles();
             }
+        }
+        // Item 6 — BOLLINGER early reversal: score ≥ bollingerEarlyEntryMinScore → bypass to 1-candle confirm
+        if (winner != null && "BOLLINGER_REVERSION".equals(winner.strategyType)
+                && dc.getBollingerEarlyEntryMinScore() > 0
+                && winnerScore >= dc.getBollingerEarlyEntryMinScore()) {
+            confirmRequired = Math.min(confirmRequired, 1);
+            log.debug("BOLLINGER_EARLY_CONFIRM: confirmRequired overridden to 1 (score={})",
+                    String.format("%.1f", winnerScore));
         }
 
         boolean switchRequested = rawBias != NiftyDecisionResult.Bias.NEUTRAL
@@ -422,6 +486,8 @@ public class NiftyDecisionEngine {
                 // Switch
                 .switchRequested(switchRequested)
                 .switchConfirmed(switchConfirmed)
+                .confirmCount(confirmCount)
+                .confirmRequired(confirmRequired)
                 .switchReason(switchReason)
                 .switchCountToday(switchCountToday)
                 // Full candidate list (all strategies, including HOLD)
@@ -641,28 +707,30 @@ public class NiftyDecisionEngine {
     private EntryPenalties computeEntryPenalties(double m3, double m5, double absVwap, String regime) {
         EntryPenalties ep = new EntryPenalties();
 
-        // Weak bias / over-extension penalty (-5): recent move exceeded threshold
+        boolean isRanging = "RANGING".equals(regime);
+
+        // Move / over-extension penalty (-3, reduced from -5)
         if (m3 > dc.getMaxRecentMove3() || m5 > dc.getMaxRecentMove5())
-            ep.add("move", -5);
+            ep.add("move", -3);
 
         // VWAP distance penalty (-5)
         if (absVwap > dc.getMaxAbsVwapDist())
             ep.add("vwap", -5);
 
-        // Chop penalty (-8)
-        if (dc.isChopFilter() && isChopFilterActiveForRegime(regime)
+        // Chop penalty: disabled in RANGING; -2 in other regimes (reduced from -4)
+        if (!isRanging && dc.isChopFilter() && isChopFilterActiveForRegime(regime)
                 && isChoppy(chopFlipRatioForRegime(regime)))
-            ep.add("chop", -8);
+            ep.add("chop", -2);
 
         // Range quality penalties (RANGING only)
-        if ("RANGING".equals(regime)) {
+        if (isRanging) {
             RangeQualityFilter.Result rq = rqf.evaluate(history);
             if (!rq.isAllowed()) {
                 String reason = rq.getReason();
-                double penalty = reason.startsWith("RANGE_DRIFTING")       ? -10
-                               : reason.startsWith("RANGE_POOR_STRUCTURE") ? -8
-                               : reason.startsWith("RANGE_CHOPPY")         ? -8
-                               : -5; // TOO_NARROW, TOO_WIDE
+                double penalty = reason.startsWith("RANGE_DRIFTING")       ? -3   // 50% cut from -5 (RANGING fix)
+                               : reason.startsWith("RANGE_POOR_STRUCTURE") ? -4
+                               : reason.startsWith("RANGE_CHOPPY")         ? -2   // halved (chop reduced in RANGING)
+                               : -2; // TOO_NARROW, TOO_WIDE (reduced from -5)
                 String label = reason.contains(":") ? reason.substring(0, reason.indexOf(':')) : reason;
                 ep.add(label.toLowerCase().replace("range_", ""), penalty);
             }

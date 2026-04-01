@@ -6,8 +6,8 @@ spring:
     name: sma-execution-engine
 
   datasource:
-    url: jdbc:postgresql://db.ubcfqlqowoybswafwyun.supabase.co:5432/postgres
-    username: postgres
+    url: jdbc:postgresql://aws-1-ap-northeast-1.pooler.supabase.com:5432/postgres?sslmode=require
+    username: postgres.ubcfqlqowoybswafwyun
     password: SMARootKrishna
     driver-class-name: org.postgresql.Driver
     hikari:

@@ -71,12 +71,15 @@ public class OptionExecutionEngine {
     private final ExitEvaluator exitEval;
 
     // Per-candle observable fields
-    @Getter private String  lastExitReason = null;
-    @Getter private String  entryRegime    = null;
-    @Getter private int     appliedMinHold = 0;
-    @Getter private boolean holdActive     = false;
-    @Getter private double  peakPnlPct     = 0.0;
+    @Getter private String  lastExitReason  = null;
+    @Getter private String  execWaitReason  = null;   // why execution returned WAITING (separate from decision blockReason)
+    @Getter private String  entryRegime     = null;
+    @Getter private int     appliedMinHold  = 0;
+    @Getter private boolean holdActive      = false;
+    @Getter private double  peakPnlPct      = 0.0;
     @Getter private double  profitLockFloor = 0.0;
+    @Getter private boolean inHoldZone      = false;
+    @Getter private boolean inStrongTrendMode = false;
 
     // Risk management (legacy daily-loss-cap + cooldown — kept alongside ExitEvaluator)
     private final OptionsReplayRequest.RiskConfig rc;
@@ -144,6 +147,7 @@ public class OptionExecutionEngine {
         if (barsSinceLastLoss < Integer.MAX_VALUE) barsSinceLastLoss++;
         unrealizedPnl   = 0;
         lastExitReason  = null;
+        execWaitReason  = null;
         holdActive      = false;
 
         // Update unrealized P&L and bar count (unconditional — option candle absence does not freeze counter)
@@ -156,9 +160,11 @@ public class OptionExecutionEngine {
         }
 
         // Expose latest exit-eval state for the SSE event builder
-        peakPnlPct     = exitEval.getPeakPnlPct();
-        profitLockFloor = exitEval.getProfitLockFloor() == Double.NEGATIVE_INFINITY
+        peakPnlPct        = exitEval.getPeakPnlPct();
+        profitLockFloor   = exitEval.getProfitLockFloor() == Double.NEGATIVE_INFINITY
                 ? 0.0 : exitEval.getProfitLockFloor();
+        inHoldZone        = state != PositionState.FLAT && exitEval.isInHoldZone();
+        inStrongTrendMode = state != PositionState.FLAT && exitEval.isInStrongTrendMode();
 
         return switch (state) {
             case FLAT      -> processFlatState(decision, selector, cePool, pePool, niftyClose, candleTime);
@@ -183,40 +189,58 @@ public class OptionExecutionEngine {
                 && (desiredSide == DesiredSide.NONE || desiredSide == DesiredSide.PE);
 
         if (!decision.isEntryAllowed())                                          return "WAITING";
-        if (barsSinceLastTrade < minBarsSinceTrade)                              return "WAITING";
-        if (switchCountToday >= maxSwitchesPerDay && desiredSide != DesiredSide.NONE) return "WAITING";
+        if (barsSinceLastTrade < minBarsSinceTrade) {
+            execWaitReason = "minBars cooldown (" + barsSinceLastTrade + "/" + minBarsSinceTrade + ")";
+            return "WAITING";
+        }
+        if (switchCountToday >= maxSwitchesPerDay && desiredSide != DesiredSide.NONE) {
+            execWaitReason = "max switches reached (" + switchCountToday + "/" + maxSwitchesPerDay + ")";
+            return "WAITING";
+        }
 
         if (rc.isEnabled() && rc.getDailyLossCapPct() > 0
                 && dailyRealizedPnl < -(initialCapital.doubleValue() * rc.getDailyLossCapPct() / 100)) {
+            execWaitReason = "daily loss cap hit";
             return "WAITING";
         }
         if (rc.isEnabled() && rc.getCooldownCandles() > 0
                 && barsSinceLastLoss < rc.getCooldownCandles()) {
+            execWaitReason = "risk cooldown (" + barsSinceLastLoss + "/" + rc.getCooldownCandles() + ")";
             return "WAITING";
         }
 
         if (wantCE) {
             OptionsReplayRequest.OptionCandidate cand = selector.select(cePool, niftyClose, candleTime);
-            if (cand != null) {
-                double prem = selector.getPremium(cand.getInstrumentToken(), candleTime);
-                if (prem > 0) {
-                    enterPosition(cand, prem, PositionState.LONG_CALL, candleTime,
-                            decision.getRegime(), decision.getWinnerScore());
-                    desiredSide = DesiredSide.NONE;
-                    return "ENTERED";
-                }
+            if (cand == null) {
+                execWaitReason = "CE: no valid candidate in pool";
+                return "WAITING";
             }
+            double prem = selector.getPremium(cand.getInstrumentToken(), candleTime);
+            if (prem <= 0) {
+                execWaitReason = "CE: no option price data at " + candleTime + " for " + cand.getTradingSymbol();
+                log.warn("CE entry blocked — no price data for {} at {}", cand.getTradingSymbol(), candleTime);
+                return "WAITING";
+            }
+            enterPosition(cand, prem, PositionState.LONG_CALL, candleTime,
+                    decision.getRegime(), decision.getWinnerScore());
+            desiredSide = DesiredSide.NONE;
+            return "ENTERED";
         } else if (wantPE) {
             OptionsReplayRequest.OptionCandidate cand = selector.select(pePool, niftyClose, candleTime);
-            if (cand != null) {
-                double prem = selector.getPremium(cand.getInstrumentToken(), candleTime);
-                if (prem > 0) {
-                    enterPosition(cand, prem, PositionState.LONG_PUT, candleTime,
-                            decision.getRegime(), decision.getWinnerScore());
-                    desiredSide = DesiredSide.NONE;
-                    return "ENTERED";
-                }
+            if (cand == null) {
+                execWaitReason = "PE: no valid candidate in pool";
+                return "WAITING";
             }
+            double prem = selector.getPremium(cand.getInstrumentToken(), candleTime);
+            if (prem <= 0) {
+                execWaitReason = "PE: no option price data at " + candleTime + " for " + cand.getTradingSymbol();
+                log.warn("PE entry blocked — no price data for {} at {}", cand.getTradingSymbol(), candleTime);
+                return "WAITING";
+            }
+            enterPosition(cand, prem, PositionState.LONG_PUT, candleTime,
+                    decision.getRegime(), decision.getWinnerScore());
+            desiredSide = DesiredSide.NONE;
+            return "ENTERED";
         }
 
         return "WAITING";
