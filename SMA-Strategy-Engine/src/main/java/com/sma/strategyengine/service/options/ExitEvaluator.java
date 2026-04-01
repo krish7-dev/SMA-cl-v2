@@ -11,20 +11,29 @@ import java.util.Deque;
 /**
  * Modular exit evaluator — runs on every candle while in a position.
  *
- * Priority order:
- *   P1  Hard Stop Loss          (fires inside hold window)
- *   P2  Profit Lock / Trailing  (post-hold only — minimum 2 bars respected)
- *   P3  First-Move Protection   (arms lock — no forced exit)
- *   P4  Structure Failure       (post-hold only)
- *   P5b Score Below Floor       (post-hold, non-TRENDING only)
- *   P5c Bias Reversal           (post-hold; TRENDING requires score ≥ strongExitScore)
- *   P6a Time / No Improvement   (post-hold, non-TRENDING only)
- *   P6b Time / Stagnation       (post-hold, non-TRENDING only)
- *   P6c RANGING Time Limit      (post-hold, RANGING only)
- *   P7  No-Hope                 (post-hold, non-TRENDING only)
+ * ── Hold Zone (profit < holdZonePct) ────────────────────────────────────────
+ *   Only P1 (SL) and P6d (dead-trade time kill) are active.
+ *   All other signals are suppressed until profit clears the hold zone.
+ *
+ * ── Strong Trend Mode (TRENDING + peakPnl > trendStrongModeThresholdPct) ──
+ *   Only P1, P2, and P5c (strong opposite signal) are active.
+ *   Structure, score-floor, time, and no-hope exits are suppressed.
+ *
+ * Priority order (after hold-zone / strong-trend gates):
+ *   P1   Hard Stop Loss           (always — fires inside bar-hold and hold zone)
+ *   P2   Profit Lock / Trailing   (post bar-hold; only arms once profit ≥ holdZonePct)
+ *   P3   First-Move Protection    (arms lock — no forced exit; disabled by default)
+ *   P4   Structure Failure        (non-TRENDING + non-RANGING only)
+ *   P5c  Bias Reversal            (TRENDING: score ≥ strongExitScore; RANGING/other: any flip)
+ *   P6a  Time / No Improvement    (non-TRENDING + non-RANGING only)
+ *   P6b  Time / Stagnation        (non-TRENDING + non-RANGING only)
+ *   P6c  RANGING Time Limit       (RANGING only)
+ *   P6d  Dead Trade               (any regime; fires from inside hold zone)
+ *   P7   No-Hope                  (non-TRENDING + non-RANGING only)
  *
  * Removed:
- *   P5a Score Collapsed — removed (score drop alone is not an exit signal)
+ *   P5a  Score Collapsed  — score drop is not an exit signal
+ *   P5b  Score Below Floor — score must NOT trigger exit under any condition
  */
 @Slf4j
 public class ExitEvaluator {
@@ -37,7 +46,7 @@ public class ExitEvaluator {
         public final String          reason;
         public final double          exitPx;
         public final DesiredSideHint desiredSide;
-        /** true = signal fires even inside the hold window */
+        /** true = signal fires even inside the bar-based hold window */
         public final boolean         allowedInHold;
 
         ExitSignal(String reason, double exitPx, DesiredSideHint side, boolean allowedInHold) {
@@ -50,17 +59,21 @@ public class ExitEvaluator {
 
     // ── Per-position state ────────────────────────────────────────────────────
 
-    @Getter private double  peakPnlPct        = 0.0;
-    @Getter private double  profitLockFloor   = Double.NEGATIVE_INFINITY;
-    @Getter private boolean everProfitable    = false;
+    @Getter private double  peakPnlPct         = 0.0;
+    @Getter private double  profitLockFloor    = Double.NEGATIVE_INFINITY;
+    @Getter private boolean everProfitable     = false;
     @Getter private int     barsWithoutNewHigh = 0;
-    @Getter private int     barsNegative      = 0;
+    @Getter private int     barsNegative       = 0;
+    /** True when the current pnl is below holdZonePct — only SL/dead-trade can exit. */
+    @Getter private boolean inHoldZone         = false;
+    /** True when TRENDING regime + peak pnl has cleared trendStrongModeThresholdPct. */
+    @Getter private boolean inStrongTrendMode  = false;
 
     private double entryScore       = 0.0;
     private double entryOptionPrice = 0.0;
 
-    private final Deque<CandleDto>                    niftyWindow = new ArrayDeque<>();
-    private final OptionsReplayRequest.ExitConfig     ec;
+    private final Deque<CandleDto>                niftyWindow = new ArrayDeque<>();
+    private final OptionsReplayRequest.ExitConfig ec;
 
     public ExitEvaluator(OptionsReplayRequest.ExitConfig ec) {
         this.ec = ec != null ? ec : new OptionsReplayRequest.ExitConfig();
@@ -69,13 +82,15 @@ public class ExitEvaluator {
     // ── Reset on new entry ────────────────────────────────────────────────────
 
     public void onEntry(double entryScore, double entryOptionPrice) {
-        this.entryScore        = entryScore;
-        this.entryOptionPrice  = entryOptionPrice;
-        this.peakPnlPct        = 0.0;
-        this.profitLockFloor   = Double.NEGATIVE_INFINITY;
-        this.everProfitable    = false;
+        this.entryScore         = entryScore;
+        this.entryOptionPrice   = entryOptionPrice;
+        this.peakPnlPct         = 0.0;
+        this.profitLockFloor    = Double.NEGATIVE_INFINITY;
+        this.everProfitable     = false;
         this.barsWithoutNewHigh = 0;
-        this.barsNegative      = 0;
+        this.barsNegative       = 0;
+        this.inHoldZone         = true;   // always start in hold zone
+        this.inStrongTrendMode  = false;
         this.niftyWindow.clear();
     }
 
@@ -98,6 +113,10 @@ public class ExitEvaluator {
                 ? (currentOptPx - entryOptionPrice) / entryOptionPrice * 100.0
                 : 0.0;
 
+        // Update observable mode flags (read by OptionExecutionEngine for SSE events)
+        this.inHoldZone        = currentPnlPct < ec.getHoldZonePct();
+        this.inStrongTrendMode = isTrending && peakPnlPct > ec.getTrendStrongModeThresholdPct();
+
         // ── Update rolling NIFTY window ───────────────────────────────────────
         if (niftyCandle != null) {
             niftyWindow.addLast(niftyCandle);
@@ -113,7 +132,6 @@ public class ExitEvaluator {
         } else {
             barsWithoutNewHigh++;
         }
-
         if (currentPnlPct > 0) {
             everProfitable = true;
             barsNegative   = 0;
@@ -121,12 +139,13 @@ public class ExitEvaluator {
             barsNegative++;
         }
 
+        // Always update ratchet so the floor is ready when hold zone is cleared
         updateProfitLock(currentPnlPct);
 
         double exitPx = currentOptPx;
 
         // ════════════════════════════════════════════════════════════════════
-        // P1 — Hard Stop Loss  (allowed inside hold window)
+        // P1 — Hard Stop Loss  (always — fires inside bar-hold and hold zone)
         // ════════════════════════════════════════════════════════════════════
         if (ec.getHardStopPct() > 0 && currentPnlPct <= -ec.getHardStopPct()) {
             double slPx = entryOptionPrice * (1 - ec.getHardStopPct() / 100.0);
@@ -136,7 +155,9 @@ public class ExitEvaluator {
         }
 
         // ════════════════════════════════════════════════════════════════════
-        // P2 — Profit Lock / Trailing  (post-hold only — min 2 bars respected)
+        // P2 — Profit Lock / Trailing
+        //      Only fires once profit has previously cleared holdZonePct,
+        //      which guarantees the floor was ratcheted from a real gain.
         // ════════════════════════════════════════════════════════════════════
         if (profitLockFloor > Double.NEGATIVE_INFINITY && currentPnlPct < profitLockFloor) {
             log.debug("EXIT P2 PROFIT_LOCK_HIT pnl={}% < floor={}%",
@@ -145,7 +166,32 @@ public class ExitEvaluator {
         }
 
         // ════════════════════════════════════════════════════════════════════
+        // HOLD ZONE — profit below holdZonePct: hold unless dead-trade kill
+        //
+        // This prevents all signal-based exits until the trade has proven
+        // itself with a meaningful gain.  The only escape before +holdZonePct
+        // is P1 (SL) above or P6d (dead-trade time kill) below.
+        // ════════════════════════════════════════════════════════════════════
+        boolean inHoldZone = currentPnlPct < ec.getHoldZonePct();
+        if (inHoldZone) {
+            // P6d inside hold zone — eject a dead trade that never moved
+            if (ec.getMaxBarsDeadTrade() > 0
+                    && barsInTrade > ec.getMaxBarsDeadTrade()
+                    && currentPnlPct < ec.getDeadTradePnlPct()) {
+                log.debug("EXIT P6d DEAD_TRADE_IN_HOLD_ZONE bars={} pnl={}% < {}%",
+                        barsInTrade,
+                        String.format("%.2f", currentPnlPct),
+                        ec.getDeadTradePnlPct());
+                return new ExitSignal("DEAD_TRADE", exitPx, DesiredSideHint.NONE, false);
+            }
+            log.trace("HOLD_ZONE pnl={}% < {}% — waiting for zone break",
+                    String.format("%.2f", currentPnlPct), ec.getHoldZonePct());
+            return null;
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         // P3 — First-Move Protection  (arms lock, no exit)
+        //      Disabled by default (firstMoveBars=0) — hold zone supersedes it.
         // ════════════════════════════════════════════════════════════════════
         if (ec.getFirstMoveBars() > 0 && barsInTrade <= ec.getFirstMoveBars() && everProfitable) {
             double targetFloor = ec.getFirstMoveLockPct();
@@ -156,13 +202,45 @@ public class ExitEvaluator {
             }
         }
 
-        // ── P4-P7: blocked inside hold window (engine enforces) ──────────────
+        // ════════════════════════════════════════════════════════════════════
+        // STRONG TREND MODE — TRENDING + peak has cleared trendStrongModeThresholdPct
+        //
+        // In this mode only the trailing stop (P2, already checked) and a
+        // strong opposite confirmed bias (P5c with score ≥ strongExitScore)
+        // are allowed to exit.  All other signals are suppressed.
+        // ════════════════════════════════════════════════════════════════════
+        boolean inStrongTrendMode = isTrending
+                && peakPnlPct > ec.getTrendStrongModeThresholdPct();
+
+        if (inStrongTrendMode) {
+            if (ec.isBiasExitEnabled() && currentScore >= ec.getStrongExitScore()) {
+                if (positionType == OptionExecutionEngine.PositionState.LONG_CALL
+                        && confirmedBias == NiftyDecisionResult.Bias.BEARISH) {
+                    log.debug("EXIT P5c STRONG_TREND_BIAS_REVERSAL LONG_CALL bearish score={}",
+                            String.format("%.1f", currentScore));
+                    return new ExitSignal("BIAS_REVERSAL_STRONG", exitPx, DesiredSideHint.PE, false);
+                }
+                if (positionType == OptionExecutionEngine.PositionState.LONG_PUT
+                        && confirmedBias == NiftyDecisionResult.Bias.BULLISH) {
+                    log.debug("EXIT P5c STRONG_TREND_BIAS_REVERSAL LONG_PUT bullish score={}",
+                            String.format("%.1f", currentScore));
+                    return new ExitSignal("BIAS_REVERSAL_STRONG", exitPx, DesiredSideHint.CE, false);
+                }
+            }
+            log.trace("STRONG_TREND_MODE — suppressing all non-trail exits pnl={}%",
+                    String.format("%.2f", currentPnlPct));
+            return null;
+        }
+
+        // ── Full exit system (profit ≥ holdZonePct, not in strong trend mode) ─
 
         // ════════════════════════════════════════════════════════════════════
-        // P4 — Structure Failure (uses NIFTY close vs rolling high/low)
+        // P4 — Structure Failure (NIFTY close vs rolling high/low)
+        //      Skipped in RANGING (use time limit instead of structure).
         // ════════════════════════════════════════════════════════════════════
-        if (niftyWindow.size() >= Math.min(3, ec.getStructureLookback()) && niftyCandle != null
-                && niftyCandle.close() != null) {
+        if (!isRanging
+                && niftyWindow.size() >= Math.min(3, ec.getStructureLookback())
+                && niftyCandle != null && niftyCandle.close() != null) {
             double niftyClose = niftyCandle.close().doubleValue();
 
             if (positionType == OptionExecutionEngine.PositionState.LONG_CALL) {
@@ -176,7 +254,6 @@ public class ExitEvaluator {
                     return new ExitSignal("STRUCTURE_FAILURE_SUPPORT", exitPx, DesiredSideHint.NONE, false);
                 }
             }
-
             if (positionType == OptionExecutionEngine.PositionState.LONG_PUT) {
                 double resistance = niftyWindow.stream()
                         .filter(c -> c.high() != null)
@@ -190,39 +267,25 @@ public class ExitEvaluator {
             }
         }
 
-        // P5a — REMOVED: Score Collapsed exit removed.
-        // Score drop alone is not a reliable exit signal.
-
-        // ════════════════════════════════════════════════════════════════════
-        // P5b — Score Below Absolute Floor + Neutral Bias
-        //        Skipped in TRENDING — hold the trend regardless of score.
-        // ════════════════════════════════════════════════════════════════════
-        if (!isTrending
-                && ec.getScoreAbsoluteMin() > 0
-                && currentScore < ec.getScoreAbsoluteMin()
-                && confirmedBias == NiftyDecisionResult.Bias.NEUTRAL) {
-            log.debug("EXIT P5b SCORE_BELOW_FLOOR score={} < {} NEUTRAL",
-                    String.format("%.1f", currentScore), ec.getScoreAbsoluteMin());
-            return new ExitSignal("SCORE_BELOW_FLOOR", exitPx, DesiredSideHint.NONE, false);
-        }
+        // P5b — REMOVED: Score must NOT trigger exit under any condition.
 
         // ════════════════════════════════════════════════════════════════════
         // P5c — Confirmed Bias Reversal
-        //        TRENDING: require score >= strongExitScore (default 35).
-        //        RANGING / other: fire on any confirmed bias flip.
+        //        TRENDING (not in strong mode): require score ≥ strongExitScore.
+        //        RANGING / other: fire on any confirmed flip.
         // ════════════════════════════════════════════════════════════════════
         if (ec.isBiasExitEnabled()) {
             boolean strongEnough = !isTrending || currentScore >= ec.getStrongExitScore();
             if (strongEnough) {
                 if (positionType == OptionExecutionEngine.PositionState.LONG_CALL
                         && confirmedBias == NiftyDecisionResult.Bias.BEARISH) {
-                    log.debug("EXIT P5c BIAS_REVERSAL LONG_CALL bearish confirmed score={}",
+                    log.debug("EXIT P5c BIAS_REVERSAL LONG_CALL bearish score={}",
                             String.format("%.1f", currentScore));
                     return new ExitSignal("BIAS_REVERSAL", exitPx, DesiredSideHint.PE, false);
                 }
                 if (positionType == OptionExecutionEngine.PositionState.LONG_PUT
                         && confirmedBias == NiftyDecisionResult.Bias.BULLISH) {
-                    log.debug("EXIT P5c BIAS_REVERSAL LONG_PUT bullish confirmed score={}",
+                    log.debug("EXIT P5c BIAS_REVERSAL LONG_PUT bullish score={}",
                             String.format("%.1f", currentScore));
                     return new ExitSignal("BIAS_REVERSAL", exitPx, DesiredSideHint.CE, false);
                 }
@@ -231,9 +294,10 @@ public class ExitEvaluator {
 
         // ════════════════════════════════════════════════════════════════════
         // P6a — Time: No Improvement (never profitable)
-        //        Skipped in TRENDING — give trend trades room to develop.
+        //        Non-TRENDING and non-RANGING only.
+        //        RANGING uses P6c (time limit) instead.
         // ════════════════════════════════════════════════════════════════════
-        if (!isTrending
+        if (!isTrending && !isRanging
                 && ec.getMaxBarsNoImprovement() > 0
                 && !everProfitable
                 && barsInTrade >= ec.getMaxBarsNoImprovement()) {
@@ -242,10 +306,10 @@ public class ExitEvaluator {
         }
 
         // ════════════════════════════════════════════════════════════════════
-        // P6b — Time: Stagnation (was profitable, peak not updated for N bars)
-        //        Skipped in TRENDING.
+        // P6b — Time: Stagnation (was profitable, peak stale)
+        //        Non-TRENDING and non-RANGING only.
         // ════════════════════════════════════════════════════════════════════
-        if (!isTrending
+        if (!isTrending && !isRanging
                 && ec.getStagnationBars() > 0
                 && everProfitable
                 && barsWithoutNewHigh >= ec.getStagnationBars()
@@ -257,8 +321,6 @@ public class ExitEvaluator {
 
         // ════════════════════════════════════════════════════════════════════
         // P6c — RANGING Time Limit
-        //        In RANGING regime, cap trade duration to avoid range-bound
-        //        trades that overstay and get caught on band reversals.
         // ════════════════════════════════════════════════════════════════════
         if (isRanging && ec.getMaxBarsRanging() > 0 && barsInTrade >= ec.getMaxBarsRanging()) {
             log.debug("EXIT P6c RANGING_TIME_LIMIT bars={} >= {}", barsInTrade, ec.getMaxBarsRanging());
@@ -266,10 +328,23 @@ public class ExitEvaluator {
         }
 
         // ════════════════════════════════════════════════════════════════════
-        // P7 — No-Hope (sustained loss)
-        //        Skipped in TRENDING — trailing stop (P2) handles loss control.
+        // P6d — Dead Trade (time kill — any regime, any profit level)
+        //        Safety net for trades that stagnate above the hold zone.
         // ════════════════════════════════════════════════════════════════════
-        if (!isTrending
+        if (ec.getMaxBarsDeadTrade() > 0
+                && barsInTrade > ec.getMaxBarsDeadTrade()
+                && currentPnlPct < ec.getDeadTradePnlPct()) {
+            log.debug("EXIT P6d DEAD_TRADE bars={} pnl={}% < {}%",
+                    barsInTrade, String.format("%.2f", currentPnlPct), ec.getDeadTradePnlPct());
+            return new ExitSignal("DEAD_TRADE", exitPx, DesiredSideHint.NONE, false);
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // P7 — No-Hope (sustained loss)
+        //        Non-TRENDING and non-RANGING only.
+        //        RANGING: SL (P1) handles losses; no-hope would exit too early.
+        // ════════════════════════════════════════════════════════════════════
+        if (!isTrending && !isRanging
                 && ec.getNoHopeThresholdPct() > 0
                 && currentPnlPct <= -ec.getNoHopeThresholdPct()
                 && barsNegative >= ec.getNoHopeBars()) {

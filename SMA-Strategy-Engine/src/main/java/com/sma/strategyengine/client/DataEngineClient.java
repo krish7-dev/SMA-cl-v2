@@ -51,6 +51,8 @@ public class DataEngineClient {
     public record HistoryRequest(
             String        userId,
             String        brokerName,
+            String        apiKey,
+            String        accessToken,
             Long          instrumentToken,
             String        symbol,
             String        exchange,
@@ -58,7 +60,16 @@ public class DataEngineClient {
             LocalDateTime fromDate,
             LocalDateTime toDate,
             boolean       persist
-    ) {}
+    ) {
+        /** Convenience constructor — no credentials (Data Engine will auto-resolve from Broker Engine). */
+        public HistoryRequest(String userId, String brokerName,
+                              Long instrumentToken, String symbol, String exchange,
+                              String interval, LocalDateTime fromDate, LocalDateTime toDate,
+                              boolean persist) {
+            this(userId, brokerName, null, null,
+                 instrumentToken, symbol, exchange, interval, fromDate, toDate, persist);
+        }
+    }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record CandleDto(

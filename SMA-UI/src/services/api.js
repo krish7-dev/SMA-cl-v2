@@ -333,3 +333,47 @@ export async function startOptionsReplayEval(config, signal) {
   }
   return res;
 }
+
+// ─── Strategy Engine — Options Live Eval ──────────────────────────────────────
+
+/**
+ * Starts a live options evaluation session.
+ * Returns { data: { sessionId: "..." } }
+ */
+export async function startOptionsLiveEval(config) {
+  return request(`${STRATEGY_API}/api/v1/strategy/options-live/evaluate`, {
+    method: 'POST',
+    body: config,
+  });
+}
+
+/**
+ * Opens the SSE stream for a live options session.
+ * Returns a fetch Response whose body is a text/event-stream.
+ * Events: "init", "candle" (OptionsReplayCandleEvent JSON), "error".
+ */
+export async function streamOptionsLiveEval(sessionId, signal) {
+  const res = await fetch(
+    `${STRATEGY_API}/api/v1/strategy/options-live/stream/${encodeURIComponent(sessionId)}`,
+    { headers: { Accept: 'text/event-stream' }, signal },
+  );
+  if (!res.ok) {
+    let errorMsg = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      errorMsg = err.message || err.error || errorMsg;
+    } catch (_) {}
+    throw new Error(errorMsg);
+  }
+  return res;
+}
+
+/**
+ * Stops a live options evaluation session.
+ */
+export async function stopOptionsLiveEval(sessionId) {
+  return request(
+    `${STRATEGY_API}/api/v1/strategy/options-live/${encodeURIComponent(sessionId)}`,
+    { method: 'DELETE' },
+  );
+}

@@ -11,6 +11,7 @@ import com.sma.dataengine.model.request.HistoricalDataRequest;
 import com.zerodhatech.models.Instrument;
 import com.zerodhatech.kiteconnect.KiteConnect;
 import com.zerodhatech.kiteconnect.kitehttp.exceptions.KiteException;
+import com.zerodhatech.kiteconnect.kitehttp.exceptions.TokenException;
 import com.zerodhatech.models.HistoricalData;
 import com.zerodhatech.models.Tick;
 import com.zerodhatech.ticker.KiteTicker;
@@ -278,10 +279,16 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
 
             } catch (KiteException e) {
                 String kiteMsg = e.message != null ? e.message : ("code=" + e.code);
-                if (kiteMsg.toLowerCase().contains("invalid token")) {
+                if (e instanceof TokenException) {
                     throw new MarketDataAdapterException(
                             "Kite access token is expired or invalid. " +
                             "Please re-authenticate: go to the Session page and log in to your Kite account again.", e);
+                }
+                if (kiteMsg.toLowerCase().contains("invalid token")) {
+                    // InputException with "invalid token" = instrument token not found (expired/delisted contract)
+                    throw new MarketDataAdapterException(
+                            "Kite rejected instrument token " + token + " — the options contract may have expired " +
+                            "or the token is no longer valid. Historical data unavailable for this instrument.", e);
                 }
                 throw new MarketDataAdapterException(
                         "Kite API error fetching historical data (chunk " + chunkIndex + "): [" + e.code + "] " + kiteMsg, e);

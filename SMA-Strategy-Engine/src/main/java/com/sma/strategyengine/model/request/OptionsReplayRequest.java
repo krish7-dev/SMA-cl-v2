@@ -11,6 +11,8 @@ public class OptionsReplayRequest {
 
     private String userId;
     private String brokerName;
+    private String apiKey;
+    private String accessToken;
 
     // NIFTY (decision source only — never traded)
     private Long          niftyInstrumentToken;
@@ -59,6 +61,22 @@ public class OptionsReplayRequest {
         private int     chopLookback      = 8;
         /** Floor for winner score after entry penalties are applied. Trades below this are blocked. */
         private double  penaltyMinScore   = 25.0;
+        /** If raw winnerScore >= this, penalties cannot push penalizedScore below scoreFloorMin. */
+        private double  scoreFloorTrigger = 35.0;
+        /** Minimum penalizedScore when scoreFloorTrigger is met. 0 = disabled. */
+        private double  scoreFloorMin     = 25.0;
+        /** BOLLINGER_REVERSION bonus: if winnerScore >= this, add bollingerBonus to penalizedScore. */
+        private double  bollingerBonusThreshold = 35.0;
+        /** Points added to penalizedScore when BOLLINGER bonus triggers. 0 = disabled. */
+        private double  bollingerBonus    = 5.0;
+        /** Allow early entry if winnerScore has risen for this many consecutive candles. 0 = disabled. */
+        private int     earlyEntryRisingBars = 2;
+        /** Raw score bypass: if winnerScore >= this AND scoreGap >= rawScoreBypassGap, allow entry regardless of penalized score. 0 = disabled. */
+        private double  rawScoreBypassThreshold = 30.0;
+        /** Min score gap required for raw score bypass. */
+        private double  rawScoreBypassGap       = 3.0;
+        /** BOLLINGER_REVERSION: if winnerScore >= this, override confirmRequired to 1 (early reversal). 0 = disabled. */
+        private double  bollingerEarlyEntryMinScore = 28.0;
     }
 
     // Option selection
@@ -154,8 +172,8 @@ public class OptionsReplayRequest {
         private int     minUpperTouches              = 2;
         private int     minLowerTouches              = 2;
         private double  bandTouchTolerancePct        = 0.15;
-        private double  minRangeWidthPct             = 0.4;
-        private double  maxRangeWidthPct             = 2.0;
+        private double  minRangeWidthPct             = 0.3;
+        private double  maxRangeWidthPct             = 3.0;
         private double  maxDirectionalDriftPctOfRange = 0.6;
         private double  chopFlipRatioLimit           = 0.65;
         private boolean enableChopCheck              = true;
@@ -204,9 +222,9 @@ public class OptionsReplayRequest {
         /** Candles to look back for breakout high/low (excluding current). */
         private int     breakoutLookback = 5;
         /** Minimum body % of full range to qualify as a "strong candle". */
-        private double  minBodyPct       = 60.0;
+        private double  minBodyPct       = 45.0;
         /** Body % below this → hard block (weak candle). */
-        private double  weakBodyPct      = 30.0;
+        private double  weakBodyPct      = 20.0;
         /** EMA period used for momentum slope check. */
         private int     ema9Period       = 9;
     }
@@ -241,10 +259,14 @@ public class OptionsReplayRequest {
         private int     weakTradeLossCooldown  = 5;
         /** Block WEAK trades in RANGING regime */
         private boolean blockWeakInRanging     = true;
+        /** Min penalizedScore for WEAK trades allowed in RANGING (when blockWeakInRanging=true). */
+        private double  weakRangingMinScore    = 28.0;
+        /** Min score gap for WEAK trades allowed in RANGING. */
+        private double  weakRangingMinGap      = 3.0;
         /** Confirmation candles required in RANGING regime */
-        private int     rangingConfirmCandles  = 3;
+        private int     rangingConfirmCandles  = 2;
         /** Confirmation candles required in TRENDING/COMPRESSION regime */
-        private int     trendingConfirmCandles = 2;
+        private int     trendingConfirmCandles = 1;
     }
 
     // Smart exit system
@@ -254,48 +276,60 @@ public class OptionsReplayRequest {
     public static class ExitConfig {
         private boolean enabled = true;
 
-        // P1 — Hard Stop Loss
-        private double hardStopPct          = 7.0;
+        // P1 — Hard Stop Loss (always fires, even inside hold zone)
+        private double hardStopPct               = 7.0;
 
-        // P2 — Profit Lock tiers (activate only after meaningful gains)
-        private double lock1TriggerPct      = 5.0;   // +5% → lock 2%
-        private double lock1FloorPct        = 2.0;
-        private double lock2TriggerPct      = 10.0;  // +10% → lock 5%
-        private double lock2FloorPct        = 5.0;
-        private double trailTriggerPct      = 10.0;  // after +10% → 50% of peak
-        private double trailFactor          = 0.50;
+        // Hold Zone — profit must clear this before ANY non-SL exit is allowed
+        // (except P6d dead-trade kill which fires from inside the hold zone)
+        private double holdZonePct               = 5.0;
 
-        // P3 — First-move protection
-        private int    firstMoveBars        = 2;
-        private double firstMoveLockPct     = 0.5;
+        // P2 — Profit Lock tiers (only arm once profit clears holdZonePct)
+        private double lock1TriggerPct           = 5.0;   // +5%  → floor 2%
+        private double lock1FloorPct             = 2.0;
+        private double lock2TriggerPct           = 10.0;  // +10% → floor 5%
+        private double lock2FloorPct             = 5.0;
+        private double trailTriggerPct           = 15.0;  // +15% → trail 40% of peak
+        private double trailFactor               = 0.40;
 
-        // P4 — Structure failure
-        private int    structureLookback    = 5;
+        // P3 — First-move protection (disabled by default; hold zone supersedes it)
+        private int    firstMoveBars             = 0;
+        private double firstMoveLockPct          = 0.5;
 
-        // P5a — Score Collapsed: REMOVED (score drop alone is not an exit signal)
-        private double scoreDropFactor      = 0.0;   // 0 = disabled
+        // P4 — Structure failure (skipped in RANGING)
+        private int    structureLookback         = 5;
 
-        // P5b — Score Below Floor (non-TRENDING only)
-        private double scoreAbsoluteMin     = 20.0;
+        // P5a — Score Collapsed: DISABLED (score must NOT trigger exit)
+        private double scoreDropFactor           = 0.0;
+
+        // P5b — Score Below Floor: DISABLED (score must NOT trigger exit)
+        private double scoreAbsoluteMin          = 0.0;
 
         // P5c — Bias exit
-        private boolean biasExitEnabled     = true;
+        private boolean biasExitEnabled          = true;
         /**
-         * TRENDING only: minimum winner score for the opposite bias to trigger an exit.
-         * In non-TRENDING regimes any confirmed bias flip exits immediately.
+         * Minimum score for opposite bias to exit.
+         * TRENDING uses this in both normal and Strong Trend Mode.
+         * Non-TRENDING exits on any confirmed flip.
          */
-        private double strongExitScore      = 35.0;
+        private double strongExitScore           = 40.0;
+
+        // Strong Trend Mode: TRENDING + peakPnl > this → only P1/P2/P5c(strong) allowed
+        private double trendStrongModeThresholdPct = 5.0;
 
         // P6a/P6b — Time exit (non-TRENDING only)
-        private int    maxBarsNoImprovement = 3;
-        private int    stagnationBars       = 2;
+        private int    maxBarsNoImprovement      = 3;
+        private int    stagnationBars            = 2;
 
         // P6c — RANGING time limit
-        private int    maxBarsRanging       = 6;
+        private int    maxBarsRanging            = 6;
+
+        // P6d — Dead Trade kill (any regime; also fires from inside hold zone)
+        private int    maxBarsDeadTrade          = 10;
+        private double deadTradePnlPct           = 2.0;
 
         // P7 — No-hope (non-TRENDING only)
-        private double noHopeThresholdPct   = 1.5;
-        private int    noHopeBars           = 2;
+        private double noHopeThresholdPct        = 1.5;
+        private int    noHopeBars                = 2;
     }
 
     private int     speedMultiplier = 1;

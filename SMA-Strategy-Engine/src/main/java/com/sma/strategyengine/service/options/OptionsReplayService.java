@@ -63,6 +63,7 @@ public class OptionsReplayService {
         List<CandleDto> allNiftyCandles = dataEngineClient.fetchHistory(
                 new DataEngineClient.HistoryRequest(
                         req.getUserId(), req.getBrokerName(),
+                        req.getApiKey(), req.getAccessToken(),
                         req.getNiftyInstrumentToken(), req.getNiftySymbol(), req.getNiftyExchange(),
                         req.getInterval(), warmupFrom, req.getToDate(), req.isPersist()));
 
@@ -125,6 +126,7 @@ public class OptionsReplayService {
                 List<CandleDto> optCandles = dataEngineClient.fetchHistory(
                         new DataEngineClient.HistoryRequest(
                                 req.getUserId(), req.getBrokerName(),
+                                req.getApiKey(), req.getAccessToken(),
                                 opt.getInstrumentToken(), opt.getTradingSymbol(), opt.getExchange(),
                                 req.getInterval(), req.getFromDate(), req.getToDate(), req.isPersist()));
                 Map<LocalDateTime, CandleDto> byTime = optCandles.stream()
@@ -256,11 +258,20 @@ public class OptionsReplayService {
             return;
         }
 
-        // Block WEAK trades in RANGING regime
+        // Block WEAK trades in RANGING — but allow if score ≥ weakRangingMinScore AND gap ≥ weakRangingMinGap
         if (tqc.isBlockWeakInRanging() && "RANGING".equals(regime)) {
-            decision.setEntryAllowed(false);
-            decision.setBlockReason("WEAK trade blocked in RANGING regime");
-            decision.setTradeStrength("NONE");
+            boolean allowedByScore = tqc.getWeakRangingMinScore() > 0
+                    && decision.getPenalizedScore() >= tqc.getWeakRangingMinScore()
+                    && decision.getScoreGap() >= tqc.getWeakRangingMinGap();
+            if (!allowedByScore) {
+                decision.setEntryAllowed(false);
+                decision.setBlockReason("WEAK trade blocked in RANGING (score="
+                        + String.format("%.1f", decision.getPenalizedScore())
+                        + " gap=" + String.format("%.1f", decision.getScoreGap())
+                        + " need score≥" + tqc.getWeakRangingMinScore()
+                        + " gap≥" + tqc.getWeakRangingMinGap() + ")");
+                decision.setTradeStrength("NONE");
+            }
         }
     }
 
@@ -319,6 +330,7 @@ public class OptionsReplayService {
                 .barsSinceLastTrade(exec.getBarsSinceLastTrade())
                 .entryAllowed(decision.isEntryAllowed())
                 .blockReason(decision.getBlockReason())
+                .execWaitReason(exec.getExecWaitReason())
                 .penalizedScore(decision.getPenalizedScore())
                 .tradeStrength(decision.getTradeStrength())
                 .neutralReason(decision.getNeutralReason())
@@ -333,6 +345,8 @@ public class OptionsReplayService {
                 .switchConfirmed(decision.isSwitchConfirmed())
                 .switchReason(decision.getSwitchReason())
                 .switchCountToday(decision.getSwitchCountToday())
+                .confirmCount(decision.getConfirmCount())
+                .confirmRequired(decision.getConfirmRequired())
                 .candidates(toCandidateEvents(decision.getCandidates()))
                 // Execution
                 .positionState(exec.getState().name())
@@ -344,6 +358,8 @@ public class OptionsReplayService {
                 .holdActive(exec.isHoldActive())
                 .peakPnlPct(exec.getPeakPnlPct())
                 .profitLockFloor(exec.getProfitLockFloor())
+                .inHoldZone(exec.isInHoldZone())
+                .inStrongTrendMode(exec.isInStrongTrendMode())
                 .selectedToken(exec.getActiveToken())
                 .selectedOptionType(exec.getActiveOptionType())
                 .selectedStrike(exec.getActiveStrike())

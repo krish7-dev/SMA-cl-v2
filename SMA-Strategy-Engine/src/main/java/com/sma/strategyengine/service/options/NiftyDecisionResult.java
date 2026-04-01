@@ -53,6 +53,10 @@ public class NiftyDecisionResult {
     private boolean switchConfirmed;
     private String  switchReason;
     private int     switchCountToday;
+    /** How many consecutive matching-bias candles have been seen (resets on switch or opposite). */
+    private int     confirmCount;
+    /** How many consecutive matching-bias candles are required to confirm a switch. */
+    private int     confirmRequired;
 
     /** All strategies evaluated this candle, including those that returned HOLD. */
     private List<CandidateScore> candidates;

@@ -7,6 +7,7 @@ import {
   startReplayEval,
   startLiveEval, stopLiveEval,
   startOptionsReplayEval,
+  startOptionsLiveEval, streamOptionsLiveEval, stopOptionsLiveEval,
 } from '../services/api';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { useSession } from '../context/SessionContext';
@@ -1012,6 +1013,7 @@ export default function Backtest() {
           ['replay',          'Replay Test'],
           ['live',            'Live Test'],
           ['options-replay',  'Options Replay Test'],
+          ['options-live',    'Options Live Test'],
         ].map(([key, label]) => (
           <button
             key={key}
@@ -1027,6 +1029,1507 @@ export default function Backtest() {
       {tab === 'replay'         && <ReplayTest />}
       {tab === 'live'           && <LiveTest />}
       {tab === 'options-replay' && <OptionsReplayTest />}
+      {tab === 'options-live'   && <OptionsLiveTest />}
+    </div>
+  );
+}
+
+// ─── Tab 5: Options Live Test ─────────────────────────────────────────────────
+
+function OptionsLiveTest() {
+  const { session, isActive } = useSession();
+
+  const ls = (key, def) => { try { const s = localStorage.getItem(key); if (!s) return def; const v = JSON.parse(s); return (Array.isArray(def) && !Array.isArray(v)) ? def : v; } catch { return def; } };
+
+  // ── NIFTY instrument
+  const [nifty, setNifty] = useState(() => ls('sma_live_opts_nifty', { symbol: '', exchange: 'NSE', instrumentToken: '' }));
+
+  // ── Option pools
+  const [cePool, setCePool] = useState(() => ls('sma_live_opts_ce_pool', [EMPTY_OPTION_INST()]));
+  const [pePool, setPePool] = useState(() => ls('sma_live_opts_pe_pool', [EMPTY_OPTION_INST()]));
+
+  // ── Live settings (no fromDate/toDate/speed)
+  const [interval,   setInterval]   = useState(() => ls('sma_live_opts_interval',   'MINUTE_5'));
+  const [warmupDays, setWarmupDays] = useState(() => ls('sma_live_opts_warmup',      '5'));
+  const [quantity,   setQuantity]   = useState(() => ls('sma_live_opts_qty',         '0'));
+  const [capital,    setCapital]    = useState(() => ls('sma_live_opts_capital',     '100000'));
+
+  // ── Strategies
+  const [strategies, setStrategies] = useState(() => ls('sma_live_opts_strategies', defaultStrategies()));
+
+  // ── Config (all same as replay)
+  const [decisionCfg,         setDecisionCfg]         = useState(() => ls('sma_live_opts_decision',           DEFAULT_DECISION));
+  const [selectionCfg,        setSelectionCfg]        = useState(() => ls('sma_live_opts_selection',          DEFAULT_SELECTION));
+  const [switchCfg,           setSwitchCfg]           = useState(() => ls('sma_live_opts_switch',             DEFAULT_SWITCH));
+  const [optsRegimeCfg,       setOptsRegimeCfg]       = useState(() => ls('sma_live_opts_regime_cfg',         DEFAULT_OPTS_REGIME_CONFIG));
+  const [chopRules,           setChopRules]           = useState(() => ls('sma_live_opts_chop_rules',         DEFAULT_CHOP_RULES));
+  const [tradingRules,        setTradingRules]        = useState(() => ls('sma_live_opts_trading_rules',      DEFAULT_TRADING_RULES));
+  const [regimeRules,         setRegimeRules]         = useState(() => ls('sma_live_opts_regime_rules',       DEFAULT_REGIME_RULES));
+  const [regimeStrategyRules, setRegimeStrategyRules] = useState(() => ls('sma_live_opts_regime_strat_rules', DEFAULT_REGIME_STRATEGY_RULES));
+  const [optsRisk,            setOptsRisk]            = useState(() => ls('sma_live_opts_risk',               DEFAULT_OPTS_RISK));
+  const [rangeQuality,        setRangeQuality]        = useState(() => ls('sma_live_opts_range_quality',      DEFAULT_RANGE_QUALITY));
+  const [tradeQuality,        setTradeQuality]        = useState(() => ls('sma_live_opts_trade_quality',      DEFAULT_TRADE_QUALITY));
+  const [trendEntry,          setTrendEntry]          = useState(() => ls('sma_live_opts_trend_entry',        DEFAULT_TREND_ENTRY));
+  const [compressionEntry,    setCompressionEntry]    = useState(() => ls('sma_live_opts_compression_entry',  DEFAULT_COMPRESSION_ENTRY));
+  const [holdConfig,          setHoldConfig]          = useState(() => ({ ...DEFAULT_HOLD,        ...ls('sma_live_opts_hold_config',  {}) }));
+  const [exitConfig,          setExitConfig]          = useState(() => ({ ...DEFAULT_EXIT_CONFIG, ...ls('sma_live_opts_exit_config',  {}) }));
+
+  function updateOptsRisk(key, val)         { setOptsRisk(p => ({ ...p, [key]: val })); }
+  function updateRangeQuality(key, val)     { setRangeQuality(p => ({ ...p, [key]: val })); }
+  function updateHoldConfig(key, val)       { setHoldConfig(p => ({ ...p, [key]: val })); }
+  function updateExitConfig(key, val)       { setExitConfig(p => ({ ...p, [key]: val })); }
+  function updateTradeQuality(key, val)     { setTradeQuality(p => ({ ...p, [key]: val })); }
+  function updateTrendEntry(key, val)       { setTrendEntry(p => ({ ...p, [key]: val })); }
+  function updateCompressionEntry(key, val) { setCompressionEntry(p => ({ ...p, [key]: val })); }
+
+  // ── Config presets (shared with Options Replay — same sma_opts_presets key) ──
+  const [presets, setPresets] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('sma_opts_presets') || '[]'); } catch { return []; }
+  });
+  const [presetName,        setPresetName]        = useState('');
+  const [presetDescription, setPresetDescription] = useState('');
+  const [showPresetSave,    setShowPresetSave]    = useState(false);
+
+  function capturePresetConfig() {
+    return {
+      interval, warmupDays, quantity, capital,
+      strategies,
+      decisionCfg, selectionCfg, switchCfg,
+      optsRegimeCfg, chopRules, tradingRules, regimeRules, regimeStrategyRules,
+      optsRisk, rangeQuality, tradeQuality, trendEntry, compressionEntry,
+      holdConfig, exitConfig,
+    };
+  }
+
+  const selectedPresetId = (() => {
+    const { nifty: _n, cePool: _ce, pePool: _pe, ...currentCmp } = capturePresetConfig();
+    const current = JSON.stringify(currentCmp);
+    return presets.find(p => {
+      const { nifty: _n2, cePool: _ce2, pePool: _pe2, ...presetCmp } = p.config;
+      return JSON.stringify(presetCmp) === current;
+    })?.id ?? null;
+  })();
+
+  function savePreset() {
+    if (!presetName.trim()) return;
+    const preset = {
+      id:          Date.now().toString(),
+      name:        presetName.trim(),
+      description: presetDescription.trim(),
+      createdAt:   new Date().toISOString(),
+      config:      capturePresetConfig(),
+    };
+    const next = [preset, ...presets];
+    setPresets(next);
+    try { localStorage.setItem('sma_opts_presets', JSON.stringify(next)); } catch {}
+    setPresetName(''); setPresetDescription(''); setShowPresetSave(false);
+  }
+
+  function applyPreset(preset) {
+    const c = preset.config;
+    if (c.interval     !== undefined) setInterval(c.interval);
+    if (c.warmupDays   !== undefined) setWarmupDays(c.warmupDays);
+    if (c.quantity     !== undefined) setQuantity(c.quantity);
+    if (c.capital      !== undefined) setCapital(c.capital);
+    if (c.strategies   !== undefined) setStrategies(c.strategies);
+    if (c.decisionCfg  !== undefined) setDecisionCfg(c.decisionCfg);
+    if (c.selectionCfg !== undefined) setSelectionCfg(c.selectionCfg);
+    if (c.switchCfg    !== undefined) setSwitchCfg(c.switchCfg);
+    if (c.optsRegimeCfg        !== undefined) setOptsRegimeCfg(c.optsRegimeCfg);
+    if (c.chopRules            !== undefined) setChopRules(c.chopRules);
+    if (c.tradingRules         !== undefined) setTradingRules(c.tradingRules);
+    if (c.regimeRules          !== undefined) setRegimeRules(c.regimeRules);
+    if (c.regimeStrategyRules  !== undefined) setRegimeStrategyRules(c.regimeStrategyRules);
+    if (c.optsRisk             !== undefined) setOptsRisk(c.optsRisk);
+    if (c.rangeQuality         !== undefined) setRangeQuality(c.rangeQuality);
+    if (c.tradeQuality         !== undefined) setTradeQuality(c.tradeQuality);
+    if (c.trendEntry           !== undefined) setTrendEntry(c.trendEntry);
+    if (c.compressionEntry     !== undefined) setCompressionEntry(c.compressionEntry);
+    if (c.holdConfig           !== undefined) setHoldConfig(c.holdConfig);
+    if (c.exitConfig           !== undefined) setExitConfig(c.exitConfig);
+  }
+
+  function deletePreset(id) {
+    const next = presets.filter(p => p.id !== id);
+    setPresets(next);
+    try { localStorage.setItem('sma_opts_presets', JSON.stringify(next)); } catch {}
+  }
+
+  // ── Persist to localStorage
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_nifty',              JSON.stringify(nifty));               } catch {} }, [nifty]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_ce_pool',            JSON.stringify(cePool));              } catch {} }, [cePool]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_pe_pool',            JSON.stringify(pePool));              } catch {} }, [pePool]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_interval',           JSON.stringify(interval));            } catch {} }, [interval]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_warmup',             JSON.stringify(warmupDays));          } catch {} }, [warmupDays]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_qty',                JSON.stringify(quantity));            } catch {} }, [quantity]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_capital',            JSON.stringify(capital));             } catch {} }, [capital]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_strategies',         JSON.stringify(strategies));          } catch {} }, [strategies]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_decision',           JSON.stringify(decisionCfg));         } catch {} }, [decisionCfg]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_selection',          JSON.stringify(selectionCfg));        } catch {} }, [selectionCfg]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_switch',             JSON.stringify(switchCfg));           } catch {} }, [switchCfg]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_regime_cfg',         JSON.stringify(optsRegimeCfg));       } catch {} }, [optsRegimeCfg]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_chop_rules',         JSON.stringify(chopRules));           } catch {} }, [chopRules]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_trading_rules',      JSON.stringify(tradingRules));        } catch {} }, [tradingRules]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_regime_rules',       JSON.stringify(regimeRules));         } catch {} }, [regimeRules]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_regime_strat_rules', JSON.stringify(regimeStrategyRules)); } catch {} }, [regimeStrategyRules]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_risk',               JSON.stringify(optsRisk));            } catch {} }, [optsRisk]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_range_quality',      JSON.stringify(rangeQuality));        } catch {} }, [rangeQuality]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_trade_quality',      JSON.stringify(tradeQuality));        } catch {} }, [tradeQuality]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_trend_entry',        JSON.stringify(trendEntry));          } catch {} }, [trendEntry]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_compression_entry',  JSON.stringify(compressionEntry));    } catch {} }, [compressionEntry]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_hold_config',        JSON.stringify(holdConfig));          } catch {} }, [holdConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_exit_config',        JSON.stringify(exitConfig));          } catch {} }, [exitConfig]);
+
+  // ── Session / run state
+  const [status,    setStatus]    = useState('idle'); // idle|running|error
+  const [sessionId, setSessionId] = useState(null);
+  const [feed,      setFeed]      = useState([]);
+  const [initInfo,  setInitInfo]  = useState(null);
+  const [error,     setError]     = useState('');
+  const [rightTab,  setRightTab]  = useState('feed');
+  const abortRef     = useRef(null);
+  const readerRef    = useRef(null);
+  const sessionIdRef = useRef(null);
+
+  useEffect(() => () => {
+    abortRef.current?.abort();
+    const sid = sessionIdRef.current;
+    if (sid) stopOptionsLiveEval(sid).catch(() => {});
+  }, []);
+
+  // ── Pool helpers
+  function updatePoolInst(pool, setPool, id, patch) { setPool(p => p.map(i => i.id === id ? { ...i, ...patch } : i)); }
+  function addPoolInst(setPool)                      { setPool(p => [...p, EMPTY_OPTION_INST()]); }
+  function removePoolInst(pool, setPool, id)         { setPool(p => p.length > 1 ? p.filter(i => i.id !== id) : p); }
+
+  function updateStrategy(idx, patch)        { setStrategies(p => p.map((s, i) => i === idx ? { ...s, ...patch } : s)); }
+  function updateStratParam(idx, key, val)   { setStrategies(p => p.map((s, i) => i === idx ? { ...s, parameters: { ...s.parameters, [key]: val } } : s)); }
+
+  async function handleStop() {
+    abortRef.current?.abort();
+    try { readerRef.current?.cancel(); } catch {}
+    const sid = sessionIdRef.current;
+    if (sid) {
+      try { await stopOptionsLiveEval(sid); } catch {}
+      sessionIdRef.current = null;
+      setSessionId(null);
+    }
+    setStatus('idle');
+  }
+
+  async function handleStart(e) {
+    e.preventDefault();
+    if (status === 'running') { handleStop(); return; }
+
+    setFeed([]); setInitInfo(null); setError(''); setStatus('running');
+
+    const enabledStrats = strategies
+      .filter(s => s.enabled)
+      .map(s => ({ strategyType: s.strategyType, parameters: s.parameters }));
+
+    const payload = {
+      userId:      session.userId,
+      brokerName:  session.brokerName,
+      apiKey:      session.apiKey      || undefined,
+      accessToken: session.accessToken || undefined,
+      niftyInstrumentToken: nifty.instrumentToken ? parseInt(nifty.instrumentToken, 10) : undefined,
+      niftySymbol:   nifty.symbol   || 'NIFTY 50',
+      niftyExchange: nifty.exchange  || 'NSE',
+      interval,
+      warmupDays: parseInt(warmupDays, 10) || 5,
+      quantity:   parseInt(quantity,   10) || 0,
+      initialCapital: parseFloat(capital) || 100000,
+      ceOptions: cePool.filter(i => i.instrumentToken).map(i => ({
+        instrumentToken: parseInt(i.instrumentToken, 10),
+        tradingSymbol: i.symbol,
+        exchange: i.exchange,
+      })),
+      peOptions: pePool.filter(i => i.instrumentToken).map(i => ({
+        instrumentToken: parseInt(i.instrumentToken, 10),
+        tradingSymbol: i.symbol,
+        exchange: i.exchange,
+      })),
+      strategies: enabledStrats,
+      decisionConfig: {
+        minScore:                    parseFloat(decisionCfg.minScore)                    || 40,
+        minScoreGap:                 parseFloat(decisionCfg.minScoreGap)                 || 8,
+        maxRecentMove3:              parseFloat(decisionCfg.maxRecentMove3)               || 1.5,
+        maxRecentMove5:              parseFloat(decisionCfg.maxRecentMove5)               || 2.5,
+        maxAbsVwapDist:              parseFloat(decisionCfg.maxAbsVwapDist)               || 1.5,
+        minBarsSinceTrade:           parseInt(decisionCfg.minBarsSinceTrade, 10)           || 3,
+        chopFilter:                  decisionCfg.chopFilter,
+        chopLookback:                parseInt(decisionCfg.chopLookback, 10)               || 8,
+        penaltyMinScore:             parseFloat(decisionCfg.penaltyMinScore)              || 25,
+        scoreFloorTrigger:           parseFloat(decisionCfg.scoreFloorTrigger)            || 35,
+        scoreFloorMin:               parseFloat(decisionCfg.scoreFloorMin)                || 25,
+        bollingerBonusThreshold:     parseFloat(decisionCfg.bollingerBonusThreshold)      || 35,
+        bollingerBonus:              parseFloat(decisionCfg.bollingerBonus)               || 0,
+        earlyEntryRisingBars:        parseInt(decisionCfg.earlyEntryRisingBars, 10)       || 0,
+        rawScoreBypassThreshold:     parseFloat(decisionCfg.rawScoreBypassThreshold)      || 0,
+        rawScoreBypassGap:           parseFloat(decisionCfg.rawScoreBypassGap)            || 3,
+        bollingerEarlyEntryMinScore: parseFloat(decisionCfg.bollingerEarlyEntryMinScore)  || 0,
+      },
+      selectionConfig: {
+        minPremium: parseFloat(selectionCfg.minPremium) || 50,
+        maxPremium: parseFloat(selectionCfg.maxPremium) || 300,
+      },
+      switchConfig: {
+        switchConfirmationCandles:    parseInt(switchCfg.switchConfirmationCandles, 10)    || 2,
+        maxSwitchesPerDay:            parseInt(switchCfg.maxSwitchesPerDay, 10)            || 3,
+        minScoreImprovementForSwitch: parseFloat(switchCfg.minScoreImprovementForSwitch)  || 0,
+      },
+      regimeConfig: optsRegimeCfg.enabled ? {
+        enabled: true,
+        adxPeriod:         parseInt(optsRegimeCfg.adxPeriod, 10)        || 14,
+        atrPeriod:         parseInt(optsRegimeCfg.atrPeriod, 10)        || 14,
+        adxTrendThreshold: parseFloat(optsRegimeCfg.adxTrendThreshold)  || 25,
+        atrVolatilePct:    parseFloat(optsRegimeCfg.atrVolatilePct)     || 2.0,
+        atrCompressionPct: parseFloat(optsRegimeCfg.atrCompressionPct)  || 0.5,
+      } : { enabled: false },
+      regimeRules: {
+        enabled:                regimeRules.enabled,
+        rangingMinScore:        parseFloat(regimeRules.rangingMinScore)        || 35,
+        rangingMinScoreGap:     parseFloat(regimeRules.rangingMinScoreGap)     || 6,
+        trendingMinScore:       parseFloat(regimeRules.trendingMinScore)       || 25,
+        trendingMinScoreGap:    parseFloat(regimeRules.trendingMinScoreGap)    || 3,
+        compressionMinScore:    parseFloat(regimeRules.compressionMinScore)    || 25,
+        compressionMinScoreGap: parseFloat(regimeRules.compressionMinScoreGap) || 3,
+      },
+      chopRules: {
+        enabled: chopRules.enabled,
+        ...Object.fromEntries(['ranging','trending','compression','volatile'].map(rk => [
+          rk === 'volatile' ? 'volatileRegime' : rk,
+          { filterEnabled: chopRules[rk].filterEnabled, flipRatio: parseFloat(chopRules[rk].flipRatio) || 0.65 },
+        ])),
+      },
+      tradingRules: {
+        enabled:              tradingRules.enabled,
+        rangingNoTrade:       tradingRules.rangingNoTrade,
+        volatileNoTrade:      tradingRules.volatileNoTrade,
+        noSameCandleReversal: tradingRules.noSameCandleReversal,
+      },
+      regimeStrategyRules: {
+        enabled:        regimeStrategyRules.enabled,
+        ranging:        regimeStrategyRules.ranging.enabled     ? regimeStrategyRules.ranging.allowed     : [],
+        trending:       regimeStrategyRules.trending.enabled    ? regimeStrategyRules.trending.allowed    : [],
+        compression:    regimeStrategyRules.compression.enabled ? regimeStrategyRules.compression.allowed : [],
+        volatileRegime: regimeStrategyRules.volatile.enabled    ? regimeStrategyRules.volatile.allowed    : [],
+      },
+      riskConfig: optsRisk.enabled ? {
+        enabled:            true,
+        stopLossPct:        parseFloat(optsRisk.stopLossPct)        || 0,
+        takeProfitPct:      parseFloat(optsRisk.takeProfitPct)      || 0,
+        maxRiskPerTradePct: parseFloat(optsRisk.maxRiskPerTradePct) || 0,
+        dailyLossCapPct:    parseFloat(optsRisk.dailyLossCapPct)    || 0,
+        cooldownCandles:    parseInt(optsRisk.cooldownCandles, 10)  || 0,
+      } : { enabled: false },
+      rangeQualityConfig: rangeQuality.enabled ? {
+        enabled:                       true,
+        lookbackBars:                  parseInt(rangeQuality.lookbackBars, 10)               || 10,
+        minUpperTouches:               parseInt(rangeQuality.minUpperTouches, 10)            || 2,
+        minLowerTouches:               parseInt(rangeQuality.minLowerTouches, 10)            || 2,
+        bandTouchTolerancePct:         parseFloat(rangeQuality.bandTouchTolerancePct)        || 0.15,
+        minRangeWidthPct:              parseFloat(rangeQuality.minRangeWidthPct)             || 0.3,
+        maxRangeWidthPct:              parseFloat(rangeQuality.maxRangeWidthPct)             || 3.0,
+        maxDirectionalDriftPctOfRange: parseFloat(rangeQuality.maxDirectionalDriftPctOfRange) || 0.6,
+        chopFlipRatioLimit:            parseFloat(rangeQuality.chopFlipRatioLimit)           || 0.65,
+        enableChopCheck:               rangeQuality.enableChopCheck,
+      } : { enabled: false },
+      tradeQualityConfig: tradeQuality.enabled ? {
+        enabled:                true,
+        strongScoreThreshold:   parseFloat(tradeQuality.strongScoreThreshold)   || 40,
+        normalScoreThreshold:   parseFloat(tradeQuality.normalScoreThreshold)   || 32,
+        weakTradeLossCooldown:  parseInt(tradeQuality.weakTradeLossCooldown, 10) || 5,
+        blockWeakInRanging:     tradeQuality.blockWeakInRanging,
+        weakRangingMinScore:    parseFloat(tradeQuality.weakRangingMinScore)    || 28,
+        weakRangingMinGap:      parseFloat(tradeQuality.weakRangingMinGap)      || 3,
+        rangingConfirmCandles:  parseInt(tradeQuality.rangingConfirmCandles, 10) || 2,
+        trendingConfirmCandles: parseInt(tradeQuality.trendingConfirmCandles, 10) || 1,
+      } : { enabled: false },
+      trendEntryConfig: trendEntry.enabled ? {
+        enabled:          true,
+        breakoutLookback: parseInt(trendEntry.breakoutLookback, 10) || 5,
+        minBodyPct:       parseFloat(trendEntry.minBodyPct)         || 45,
+        weakBodyPct:      parseFloat(trendEntry.weakBodyPct)        || 20,
+        ema9Period:       parseInt(trendEntry.ema9Period, 10)       || 9,
+      } : { enabled: false },
+      compressionEntryConfig: compressionEntry.enabled ? {
+        enabled:              true,
+        rangeLookback:        parseInt(compressionEntry.rangeLookback, 10)  || 10,
+        longZoneMax:          parseFloat(compressionEntry.longZoneMax)       || 0.2,
+        shortZoneMin:         parseFloat(compressionEntry.shortZoneMin)      || 0.8,
+        noTradeZoneMin:       parseFloat(compressionEntry.noTradeZoneMin)    || 0.4,
+        noTradeZoneMax:       parseFloat(compressionEntry.noTradeZoneMax)    || 0.6,
+        rejectBreakoutCandle: compressionEntry.rejectBreakoutCandle,
+      } : { enabled: false },
+      holdConfig: {
+        enabled:             holdConfig.enabled,
+        defaultMinHoldBars:  parseInt(holdConfig.defaultMinHoldBars,  10) || 3,
+        rangingMinHoldBars:  parseInt(holdConfig.rangingMinHoldBars,  10) || 4,
+        trendingMinHoldBars: parseInt(holdConfig.trendingMinHoldBars, 10) || 2,
+        strongOppositeScore: parseFloat(holdConfig.strongOppositeScore)   || 35,
+        persistentExitBars:  parseInt(holdConfig.persistentExitBars,  10) || 2,
+      },
+      exitConfig: {
+        enabled:                     exitConfig.enabled,
+        hardStopPct:                 parseFloat(exitConfig.hardStopPct)                 || 7,
+        holdZonePct:                 parseFloat(exitConfig.holdZonePct)                 || 5,
+        lock1TriggerPct:             parseFloat(exitConfig.lock1TriggerPct)             || 5,
+        lock1FloorPct:               parseFloat(exitConfig.lock1FloorPct)               || 2,
+        lock2TriggerPct:             parseFloat(exitConfig.lock2TriggerPct)             || 10,
+        lock2FloorPct:               parseFloat(exitConfig.lock2FloorPct)               || 5,
+        trailTriggerPct:             parseFloat(exitConfig.trailTriggerPct)             || 15,
+        trailFactor:                 parseFloat(exitConfig.trailFactor)                 || 0.4,
+        firstMoveBars:               parseInt(exitConfig.firstMoveBars,  10)            || 0,
+        firstMoveLockPct:            parseFloat(exitConfig.firstMoveLockPct)            || 0.5,
+        structureLookback:           parseInt(exitConfig.structureLookback, 10)         || 5,
+        scoreDropFactor:             parseFloat(exitConfig.scoreDropFactor)             || 0,
+        scoreAbsoluteMin:            parseFloat(exitConfig.scoreAbsoluteMin)            || 0,
+        biasExitEnabled:             exitConfig.biasExitEnabled,
+        strongExitScore:             parseFloat(exitConfig.strongExitScore)             || 40,
+        trendStrongModeThresholdPct: parseFloat(exitConfig.trendStrongModeThresholdPct) || 5,
+        maxBarsNoImprovement:        parseInt(exitConfig.maxBarsNoImprovement, 10)      || 3,
+        stagnationBars:              parseInt(exitConfig.stagnationBars, 10)            || 2,
+        maxBarsRanging:              parseInt(exitConfig.maxBarsRanging, 10)            || 6,
+        maxBarsDeadTrade:            parseInt(exitConfig.maxBarsDeadTrade, 10)          || 10,
+        deadTradePnlPct:             parseFloat(exitConfig.deadTradePnlPct)             || 2,
+        noHopeThresholdPct:          parseFloat(exitConfig.noHopeThresholdPct)          || 1.5,
+        noHopeBars:                  parseInt(exitConfig.noHopeBars, 10)               || 2,
+      },
+    };
+
+    try {
+      // Step 1: start session
+      const startRes = await startOptionsLiveEval(payload);
+      const sid = startRes?.data?.sessionId;
+      if (!sid) throw new Error('No sessionId returned');
+      sessionIdRef.current = sid;
+      setSessionId(sid);
+
+      // Step 2: stream SSE
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+      const response = await streamOptionsLiveEval(sid, ctrl.signal);
+      if (!response.body) throw new Error('No response body');
+      const reader = response.body.getReader();
+      readerRef.current = reader;
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop();
+        for (const part of parts) {
+          let evtName = null, data = null;
+          for (const line of part.split('\n')) {
+            if (line.startsWith('event:')) evtName = line.slice(6).trim();
+            else if (line.startsWith('data:')) data = line.slice(5).trim();
+          }
+          if (!evtName || !data) continue;
+          if (evtName === 'error') {
+            setError(data.replace(/^"|"$/g, ''));
+            setStatus('error');
+            return;
+          }
+          try {
+            const parsed = JSON.parse(data);
+            if (evtName === 'init')   setInitInfo(parsed);
+            else if (evtName === 'candle') setFeed(prev => [...prev.slice(-499), parsed]);
+          } catch {}
+        }
+      }
+      setStatus('idle');
+    } catch (err) {
+      if (err.name === 'AbortError') { setStatus('idle'); return; }
+      setError(err.message);
+      setStatus('error');
+    } finally {
+      sessionIdRef.current = null;
+      setSessionId(null);
+    }
+  }
+
+  if (!isActive) return (
+    <div className="bt-empty-state">
+      <p>Activate a broker session to use Options Live Test.</p>
+    </div>
+  );
+
+  const isRunning    = status === 'running';
+  const canRun       = nifty.instrumentToken &&
+    (cePool.some(i => i.instrumentToken) || pePool.some(i => i.instrumentToken));
+  const lastEvt      = feed[feed.length - 1];
+  const closedTrades = lastEvt?.closedTrades || [];
+
+  return (
+    <div>
+      {/* ── Results panel ── */}
+      <div className="card bt-opts-card" style={{ marginBottom: 16 }}>
+        <div className="bt-live-right-tabs" style={{ marginBottom: 14 }}>
+          {[['feed','Feed'],['chart','Chart'],['pnl','P&L'],['portfolio','Portfolio'],['details','Details']].map(([k, l]) => (
+            <button key={k} className={`bt-live-tab-btn ${rightTab === k ? 'active' : ''}`} onClick={() => setRightTab(k)}>{l}</button>
+          ))}
+          {feed.length > 0 && (
+            <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-secondary)' }}>
+              {feed.length} candles · {closedTrades.length} trades
+            </span>
+          )}
+        </div>
+
+        {/* P&L strip */}
+        {lastEvt && (() => {
+          const totalPnl    = lastEvt.totalPnl;
+          const realizedPnl = lastEvt.realizedPnl;
+          const unrealPnl   = lastEvt.unrealizedPnl;
+          const cap         = lastEvt.capital;
+          const wins        = closedTrades.filter(t => t.pnl > 0).length;
+          const losses      = closedTrades.filter(t => t.pnl < 0).length;
+          const winRate     = closedTrades.length > 0 ? (wins / closedTrades.length * 100).toFixed(1) + '%' : '—';
+          return (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 12px', marginBottom: 12, padding: '8px 12px', background: 'var(--bg-secondary)', borderRadius: 6, borderLeft: '3px solid ' + (totalPnl > 0 ? '#22c55e' : totalPnl < 0 ? '#ef4444' : 'var(--border)') }}>
+              {[
+                ['Total P&L',  totalPnl,    true,  true],
+                ['Realized',   realizedPnl, true,  false],
+                ['Unrealized', unrealPnl,   true,  false],
+                ['Capital',    cap,         false, false],
+                ['Trades',     closedTrades.length, false, false],
+                ['W/L',        `${wins}/${losses}`, false, false],
+                ['Win Rate',   winRate,     false, false],
+              ].map(([lbl, val, isPnl, bold]) => (
+                <div key={lbl} style={{ fontSize: 11 }}>
+                  <div style={{ color: 'var(--text-muted)', marginBottom: 1 }}>{lbl}</div>
+                  <div style={{ fontWeight: bold ? 800 : 700, fontSize: bold ? 13 : 11, ...(isPnl && val != null ? pnlStyle(val) : {}) }}>
+                    {val != null ? (typeof val === 'number' ? fmt2(val) : val) : '—'}
+                  </div>
+                </div>
+              ))}
+            </div>
+          );
+        })()}
+
+        {/* Feed tab */}
+        {rightTab === 'feed' && (
+          <>
+            {lastEvt && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 18px', marginBottom: 14, padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 6 }}>
+                {[
+                  ['Position', lastEvt.positionState, lastEvt.positionState === 'LONG_CALL' ? '#22c55e' : lastEvt.positionState === 'LONG_PUT' ? '#ef4444' : undefined],
+                  ['Bias', lastEvt.niftyBias, lastEvt.niftyBias === 'BULLISH' ? '#22c55e' : lastEvt.niftyBias === 'BEARISH' ? '#ef4444' : undefined],
+                  ['Conf Bias', lastEvt.confirmedBias, lastEvt.confirmedBias === 'BULLISH' ? '#22c55e' : lastEvt.confirmedBias === 'BEARISH' ? '#ef4444' : undefined],
+                  ['Action', lastEvt.action, lastEvt.action === 'ENTERED' ? '#22c55e' : lastEvt.action === 'EXITED' || lastEvt.action === 'FORCE_CLOSED' ? '#f97316' : undefined],
+                  ['Winner', lastEvt.winnerStrategy || (lastEvt.shadowWinner && `(${lastEvt.shadowWinner})`), undefined],
+                  ['Score', fmt2(lastEvt.winnerScore || lastEvt.shadowWinnerScore), undefined],
+                  ['2nd', lastEvt.secondStrategy ? `${lastEvt.secondStrategy} ${fmt2(lastEvt.secondScore)}` : '—', undefined],
+                  ['Gap', fmt2(lastEvt.scoreGap), undefined],
+                  ['NeutralReason', lastEvt.neutralReason || '—', lastEvt.neutralReason ? '#f59e0b' : undefined],
+                  ['Shadow', lastEvt.shadowWinner ? `${lastEvt.shadowWinner} ${fmt2(lastEvt.shadowWinnerScore)}` : '—', lastEvt.shadowWinner ? '#8b5cf6' : undefined],
+                  ['uPnL', fmt2(lastEvt.unrealizedPnl), lastEvt.unrealizedPnl > 0 ? '#22c55e' : lastEvt.unrealizedPnl < 0 ? '#ef4444' : undefined],
+                  ['rPnL', fmt2(lastEvt.realizedPnl), lastEvt.realizedPnl > 0 ? '#22c55e' : lastEvt.realizedPnl < 0 ? '#ef4444' : undefined],
+                  ['Capital', fmt2(lastEvt.capital), undefined],
+                  ['Block', lastEvt.blockReason || '—', lastEvt.blockReason ? '#ef4444' : undefined],
+                  ['Exec', lastEvt.execWaitReason || '—', lastEvt.execWaitReason ? '#f59e0b' : undefined],
+                ].map(([lbl, val, color]) => (
+                  <div key={lbl} style={{ fontSize: 11 }}>
+                    <div style={{ color: 'var(--text-secondary)' }}>{lbl}</div>
+                    <div style={{ fontWeight: 700, color }}>{val || '—'}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Config summary */}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 0', fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.6, marginBottom: 10 }}>
+              <span style={{ marginRight: 10, fontWeight: 700, color: 'var(--text-primary)' }}>Live:</span>
+              <span style={{ marginRight: 14 }}><b style={{ color: 'var(--text-primary)' }}>{nifty.symbol || '—'}</b></span>
+              <span style={{ marginRight: 14 }}><b style={{ color: 'var(--text-primary)' }}>{interval}</b></span>
+              {cePool.some(i => i.symbol) && <span style={{ marginRight: 14 }}>CE=<b style={{ color: '#22c55e' }}>{cePool.filter(i => i.symbol).map(i => i.symbol).join(', ')}</b></span>}
+              {pePool.some(i => i.symbol) && <span style={{ marginRight: 14 }}>PE=<b style={{ color: '#ef4444' }}>{pePool.filter(i => i.symbol).map(i => i.symbol).join(', ')}</b></span>}
+              <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+              <span style={{ marginRight: 14 }}>minScore=<b style={{ color: 'var(--text-primary)' }}>{decisionCfg.minScore}</b></span>
+              <span style={{ marginRight: 14 }}>gap=<b style={{ color: 'var(--text-primary)' }}>{decisionCfg.minScoreGap}</b></span>
+              <span style={{ marginRight: 14 }}>prem=<b style={{ color: 'var(--text-primary)' }}>{selectionCfg.minPremium}–{selectionCfg.maxPremium}</b></span>
+              <span style={{ marginRight: 14 }}>switchConf=<b style={{ color: 'var(--text-primary)' }}>{switchCfg.switchConfirmationCandles}</b></span>
+              {sessionId && <span style={{ marginLeft: 8, color: '#22c55e', fontWeight: 700 }}>● LIVE sid={sessionId.slice(0, 8)}</span>}
+            </div>
+
+            {feed.length === 0
+              ? <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 32 }}>Feed will appear once the live session starts.</div>
+              : (
+                <div className="bt-opts-feed-wrap">
+                  <table className="bt-opts-feed-table">
+                    <thead>
+                      <tr>
+                        <th>Time</th><th>NIFTY</th><th>Regime</th><th>Bias</th><th>Conf</th>
+                        <th>Winner</th><th>Score</th><th>PenScore</th><th>Str</th><th>2nd</th><th>Gap</th>
+                        <th>Shadow</th><th>NeutralReason</th>
+                        <th title="Consecutive candles seen">Cnf</th><th title="Candles required">Req</th>
+                        <th>State</th><th>Bars</th><th>Hold</th><th>Action</th><th>ExitRsn</th>
+                        <th>PeakPnL%</th><th>LockFloor%</th><th>Zone</th><th>TrendMode</th>
+                        <th>Option</th><th>Opt Px</th><th>uPnL</th><th>rPnL</th><th>Block</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...feed].reverse().map((evt, i) => (
+                        <tr key={i}>
+                          <td className="de-mono">{(evt.niftyTime || '').slice(0, 16)}</td>
+                          <td>{fmt2(evt.niftyClose)}</td>
+                          <td>{evt.regime || '—'}</td>
+                          <td style={{ color: evt.niftyBias === 'BULLISH' ? '#22c55e' : evt.niftyBias === 'BEARISH' ? '#ef4444' : undefined }}>{evt.niftyBias || '—'}</td>
+                          <td style={{ color: evt.confirmedBias === 'BULLISH' ? '#22c55e' : evt.confirmedBias === 'BEARISH' ? '#ef4444' : undefined }}>{evt.confirmedBias || '—'}</td>
+                          <td>{evt.winnerStrategy || '—'}</td>
+                          <td>{fmt2(evt.winnerScore)}</td>
+                          <td style={{ color: evt.penalizedScore != null && evt.penalizedScore < evt.winnerScore ? '#f59e0b' : undefined }}>{evt.penalizedScore != null && evt.penalizedScore !== evt.winnerScore ? fmt2(evt.penalizedScore) : '—'}</td>
+                          <td style={{ fontSize: 11, fontWeight: 600, color: evt.tradeStrength === 'STRONG' ? '#22c55e' : evt.tradeStrength === 'NORMAL' ? '#0ea5e9' : evt.tradeStrength === 'WEAK' ? '#f59e0b' : undefined }}>{evt.tradeStrength && evt.tradeStrength !== 'NONE' ? evt.tradeStrength : '—'}</td>
+                          <td style={{ fontSize: 10, color: 'var(--text-secondary)' }}>{evt.secondStrategy ? `${evt.secondStrategy} ${fmt2(evt.secondScore)}` : '—'}</td>
+                          <td>{fmt2(evt.scoreGap)}</td>
+                          <td style={{ fontSize: 10, color: '#8b5cf6' }}>{evt.shadowWinner ? `${evt.shadowWinner} ${fmt2(evt.shadowWinnerScore)}` : '—'}</td>
+                          <td style={{ fontSize: 10, color: evt.neutralReason ? '#f59e0b' : undefined }}>{evt.neutralReason || '—'}</td>
+                          <td style={{ fontSize: 11, fontWeight: 600, color: evt.confirmCount > 0 && evt.confirmCount < evt.confirmRequired ? '#f59e0b' : evt.confirmCount >= evt.confirmRequired && evt.confirmRequired > 0 ? '#22c55e' : undefined }}>{evt.confirmCount > 0 ? evt.confirmCount : ''}</td>
+                          <td style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{evt.confirmRequired > 0 ? evt.confirmRequired : ''}</td>
+                          <td style={{ fontWeight: 600 }}>{evt.positionState || '—'}</td>
+                          <td style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{evt.positionState !== 'FLAT' ? (evt.barsInTrade ?? '—') : ''}</td>
+                          <td style={{ fontSize: 11, fontWeight: 600, color: '#14b8a6' }}>{evt.holdActive ? `🔒${evt.barsInTrade}/${evt.appliedMinHold}` : ''}</td>
+                          <td style={{ color: evt.action === 'ENTERED' ? '#22c55e' : evt.action === 'EXITED' || evt.action === 'FORCE_CLOSED' ? '#f97316' : undefined }}>{evt.action || '—'}</td>
+                          <td style={{ fontSize: 10, color: '#f97316' }}>{evt.exitReason || ''}</td>
+                          <td style={{ fontSize: 11, color: evt.peakPnlPct > 0 ? '#22c55e' : undefined }}>{evt.positionState !== 'FLAT' && evt.peakPnlPct != null ? fmt2(evt.peakPnlPct) : ''}</td>
+                          <td style={{ fontSize: 11, color: '#14b8a6' }}>{evt.positionState !== 'FLAT' && evt.profitLockFloor != null && evt.profitLockFloor > -1e10 ? fmt2(evt.profitLockFloor) : ''}</td>
+                          <td style={{ fontSize: 10, fontWeight: 600, color: '#f59e0b' }}>{evt.inHoldZone ? 'ZONE' : ''}</td>
+                          <td style={{ fontSize: 10, fontWeight: 600, color: '#22c55e' }}>{evt.inStrongTrendMode ? '⚡TREND' : ''}</td>
+                          <td className="de-mono">{evt.selectedTradingSymbol || '—'}</td>
+                          <td>{fmt2(evt.optionClose)}</td>
+                          <td style={pnlStyle(evt.unrealizedPnl)}>{fmt2(evt.unrealizedPnl)}</td>
+                          <td style={pnlStyle(evt.realizedPnl)}>{fmt2(evt.realizedPnl)}</td>
+                          <td style={{ color: evt.blockReason ? '#ef4444' : evt.execWaitReason ? '#f59e0b' : undefined, fontSize: 10 }}>
+                            {evt.blockReason || (evt.execWaitReason ? '⚠ ' + evt.execWaitReason : '')}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <div className="bt-opts-feed-count">{feed.length} candles received</div>
+                </div>
+              )
+            }
+          </>
+        )}
+
+        {/* Chart tab */}
+        {rightTab === 'chart' && <ReplayChart feed={feed} closedTrades={closedTrades} />}
+
+        {/* P&L tab */}
+        {rightTab === 'pnl' && (
+          <>
+            {!lastEvt
+              ? <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 32 }}>P&L data will appear as the live session runs.</div>
+              : (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: '10px 20px' }}>
+                  {[
+                    ['Total P&L',    lastEvt.totalPnl,    true],
+                    ['Realized P&L', lastEvt.realizedPnl, true],
+                    ['Unrealized',   lastEvt.unrealizedPnl, true],
+                    ['Capital',      lastEvt.capital,     false],
+                    ['Trades',       closedTrades.length, false],
+                    ['Wins',         closedTrades.filter(t => t.pnl > 0).length, false],
+                    ['Losses',       closedTrades.filter(t => t.pnl < 0).length, false],
+                    ['Win Rate', closedTrades.length > 0 ? `${(closedTrades.filter(t => t.pnl > 0).length / closedTrades.length * 100).toFixed(1)}%` : '—', false],
+                  ].map(([lbl, val, isPnl]) => (
+                    <div key={lbl} style={{ padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 6 }}>
+                      <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 }}>{lbl}</div>
+                      <div style={{ fontSize: 16, fontWeight: 700, ...(isPnl && val != null ? pnlStyle(val) : {}) }}>
+                        {val != null ? (typeof val === 'number' ? fmt2(val) : val) : '—'}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )
+            }
+          </>
+        )}
+
+        {/* Portfolio tab */}
+        {rightTab === 'portfolio' && (
+          <>
+            {!lastEvt
+              ? <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 32 }}>Position data will appear once the live session starts.</div>
+              : (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: '10px 20px' }}>
+                  {[
+                    ['Position State', lastEvt.positionState],
+                    ['Desired Side', lastEvt.desiredSide],
+                    ['Selected Option', lastEvt.selectedTradingSymbol],
+                    ['Option Type', lastEvt.selectedOptionType],
+                    ['Strike', lastEvt.selectedStrike],
+                    ['Expiry', lastEvt.selectedExpiry],
+                    ['Entry Price', fmt2(lastEvt.entryPrice)],
+                    ['Current Price', fmt2(lastEvt.optionClose)],
+                    ['Bars in Trade', lastEvt.barsInTrade],
+                    ['Unrealized P&L', fmt2(lastEvt.unrealizedPnl)],
+                    ['Realized P&L', fmt2(lastEvt.realizedPnl)],
+                    ['Total P&L', fmt2(lastEvt.totalPnl)],
+                    ['Capital', fmt2(lastEvt.capital)],
+                    ['Bars Since Trade', lastEvt.barsSinceLastTrade],
+                    ['Switch Count Today', lastEvt.switchCountToday],
+                    ['Regime', lastEvt.regime],
+                    ['NIFTY Bias', lastEvt.niftyBias],
+                    ['Confirmed Bias', lastEvt.confirmedBias],
+                    ['VWAP Dist %', fmt2(lastEvt.distanceFromVwap)],
+                  ].map(([lbl, val]) => (
+                    <div key={lbl} style={{ padding: '8px 10px', background: 'var(--bg-secondary)', borderRadius: 6 }}>
+                      <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 3 }}>{lbl}</div>
+                      <div style={{ fontWeight: 700, fontSize: 13 }}>{val ?? '—'}</div>
+                    </div>
+                  ))}
+                </div>
+              )
+            }
+          </>
+        )}
+
+        {/* Details tab (closed trades) */}
+        {rightTab === 'details' && (
+          <>
+            {closedTrades.length === 0
+              ? <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 32 }}>Closed trades will appear here as the session runs.</div>
+              : (
+                <div className="bt-opts-feed-wrap">
+                  <table className="bt-opts-feed-table">
+                    <thead>
+                      <tr>
+                        <th>Entry Time</th><th>Exit Time</th><th>Type</th><th>Symbol</th>
+                        <th>Strike</th><th>Expiry</th><th>Entry Px</th><th>Exit Px</th>
+                        <th>Qty</th><th>P&L</th><th>P&L %</th><th>Bars</th><th>Exit Reason</th><th>Capital After</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {closedTrades.map((t, i) => (
+                        <tr key={i}>
+                          <td className="de-mono">{(t.entryTime || '').slice(0, 16)}</td>
+                          <td className="de-mono">{(t.exitTime  || '').slice(0, 16)}</td>
+                          <td style={{ color: t.optionType === 'CE' ? '#22c55e' : '#ef4444', fontWeight: 700 }}>{t.optionType}</td>
+                          <td className="de-mono">{t.tradingSymbol}</td>
+                          <td>{t.strike}</td>
+                          <td>{t.expiry}</td>
+                          <td>{fmt2(t.entryPrice)}</td>
+                          <td>{fmt2(t.exitPrice)}</td>
+                          <td>{t.quantity}</td>
+                          <td style={pnlStyle(t.pnl)}>{fmt2(t.pnl)}</td>
+                          <td style={pnlStyle(t.pnlPct)}>{t.pnlPct != null ? `${Number(t.pnlPct).toFixed(1)}%` : '—'}</td>
+                          <td>{t.barsInTrade}</td>
+                          <td style={{ fontSize: 10 }}>{t.exitReason}</td>
+                          <td>{fmt2(t.capitalAfter)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )
+            }
+          </>
+        )}
+      </div>
+
+      <form onSubmit={handleStart}>
+        {/* ── Actions ── */}
+        {initInfo && (
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8, padding: '6px 10px', background: 'var(--bg-secondary)', borderRadius: 4 }}>
+            Session started — <strong>{initInfo.warmupCandles}</strong> warmup candles, <strong>{initInfo.ceOptions}</strong> CE + <strong>{initInfo.peOptions}</strong> PE options subscribed
+          </div>
+        )}
+        {error && <div className="error-msg" style={{ marginBottom: 12 }}>{error}</div>}
+        <div className="form-actions" style={{ marginBottom: 16 }}>
+          <button type="submit" className="btn-primary" disabled={!canRun && !isRunning}>
+            {isRunning ? 'Stop Live Session' : 'Start Options Live'}
+          </button>
+          <button type="button" className="btn-secondary" onClick={() => {
+            setFeed([]); setInitInfo(null); setError(''); setStatus('idle');
+            setNifty({ symbol: '', exchange: 'NSE', instrumentToken: '' });
+            setCePool([EMPTY_OPTION_INST()]); setPePool([EMPTY_OPTION_INST()]);
+            setStrategies(defaultStrategies());
+            setDecisionCfg(DEFAULT_DECISION); setSelectionCfg(DEFAULT_SELECTION); setSwitchCfg(DEFAULT_SWITCH);
+            setOptsRegimeCfg(DEFAULT_OPTS_REGIME_CONFIG); setChopRules(DEFAULT_CHOP_RULES); setTradingRules(DEFAULT_TRADING_RULES);
+            setRegimeRules(DEFAULT_REGIME_RULES); setRegimeStrategyRules(DEFAULT_REGIME_STRATEGY_RULES);
+            setOptsRisk(DEFAULT_OPTS_RISK); setRangeQuality(DEFAULT_RANGE_QUALITY);
+            setTradeQuality(DEFAULT_TRADE_QUALITY); setTrendEntry(DEFAULT_TREND_ENTRY);
+            setCompressionEntry(DEFAULT_COMPRESSION_ENTRY); setHoldConfig(DEFAULT_HOLD); setExitConfig(DEFAULT_EXIT_CONFIG);
+            setInterval('MINUTE_5'); setWarmupDays('5'); setQuantity('0'); setCapital('100000');
+            ['sma_live_opts_nifty','sma_live_opts_ce_pool','sma_live_opts_pe_pool','sma_live_opts_interval',
+             'sma_live_opts_warmup','sma_live_opts_qty','sma_live_opts_capital','sma_live_opts_strategies',
+             'sma_live_opts_decision','sma_live_opts_selection','sma_live_opts_switch','sma_live_opts_regime_cfg',
+             'sma_live_opts_chop_rules','sma_live_opts_trading_rules','sma_live_opts_regime_rules',
+             'sma_live_opts_regime_strat_rules','sma_live_opts_risk','sma_live_opts_range_quality',
+             'sma_live_opts_trade_quality','sma_live_opts_trend_entry','sma_live_opts_compression_entry',
+             'sma_live_opts_hold_config','sma_live_opts_exit_config'].forEach(k => localStorage.removeItem(k));
+          }} disabled={isRunning}>Reset</button>
+          {status === 'error' && <span className="badge badge-danger">Error</span>}
+          {feed.length > 0 && (
+            <span style={{ fontSize: 12, color: 'var(--text-secondary)', marginLeft: 8 }}>
+              {feed.length} candles · {closedTrades.length} trades
+            </span>
+          )}
+        </div>
+
+        {/* ── Presets ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: presets.length > 0 || showPresetSave ? 12 : 0 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Config Presets</span>
+            <button type="button" className="btn-secondary btn-xs" style={{ marginLeft: 'auto' }}
+              onClick={() => setShowPresetSave(s => !s)} disabled={isRunning}>
+              {showPresetSave ? 'Cancel' : '+ Save Current'}
+            </button>
+          </div>
+
+          {showPresetSave && (
+            <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', marginBottom: 14, padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 6 }}>
+              <div className="form-group" style={{ flex: '1 1 160px', marginBottom: 0 }}>
+                <label style={{ fontSize: 11 }}>Preset Name *</label>
+                <input
+                  type="text"
+                  value={presetName}
+                  onChange={e => setPresetName(e.target.value)}
+                  placeholder="e.g. Conservative RANGING"
+                  maxLength={60}
+                  style={{ fontSize: 12 }}
+                />
+              </div>
+              <div className="form-group" style={{ flex: '2 1 240px', marginBottom: 0 }}>
+                <label style={{ fontSize: 11 }}>Description (optional)</label>
+                <input
+                  type="text"
+                  value={presetDescription}
+                  onChange={e => setPresetDescription(e.target.value)}
+                  placeholder="e.g. High score threshold, no RANGING trades"
+                  maxLength={160}
+                  style={{ fontSize: 12 }}
+                />
+              </div>
+              <button type="button" className="btn-primary btn-xs" style={{ flexShrink: 0, marginBottom: 1 }}
+                onClick={savePreset} disabled={!presetName.trim()}>
+                Save
+              </button>
+            </div>
+          )}
+
+          {presets.length === 0 && !showPresetSave && (
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>
+              No presets saved yet. Click <b>+ Save Current</b> to save your active configuration as a preset.
+            </p>
+          )}
+
+          {presets.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+              {presets.map(preset => (
+                <div key={preset.id} style={{
+                  display: 'flex', alignItems: 'flex-start', gap: 8,
+                  padding: '8px 10px',
+                  background: selectedPresetId === preset.id ? 'rgba(99,102,241,0.12)' : 'var(--bg-secondary)',
+                  borderRadius: 6,
+                  border: selectedPresetId === preset.id ? '1px solid #6366f1' : '1px solid var(--border)',
+                  maxWidth: 320, minWidth: 180,
+                }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 700, fontSize: 12, color: selectedPresetId === preset.id ? '#818cf8' : 'var(--text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {selectedPresetId === preset.id && <span style={{ marginRight: 4 }}>●</span>}{preset.name}
+                    </div>
+                    {preset.description && (
+                      <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 2, overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+                        {preset.description}
+                      </div>
+                    )}
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
+                      {new Date(preset.createdAt).toLocaleDateString()}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flexShrink: 0 }}>
+                    <button type="button" className="btn-primary btn-xs"
+                      onClick={() => applyPreset(preset)} disabled={isRunning}
+                      title="Apply this preset to current config">
+                      Apply
+                    </button>
+                    <button type="button" className="btn-secondary btn-xs"
+                      onClick={() => deletePreset(preset.id)}
+                      title="Delete preset"
+                      style={{ fontSize: 10 }}>
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Live Settings ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Live Settings</span>
+          <div className="bt-form-grid" style={{ marginTop: 12 }}>
+            <div className="form-group">
+              <label>Interval</label>
+              <select value={interval} onChange={e => setInterval(e.target.value)} disabled={isRunning}>
+                {OPT_INTERVALS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+              </select>
+            </div>
+            <div className="form-group">
+              <label>Warmup Days</label>
+              <input type="number" min="0" max="30" value={warmupDays} onChange={e => setWarmupDays(e.target.value)} disabled={isRunning} />
+            </div>
+            <div className="form-group">
+              <label>Quantity (lots)</label>
+              <input type="number" min="0" value={quantity} onChange={e => setQuantity(e.target.value)} disabled={isRunning} />
+            </div>
+            <div className="form-group">
+              <label>Initial Capital (₹)</label>
+              <input type="number" min="0" value={capital} onChange={e => setCapital(e.target.value)} disabled={isRunning} />
+            </div>
+          </div>
+        </div>
+
+        {/* ── NIFTY Source ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">NIFTY Instrument (Decision Source)</span>
+          <p className="bt-section-sub" style={{ marginBottom: 10 }}>
+            Strategies run exclusively on NIFTY candles. Options are only used for execution pricing.
+          </p>
+          <InstrumentPicker
+            session={session}
+            symbol={nifty.symbol}
+            exchange={nifty.exchange}
+            instrumentToken={nifty.instrumentToken}
+            onSelect={r => { setNifty({ symbol: r.tradingSymbol, exchange: r.exchange, instrumentToken: String(r.instrumentToken) }); saveRecentInstrument(r); }}
+            onChange={patch => setNifty(p => ({ ...p, ...patch }))}
+            disabled={isRunning}
+          />
+        </div>
+
+        {/* ── Option Pools ── */}
+        {[
+          { label: 'CE Pool', pool: cePool, setPool: setCePool, tag: 'CE' },
+          { label: 'PE Pool', pool: pePool, setPool: setPePool, tag: 'PE' },
+        ].map(({ label, pool, setPool, tag }) => (
+          <div key={tag} className="card bt-opts-card">
+            <div className="bt-opts-legs-header">
+              <span className="bt-section-title">{label}</span>
+              <button type="button" className="btn-secondary btn-sm" onClick={() => addPoolInst(setPool)} disabled={isRunning}>+ Add</button>
+            </div>
+            <p className="bt-section-sub" style={{ marginBottom: 10 }}>
+              Add {tag} contracts. The engine picks the best-fit instrument each candle based on premium and ATM proximity.
+            </p>
+            {pool.map(inst => (
+              <div key={inst.id} className="bt-opts-leg-block">
+                <div className="bt-opts-leg-topbar">
+                  <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)' }}>{tag}</span>
+                  {pool.length > 1 && (
+                    <button type="button" className="btn-danger btn-sm" onClick={() => removePoolInst(pool, setPool, inst.id)} disabled={isRunning}>✕</button>
+                  )}
+                </div>
+                <InstrumentPicker
+                  session={session}
+                  symbol={inst.symbol}
+                  exchange={inst.exchange}
+                  instrumentToken={inst.instrumentToken}
+                  onSelect={r => { updatePoolInst(pool, setPool, inst.id, { symbol: r.tradingSymbol, exchange: r.exchange, instrumentToken: String(r.instrumentToken) }); saveRecentInstrument(r); }}
+                  onChange={patch => updatePoolInst(pool, setPool, inst.id, patch)}
+                  disabled={isRunning}
+                />
+              </div>
+            ))}
+          </div>
+        ))}
+
+        {/* ── Decision Config ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Decision Config</span>
+          <p className="bt-section-sub" style={{ marginBottom: 10 }}>
+            Filters applied to the winner score. Only no-signal and score&lt;15 are hard blocks. Trade allowed if penalized score ≥ Penalty Min Score.
+          </p>
+          <div className="bt-form-grid" style={{ marginTop: 8 }}>
+            {[
+              ['minScore',                    'Min Score',                ''],
+              ['minScoreGap',                 'Min Score Gap',            ''],
+              ['penaltyMinScore',             'Penalty Min Score',        ''],
+              ['maxRecentMove3',              'Max 3-bar Move %',         ''],
+              ['maxRecentMove5',              'Max 5-bar Move %',         ''],
+              ['maxAbsVwapDist',              'Max VWAP Dist %',          ''],
+              ['minBarsSinceTrade',           'Min Bars Since Trade',     ''],
+              ['chopLookback',                'Chop Lookback',            ''],
+              ['scoreFloorTrigger',           'Score Floor Trigger',      ''],
+              ['scoreFloorMin',               'Score Floor Min',          ''],
+              ['bollingerBonusThreshold',     'BOLLINGER Bonus Trigger',  ''],
+              ['bollingerBonus',              'BOLLINGER Bonus Pts',      ''],
+              ['earlyEntryRisingBars',        'Early Entry Rising Bars',  ''],
+              ['rawScoreBypassThreshold',     'Raw Score Bypass Threshold',''],
+              ['rawScoreBypassGap',           'Raw Score Bypass Gap',     ''],
+              ['bollingerEarlyEntryMinScore', 'BOLLINGER Early Entry Score',''],
+            ].map(([key, lbl]) => (
+              <div key={key} className="form-group">
+                <label>{lbl}</label>
+                <input type="number" step="any" value={decisionCfg[key]} onChange={e => setDecisionCfg(p => ({ ...p, [key]: e.target.value }))} disabled={isRunning} />
+              </div>
+            ))}
+            <div className="form-group">
+              <label>Chop Filter</label>
+              <select value={decisionCfg.chopFilter ? 'on' : 'off'} onChange={e => setDecisionCfg(p => ({ ...p, chopFilter: e.target.value === 'on' }))} disabled={isRunning}>
+                <option value="on">ON</option>
+                <option value="off">OFF</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        {/* ── Chop Filter Regime Rules ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Chop Filter Regime Rules</span>
+            <button type="button" className={`btn-sm ${chopRules.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setChopRules(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>
+              {chopRules.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          {chopRules.enabled && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 12 }}>
+              {[
+                { key: 'ranging', label: 'RANGING', color: '#f59e0b' },
+                { key: 'trending', label: 'TRENDING', color: '#22c55e' },
+                { key: 'compression', label: 'COMPRESSION', color: '#0ea5e9' },
+                { key: 'volatile', label: 'VOLATILE', color: '#ef4444' },
+              ].map(({ key: rk, label, color }) => (
+                <div key={rk} style={{ padding: '10px 14px', background: 'var(--bg-secondary)', borderRadius: 7, borderLeft: `3px solid ${color}` }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color, textTransform: 'uppercase', letterSpacing: 1 }}>{label}</span>
+                    <button type="button" disabled={isRunning}
+                      className={`btn-xs ${chopRules[rk].filterEnabled ? 'btn-primary' : 'btn-secondary'}`}
+                      onClick={() => setChopRules(p => ({ ...p, [rk]: { ...p[rk], filterEnabled: !p[rk].filterEnabled } }))}>
+                      {chopRules[rk].filterEnabled ? 'Filter ON' : 'Disabled'}
+                    </button>
+                  </div>
+                  {chopRules[rk].filterEnabled && (
+                    <div className="form-group" style={{ marginBottom: 0 }}>
+                      <label>Flip Ratio</label>
+                      <input type="number" min="0.1" max="1.0" step="0.05" disabled={isRunning}
+                        value={chopRules[rk].flipRatio}
+                        onChange={e => setChopRules(p => ({ ...p, [rk]: { ...p[rk], flipRatio: e.target.value } }))} />
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Market Regime Detection ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Market Regime Detection</span>
+            <button type="button" className={`btn-sm ${optsRegimeCfg.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setOptsRegimeCfg(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>
+              {optsRegimeCfg.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <p className="bt-section-sub" style={{ marginBottom: optsRegimeCfg.enabled ? 12 : 0 }}>
+            {optsRegimeCfg.enabled
+              ? `ADX(${optsRegimeCfg.adxPeriod}) trend >${optsRegimeCfg.adxTrendThreshold} · ATR(${optsRegimeCfg.atrPeriod}) volatile >${optsRegimeCfg.atrVolatilePct}% compress <${optsRegimeCfg.atrCompressionPct}%`
+              : 'OFF — every candle is RANGING. Enable to classify as TRENDING / VOLATILE / COMPRESSION / RANGING.'}
+          </p>
+          {optsRegimeCfg.enabled && (
+            <div className="bt-form-grid">
+              {[
+                ['adxPeriod', 'ADX Period', 2, null, 1],
+                ['atrPeriod', 'ATR Period', 2, null, 1],
+                ['adxTrendThreshold', 'ADX Trend Threshold', 1, 100, 0.5],
+                ['atrVolatilePct', 'ATR Volatile %', 0, null, 0.1],
+                ['atrCompressionPct', 'ATR Compression %', 0, null, 0.05],
+              ].map(([key, lbl, min, max, step]) => (
+                <div key={key} className="form-group">
+                  <label>{lbl}</label>
+                  <input type="number" min={min} max={max ?? undefined} step={step}
+                    value={optsRegimeCfg[key]} onChange={e => setOptsRegimeCfg(p => ({ ...p, [key]: e.target.value }))} disabled={isRunning} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Selection Config ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Option Selection Config</span>
+          <div className="bt-form-grid" style={{ marginTop: 8 }}>
+            <div className="form-group">
+              <label>Min Premium (₹)</label>
+              <input type="number" step="any" value={selectionCfg.minPremium} onChange={e => setSelectionCfg(p => ({ ...p, minPremium: e.target.value }))} disabled={isRunning} />
+            </div>
+            <div className="form-group">
+              <label>Max Premium (₹)</label>
+              <input type="number" step="any" value={selectionCfg.maxPremium} onChange={e => setSelectionCfg(p => ({ ...p, maxPremium: e.target.value }))} disabled={isRunning} />
+            </div>
+          </div>
+        </div>
+
+        {/* ── Switch Config ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Switch Config</span>
+          <div className="bt-form-grid" style={{ marginTop: 8 }}>
+            <div className="form-group">
+              <label>Confirmation Candles</label>
+              <input type="number" min="1" max="20" value={switchCfg.switchConfirmationCandles} onChange={e => setSwitchCfg(p => ({ ...p, switchConfirmationCandles: e.target.value }))} disabled={isRunning} />
+            </div>
+            <div className="form-group">
+              <label>Max Switches / Day</label>
+              <input type="number" min="0" max="20" value={switchCfg.maxSwitchesPerDay} onChange={e => setSwitchCfg(p => ({ ...p, maxSwitchesPerDay: e.target.value }))} disabled={isRunning} />
+            </div>
+            <div className="form-group">
+              <label>Min Score Improvement for Switch</label>
+              <input type="number" min="0" max="50" step="1" value={switchCfg.minScoreImprovementForSwitch} onChange={e => setSwitchCfg(p => ({ ...p, minScoreImprovementForSwitch: e.target.value }))} disabled={isRunning} />
+            </div>
+          </div>
+        </div>
+
+        {/* ── Trading Rules ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Trading Rules</span>
+            <button type="button" className={`btn-sm ${tradingRules.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setTradingRules(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>
+              {tradingRules.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          {tradingRules.enabled && (
+            <>
+              {[
+                ['rangingNoTrade', 'No trade in RANGING regime'],
+                ['volatileNoTrade', 'No trade in VOLATILE regime'],
+                ['noSameCandleReversal', 'No same-candle reversal'],
+              ].map(([key, lbl]) => (
+                <div key={key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 0', borderBottom: '1px solid var(--border)' }}>
+                  <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1, paddingRight: 12 }}>{lbl}</span>
+                  <button type="button" disabled={isRunning}
+                    className={tradingRules[key] ? 'btn-primary btn-xs' : 'btn-secondary btn-xs'}
+                    onClick={() => setTradingRules(p => ({ ...p, [key]: !p[key] }))}>
+                    {tradingRules[key] ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+
+        {/* ── Regime Score Rules ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Regime Score Rules</span>
+            <button type="button" className={`btn-sm ${regimeRules.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setRegimeRules(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>
+              {regimeRules.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          {regimeRules.enabled && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 12 }}>
+              {[
+                { regime: 'RANGING', scoreKey: 'rangingMinScore', gapKey: 'rangingMinScoreGap', color: '#f59e0b' },
+                { regime: 'TRENDING', scoreKey: 'trendingMinScore', gapKey: 'trendingMinScoreGap', color: '#22c55e' },
+                { regime: 'COMPRESSION', scoreKey: 'compressionMinScore', gapKey: 'compressionMinScoreGap', color: '#0ea5e9' },
+              ].map(({ regime: r, scoreKey, gapKey, color }) => (
+                <div key={r} style={{ padding: '10px 14px', background: 'var(--bg-secondary)', borderRadius: 7, borderLeft: `3px solid ${color}` }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 1 }}>{r}</div>
+                  <div style={{ display: 'flex', gap: 12 }}>
+                    <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
+                      <label>Min Score</label>
+                      <input type="number" step="1" min="0" max="100" value={regimeRules[scoreKey]}
+                        onChange={e => setRegimeRules(p => ({ ...p, [scoreKey]: e.target.value }))} disabled={isRunning} />
+                    </div>
+                    <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
+                      <label>Min Score Gap</label>
+                      <input type="number" step="1" min="0" max="50" value={regimeRules[gapKey]}
+                        onChange={e => setRegimeRules(p => ({ ...p, [gapKey]: e.target.value }))} disabled={isRunning} />
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Regime Strategy Rules ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Regime Strategy Rules</span>
+            <button type="button" className={`btn-sm ${regimeStrategyRules.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setRegimeStrategyRules(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>
+              {regimeStrategyRules.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          {regimeStrategyRules.enabled && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 12 }}>
+              {[
+                { key: 'ranging', label: 'RANGING', color: '#f59e0b' },
+                { key: 'trending', label: 'TRENDING', color: '#22c55e' },
+                { key: 'compression', label: 'COMPRESSION', color: '#0ea5e9' },
+                { key: 'volatile', label: 'VOLATILE', color: '#ef4444' },
+              ].map(({ key: rk, label, color }) => (
+                <div key={rk} style={{ padding: '10px 14px', background: 'var(--bg-secondary)', borderRadius: 7, borderLeft: `3px solid ${color}` }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color, textTransform: 'uppercase', letterSpacing: 1 }}>{label}</span>
+                    <button type="button"
+                      className={`btn-xs ${regimeStrategyRules[rk].enabled ? 'btn-primary' : 'btn-secondary'}`}
+                      onClick={() => setRegimeStrategyRules(p => ({ ...p, [rk]: { ...p[rk], enabled: !p[rk].enabled } }))} disabled={isRunning}>
+                      {regimeStrategyRules[rk].enabled ? 'Filter ON' : 'All allowed'}
+                    </button>
+                  </div>
+                  {regimeStrategyRules[rk].enabled && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                      {ALL_STRATEGY_TYPES.map(st => {
+                        const checked = regimeStrategyRules[rk].allowed.includes(st);
+                        return (
+                          <label key={st} style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 11, cursor: isRunning ? 'default' : 'pointer', color: checked ? 'var(--text-primary)' : 'var(--text-muted)' }}>
+                            <input type="checkbox" checked={checked} disabled={isRunning}
+                              onChange={() => setRegimeStrategyRules(p => {
+                                const prev = p[rk].allowed;
+                                const next = prev.includes(st) ? prev.filter(x => x !== st) : [...prev, st];
+                                return { ...p, [rk]: { ...p[rk], allowed: next } };
+                              })} />
+                            {st}
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Range Quality Filter ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Range Quality Filter</span>
+            <button type="button" className={`btn-sm ${rangeQuality.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updateRangeQuality('enabled', !rangeQuality.enabled)} disabled={isRunning}>
+              {rangeQuality.enabled ? 'ON' : 'OFF'}
+            </button>
+            <span style={{ fontSize: 11, color: '#f59e0b', fontWeight: 600 }}>RANGING only</span>
+          </div>
+          {rangeQuality.enabled && (
+            <>
+              <div className="bt-form-grid" style={{ marginTop: 4 }}>
+                {[
+                  ['Lookback Bars', 'lookbackBars', '1', null],
+                  ['Min Upper Touches', 'minUpperTouches', '1', null],
+                  ['Min Lower Touches', 'minLowerTouches', '1', null],
+                  ['Band Touch Tol %', 'bandTouchTolerancePct', '0.01', '100'],
+                  ['Min Range Width %', 'minRangeWidthPct', '0.01', '100'],
+                  ['Max Range Width %', 'maxRangeWidthPct', '0.01', '100'],
+                  ['Max Drift Ratio', 'maxDirectionalDriftPctOfRange', '0.01', '1'],
+                  ['Chop Flip Limit', 'chopFlipRatioLimit', '0.01', '1'],
+                ].map(([label, key, step, max]) => (
+                  <div className="form-group" key={key}>
+                    <label>{label}</label>
+                    <input type="number" min="0" max={max || undefined} step={step}
+                      value={rangeQuality[key]} disabled={isRunning} onChange={e => updateRangeQuality(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginTop: 8, cursor: isRunning ? 'default' : 'pointer' }}>
+                <input type="checkbox" checked={rangeQuality.enableChopCheck} disabled={isRunning}
+                  onChange={e => updateRangeQuality('enableChopCheck', e.target.checked)} />
+                Enable chop flip check
+              </label>
+            </>
+          )}
+        </div>
+
+        {/* ── Risk Management ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Risk Management</span>
+            <button type="button" className={`btn-sm ${optsRisk.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updateOptsRisk('enabled', !optsRisk.enabled)} disabled={isRunning}>
+              {optsRisk.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          {optsRisk.enabled && (
+            <div className="bt-form-grid" style={{ marginTop: 4 }}>
+              {[
+                ['Stop Loss %', 'stopLossPct', '0.1', '100'],
+                ['Take Profit %', 'takeProfitPct', '0.1', null],
+                ['Max Risk / Trade %', 'maxRiskPerTradePct', '0.1', '100'],
+                ['Daily Loss Cap %', 'dailyLossCapPct', '0.1', '100'],
+                ['Cooldown Candles', 'cooldownCandles', '1', null],
+              ].map(([label, key, step, max]) => (
+                <div className="form-group" key={key}>
+                  <label>{label}</label>
+                  <input type="number" min="0" max={max || undefined} step={step}
+                    value={optsRisk[key]} disabled={isRunning} onChange={e => updateOptsRisk(key, e.target.value)} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Trade Quality ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Trade Quality</span>
+            <button type="button" className={`btn-sm ${tradeQuality.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updateTradeQuality('enabled', !tradeQuality.enabled)} disabled={isRunning}>
+              {tradeQuality.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          {tradeQuality.enabled && (
+            <>
+              <div className="bt-form-grid" style={{ marginTop: 4 }}>
+                {[
+                  ['Strong Score ≥', 'strongScoreThreshold', '1'],
+                  ['Normal Score ≥', 'normalScoreThreshold', '1'],
+                  ['Weak Loss Cooldown', 'weakTradeLossCooldown', '1'],
+                  ['RANGING Weak Min Score', 'weakRangingMinScore', '0.5'],
+                  ['RANGING Weak Min Gap', 'weakRangingMinGap', '0.5'],
+                  ['RANGING Confirm Candles', 'rangingConfirmCandles', '1'],
+                  ['TRENDING Confirm Candles', 'trendingConfirmCandles', '1'],
+                ].map(([label, key, step]) => (
+                  <div className="form-group" key={key}>
+                    <label>{label}</label>
+                    <input type="number" min="0" step={step} value={tradeQuality[key]} disabled={isRunning}
+                      onChange={e => updateTradeQuality(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginTop: 8, cursor: isRunning ? 'default' : 'pointer' }}>
+                <input type="checkbox" checked={tradeQuality.blockWeakInRanging} disabled={isRunning}
+                  onChange={e => updateTradeQuality('blockWeakInRanging', e.target.checked)} />
+                Block WEAK trades in RANGING regime
+              </label>
+            </>
+          )}
+        </div>
+
+        {/* ── Trending Entry Structure ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Trending Entry Structure</span>
+            <button type="button" className={`btn-sm ${trendEntry.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updateTrendEntry('enabled', !trendEntry.enabled)} disabled={isRunning}>
+              {trendEntry.enabled ? 'ON' : 'OFF'}
+            </button>
+            <span style={{ fontSize: 11, color: '#0ea5e9', fontWeight: 600 }}>TRENDING only</span>
+          </div>
+          {trendEntry.enabled && (
+            <div className="bt-form-grid" style={{ marginTop: 4 }}>
+              {[
+                ['Breakout Lookback', 'breakoutLookback', '1', null],
+                ['Min Body %', 'minBodyPct', '1', '100'],
+                ['Weak Body % (block)', 'weakBodyPct', '1', '100'],
+                ['EMA Period', 'ema9Period', '1', null],
+              ].map(([label, key, step, max]) => (
+                <div className="form-group" key={key}>
+                  <label>{label}</label>
+                  <input type="number" min="0" max={max || undefined} step={step}
+                    value={trendEntry[key]} disabled={isRunning} onChange={e => updateTrendEntry(key, e.target.value)} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Compression Entry Structure ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Compression Entry Structure</span>
+            <button type="button" className={`btn-sm ${compressionEntry.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updateCompressionEntry('enabled', !compressionEntry.enabled)} disabled={isRunning}>
+              {compressionEntry.enabled ? 'ON' : 'OFF'}
+            </button>
+            <span style={{ fontSize: 11, color: '#8b5cf6', fontWeight: 600 }}>COMPRESSION only</span>
+          </div>
+          {compressionEntry.enabled && (
+            <>
+              <div className="bt-form-grid" style={{ marginTop: 4 }}>
+                {[
+                  ['Range Lookback', 'rangeLookback', '1', null],
+                  ['Long Zone Max', 'longZoneMax', '0.05', '1'],
+                  ['Short Zone Min', 'shortZoneMin', '0.05', '1'],
+                  ['No-Trade Zone Min', 'noTradeZoneMin', '0.05', '1'],
+                  ['No-Trade Zone Max', 'noTradeZoneMax', '0.05', '1'],
+                ].map(([label, key, step, max]) => (
+                  <div className="form-group" key={key}>
+                    <label>{label}</label>
+                    <input type="number" min="0" max={max || undefined} step={step}
+                      value={compressionEntry[key]} disabled={isRunning} onChange={e => updateCompressionEntry(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginTop: 8, cursor: isRunning ? 'default' : 'pointer' }}>
+                <input type="checkbox" checked={compressionEntry.rejectBreakoutCandle} disabled={isRunning}
+                  onChange={e => updateCompressionEntry('rejectBreakoutCandle', e.target.checked)} />
+                Reject breakout candles
+              </label>
+            </>
+          )}
+        </div>
+
+        {/* ── Hold Config ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Minimum Hold Period</span>
+            <button type="button" className={`btn-sm ${holdConfig.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updateHoldConfig('enabled', !holdConfig.enabled)} disabled={isRunning}>
+              {holdConfig.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          {holdConfig.enabled && (
+            <div className="bt-form-grid" style={{ marginTop: 4 }}>
+              {[
+                { key: 'defaultMinHoldBars',  label: 'Default Min Hold',     step: '1' },
+                { key: 'rangingMinHoldBars',  label: 'RANGING Min Hold',     step: '1' },
+                { key: 'trendingMinHoldBars', label: 'TRENDING Min Hold',    step: '1' },
+                { key: 'strongOppositeScore', label: 'Strong Opp Score',     step: '1' },
+                { key: 'persistentExitBars',  label: 'Persistent Exit Bars', step: '1' },
+              ].map(({ key, label, step }) => (
+                <div key={key} className="form-group">
+                  <label>{label}</label>
+                  <input type="number" min="0" step={step} value={holdConfig[key]} disabled={isRunning}
+                    onChange={e => updateHoldConfig(key, e.target.value)} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Smart Exit System ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Smart Exit System</span>
+            <button type="button" className={`btn-sm ${exitConfig.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updateExitConfig('enabled', !exitConfig.enabled)} disabled={isRunning}>
+              {exitConfig.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          {exitConfig.enabled && (
+            <>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#ef4444', marginBottom: 6, marginTop: 4 }}>P1 — Hard Stop Loss</div>
+              <div className="bt-form-grid" style={{ marginBottom: 12 }}>
+                <div className="form-group">
+                  <label>Hard Stop %</label>
+                  <input type="number" min="0" step="0.5" value={exitConfig.hardStopPct} disabled={isRunning}
+                    onChange={e => updateExitConfig('hardStopPct', e.target.value)} />
+                </div>
+                <div className="form-group">
+                  <label>Hold Zone % (profit threshold)</label>
+                  <input type="number" min="0" step="0.5" value={exitConfig.holdZonePct} disabled={isRunning}
+                    onChange={e => updateExitConfig('holdZonePct', e.target.value)} />
+                </div>
+              </div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#22c55e', marginBottom: 6 }}>P2 — Profit Lock / Trailing</div>
+              <div className="bt-form-grid" style={{ marginBottom: 12 }}>
+                {[
+                  { key: 'lock1TriggerPct', label: 'Lock1 Trigger %', step: '0.5' },
+                  { key: 'lock1FloorPct',   label: 'Lock1 Floor %',   step: '0.5' },
+                  { key: 'lock2TriggerPct', label: 'Lock2 Trigger %', step: '0.5' },
+                  { key: 'lock2FloorPct',   label: 'Lock2 Floor %',   step: '0.5' },
+                  { key: 'trailTriggerPct', label: 'Trail Trigger %', step: '0.5' },
+                  { key: 'trailFactor',     label: 'Trail Factor',    step: '0.05' },
+                ].map(({ key, label, step }) => (
+                  <div key={key} className="form-group">
+                    <label>{label}</label>
+                    <input type="number" min="0" step={step} value={exitConfig[key]} disabled={isRunning}
+                      onChange={e => updateExitConfig(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#0ea5e9', marginBottom: 6 }}>P4 — Structure Failure</div>
+              <div className="bt-form-grid" style={{ marginBottom: 12 }}>
+                <div className="form-group">
+                  <label>Structure Lookback</label>
+                  <input type="number" min="2" step="1" value={exitConfig.structureLookback} disabled={isRunning}
+                    onChange={e => updateExitConfig('structureLookback', e.target.value)} />
+                </div>
+              </div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#8b5cf6', marginBottom: 6 }}>P5c — Bias Reversal</div>
+              <div className="bt-form-grid" style={{ marginBottom: 8 }}>
+                {[
+                  { key: 'strongExitScore',            label: 'Strong Exit Score',           step: '1' },
+                  { key: 'trendStrongModeThresholdPct', label: 'Strong Trend Mode Threshold %', step: '1' },
+                ].map(({ key, label, step }) => (
+                  <div key={key} className="form-group">
+                    <label>{label}</label>
+                    <input type="number" min="0" step={step} value={exitConfig[key]} disabled={isRunning}
+                      onChange={e => updateExitConfig(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginBottom: 12, cursor: isRunning ? 'default' : 'pointer' }}>
+                <input type="checkbox" checked={exitConfig.biasExitEnabled} disabled={isRunning}
+                  onChange={e => updateExitConfig('biasExitEnabled', e.target.checked)} />
+                Bias reversal exit enabled
+              </label>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#06b6d4', marginBottom: 6 }}>P6 — Time Exits · Dead Trade Kill</div>
+              <div className="bt-form-grid" style={{ marginBottom: 12 }}>
+                {[
+                  { key: 'maxBarsNoImprovement', label: 'Max Bars No Improvement', step: '1' },
+                  { key: 'stagnationBars',       label: 'Stagnation Bars',         step: '1' },
+                  { key: 'maxBarsRanging',       label: 'Max Bars RANGING',        step: '1' },
+                  { key: 'maxBarsDeadTrade',     label: 'Dead Trade Max Bars',     step: '1' },
+                  { key: 'deadTradePnlPct',      label: 'Dead Trade PnL %',        step: '0.5' },
+                ].map(({ key, label, step }) => (
+                  <div key={key} className="form-group">
+                    <label>{label}</label>
+                    <input type="number" min="0" step={step} value={exitConfig[key]} disabled={isRunning}
+                      onChange={e => updateExitConfig(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#ec4899', marginBottom: 6 }}>P7 — No-Hope</div>
+              <div className="bt-form-grid">
+                {[
+                  { key: 'noHopeThresholdPct', label: 'No-Hope Threshold %', step: '0.5' },
+                  { key: 'noHopeBars',         label: 'No-Hope Bars',        step: '1'   },
+                ].map(({ key, label, step }) => (
+                  <div key={key} className="form-group">
+                    <label>{label}</label>
+                    <input type="number" min="0" step={step} value={exitConfig[key]} disabled={isRunning}
+                      onChange={e => updateExitConfig(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* ── Strategies ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Strategies (on NIFTY)</span>
+          <p className="bt-section-sub" style={{ marginBottom: 12 }}>
+            All enabled strategies compete each NIFTY candle. The highest-scoring bias wins.
+          </p>
+          <div className="bt-variants-grid">
+            {strategies.map((s, idx) => {
+              const color     = STRATEGY_COLORS[s.strategyType] || '#6366f1';
+              const paramDefs = PARAM_DEFS[s.strategyType] || [];
+              return (
+                <div key={s.strategyType} className={`bt-variant-card ${!s.enabled ? 'bt-variant-disabled' : ''}`} style={{ '--variant-color': color }}>
+                  <div className="bt-variant-header">
+                    <label className="bt-variant-toggle">
+                      <input type="checkbox" checked={s.enabled} onChange={e => updateStrategy(idx, { enabled: e.target.checked })} disabled={isRunning} />
+                      <span className="bt-variant-index" style={{ background: color }}>{s.strategyType.replace(/_/g, ' ')}</span>
+                    </label>
+                  </div>
+                  {s.enabled && paramDefs.length > 0 && (
+                    <div className="bt-params-block">
+                      {paramDefs.map(def => (
+                        <div key={def.key} className="bt-param-row">
+                          <label className="bt-param-label" title={def.hint}>{def.label}</label>
+                          <input type="number" className="bt-param-input" value={s.parameters[def.key] || ''} onChange={e => updateStratParam(idx, def.key, e.target.value)} placeholder={def.placeholder} disabled={isRunning} />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+      </form>
     </div>
   );
 }
@@ -6656,6 +8159,11 @@ const DEFAULT_DECISION = {
   minScore: '40', minScoreGap: '8', maxRecentMove3: '1.5', maxRecentMove5: '2.5',
   maxAbsVwapDist: '1.5', minBarsSinceTrade: '3', chopFilter: true, chopLookback: '8',
   penaltyMinScore: '25',
+  scoreFloorTrigger: '35', scoreFloorMin: '25',
+  bollingerBonusThreshold: '35', bollingerBonus: '5',
+  earlyEntryRisingBars: '2',
+  rawScoreBypassThreshold: '30', rawScoreBypassGap: '3',
+  bollingerEarlyEntryMinScore: '28',
 };
 const DEFAULT_SELECTION = { minPremium: '50', maxPremium: '300' };
 const DEFAULT_SWITCH    = { switchConfirmationCandles: '2', maxSwitchesPerDay: '3', minScoreImprovementForSwitch: '0' };
@@ -6707,8 +8215,8 @@ const DEFAULT_RANGE_QUALITY = {
   minUpperTouches:               '2',
   minLowerTouches:               '2',
   bandTouchTolerancePct:         '0.15',
-  minRangeWidthPct:              '0.4',
-  maxRangeWidthPct:              '2.0',
+  minRangeWidthPct:              '0.3',
+  maxRangeWidthPct:              '3.0',
   maxDirectionalDriftPctOfRange: '0.6',
   chopFlipRatioLimit:            '0.65',
   enableChopCheck:               true,
@@ -6719,14 +8227,16 @@ const DEFAULT_TRADE_QUALITY = {
   normalScoreThreshold:  '32',
   weakTradeLossCooldown: '5',
   blockWeakInRanging:    true,
-  rangingConfirmCandles: '3',
-  trendingConfirmCandles:'2',
+  weakRangingMinScore:   '28',
+  weakRangingMinGap:     '3',
+  rangingConfirmCandles: '2',
+  trendingConfirmCandles:'1',
 };
 const DEFAULT_TREND_ENTRY = {
   enabled:         false,
   breakoutLookback:'5',
-  minBodyPct:      '60',
-  weakBodyPct:     '30',
+  minBodyPct:      '45',
+  weakBodyPct:     '20',
   ema9Period:      '9',
 };
 const DEFAULT_COMPRESSION_ENTRY = {
@@ -6747,36 +8257,42 @@ const DEFAULT_HOLD = {
   persistentExitBars:  '2',
 };
 const DEFAULT_EXIT_CONFIG = {
-  enabled:               true,
-  // P1 — Hard Stop Loss
-  hardStopPct:           '7',
-  // P2 — Profit Lock tiers (activate only after meaningful gains)
-  lock1TriggerPct:       '5',    // +5% → lock 2%
-  lock1FloorPct:         '2',
-  lock2TriggerPct:       '10',   // +10% → lock 5%
-  lock2FloorPct:         '5',
-  trailTriggerPct:       '10',   // after +10% → trail at 50% of peak
-  trailFactor:           '0.5',
-  // P3 — First-move protection
-  firstMoveBars:         '2',
-  firstMoveLockPct:      '0.5',
-  // P4 — Structure failure
-  structureLookback:     '5',
-  // P5a — Score Collapsed: REMOVED (0 = disabled)
-  scoreDropFactor:       '0',
-  // P5b — Score Below Floor (non-TRENDING only)
-  scoreAbsoluteMin:      '20',
+  enabled:                      true,
+  // P1 — Hard Stop Loss (always; fires from inside hold zone)
+  hardStopPct:                  '7',
+  // Hold Zone — no exit below this profit (except SL + dead trade kill)
+  holdZonePct:                  '5',
+  // P2 — Profit Lock tiers (only arm once profit clears holdZonePct)
+  lock1TriggerPct:              '5',    // +5%  → floor 2%
+  lock1FloorPct:                '2',
+  lock2TriggerPct:              '10',   // +10% → floor 5%
+  lock2FloorPct:                '5',
+  trailTriggerPct:              '15',   // +15% → trail 40% of peak
+  trailFactor:                  '0.4',
+  // P3 — First-move protection (disabled; hold zone supersedes it)
+  firstMoveBars:                '0',
+  firstMoveLockPct:             '0.5',
+  // P4 — Structure failure (skipped in RANGING)
+  structureLookback:            '5',
+  // P5a/P5b — Score exits: DISABLED (score must NOT trigger exit)
+  scoreDropFactor:              '0',
+  scoreAbsoluteMin:             '0',
   // P5c — Bias exit
-  biasExitEnabled:       true,
-  strongExitScore:       '35',   // TRENDING: minimum score for opposite bias to exit
-  // P6 — Time exit (non-TRENDING only)
-  maxBarsNoImprovement:  '3',
-  stagnationBars:        '2',
+  biasExitEnabled:              true,
+  strongExitScore:              '40',   // TRENDING: requires this score to exit
+  // Strong Trend Mode — TRENDING + peak > this → only P1/P2/strong-bias exits
+  trendStrongModeThresholdPct:  '5',
+  // P6a/P6b — Time exit (non-TRENDING only)
+  maxBarsNoImprovement:         '3',
+  stagnationBars:               '2',
   // P6c — RANGING time limit
-  maxBarsRanging:        '6',
+  maxBarsRanging:               '6',
+  // P6d — Dead Trade kill (any regime; fires from inside hold zone)
+  maxBarsDeadTrade:             '10',
+  deadTradePnlPct:              '2',
   // P7 — No-hope (non-TRENDING only)
-  noHopeThresholdPct:    '1.5',
-  noHopeBars:            '2',
+  noHopeThresholdPct:           '1.5',
+  noHopeBars:                   '2',
 };
 
 function fmt2(v) { return v != null ? Number(v).toFixed(2) : '—'; }
@@ -7201,6 +8717,79 @@ function OptionsReplayTest() {
   useEffect(() => { try { localStorage.setItem('sma_opts_decision',   JSON.stringify(decisionCfg));  } catch {} }, [decisionCfg]);
   useEffect(() => { try { localStorage.setItem('sma_opts_selection',  JSON.stringify(selectionCfg)); } catch {} }, [selectionCfg]);
   useEffect(() => { try { localStorage.setItem('sma_opts_switch',       JSON.stringify(switchCfg));      } catch {} }, [switchCfg]);
+  // ── Config presets ────────────────────────────────────────────────────────
+  const [presets, setPresets] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('sma_opts_presets') || '[]'); } catch { return []; }
+  });
+  const [presetName,        setPresetName]        = useState('');
+  const [presetDescription, setPresetDescription] = useState('');
+  const [showPresetSave,    setShowPresetSave]    = useState(false);
+
+  function capturePresetConfig() {
+    return {
+      interval, warmupDays, quantity, capital,
+      strategies,
+      decisionCfg, selectionCfg, switchCfg,
+      optsRegimeCfg, chopRules, tradingRules, regimeRules, regimeStrategyRules,
+      optsRisk, rangeQuality, tradeQuality, trendEntry, compressionEntry,
+      holdConfig, exitConfig,
+    };
+  }
+
+  const selectedPresetId = (() => {
+    const { nifty: _n, cePool: _ce, pePool: _pe, ...currentCmp } = capturePresetConfig();
+    const current = JSON.stringify(currentCmp);
+    return presets.find(p => {
+      const { nifty: _n2, cePool: _ce2, pePool: _pe2, ...presetCmp } = p.config;
+      return JSON.stringify(presetCmp) === current;
+    })?.id ?? null;
+  })();
+
+  function savePreset() {
+    if (!presetName.trim()) return;
+    const preset = {
+      id:          Date.now().toString(),
+      name:        presetName.trim(),
+      description: presetDescription.trim(),
+      createdAt:   new Date().toISOString(),
+      config:      capturePresetConfig(),
+    };
+    const next = [preset, ...presets];
+    setPresets(next);
+    try { localStorage.setItem('sma_opts_presets', JSON.stringify(next)); } catch {}
+    setPresetName(''); setPresetDescription(''); setShowPresetSave(false);
+  }
+
+  function applyPreset(preset) {
+    const c = preset.config;
+    if (c.interval     !== undefined) setInterval(c.interval);
+    if (c.warmupDays   !== undefined) setWarmupDays(c.warmupDays);
+    if (c.quantity     !== undefined) setQuantity(c.quantity);
+    if (c.capital      !== undefined) setCapital(c.capital);
+    if (c.strategies   !== undefined) setStrategies(c.strategies);
+    if (c.decisionCfg  !== undefined) setDecisionCfg(c.decisionCfg);
+    if (c.selectionCfg !== undefined) setSelectionCfg(c.selectionCfg);
+    if (c.switchCfg    !== undefined) setSwitchCfg(c.switchCfg);
+    if (c.optsRegimeCfg        !== undefined) setOptsRegimeCfg(c.optsRegimeCfg);
+    if (c.chopRules            !== undefined) setChopRules(c.chopRules);
+    if (c.tradingRules         !== undefined) setTradingRules(c.tradingRules);
+    if (c.regimeRules          !== undefined) setRegimeRules(c.regimeRules);
+    if (c.regimeStrategyRules  !== undefined) setRegimeStrategyRules(c.regimeStrategyRules);
+    if (c.optsRisk             !== undefined) setOptsRisk(c.optsRisk);
+    if (c.rangeQuality         !== undefined) setRangeQuality(c.rangeQuality);
+    if (c.tradeQuality         !== undefined) setTradeQuality(c.tradeQuality);
+    if (c.trendEntry           !== undefined) setTrendEntry(c.trendEntry);
+    if (c.compressionEntry     !== undefined) setCompressionEntry(c.compressionEntry);
+    if (c.holdConfig           !== undefined) setHoldConfig(c.holdConfig);
+    if (c.exitConfig           !== undefined) setExitConfig(c.exitConfig);
+  }
+
+  function deletePreset(id) {
+    const next = presets.filter(p => p.id !== id);
+    setPresets(next);
+    try { localStorage.setItem('sma_opts_presets', JSON.stringify(next)); } catch {}
+  }
+
   // ── Recent replay dates ──────────────────────────────────────────────────
   const [recentDates, setRecentDates] = useState(() => {
     try { return JSON.parse(localStorage.getItem('sma_opts_recent_dates') || '[]'); } catch { return []; }
@@ -7451,26 +9040,27 @@ function OptionsReplayTest() {
 
     // ── Exit System ──────────────────────────────────────────────────────────
     lines.push(row('=== Exit System ==='));
-    lines.push(row('Enabled', 'Hard Stop %',
+    lines.push(row('Enabled', 'Hard Stop %', 'Hold Zone %',
       'Lock1 Trigger %', 'Lock1 Floor %', 'Lock2 Trigger %', 'Lock2 Floor %',
       'Trail Trigger %', 'Trail Factor',
-      'First Move Bars', 'First Move Lock %',
       'Structure Lookback',
-      'Score Drop Factor (0=off)', 'Score Abs Min',
-      'Bias Exit', 'Strong Exit Score (TRENDING)',
+      'Score Abs Min', 'Bias Exit', 'Strong Exit Score',
+      'Trend Strong Mode Threshold %',
       'Max Bars No Improvement', 'Stagnation Bars', 'Max Bars RANGING',
+      'Max Bars Dead Trade', 'Dead Trade PnL %',
       'No-Hope Threshold %', 'No-Hope Bars'));
     lines.push(row(
       exitConfig.enabled ? 'Yes' : 'No',
-      exitConfig.hardStopPct,
+      exitConfig.hardStopPct, exitConfig.holdZonePct,
       exitConfig.lock1TriggerPct, exitConfig.lock1FloorPct,
       exitConfig.lock2TriggerPct, exitConfig.lock2FloorPct,
       exitConfig.trailTriggerPct, exitConfig.trailFactor,
-      exitConfig.firstMoveBars, exitConfig.firstMoveLockPct,
       exitConfig.structureLookback,
-      exitConfig.scoreDropFactor, exitConfig.scoreAbsoluteMin,
+      exitConfig.scoreAbsoluteMin,
       exitConfig.biasExitEnabled ? 'Yes' : 'No', exitConfig.strongExitScore,
+      exitConfig.trendStrongModeThresholdPct,
       exitConfig.maxBarsNoImprovement, exitConfig.stagnationBars, exitConfig.maxBarsRanging,
+      exitConfig.maxBarsDeadTrade, exitConfig.deadTradePnlPct,
       exitConfig.noHopeThresholdPct, exitConfig.noHopeBars,
     ));
     lines.push(blank);
@@ -7541,15 +9131,15 @@ function OptionsReplayTest() {
         'Neutral Reason',
         'Shadow Winner', 'Shadow Score', 'Shadow Not-Taken Reason',
         'Recent Move 3%', 'Recent Move 5%', 'VWAP Dist%',
-        'Entry Allowed', 'Block Reason',
-        'Switch Requested', 'Switch Confirmed', 'Switch Reason', 'Switch Count Today',
+        'Entry Allowed', 'Block Reason', 'Exec Wait Reason',
+        'Switch Requested', 'Switch Confirmed', 'Switch Reason', 'Switch Count Today', 'Confirm Count', 'Confirm Required',
         'Bars Since Trade',
         // Candidates (compact signal:score:eligible per strategy)
         'Candidates',
         // Execution
         'Position State', 'Desired Side', 'Action', 'Exit Reason',
         'Entry Regime', 'Applied Min Hold', 'Hold Active',
-        'Peak PnL %', 'Profit Lock Floor %',
+        'Peak PnL %', 'Profit Lock Floor %', 'In Hold Zone', 'In Strong Trend Mode',
         'Selected Symbol', 'Option Type', 'Strike', 'Expiry',
         'Entry Price', 'Exit Price', 'Bars In Trade',
         'uPnL', 'rPnL', 'Total PnL', 'Capital',
@@ -7569,9 +9159,9 @@ function OptionsReplayTest() {
         e.neutralReason || '',
         e.shadowWinner || '', n2(e.shadowWinnerScore), e.shadowWinnerReasonNotTaken || '',
         n2(e.recentMove3), n2(e.recentMove5), n2(e.distanceFromVwap),
-        e.entryAllowed ? 'Yes' : 'No', e.blockReason || '',
+        e.entryAllowed ? 'Yes' : 'No', e.blockReason || '', e.execWaitReason || '',
         e.switchRequested ? 'Yes' : 'No', e.switchConfirmed ? 'Yes' : 'No',
-        e.switchReason || '', e.switchCountToday ?? '',
+        e.switchReason || '', e.switchCountToday ?? '', e.confirmCount ?? '', e.confirmRequired ?? '',
         e.barsSinceLastTrade ?? '',
         // Candidates: strategyType|signal|score|eligible|eligibilityReason for each
         (e.candidates || []).map(c =>
@@ -7580,6 +9170,7 @@ function OptionsReplayTest() {
         e.positionState || '', e.desiredSide || '', e.action || '', e.exitReason || '',
         e.entryRegime || '', e.appliedMinHold ?? '', e.holdActive ? 'Yes' : 'No',
         n2(e.peakPnlPct), n2(e.profitLockFloor),
+        e.inHoldZone ? 'Yes' : 'No', e.inStrongTrendMode ? 'Yes' : 'No',
         e.selectedTradingSymbol || '', e.selectedOptionType || '',
         e.selectedStrike ?? '', e.selectedExpiry || '',
         n2(e.entryPrice), n2(e.exitPrice), e.barsInTrade ?? '',
@@ -7649,8 +9240,10 @@ function OptionsReplayTest() {
       .map(s => ({ strategyType: s.strategyType, parameters: s.parameters }));
 
     const payload = {
-      userId:    session.userId,
-      brokerName: session.brokerName,
+      userId:      session.userId,
+      brokerName:  session.brokerName,
+      apiKey:      session.apiKey      || undefined,
+      accessToken: session.accessToken || undefined,
       niftyInstrumentToken: nifty.instrumentToken ? parseInt(nifty.instrumentToken, 10) : undefined,
       niftySymbol:   nifty.symbol   || 'NIFTY 50',
       niftyExchange: nifty.exchange || 'NSE',
@@ -7678,9 +9271,17 @@ function OptionsReplayTest() {
         maxRecentMove5:    parseFloat(decisionCfg.maxRecentMove5)     || 2.5,
         maxAbsVwapDist:    parseFloat(decisionCfg.maxAbsVwapDist)     || 1.5,
         minBarsSinceTrade: parseInt(decisionCfg.minBarsSinceTrade, 10) || 3,
-        chopFilter:        decisionCfg.chopFilter,
-        chopLookback:      parseInt(decisionCfg.chopLookback, 10)      || 8,
-        penaltyMinScore:   parseFloat(decisionCfg.penaltyMinScore)    || 25,
+        chopFilter:              decisionCfg.chopFilter,
+        chopLookback:            parseInt(decisionCfg.chopLookback, 10)           || 8,
+        penaltyMinScore:         parseFloat(decisionCfg.penaltyMinScore)          || 25,
+        scoreFloorTrigger:          parseFloat(decisionCfg.scoreFloorTrigger)          || 35,
+        scoreFloorMin:              parseFloat(decisionCfg.scoreFloorMin)              || 25,
+        bollingerBonusThreshold:    parseFloat(decisionCfg.bollingerBonusThreshold)    || 35,
+        bollingerBonus:             parseFloat(decisionCfg.bollingerBonus)             || 0,
+        earlyEntryRisingBars:       parseInt(decisionCfg.earlyEntryRisingBars, 10)     || 0,
+        rawScoreBypassThreshold:    parseFloat(decisionCfg.rawScoreBypassThreshold)    || 0,
+        rawScoreBypassGap:          parseFloat(decisionCfg.rawScoreBypassGap)          || 3,
+        bollingerEarlyEntryMinScore:parseFloat(decisionCfg.bollingerEarlyEntryMinScore)|| 0,
       },
       selectionConfig: {
         minPremium: parseFloat(selectionCfg.minPremium) || 50,
@@ -7742,8 +9343,8 @@ function OptionsReplayTest() {
         minUpperTouches:               parseInt(rangeQuality.minUpperTouches, 10)            || 2,
         minLowerTouches:               parseInt(rangeQuality.minLowerTouches, 10)            || 2,
         bandTouchTolerancePct:         parseFloat(rangeQuality.bandTouchTolerancePct)        || 0.15,
-        minRangeWidthPct:              parseFloat(rangeQuality.minRangeWidthPct)             || 0.4,
-        maxRangeWidthPct:              parseFloat(rangeQuality.maxRangeWidthPct)             || 2.0,
+        minRangeWidthPct:              parseFloat(rangeQuality.minRangeWidthPct)             || 0.3,
+        maxRangeWidthPct:              parseFloat(rangeQuality.maxRangeWidthPct)             || 3.0,
         maxDirectionalDriftPctOfRange: parseFloat(rangeQuality.maxDirectionalDriftPctOfRange) || 0.6,
         chopFlipRatioLimit:            parseFloat(rangeQuality.chopFlipRatioLimit)           || 0.65,
         enableChopCheck:               rangeQuality.enableChopCheck,
@@ -7754,14 +9355,16 @@ function OptionsReplayTest() {
         normalScoreThreshold:   parseFloat(tradeQuality.normalScoreThreshold)   || 32,
         weakTradeLossCooldown:  parseInt(tradeQuality.weakTradeLossCooldown, 10) || 5,
         blockWeakInRanging:     tradeQuality.blockWeakInRanging,
-        rangingConfirmCandles:  parseInt(tradeQuality.rangingConfirmCandles, 10) || 3,
-        trendingConfirmCandles: parseInt(tradeQuality.trendingConfirmCandles, 10) || 2,
+        weakRangingMinScore:    parseFloat(tradeQuality.weakRangingMinScore)      || 28,
+        weakRangingMinGap:      parseFloat(tradeQuality.weakRangingMinGap)        || 3,
+        rangingConfirmCandles:  parseInt(tradeQuality.rangingConfirmCandles, 10)  || 2,
+        trendingConfirmCandles: parseInt(tradeQuality.trendingConfirmCandles, 10) || 1,
       } : { enabled: false },
       trendEntryConfig: trendEntry.enabled ? {
         enabled:         true,
         breakoutLookback:parseInt(trendEntry.breakoutLookback, 10) || 5,
-        minBodyPct:      parseFloat(trendEntry.minBodyPct)         || 60,
-        weakBodyPct:     parseFloat(trendEntry.weakBodyPct)        || 30,
+        minBodyPct:      parseFloat(trendEntry.minBodyPct)         || 45,
+        weakBodyPct:     parseFloat(trendEntry.weakBodyPct)        || 20,
         ema9Period:      parseInt(trendEntry.ema9Period, 10)       || 9,
       } : { enabled: false },
       compressionEntryConfig: compressionEntry.enabled ? {
@@ -7782,26 +9385,30 @@ function OptionsReplayTest() {
         persistentExitBars:  parseInt(holdConfig.persistentExitBars, 10)  || 2,
       },
       exitConfig: {
-        enabled:              exitConfig.enabled,
-        hardStopPct:          parseFloat(exitConfig.hardStopPct)          || 7,
-        lock1TriggerPct:      parseFloat(exitConfig.lock1TriggerPct)      || 2,
-        lock1FloorPct:        parseFloat(exitConfig.lock1FloorPct)        || 1,
-        lock2TriggerPct:      parseFloat(exitConfig.lock2TriggerPct)      || 4,
-        lock2FloorPct:        parseFloat(exitConfig.lock2FloorPct)        || 2,
-        trailTriggerPct:      parseFloat(exitConfig.trailTriggerPct)      || 6,
-        trailFactor:          parseFloat(exitConfig.trailFactor)          || 0.5,
-        firstMoveBars:        parseInt(exitConfig.firstMoveBars, 10)      || 2,
-        firstMoveLockPct:     parseFloat(exitConfig.firstMoveLockPct)     || 0.5,
-        structureLookback:    parseInt(exitConfig.structureLookback, 10)  || 5,
-        scoreDropFactor:      parseFloat(exitConfig.scoreDropFactor)      || 0.6,
-        scoreAbsoluteMin:     parseFloat(exitConfig.scoreAbsoluteMin)     || 20,
-        biasExitEnabled:      exitConfig.biasExitEnabled,
-        strongExitScore:      parseFloat(exitConfig.strongExitScore)      || 35,
-        maxBarsNoImprovement: parseInt(exitConfig.maxBarsNoImprovement, 10) || 3,
-        stagnationBars:       parseInt(exitConfig.stagnationBars, 10)     || 2,
-        maxBarsRanging:       parseInt(exitConfig.maxBarsRanging, 10)     || 6,
-        noHopeThresholdPct:   parseFloat(exitConfig.noHopeThresholdPct)   || 1.5,
-        noHopeBars:           parseInt(exitConfig.noHopeBars, 10)         || 2,
+        enabled:                      exitConfig.enabled,
+        hardStopPct:                  parseFloat(exitConfig.hardStopPct)                  || 7,
+        holdZonePct:                  parseFloat(exitConfig.holdZonePct)                  || 5,
+        lock1TriggerPct:              parseFloat(exitConfig.lock1TriggerPct)              || 5,
+        lock1FloorPct:                parseFloat(exitConfig.lock1FloorPct)                || 2,
+        lock2TriggerPct:              parseFloat(exitConfig.lock2TriggerPct)              || 10,
+        lock2FloorPct:                parseFloat(exitConfig.lock2FloorPct)                || 5,
+        trailTriggerPct:              parseFloat(exitConfig.trailTriggerPct)              || 15,
+        trailFactor:                  parseFloat(exitConfig.trailFactor)                  || 0.4,
+        firstMoveBars:                parseInt(exitConfig.firstMoveBars, 10)              || 0,
+        firstMoveLockPct:             parseFloat(exitConfig.firstMoveLockPct)             || 0.5,
+        structureLookback:            parseInt(exitConfig.structureLookback, 10)          || 5,
+        scoreDropFactor:              parseFloat(exitConfig.scoreDropFactor)              || 0,
+        scoreAbsoluteMin:             parseFloat(exitConfig.scoreAbsoluteMin)             || 0,
+        biasExitEnabled:              exitConfig.biasExitEnabled,
+        strongExitScore:              parseFloat(exitConfig.strongExitScore)              || 40,
+        trendStrongModeThresholdPct:  parseFloat(exitConfig.trendStrongModeThresholdPct) || 5,
+        maxBarsNoImprovement:         parseInt(exitConfig.maxBarsNoImprovement, 10)       || 3,
+        stagnationBars:               parseInt(exitConfig.stagnationBars, 10)             || 2,
+        maxBarsRanging:               parseInt(exitConfig.maxBarsRanging, 10)             || 6,
+        maxBarsDeadTrade:             parseInt(exitConfig.maxBarsDeadTrade, 10)           || 10,
+        deadTradePnlPct:              parseFloat(exitConfig.deadTradePnlPct)              || 2,
+        noHopeThresholdPct:           parseFloat(exitConfig.noHopeThresholdPct)           || 1.5,
+        noHopeBars:                   parseInt(exitConfig.noHopeBars, 10)                 || 2,
       },
       speedMultiplier: parseInt(speed, 10) || 1,
       persist: true,
@@ -7931,6 +9538,7 @@ function OptionsReplayTest() {
                   ['rPnL', fmt2(lastEvt.realizedPnl), lastEvt.realizedPnl > 0 ? '#22c55e' : lastEvt.realizedPnl < 0 ? '#ef4444' : undefined],
                   ['Capital', fmt2(lastEvt.capital), undefined],
                   ['Block', lastEvt.blockReason || '—', lastEvt.blockReason ? '#ef4444' : undefined],
+                  ['Exec', lastEvt.execWaitReason || '—', lastEvt.execWaitReason ? '#f59e0b' : undefined],
                 ].map(([lbl, val, color]) => (
                   <div key={lbl} style={{ fontSize: 11 }}>
                     <div style={{ color: 'var(--text-secondary)' }}>{lbl}</div>
@@ -7977,7 +9585,7 @@ function OptionsReplayTest() {
                   text += ` | Risk: SL=${optsRisk.stopLossPct}% TP=${optsRisk.takeProfitPct}% MaxRisk=${optsRisk.maxRiskPerTradePct}% DailyCap=${optsRisk.dailyLossCapPct}% Cooldown=${optsRisk.cooldownCandles}`;
                 }
                 if (tradeQuality.enabled) {
-                  text += ` | TQ: S>=${tradeQuality.strongScoreThreshold} N>=${tradeQuality.normalScoreThreshold} wkCooldown=${tradeQuality.weakTradeLossCooldown} blockWkRng=${tradeQuality.blockWeakInRanging} rngConf=${tradeQuality.rangingConfirmCandles} trdConf=${tradeQuality.trendingConfirmCandles}`;
+                  text += ` | TQ: S>=${tradeQuality.strongScoreThreshold} N>=${tradeQuality.normalScoreThreshold} wkCooldown=${tradeQuality.weakTradeLossCooldown} blockWkRng=${tradeQuality.blockWeakInRanging} wkRngMin=${tradeQuality.weakRangingMinScore}/gap${tradeQuality.weakRangingMinGap} rngConf=${tradeQuality.rangingConfirmCandles} trdConf=${tradeQuality.trendingConfirmCandles}`;
                 }
                 if (trendEntry.enabled) {
                   text += ` | TrendEntry: brkLbk=${trendEntry.breakoutLookback} body>=${trendEntry.minBodyPct}% weak<${trendEntry.weakBodyPct}% EMA${trendEntry.ema9Period}`;
@@ -7988,7 +9596,7 @@ function OptionsReplayTest() {
                 text += '\n\n';
 
                 // ── Feed header ──
-                const headers = ['Time','NIFTY','Regime','Bias','ConfBias','Winner','Score','PenScore','Str','2nd','Gap','Shadow','NeutralReason','State','Bars','Hold','Action','ExitRsn','PeakPnL%','LockFloor%','Option','OptPx','uPnL','rPnL','Block'];
+                const headers = ['Time','NIFTY','Regime','Bias','ConfBias','Winner','Score','PenScore','Str','2nd','Gap','Shadow','NeutralReason','State','Bars','Hold','Action','ExitRsn','PeakPnL%','LockFloor%','Zone','TrendMode','Option','OptPx','uPnL','rPnL','Block'];
                 text += headers.join('\t') + '\n';
 
                 // ── Feed rows (chronological order) ──
@@ -8014,11 +9622,13 @@ function OptionsReplayTest() {
                     evt.exitReason || '',
                     evt.positionState !== 'FLAT' && evt.peakPnlPct != null ? Number(evt.peakPnlPct).toFixed(2) : '',
                     evt.positionState !== 'FLAT' && evt.profitLockFloor != null && evt.profitLockFloor > -1e10 ? Number(evt.profitLockFloor).toFixed(2) : '',
+                    evt.inHoldZone ? 'ZONE' : '',
+                    evt.inStrongTrendMode ? 'STRONG_TREND' : '',
                     evt.selectedTradingSymbol || '',
                     evt.optionClose != null ? Number(evt.optionClose).toFixed(2) : '',
                     evt.unrealizedPnl != null ? Number(evt.unrealizedPnl).toFixed(2) : '',
                     evt.realizedPnl  != null ? Number(evt.realizedPnl).toFixed(2)  : '',
-                    evt.blockReason || '',
+                    evt.blockReason || (evt.execWaitReason ? '⚠ ' + evt.execWaitReason : ''),
                   ].join('\t') + '\n';
                 });
 
@@ -8202,9 +9812,10 @@ function OptionsReplayTest() {
                   <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
                   <span style={{ marginRight: 8, fontWeight: 700, color: '#f97316' }}>Exit:</span>
                   <span style={{ marginRight: 10 }}>SL=<b style={{ color: '#ef4444' }}>{exitConfig.hardStopPct}%</b></span>
-                  <span style={{ marginRight: 10 }}>lock1=<b style={{ color: 'var(--text-primary)' }}>{exitConfig.lock1TriggerPct}%→{exitConfig.lock1FloorPct}%</b></span>
-                  <span style={{ marginRight: 10 }}>lock2=<b style={{ color: 'var(--text-primary)' }}>{exitConfig.lock2TriggerPct}%→{exitConfig.lock2FloorPct}%</b></span>
-                  <span style={{ marginRight: 10 }}>trail=<b style={{ color: 'var(--text-primary)' }}>{exitConfig.trailTriggerPct}%@{exitConfig.trailFactor}</b></span>
+                  <span style={{ marginRight: 10 }}>zone=<b style={{ color: '#f59e0b' }}>{exitConfig.holdZonePct}%</b></span>
+                  <span style={{ marginRight: 10 }}>lock1=<b style={{ color: '#22c55e' }}>{exitConfig.lock1TriggerPct}%→{exitConfig.lock1FloorPct}%</b></span>
+                  <span style={{ marginRight: 10 }}>trail=<b style={{ color: '#22c55e' }}>{exitConfig.trailTriggerPct}%@{exitConfig.trailFactor}</b></span>
+                  <span style={{ marginRight: 10 }}>dead=<b style={{ color: 'var(--text-primary)' }}>{exitConfig.maxBarsDeadTrade}bars</b></span>
                 </>
               )}
             </div>
@@ -8220,8 +9831,9 @@ function OptionsReplayTest() {
                         <th>Time</th><th>NIFTY</th><th>Regime</th><th>Bias</th><th>Conf</th>
                         <th>Winner</th><th>Score</th><th>PenScore</th><th>Str</th><th>2nd</th><th>Gap</th>
                         <th>Shadow</th><th>NeutralReason</th>
+                        <th title="Consecutive candles seen for pending bias">Cnf</th><th title="Candles required to confirm">Req</th>
                         <th>State</th><th>Bars</th><th>Hold</th><th>Action</th><th>ExitRsn</th>
-                        <th>PeakPnL%</th><th>LockFloor%</th>
+                        <th>PeakPnL%</th><th>LockFloor%</th><th>Zone</th><th>TrendMode</th>
                         <th>Option</th><th>Opt Px</th><th>uPnL</th><th>rPnL</th><th>Block</th>
                       </tr>
                     </thead>
@@ -8241,6 +9853,8 @@ function OptionsReplayTest() {
                           <td>{fmt2(evt.scoreGap)}</td>
                           <td style={{ fontSize: 10, color: '#8b5cf6' }}>{evt.shadowWinner ? `${evt.shadowWinner} ${fmt2(evt.shadowWinnerScore)}` : '—'}</td>
                           <td style={{ fontSize: 10, color: evt.neutralReason ? '#f59e0b' : undefined }}>{evt.neutralReason || '—'}</td>
+                          <td style={{ fontSize: 11, fontWeight: 600, color: evt.confirmCount > 0 && evt.confirmCount < evt.confirmRequired ? '#f59e0b' : evt.confirmCount >= evt.confirmRequired && evt.confirmRequired > 0 ? '#22c55e' : undefined }}>{evt.confirmCount != null && evt.confirmCount > 0 ? evt.confirmCount : ''}</td>
+                          <td style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{evt.confirmRequired != null && evt.confirmRequired > 0 ? evt.confirmRequired : ''}</td>
                           <td style={{ fontWeight: 600 }}>{evt.positionState || '—'}</td>
                           <td style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{evt.positionState !== 'FLAT' ? (evt.barsInTrade ?? '—') : ''}</td>
                           <td style={{ fontSize: 11, fontWeight: 600, color: '#14b8a6' }}>{evt.holdActive ? `🔒${evt.barsInTrade}/${evt.appliedMinHold}` : ''}</td>
@@ -8248,11 +9862,15 @@ function OptionsReplayTest() {
                           <td style={{ fontSize: 10, color: '#f97316' }}>{evt.exitReason || ''}</td>
                           <td style={{ fontSize: 11, color: evt.peakPnlPct > 0 ? '#22c55e' : undefined }}>{evt.positionState !== 'FLAT' && evt.peakPnlPct != null ? fmt2(evt.peakPnlPct) : ''}</td>
                           <td style={{ fontSize: 11, color: '#14b8a6' }}>{evt.positionState !== 'FLAT' && evt.profitLockFloor != null && evt.profitLockFloor > -1e10 ? fmt2(evt.profitLockFloor) : ''}</td>
+                          <td style={{ fontSize: 10, fontWeight: 600, color: '#f59e0b' }}>{evt.inHoldZone ? 'ZONE' : ''}</td>
+                          <td style={{ fontSize: 10, fontWeight: 600, color: '#22c55e' }}>{evt.inStrongTrendMode ? '⚡TREND' : ''}</td>
                           <td className="de-mono">{evt.selectedTradingSymbol || '—'}</td>
                           <td>{fmt2(evt.optionClose)}</td>
                           <td style={pnlStyle(evt.unrealizedPnl)}>{fmt2(evt.unrealizedPnl)}</td>
                           <td style={pnlStyle(evt.realizedPnl)}>{fmt2(evt.realizedPnl)}</td>
-                          <td style={{ color: evt.blockReason ? '#ef4444' : undefined, fontSize: 10 }}>{evt.blockReason || ''}</td>
+                          <td style={{ color: evt.blockReason ? '#ef4444' : evt.execWaitReason ? '#f59e0b' : undefined, fontSize: 10 }}>
+                            {evt.blockReason || (evt.execWaitReason ? '⚠ ' + evt.execWaitReason : '')}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -8475,6 +10093,96 @@ function OptionsReplayTest() {
           )}
         </div>
 
+        {/* ── Presets ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: presets.length > 0 || showPresetSave ? 12 : 0 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Config Presets</span>
+            <button type="button" className="btn-secondary btn-xs" style={{ marginLeft: 'auto' }}
+              onClick={() => setShowPresetSave(s => !s)} disabled={isRunning}>
+              {showPresetSave ? 'Cancel' : '+ Save Current'}
+            </button>
+          </div>
+
+          {showPresetSave && (
+            <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', marginBottom: 14, padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 6 }}>
+              <div className="form-group" style={{ flex: '1 1 160px', marginBottom: 0 }}>
+                <label style={{ fontSize: 11 }}>Preset Name *</label>
+                <input
+                  type="text"
+                  value={presetName}
+                  onChange={e => setPresetName(e.target.value)}
+                  placeholder="e.g. Conservative RANGING"
+                  maxLength={60}
+                  style={{ fontSize: 12 }}
+                />
+              </div>
+              <div className="form-group" style={{ flex: '2 1 240px', marginBottom: 0 }}>
+                <label style={{ fontSize: 11 }}>Description (optional)</label>
+                <input
+                  type="text"
+                  value={presetDescription}
+                  onChange={e => setPresetDescription(e.target.value)}
+                  placeholder="e.g. High score threshold, no RANGING trades"
+                  maxLength={160}
+                  style={{ fontSize: 12 }}
+                />
+              </div>
+              <button type="button" className="btn-primary btn-xs" style={{ flexShrink: 0, marginBottom: 1 }}
+                onClick={savePreset} disabled={!presetName.trim()}>
+                Save
+              </button>
+            </div>
+          )}
+
+          {presets.length === 0 && !showPresetSave && (
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>
+              No presets saved yet. Click <b>+ Save Current</b> to save your active configuration as a preset.
+            </p>
+          )}
+
+          {presets.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+              {presets.map(preset => (
+                <div key={preset.id} style={{
+                  display: 'flex', alignItems: 'flex-start', gap: 8,
+                  padding: '8px 10px',
+                  background: selectedPresetId === preset.id ? 'rgba(99,102,241,0.12)' : 'var(--bg-secondary)',
+                  borderRadius: 6,
+                  border: selectedPresetId === preset.id ? '1px solid #6366f1' : '1px solid var(--border)',
+                  maxWidth: 320, minWidth: 180,
+                }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 700, fontSize: 12, color: selectedPresetId === preset.id ? '#818cf8' : 'var(--text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {selectedPresetId === preset.id && <span style={{ marginRight: 4 }}>●</span>}{preset.name}
+                    </div>
+                    {preset.description && (
+                      <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 2, overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+                        {preset.description}
+                      </div>
+                    )}
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
+                      {new Date(preset.createdAt).toLocaleDateString()}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flexShrink: 0 }}>
+                    <button type="button" className="btn-primary btn-xs"
+                      onClick={() => applyPreset(preset)} disabled={isRunning}
+                      title="Apply this preset to current config">
+                      Apply
+                    </button>
+                    <button type="button" className="btn-secondary btn-xs"
+                      onClick={() => deletePreset(preset.id)}
+                      title="Delete preset"
+                      style={{ fontSize: 10 }}>
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
         {/* ── Replay Settings ── */}
         <div className="card bt-opts-card">
           <span className="bt-section-title">Replay Settings</span>
@@ -8590,14 +10298,22 @@ function OptionsReplayTest() {
           </p>
           <div className="bt-form-grid" style={{ marginTop: 8 }}>
             {[
-              ['minScore',          'Min Score',          'Minimum winning strategy score to select a winner (0–100)'],
-              ['minScoreGap',       'Min Score Gap',      'Gap between top-2 strategies required'],
-              ['penaltyMinScore',   'Penalty Min Score',  'Floor after penalties applied. Trade allowed if penalized score ≥ this (move=-5, vwap=-5, chop=-8, drift=-10)'],
-              ['maxRecentMove3',    'Max 3-bar Move %',   'Penalty -5 if NIFTY moved > X% in last 3 bars'],
-              ['maxRecentMove5',    'Max 5-bar Move %',   'Penalty -5 if NIFTY moved > X% in last 5 bars'],
-              ['maxAbsVwapDist',    'Max VWAP Dist %',    'Penalty -5 if NIFTY is > X% away from intraday VWAP'],
-              ['minBarsSinceTrade', 'Min Bars Since Trade','Cooldown after last trade (bars)'],
-              ['chopLookback',      'Chop Lookback',      'Bars used for chop detection (penalty -8 if choppy)'],
+              ['minScore',                'Min Score',               'Minimum winning strategy score to select a winner (0–100)'],
+              ['minScoreGap',             'Min Score Gap',           'Gap between top-2 strategies required'],
+              ['penaltyMinScore',         'Penalty Min Score',       'Floor after penalties. Trade allowed if max(raw,penalized) ≥ this. Penalties: move=-3, vwap=-5, chop=-2(off in RANGING), drift=-3, too_wide=-2. Cap=40% of raw.'],
+              ['maxRecentMove3',          'Max 3-bar Move %',        'Penalty -5 if NIFTY moved > X% in last 3 bars'],
+              ['maxRecentMove5',          'Max 5-bar Move %',        'Penalty -5 if NIFTY moved > X% in last 5 bars'],
+              ['maxAbsVwapDist',          'Max VWAP Dist %',         'Penalty -5 if NIFTY is > X% away from intraday VWAP'],
+              ['minBarsSinceTrade',       'Min Bars Since Trade',    'Cooldown after last trade (bars)'],
+              ['chopLookback',            'Chop Lookback',           'Bars used for chop detection (penalty -4 if choppy)'],
+              ['scoreFloorTrigger',       'Score Floor Trigger',     'If raw score ≥ this, penalties cannot reduce below Score Floor Min'],
+              ['scoreFloorMin',           'Score Floor Min',         'Minimum penalized score when floor trigger is met. 0 = disabled'],
+              ['bollingerBonusThreshold',    'BOLLINGER Bonus Trigger',    'BOLLINGER_REVERSION: add bonus if raw score ≥ this'],
+              ['bollingerBonus',             'BOLLINGER Bonus Pts',         'Points added to penalized score for BOLLINGER bonus. 0 = disabled'],
+              ['earlyEntryRisingBars',       'Early Entry Rising Bars',     'Allow entry if score has risen for N consecutive candles, even below penaltyMinScore. 0 = disabled'],
+              ['rawScoreBypassThreshold',    'Raw Score Bypass Threshold',  'Allow entry if raw score ≥ this AND gap ≥ Raw Score Bypass Gap, ignoring penalized score. 0 = disabled'],
+              ['rawScoreBypassGap',          'Raw Score Bypass Gap',        'Min score gap required for raw score bypass'],
+              ['bollingerEarlyEntryMinScore','BOLLINGER Early Entry Score',  'BOLLINGER_REVERSION: if score ≥ this, override confirmRequired to 1 (1-candle early reversal). 0 = disabled'],
             ].map(([key, lbl, hint]) => (
               <div key={key} className="form-group" title={hint}>
                 <label>{lbl}</label>
@@ -8987,6 +10703,8 @@ function OptionsReplayTest() {
                   ['Strong Score ≥',         'strongScoreThreshold',  '1', null],
                   ['Normal Score ≥',         'normalScoreThreshold',  '1', null],
                   ['Weak Loss Cooldown',      'weakTradeLossCooldown', '1', null],
+                  ['RANGING Weak Min Score',  'weakRangingMinScore',   '0.5', null],
+                  ['RANGING Weak Min Gap',    'weakRangingMinGap',     '0.5', null],
                   ['RANGING Confirm Candles', 'rangingConfirmCandles', '1', null],
                   ['TRENDING Confirm Candles','trendingConfirmCandles','1', null],
                 ].map(([label, key, step]) => (
@@ -9136,13 +10854,13 @@ function OptionsReplayTest() {
           </div>
           <p className="bt-section-sub" style={{ marginBottom: exitConfig.enabled ? 12 : 0 }}>
             {exitConfig.enabled
-              ? `P1 SL=${exitConfig.hardStopPct}% · P2 lock1=${exitConfig.lock1TriggerPct}%→${exitConfig.lock1FloorPct}% lock2=${exitConfig.lock2TriggerPct}%→${exitConfig.lock2FloorPct}% trail=${exitConfig.trailTriggerPct}%@${exitConfig.trailFactor} · P4 struct=${exitConfig.structureLookback} · P5 drop=${exitConfig.scoreDropFactor} abs=${exitConfig.scoreAbsoluteMin}`
-              : 'Priority-ordered exit: Hard SL → Profit Lock → First-Move → Structure → Score/Bias → Time → No-Hope.'}
+              ? `SL=${exitConfig.hardStopPct}% · HoldZone<${exitConfig.holdZonePct}% · Lock1=${exitConfig.lock1TriggerPct}%→${exitConfig.lock1FloorPct}% · Lock2=${exitConfig.lock2TriggerPct}%→${exitConfig.lock2FloorPct}% · Trail≥${exitConfig.trailTriggerPct}%@${exitConfig.trailFactor} · StrongTrend≥${exitConfig.trendStrongModeThresholdPct}% · DeadTrade>${exitConfig.maxBarsDeadTrade}bars<${exitConfig.deadTradePnlPct}%`
+              : 'Hold Zone → only SL until +5% profit; Strong Trend Mode holds through pullbacks; Dead Trade kill after 10 bars.'}
           </p>
           {exitConfig.enabled && (
             <>
               {/* P1 Hard Stop */}
-              <div style={{ fontSize: 11, fontWeight: 700, color: '#ef4444', marginBottom: 6, marginTop: 4 }}>P1 — Hard Stop Loss</div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#ef4444', marginBottom: 6, marginTop: 4 }}>P1 — Hard Stop Loss (always fires)</div>
               <div className="bt-form-grid" style={{ marginBottom: 12 }}>
                 <div className="form-group">
                   <label>Hard Stop %</label>
@@ -9152,32 +10870,27 @@ function OptionsReplayTest() {
                 </div>
               </div>
 
-              {/* P2 Profit Lock */}
-              <div style={{ fontSize: 11, fontWeight: 700, color: '#22c55e', marginBottom: 6 }}>P2 — Profit Lock / Trailing</div>
+              {/* Hold Zone */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#f59e0b', marginBottom: 6 }}>Hold Zone — no exit below this profit (except SL + dead trade)</div>
               <div className="bt-form-grid" style={{ marginBottom: 12 }}>
-                {[
-                  { key: 'lock1TriggerPct',  label: 'Lock1 Trigger %', step: '0.5' },
-                  { key: 'lock1FloorPct',    label: 'Lock1 Floor %',   step: '0.5' },
-                  { key: 'lock2TriggerPct',  label: 'Lock2 Trigger %', step: '0.5' },
-                  { key: 'lock2FloorPct',    label: 'Lock2 Floor %',   step: '0.5' },
-                  { key: 'trailTriggerPct',  label: 'Trail Trigger %', step: '0.5' },
-                  { key: 'trailFactor',      label: 'Trail Factor',    step: '0.05' },
-                ].map(({ key, label, step }) => (
-                  <div key={key} className="form-group">
-                    <label>{label}</label>
-                    <input type="number" min="0" step={step}
-                      value={exitConfig[key]} disabled={isRunning}
-                      onChange={e => updateExitConfig(key, e.target.value)} />
-                  </div>
-                ))}
+                <div className="form-group">
+                  <label>Hold Zone % (profit threshold)</label>
+                  <input type="number" min="0" step="0.5"
+                    value={exitConfig.holdZonePct} disabled={isRunning}
+                    onChange={e => updateExitConfig('holdZonePct', e.target.value)} />
+                </div>
               </div>
 
-              {/* P3 First-Move */}
-              <div style={{ fontSize: 11, fontWeight: 700, color: '#0ea5e9', marginBottom: 6 }}>P3 — First-Move Protection</div>
+              {/* P2 Profit Lock */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#22c55e', marginBottom: 6 }}>P2 — Profit Lock / Trailing (only arms after hold zone cleared)</div>
               <div className="bt-form-grid" style={{ marginBottom: 12 }}>
                 {[
-                  { key: 'firstMoveBars',    label: 'First Move Bars',    step: '1'   },
-                  { key: 'firstMoveLockPct', label: 'First Move Lock %',  step: '0.1' },
+                  { key: 'lock1TriggerPct', label: 'Lock1 Trigger %',  step: '0.5' },
+                  { key: 'lock1FloorPct',   label: 'Lock1 Floor %',    step: '0.5' },
+                  { key: 'lock2TriggerPct', label: 'Lock2 Trigger %',  step: '0.5' },
+                  { key: 'lock2FloorPct',   label: 'Lock2 Floor %',    step: '0.5' },
+                  { key: 'trailTriggerPct', label: 'Trail Trigger %',  step: '0.5' },
+                  { key: 'trailFactor',     label: 'Trail Factor',     step: '0.05' },
                 ].map(({ key, label, step }) => (
                   <div key={key} className="form-group">
                     <label>{label}</label>
@@ -9189,7 +10902,7 @@ function OptionsReplayTest() {
               </div>
 
               {/* P4 Structure */}
-              <div style={{ fontSize: 11, fontWeight: 700, color: '#f59e0b', marginBottom: 6 }}>P4 — Structure Failure (NIFTY high/low)</div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#0ea5e9', marginBottom: 6 }}>P4 — Structure Failure (NIFTY high/low, skipped in RANGING)</div>
               <div className="bt-form-grid" style={{ marginBottom: 12 }}>
                 <div className="form-group">
                   <label>Structure Lookback</label>
@@ -9199,13 +10912,16 @@ function OptionsReplayTest() {
                 </div>
               </div>
 
-              {/* P5 Score / Bias */}
-              <div style={{ fontSize: 11, fontWeight: 700, color: '#8b5cf6', marginBottom: 6 }}>P5 — Score Floor / Bias Reversal</div>
+              {/* P5 Bias Reversal (score exits removed) */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#8b5cf6', marginBottom: 4 }}>P5c — Bias Reversal</div>
+              <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 8 }}>
+                Score-based exits (P5a/P5b) are permanently disabled — score must not trigger exit.
+                RANGING: exit on any confirmed bias flip. TRENDING: requires score ≥ Strong Exit Score.
+              </div>
               <div className="bt-form-grid" style={{ marginBottom: 8 }}>
                 {[
-                  { key: 'scoreDropFactor',  label: 'Score Drop Factor (0=off)', step: '0.05' },
-                  { key: 'scoreAbsoluteMin', label: 'Score Abs Min',             step: '1'    },
-                  { key: 'strongExitScore',  label: 'Strong Exit Score (TRENDING)', step: '1' },
+                  { key: 'strongExitScore',            label: 'Strong Exit Score (TRENDING + Strong Trend Mode)', step: '1' },
+                  { key: 'trendStrongModeThresholdPct',label: 'Strong Trend Mode Threshold % (peak > this)',      step: '1' },
                 ].map(({ key, label, step }) => (
                   <div key={key} className="form-group">
                     <label>{label}</label>
@@ -9218,16 +10934,18 @@ function OptionsReplayTest() {
               <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginBottom: 12, cursor: isRunning ? 'default' : 'pointer' }}>
                 <input type="checkbox" checked={exitConfig.biasExitEnabled} disabled={isRunning}
                   onChange={e => updateExitConfig('biasExitEnabled', e.target.checked)} />
-                Bias reversal exit (P5c) — in TRENDING requires score ≥ Strong Exit Score
+                Bias reversal exit — RANGING: any confirmed flip · TRENDING: score ≥ strong exit score
               </label>
 
-              {/* P6 Time */}
-              <div style={{ fontSize: 11, fontWeight: 700, color: '#06b6d4', marginBottom: 6 }}>P6 — Time / Stagnation (non-TRENDING) · RANGING Time Limit</div>
+              {/* P6 Time + Dead Trade */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#06b6d4', marginBottom: 6 }}>P6 — Time Exits · Dead Trade Kill (safety)</div>
               <div className="bt-form-grid" style={{ marginBottom: 12 }}>
                 {[
-                  { key: 'maxBarsNoImprovement', label: 'Max Bars No Improvement', step: '1' },
-                  { key: 'stagnationBars',       label: 'Stagnation Bars',         step: '1' },
-                  { key: 'maxBarsRanging',       label: 'Max Bars (RANGING)',       step: '1' },
+                  { key: 'maxBarsNoImprovement', label: 'Max Bars No Improvement (non-TRENDING)', step: '1' },
+                  { key: 'stagnationBars',       label: 'Stagnation Bars (non-TRENDING)',        step: '1' },
+                  { key: 'maxBarsRanging',       label: 'Max Bars RANGING',                      step: '1' },
+                  { key: 'maxBarsDeadTrade',     label: 'Dead Trade Max Bars',                   step: '1' },
+                  { key: 'deadTradePnlPct',      label: 'Dead Trade PnL % (below = exit)',       step: '0.5' },
                 ].map(({ key, label, step }) => (
                   <div key={key} className="form-group">
                     <label>{label}</label>
@@ -9239,7 +10957,7 @@ function OptionsReplayTest() {
               </div>
 
               {/* P7 No-Hope */}
-              <div style={{ fontSize: 11, fontWeight: 700, color: '#ec4899', marginBottom: 6 }}>P7 — No-Hope (sustained loss)</div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#ec4899', marginBottom: 6 }}>P7 — No-Hope (sustained loss, non-TRENDING)</div>
               <div className="bt-form-grid">
                 {[
                   { key: 'noHopeThresholdPct', label: 'No-Hope Threshold %', step: '0.5' },
