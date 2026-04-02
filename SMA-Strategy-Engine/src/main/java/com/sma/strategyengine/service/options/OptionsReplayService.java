@@ -162,8 +162,12 @@ public class OptionsReplayService {
                 .orElse(new OptionsReplayRequest.TrendEntryConfig());
         OptionsReplayRequest.CompressionEntryConfig cec = Optional.ofNullable(req.getCompressionEntryConfig())
                 .orElse(new OptionsReplayRequest.CompressionEntryConfig());
-        NiftyDecisionEngine  decisionEngine  = new NiftyDecisionEngine(strategyRegistry, req.getStrategies(), dc, sc, rr, rsr, cr, rqc, tqc, tec, cec);
-        OptionSelectorService selectorService = new OptionSelectorService(sel, optionCandleMap);
+        OptionsReplayRequest.PenaltyConfig pc = Optional.ofNullable(req.getPenaltyConfig())
+                .orElse(new OptionsReplayRequest.PenaltyConfig());
+        log.info("PenaltyConfig: enabled={} (raw req.getPenaltyConfig()={})",
+                pc.isEnabled(), req.getPenaltyConfig() != null ? req.getPenaltyConfig().isEnabled() : "null");
+        NiftyDecisionEngine  decisionEngine  = new NiftyDecisionEngine(strategyRegistry, req.getStrategies(), dc, sc, rr, rsr, cr, rqc, tqc, tec, cec, pc);
+        OptionSelectorService selectorService = OptionSelectorService.forReplay(sel, optionCandleMap);
         OptionExecutionEngine execEngine      = new OptionExecutionEngine(req);
 
         // Emit init event

@@ -119,6 +119,51 @@ public class DataEngineClient {
         }
     }
 
+    /**
+     * Subscribes a list of instrument tokens to the Data Engine live tick stream.
+     * Must be called before the tick SSE stream is consumed.
+     *
+     * @param userId        logical user id
+     * @param brokerName    broker name (e.g. "kite")
+     * @param apiKey        broker API key
+     * @param accessToken   live access token
+     * @param tokens        list of (instrumentToken, symbol, exchange) to subscribe
+     * @throws DataEngineException on HTTP error or network failure
+     */
+    public void subscribe(String userId, String brokerName, String apiKey, String accessToken,
+                          List<Map<String, Object>> tokens) {
+        try {
+            Map<String, Object> body = new java.util.LinkedHashMap<>();
+            body.put("userId",       userId);
+            body.put("brokerName",   brokerName);
+            body.put("apiKey",       apiKey);
+            body.put("accessToken",  accessToken);
+            body.put("instruments",  tokens);
+            body.put("mode",         "LTP");
+
+            String json = mapper.writeValueAsString(body);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl + "/api/v1/data/live/subscribe"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(json))
+                    .timeout(Duration.ofSeconds(15))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                throw new DataEngineException("Subscribe returned HTTP " + response.statusCode() + ": " + response.body());
+            }
+            log.info("DataEngineClient.subscribe: {} token(s) subscribed", tokens.size());
+
+        } catch (DataEngineException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new DataEngineException("Failed to subscribe to Data Engine: " + e.getMessage(), e);
+        }
+    }
+
     // ─── Exception ────────────────────────────────────────────────────────────
 
     public static class DataEngineException extends RuntimeException {

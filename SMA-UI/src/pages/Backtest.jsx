@@ -1071,13 +1071,15 @@ function OptionsLiveTest() {
   const [tradeQuality,        setTradeQuality]        = useState(() => ls('sma_live_opts_trade_quality',      DEFAULT_TRADE_QUALITY));
   const [trendEntry,          setTrendEntry]          = useState(() => ls('sma_live_opts_trend_entry',        DEFAULT_TREND_ENTRY));
   const [compressionEntry,    setCompressionEntry]    = useState(() => ls('sma_live_opts_compression_entry',  DEFAULT_COMPRESSION_ENTRY));
-  const [holdConfig,          setHoldConfig]          = useState(() => ({ ...DEFAULT_HOLD,        ...ls('sma_live_opts_hold_config',  {}) }));
-  const [exitConfig,          setExitConfig]          = useState(() => ({ ...DEFAULT_EXIT_CONFIG, ...ls('sma_live_opts_exit_config',  {}) }));
+  const [holdConfig,          setHoldConfig]          = useState(() => ({ ...DEFAULT_HOLD,           ...ls('sma_live_opts_hold_config',    {}) }));
+  const [exitConfig,          setExitConfig]          = useState(() => ({ ...DEFAULT_EXIT_CONFIG,    ...ls('sma_live_opts_exit_config',    {}) }));
+  const [penaltyConfig,       setPenaltyConfig]       = useState(() => ({ ...DEFAULT_PENALTY_CONFIG, ...ls('sma_live_opts_penalty_config',  {}) }));
 
   function updateOptsRisk(key, val)         { setOptsRisk(p => ({ ...p, [key]: val })); }
   function updateRangeQuality(key, val)     { setRangeQuality(p => ({ ...p, [key]: val })); }
   function updateHoldConfig(key, val)       { setHoldConfig(p => ({ ...p, [key]: val })); }
   function updateExitConfig(key, val)       { setExitConfig(p => ({ ...p, [key]: val })); }
+  function updatePenaltyConfig(key, val)    { setPenaltyConfig(p => ({ ...p, [key]: val })); }
   function updateTradeQuality(key, val)     { setTradeQuality(p => ({ ...p, [key]: val })); }
   function updateTrendEntry(key, val)       { setTrendEntry(p => ({ ...p, [key]: val })); }
   function updateCompressionEntry(key, val) { setCompressionEntry(p => ({ ...p, [key]: val })); }
@@ -1097,7 +1099,7 @@ function OptionsLiveTest() {
       decisionCfg, selectionCfg, switchCfg,
       optsRegimeCfg, chopRules, tradingRules, regimeRules, regimeStrategyRules,
       optsRisk, rangeQuality, tradeQuality, trendEntry, compressionEntry,
-      holdConfig, exitConfig,
+      holdConfig, exitConfig, penaltyConfig,
     };
   }
 
@@ -1147,6 +1149,7 @@ function OptionsLiveTest() {
     if (c.compressionEntry     !== undefined) setCompressionEntry(c.compressionEntry);
     if (c.holdConfig           !== undefined) setHoldConfig(c.holdConfig);
     if (c.exitConfig           !== undefined) setExitConfig(c.exitConfig);
+    if (c.penaltyConfig        !== undefined) setPenaltyConfig(c.penaltyConfig);
   }
 
   function deletePreset(id) {
@@ -1179,6 +1182,7 @@ function OptionsLiveTest() {
   useEffect(() => { try { localStorage.setItem('sma_live_opts_compression_entry',  JSON.stringify(compressionEntry));    } catch {} }, [compressionEntry]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_hold_config',        JSON.stringify(holdConfig));          } catch {} }, [holdConfig]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_exit_config',        JSON.stringify(exitConfig));          } catch {} }, [exitConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_penalty_config',     JSON.stringify(penaltyConfig));       } catch {} }, [penaltyConfig]);
 
   // ── Session / run state
   const [status,    setStatus]    = useState('idle'); // idle|running|error
@@ -1187,9 +1191,11 @@ function OptionsLiveTest() {
   const [initInfo,  setInitInfo]  = useState(null);
   const [error,     setError]     = useState('');
   const [rightTab,  setRightTab]  = useState('feed');
-  const abortRef     = useRef(null);
-  const readerRef    = useRef(null);
-  const sessionIdRef = useRef(null);
+  const [liveTicks, setLiveTicks] = useState({});   // token -> {ltp, isNifty, fOpen, fHigh, fLow, fClose, timeMs}
+  const abortRef      = useRef(null);
+  const readerRef     = useRef(null);
+  const sessionIdRef  = useRef(null);
+  const lastRunPcRef  = useRef(null);
 
   useEffect(() => () => {
     abortRef.current?.abort();
@@ -1221,7 +1227,8 @@ function OptionsLiveTest() {
     e.preventDefault();
     if (status === 'running') { handleStop(); return; }
 
-    setFeed([]); setInitInfo(null); setError(''); setStatus('running');
+    lastRunPcRef.current = { ...penaltyConfig };
+    setFeed([]); setInitInfo(null); setError(''); setStatus('running'); setLiveTicks({});
 
     const enabledStrats = strategies
       .filter(s => s.enabled)
@@ -1396,6 +1403,33 @@ function OptionsLiveTest() {
         noHopeThresholdPct:          parseFloat(exitConfig.noHopeThresholdPct)          || 1.5,
         noHopeBars:                  parseInt(exitConfig.noHopeBars, 10)               || 2,
       },
+      penaltyConfig: {
+        enabled:                   penaltyConfig.enabled,
+        reversalEnabled:           penaltyConfig.reversalEnabled,
+        reversalMax:               parseFloat(penaltyConfig.reversalMax)               || 25,
+        overextensionEnabled:      penaltyConfig.overextensionEnabled,
+        overextensionMax:          parseFloat(penaltyConfig.overextensionMax)          || 30,
+        sameColorEnabled:          penaltyConfig.sameColorEnabled,
+        sameColorMax:              parseFloat(penaltyConfig.sameColorMax)              || 30,
+        mismatchEnabled:           penaltyConfig.mismatchEnabled,
+        mismatchScale:             parseFloat(penaltyConfig.mismatchScale)             || 1.0,
+        volatileOptionEnabled:     penaltyConfig.volatileOptionEnabled,
+        volatileOptionPenalty:     parseFloat(penaltyConfig.volatileOptionPenalty)     || 35,
+        movePenaltyEnabled:        penaltyConfig.movePenaltyEnabled,
+        movePenalty:               parseFloat(penaltyConfig.movePenalty)               || 3,
+        vwapPenaltyEnabled:        penaltyConfig.vwapPenaltyEnabled,
+        vwapPenalty:               parseFloat(penaltyConfig.vwapPenalty)               || 5,
+        chopPenaltyEnabled:        penaltyConfig.chopPenaltyEnabled,
+        chopPenalty:               parseFloat(penaltyConfig.chopPenalty)               || 2,
+        rangeDriftingEnabled:      penaltyConfig.rangeDriftingEnabled,
+        rangeDriftingPenalty:      parseFloat(penaltyConfig.rangeDriftingPenalty)      || 3,
+        rangePoorStructureEnabled: penaltyConfig.rangePoorStructureEnabled,
+        rangePoorStructurePenalty: parseFloat(penaltyConfig.rangePoorStructurePenalty) || 4,
+        rangeChoppyEnabled:        penaltyConfig.rangeChoppyEnabled,
+        rangeChoppyPenalty:        parseFloat(penaltyConfig.rangeChoppyPenalty)        || 2,
+        rangeSizeEnabled:          penaltyConfig.rangeSizeEnabled,
+        rangeSizePenalty:          parseFloat(penaltyConfig.rangeSizePenalty)          || 2,
+      },
     };
 
     try {
@@ -1437,6 +1471,7 @@ function OptionsLiveTest() {
             const parsed = JSON.parse(data);
             if (evtName === 'init')   setInitInfo(parsed);
             else if (evtName === 'candle') setFeed(prev => [...prev.slice(-499), parsed]);
+            else if (evtName === 'tick')   setLiveTicks(prev => ({ ...prev, [parsed.token]: parsed }));
           } catch {}
         }
       }
@@ -1449,6 +1484,133 @@ function OptionsLiveTest() {
       sessionIdRef.current = null;
       setSessionId(null);
     }
+  }
+
+  function downloadCSV() {
+    const q   = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const row = (...cols) => cols.map(q).join(',');
+    const blank = '';
+    const lines = [];
+
+    lines.push(row('=== Run Config ==='));
+    lines.push(row('NIFTY Symbol', 'Exchange', 'Token', 'Interval', 'Warmup Days', 'Quantity', 'Capital'));
+    lines.push(row(nifty.symbol || '—', nifty.exchange || '—', nifty.instrumentToken || '—', interval, warmupDays, quantity, capital));
+    lines.push(blank);
+
+    lines.push(row('=== CE Options Pool ==='));
+    lines.push(row('Token', 'Symbol', 'Exchange'));
+    cePool.filter(i => i.instrumentToken).forEach(i => lines.push(row(i.instrumentToken, i.symbol, i.exchange)));
+    lines.push(blank);
+
+    lines.push(row('=== PE Options Pool ==='));
+    lines.push(row('Token', 'Symbol', 'Exchange'));
+    pePool.filter(i => i.instrumentToken).forEach(i => lines.push(row(i.instrumentToken, i.symbol, i.exchange)));
+    lines.push(blank);
+
+    lines.push(row('=== Strategies ==='));
+    lines.push(row('Strategy Type', 'Enabled', 'Parameters'));
+    strategies.forEach(s => lines.push(row(s.strategyType, s.enabled ? 'Yes' : 'No', JSON.stringify(s.parameters || {}))));
+    lines.push(blank);
+
+    lines.push(row('=== Decision Config ==='));
+    lines.push(row('Min Score', 'Penalty Min Score', 'Min Score Gap', 'Max Recent Move 3%', 'Max Recent Move 5%', 'Max VWAP Dist%', 'Min Bars Since Trade', 'Chop Filter', 'Chop Lookback'));
+    lines.push(row(decisionCfg.minScore, decisionCfg.penaltyMinScore, decisionCfg.minScoreGap, decisionCfg.maxRecentMove3, decisionCfg.maxRecentMove5, decisionCfg.maxAbsVwapDist, decisionCfg.minBarsSinceTrade, decisionCfg.chopFilter ? 'Yes' : 'No', decisionCfg.chopLookback));
+    lines.push(blank);
+
+    const csvPc = lastRunPcRef.current || penaltyConfig;
+    lines.push(row('=== Penalty Config (as used in last run) ==='));
+    lines.push(row('Master', csvPc.enabled ? 'ON' : 'OFF'));
+    if (csvPc.enabled) {
+      lines.push(row('Signal Penalty', 'Enabled', 'Value'));
+      lines.push(row('Reversal',        csvPc.reversalEnabled        ? 'ON' : 'OFF', `Max=${csvPc.reversalMax}`));
+      lines.push(row('Overextension',   csvPc.overextensionEnabled   ? 'ON' : 'OFF', `Max=${csvPc.overextensionMax}`));
+      lines.push(row('Same Color',      csvPc.sameColorEnabled       ? 'ON' : 'OFF', `Max=${csvPc.sameColorMax}`));
+      lines.push(row('Mismatch',        csvPc.mismatchEnabled        ? 'ON' : 'OFF', `Scale=${csvPc.mismatchScale}`));
+      lines.push(row('Volatile Option', csvPc.volatileOptionEnabled  ? 'ON' : 'OFF', `Penalty=${csvPc.volatileOptionPenalty}`));
+      lines.push(row('Entry Penalty', 'Enabled', 'Value'));
+      lines.push(row('Move',           csvPc.movePenaltyEnabled         ? 'ON' : 'OFF', csvPc.movePenalty));
+      lines.push(row('VWAP',           csvPc.vwapPenaltyEnabled         ? 'ON' : 'OFF', csvPc.vwapPenalty));
+      lines.push(row('Chop',           csvPc.chopPenaltyEnabled         ? 'ON' : 'OFF', csvPc.chopPenalty));
+      lines.push(row('Range Drifting', csvPc.rangeDriftingEnabled       ? 'ON' : 'OFF', csvPc.rangeDriftingPenalty));
+      lines.push(row('Range Poor Str', csvPc.rangePoorStructureEnabled  ? 'ON' : 'OFF', csvPc.rangePoorStructurePenalty));
+      lines.push(row('Range Choppy',   csvPc.rangeChoppyEnabled         ? 'ON' : 'OFF', csvPc.rangeChoppyPenalty));
+      lines.push(row('Range Size',     csvPc.rangeSizeEnabled           ? 'ON' : 'OFF', csvPc.rangeSizePenalty));
+    }
+    lines.push(blank);
+
+    const closedTradesForCsv = feed[feed.length - 1]?.closedTrades || [];
+    if (closedTradesForCsv.length > 0) {
+      lines.push(row('=== Closed Trades ==='));
+      lines.push(row('Entry Time', 'Exit Time', 'Type', 'Symbol', 'Strike', 'Expiry', 'Entry Px', 'Exit Px', 'Qty', 'P&L', 'P&L %', 'Bars', 'Exit Reason', 'Capital After'));
+      closedTradesForCsv.forEach(t => lines.push(row(
+        (t.entryTime || '').slice(0, 16), (t.exitTime || '').slice(0, 16),
+        t.optionType, t.tradingSymbol, t.strike, t.expiry,
+        t.entryPrice != null ? Number(t.entryPrice).toFixed(2) : '',
+        t.exitPrice  != null ? Number(t.exitPrice).toFixed(2)  : '',
+        t.quantity,
+        t.pnl    != null ? Number(t.pnl).toFixed(2)    : '',
+        t.pnlPct != null ? Number(t.pnlPct).toFixed(2) : '',
+        t.barsInTrade, t.exitReason,
+        t.capitalAfter != null ? Number(t.capitalAfter).toFixed(2) : '',
+      )));
+      lines.push(blank);
+    }
+
+    if (feed.length > 0) {
+      const n2 = v => v != null ? Number(v).toFixed(2) : '';
+      lines.push(row('=== Per-Candle Feed ==='));
+      lines.push(row('Time', 'NIFTY Close', 'Regime', 'Raw Bias', 'Conf Bias', 'Winner', 'Score', 'Gap', '2nd', '2nd Score', 'Neutral Reason', 'State', 'Action', 'Exit Reason', 'Hold Active', 'uPnL', 'rPnL', 'Capital', 'Option', 'Opt Close', 'Block', 'Exec Wait'));
+      feed.forEach(e => lines.push(row(
+        (e.niftyTime || '').slice(0, 19),
+        n2(e.niftyClose), e.regime || '', e.niftyBias || '', e.confirmedBias || '',
+        e.winnerStrategy || '', n2(e.winnerScore), n2(e.scoreGap),
+        e.secondStrategy || '', n2(e.secondScore),
+        e.neutralReason || '', e.positionState || '', e.action || '', e.exitReason || '',
+        e.holdActive ? 'Yes' : 'No',
+        n2(e.unrealizedPnl), n2(e.realizedPnl), n2(e.capital),
+        e.selectedTradingSymbol || '', n2(e.optionClose),
+        e.blockReason || '', e.execWaitReason || '',
+      )));
+      lines.push(blank);
+    }
+
+    const csv  = lines.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url;
+    a.download = `options_live_${nifty.symbol || 'data'}_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const [copied, setCopied] = useState(false);
+  function copyFeed() {
+    if (!feed.length) return;
+    const n2 = v => v != null ? Number(v).toFixed(2) : '';
+    const tab = (...cols) => cols.map(v => String(v ?? '')).join('\t');
+    const lines = [];
+    lines.push(tab('Time','NIFTY Close','Regime','Raw Bias','Conf Bias','Winner','Score','PenScore','Strength','2nd','2nd Score','Gap','Shadow','ShadowScore','NeutralReason','CnfCount','CnfReq','State','Bars','Hold','Action','ExitRsn','PeakPnL%','LockFloor%','Zone','TrendMode','Option','OptClose','uPnL','rPnL','Capital','Block','ExecWait'));
+    feed.forEach(e => lines.push(tab(
+      (e.niftyTime || '').slice(0, 19),
+      n2(e.niftyClose), e.regime || '', e.niftyBias || '', e.confirmedBias || '',
+      e.winnerStrategy || '', n2(e.winnerScore), n2(e.penalizedScore),
+      e.tradeStrength || '', e.secondStrategy || '', n2(e.secondScore), n2(e.scoreGap),
+      e.shadowWinner || '', n2(e.shadowWinnerScore), e.neutralReason || '',
+      e.confirmCount ?? '', e.confirmRequired ?? '',
+      e.positionState || '', e.barsInTrade ?? '', e.holdActive ? 'Yes' : 'No',
+      e.action || '', e.exitReason || '',
+      e.positionState !== 'FLAT' && e.peakPnlPct != null ? n2(e.peakPnlPct) : '',
+      e.positionState !== 'FLAT' && e.profitLockFloor != null ? n2(e.profitLockFloor) : '',
+      e.inHoldZone ? 'ZONE' : '', e.inStrongTrendMode ? 'TREND' : '',
+      e.selectedTradingSymbol || '', n2(e.optionClose),
+      n2(e.unrealizedPnl), n2(e.realizedPnl), n2(e.capital),
+      e.blockReason || '', e.execWaitReason || '',
+    )));
+    navigator.clipboard.writeText(lines.join('\n')).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
   }
 
   if (!isActive) return (
@@ -1472,9 +1634,15 @@ function OptionsLiveTest() {
             <button key={k} className={`bt-live-tab-btn ${rightTab === k ? 'active' : ''}`} onClick={() => setRightTab(k)}>{l}</button>
           ))}
           {feed.length > 0 && (
-            <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-secondary)' }}>
-              {feed.length} candles · {closedTrades.length} trades
-            </span>
+            <>
+              <button type="button" className="btn-secondary btn-xs" style={{ marginLeft: 'auto' }} onClick={copyFeed}>
+                {copied ? 'Copied!' : 'Copy Feed'}
+              </button>
+              <button type="button" className="btn-secondary btn-xs" onClick={downloadCSV}>Download CSV</button>
+              <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                {feed.length} candles · {closedTrades.length} trades
+              </span>
+            </>
           )}
         </div>
 
@@ -1551,11 +1719,55 @@ function OptionsLiveTest() {
               <span style={{ marginRight: 14 }}>gap=<b style={{ color: 'var(--text-primary)' }}>{decisionCfg.minScoreGap}</b></span>
               <span style={{ marginRight: 14 }}>prem=<b style={{ color: 'var(--text-primary)' }}>{selectionCfg.minPremium}–{selectionCfg.maxPremium}</b></span>
               <span style={{ marginRight: 14 }}>switchConf=<b style={{ color: 'var(--text-primary)' }}>{switchCfg.switchConfirmationCandles}</b></span>
+              {penaltyConfig.enabled && (
+                <>
+                  <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+                  <span style={{ marginRight: 8, fontWeight: 700, color: '#6366f1' }}>Pen:</span>
+                  {penaltyConfig.reversalEnabled       && <span style={{ marginRight: 8 }}>rev≤<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.reversalMax}</b></span>}
+                  {penaltyConfig.overextensionEnabled  && <span style={{ marginRight: 8 }}>ext≤<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.overextensionMax}</b></span>}
+                  {penaltyConfig.sameColorEnabled      && <span style={{ marginRight: 8 }}>col≤<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.sameColorMax}</b></span>}
+                  {penaltyConfig.mismatchEnabled       && <span style={{ marginRight: 8 }}>mis×<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.mismatchScale}</b></span>}
+                  {penaltyConfig.volatileOptionEnabled && <span style={{ marginRight: 8 }}>vol=<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.volatileOptionPenalty}</b></span>}
+                  {penaltyConfig.movePenaltyEnabled    && <span style={{ marginRight: 8 }}>mv=<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.movePenalty}</b></span>}
+                  {penaltyConfig.vwapPenaltyEnabled    && <span style={{ marginRight: 8 }}>vw=<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.vwapPenalty}</b></span>}
+                  {penaltyConfig.chopPenaltyEnabled    && <span style={{ marginRight: 8 }}>chp=<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.chopPenalty}</b></span>}
+                </>
+              )}
               {sessionId && <span style={{ marginLeft: 8, color: '#22c55e', fontWeight: 700 }}>● LIVE sid={sessionId.slice(0, 8)}</span>}
             </div>
 
+            {/* Live ticker strip — shows latest LTP per token */}
+            {Object.keys(liveTicks).length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10, padding: '8px 12px', background: 'var(--bg-secondary)', borderRadius: 6, border: '1px solid var(--border-color)' }}>
+                {Object.values(liveTicks)
+                  .sort((a, b) => (b.isNifty ? 1 : 0) - (a.isNifty ? 1 : 0))
+                  .map(t => {
+                    const sym = t.isNifty
+                      ? (nifty.symbol || 'NIFTY')
+                      : ([...cePool, ...pePool].find(c => c.instrumentToken && parseInt(c.instrumentToken,10) === t.token)?.symbol || t.token);
+                    const isCe = !t.isNifty && cePool.some(c => c.instrumentToken && parseInt(c.instrumentToken,10) === t.token);
+                    const isPe = !t.isNifty && pePool.some(c => c.instrumentToken && parseInt(c.instrumentToken,10) === t.token);
+                    const color = t.isNifty ? '#e2e8f0' : isCe ? '#22c55e' : isPe ? '#ef4444' : '#94a3b8';
+                    return (
+                      <div key={t.token} style={{ fontSize: 11, minWidth: 120, padding: '4px 8px', background: 'var(--bg-primary)', borderRadius: 4, border: `1px solid ${color}33` }}>
+                        <div style={{ fontWeight: 700, color, marginBottom: 2 }}>{sym}</div>
+                        <div style={{ fontSize: 13, fontWeight: 800, color }}>₹{Number(t.ltp).toFixed(2)}</div>
+                        {t.fOpen != null && (
+                          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
+                            O:{Number(t.fOpen).toFixed(1)} H:{Number(t.fHigh).toFixed(1)} L:{Number(t.fLow).toFixed(1)}
+                          </div>
+                        )}
+                        <div style={{ fontSize: 9, color: 'var(--text-muted)' }}>{new Date(t.timeMs).toLocaleTimeString('en-IN')}</div>
+                      </div>
+                    );
+                  })}
+              </div>
+            )}
+
             {feed.length === 0
-              ? <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 32 }}>Feed will appear once the live session starts.</div>
+              ? <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 32 }}>
+                  {status === 'running' ? 'Receiving ticks — waiting for first candle close…' : 'Feed will appear once the live session starts.'}
+                </div>
               : (
                 <div className="bt-opts-feed-wrap">
                   <table className="bt-opts-feed-table">
@@ -1753,6 +1965,7 @@ function OptionsLiveTest() {
             setOptsRisk(DEFAULT_OPTS_RISK); setRangeQuality(DEFAULT_RANGE_QUALITY);
             setTradeQuality(DEFAULT_TRADE_QUALITY); setTrendEntry(DEFAULT_TREND_ENTRY);
             setCompressionEntry(DEFAULT_COMPRESSION_ENTRY); setHoldConfig(DEFAULT_HOLD); setExitConfig(DEFAULT_EXIT_CONFIG);
+            setPenaltyConfig(DEFAULT_PENALTY_CONFIG);
             setInterval('MINUTE_5'); setWarmupDays('5'); setQuantity('0'); setCapital('100000');
             ['sma_live_opts_nifty','sma_live_opts_ce_pool','sma_live_opts_pe_pool','sma_live_opts_interval',
              'sma_live_opts_warmup','sma_live_opts_qty','sma_live_opts_capital','sma_live_opts_strategies',
@@ -1760,7 +1973,7 @@ function OptionsLiveTest() {
              'sma_live_opts_chop_rules','sma_live_opts_trading_rules','sma_live_opts_regime_rules',
              'sma_live_opts_regime_strat_rules','sma_live_opts_risk','sma_live_opts_range_quality',
              'sma_live_opts_trade_quality','sma_live_opts_trend_entry','sma_live_opts_compression_entry',
-             'sma_live_opts_hold_config','sma_live_opts_exit_config'].forEach(k => localStorage.removeItem(k));
+             'sma_live_opts_hold_config','sma_live_opts_exit_config','sma_live_opts_penalty_config'].forEach(k => localStorage.removeItem(k));
           }} disabled={isRunning}>Reset</button>
           {status === 'error' && <span className="badge badge-danger">Error</span>}
           {feed.length > 0 && (
@@ -2488,6 +2701,69 @@ function OptionsLiveTest() {
                     <label>{label}</label>
                     <input type="number" min="0" step={step} value={exitConfig[key]} disabled={isRunning}
                       onChange={e => updateExitConfig(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* ── Penalty Config ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Penalty Config</span>
+            <button type="button" className={`btn-sm ${penaltyConfig.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updatePenaltyConfig('enabled', !penaltyConfig.enabled)} disabled={isRunning}>
+              {penaltyConfig.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          {penaltyConfig.enabled && (
+            <>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#6366f1', marginTop: 12, marginBottom: 6 }}>Signal Penalties</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {[
+                  { label: 'Reversal',        enabledKey: 'reversalEnabled',        valueKey: 'reversalMax',           valueLabel: 'Max',    step: '1'   },
+                  { label: 'Overextension',   enabledKey: 'overextensionEnabled',   valueKey: 'overextensionMax',      valueLabel: 'Max',    step: '1'   },
+                  { label: 'Same Color',      enabledKey: 'sameColorEnabled',       valueKey: 'sameColorMax',          valueLabel: 'Max',    step: '1'   },
+                  { label: 'Mismatch',        enabledKey: 'mismatchEnabled',        valueKey: 'mismatchScale',         valueLabel: 'Scale',  step: '0.1' },
+                  { label: 'Volatile Option', enabledKey: 'volatileOptionEnabled',  valueKey: 'volatileOptionPenalty', valueLabel: 'Penalty',step: '1'   },
+                ].map(({ label, enabledKey, valueKey, valueLabel, step }) => (
+                  <div key={enabledKey} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '3px 0' }}>
+                    <button type="button" className={`btn-sm ${penaltyConfig[enabledKey] ? 'btn-primary' : 'btn-secondary'}`}
+                      style={{ minWidth: 36 }}
+                      onClick={() => updatePenaltyConfig(enabledKey, !penaltyConfig[enabledKey])} disabled={isRunning}>
+                      {penaltyConfig[enabledKey] ? 'ON' : 'OFF'}
+                    </button>
+                    <span style={{ fontSize: 12, width: 130, color: penaltyConfig[enabledKey] ? 'var(--text-primary)' : 'var(--text-muted)' }}>{label}</span>
+                    <label style={{ fontSize: 11, margin: 0, minWidth: 36, color: 'var(--text-secondary)' }}>{valueLabel}</label>
+                    <input type="number" min="0" step={step} value={penaltyConfig[valueKey]}
+                      disabled={isRunning || !penaltyConfig[enabledKey]} style={{ width: 64 }}
+                      onChange={e => updatePenaltyConfig(valueKey, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#6366f1', marginTop: 12, marginBottom: 6 }}>Entry Penalties</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {[
+                  { label: 'Move',               enabledKey: 'movePenaltyEnabled',           valueKey: 'movePenalty',               step: '0.5' },
+                  { label: 'VWAP',               enabledKey: 'vwapPenaltyEnabled',           valueKey: 'vwapPenalty',               step: '0.5' },
+                  { label: 'Chop',               enabledKey: 'chopPenaltyEnabled',           valueKey: 'chopPenalty',               step: '0.5' },
+                  { label: 'Range: Drifting',    enabledKey: 'rangeDriftingEnabled',         valueKey: 'rangeDriftingPenalty',      step: '0.5' },
+                  { label: 'Range: Poor Struct', enabledKey: 'rangePoorStructureEnabled',    valueKey: 'rangePoorStructurePenalty', step: '0.5' },
+                  { label: 'Range: Choppy',      enabledKey: 'rangeChoppyEnabled',           valueKey: 'rangeChoppyPenalty',        step: '0.5' },
+                  { label: 'Range: Size',        enabledKey: 'rangeSizeEnabled',             valueKey: 'rangeSizePenalty',          step: '0.5' },
+                ].map(({ label, enabledKey, valueKey, step }) => (
+                  <div key={enabledKey} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '3px 0' }}>
+                    <button type="button" className={`btn-sm ${penaltyConfig[enabledKey] ? 'btn-primary' : 'btn-secondary'}`}
+                      style={{ minWidth: 36 }}
+                      onClick={() => updatePenaltyConfig(enabledKey, !penaltyConfig[enabledKey])} disabled={isRunning}>
+                      {penaltyConfig[enabledKey] ? 'ON' : 'OFF'}
+                    </button>
+                    <span style={{ fontSize: 12, width: 130, color: penaltyConfig[enabledKey] ? 'var(--text-primary)' : 'var(--text-muted)' }}>{label}</span>
+                    <label style={{ fontSize: 11, margin: 0, minWidth: 36, color: 'var(--text-secondary)' }}>Penalty</label>
+                    <input type="number" min="0" step={step} value={penaltyConfig[valueKey]}
+                      disabled={isRunning || !penaltyConfig[enabledKey]} style={{ width: 64 }}
+                      onChange={e => updatePenaltyConfig(valueKey, e.target.value)} />
                   </div>
                 ))}
               </div>
@@ -8295,6 +8571,24 @@ const DEFAULT_EXIT_CONFIG = {
   noHopeBars:                   '2',
 };
 
+const DEFAULT_PENALTY_CONFIG = {
+  enabled: true,
+  // Signal-level
+  reversalEnabled:           true,  reversalMax:              '25',
+  overextensionEnabled:      true,  overextensionMax:         '30',
+  sameColorEnabled:          true,  sameColorMax:             '30',
+  mismatchEnabled:           true,  mismatchScale:            '1.0',
+  volatileOptionEnabled:     true,  volatileOptionPenalty:    '35',
+  // Entry-level
+  movePenaltyEnabled:        true,  movePenalty:              '3',
+  vwapPenaltyEnabled:        true,  vwapPenalty:              '5',
+  chopPenaltyEnabled:        true,  chopPenalty:              '2',
+  rangeDriftingEnabled:      true,  rangeDriftingPenalty:     '3',
+  rangePoorStructureEnabled: true,  rangePoorStructurePenalty:'4',
+  rangeChoppyEnabled:        true,  rangeChoppyPenalty:       '2',
+  rangeSizeEnabled:          true,  rangeSizePenalty:         '2',
+};
+
 function fmt2(v) { return v != null ? Number(v).toFixed(2) : '—'; }
 function pnlStyle(v) { return { color: v > 0 ? '#22c55e' : v < 0 ? '#ef4444' : undefined, fontWeight: 600 }; }
 
@@ -8398,14 +8692,23 @@ function ReplayChart({ feed, closedTrades }) {
     if (!candleRef.current || !feed?.length) return;
     const chart = chartRef.current;
 
+    // Deduplicate feed by niftyTime: tick-level (TICK_EVAL) events share a bucket start
+    // time with subsequent tick updates and the eventual closed-candle event.
+    // Keep only the last entry per timestamp so the chart always shows the freshest state.
+    const feedMap = new Map();
+    feed.forEach(e => { if (e.niftyTime) feedMap.set(e.niftyTime, e); });
+    const feedDeduped = [...feedMap.values()].sort(
+      (a, b) => toUtcSec(a.niftyTime) - toUtcSec(b.niftyTime)
+    );
+
     // ── Candles ──
-    const candleData = feed.map(e => ({
+    const candleData = feedDeduped.map(e => ({
       time:  toUtcSec(e.niftyTime),
       open:  e.niftyOpen,
       high:  e.niftyHigh,
       low:   e.niftyLow,
       close: e.niftyClose,
-    })).filter(d => d.time > 0).sort((a, b) => a.time - b.time);
+    })).filter(d => d.time > 0);
     candleRef.current.setData(candleData);
 
     const times  = candleData.map(d => d.time);
@@ -8420,14 +8723,13 @@ function ReplayChart({ feed, closedTrades }) {
     ema21Ref.current.setData(times.map((t, i) => ({ time: t, value: ema21vals[i] })));
 
     // ── VWAP (reconstruct from distanceFromVwap: dist% = (close-vwap)/vwap*100) ──
-    const vwapData = feed
+    const vwapData = feedDeduped
       .filter(e => e.distanceFromVwap != null && e.niftyClose != null && toUtcSec(e.niftyTime) > 0)
       .map(e => {
         const d = e.distanceFromVwap / 100;        // decimal fraction
         const vwap = e.niftyClose / (1 + d);       // close = vwap*(1+d)
         return { time: toUtcSec(e.niftyTime), value: vwap };
-      })
-      .sort((a, b) => a.time - b.time);
+      });
     vwapRef.current.setData(vwapData);
 
     // ── Regime bands (background shading) ─────────────────────────────────
@@ -8435,16 +8737,16 @@ function ReplayChart({ feed, closedTrades }) {
     regimeBandRefs.current.forEach(s => { try { chart.removeSeries(s); } catch {} });
     regimeBandRefs.current = [];
 
-    if (showRegime && feed.length > 1) {
+    if (showRegime && feedDeduped.length > 1) {
       // Group consecutive candles by regime → build segments
       const segments = [];
-      let seg = { regime: feed[0].regime, start: 0, end: 0 };
-      for (let i = 1; i < feed.length; i++) {
-        if (feed[i].regime === seg.regime) {
+      let seg = { regime: feedDeduped[0].regime, start: 0, end: 0 };
+      for (let i = 1; i < feedDeduped.length; i++) {
+        if (feedDeduped[i].regime === seg.regime) {
           seg.end = i;
         } else {
           segments.push({ ...seg });
-          seg = { regime: feed[i].regime, start: i, end: i };
+          seg = { regime: feedDeduped[i].regime, start: i, end: i };
         }
       }
       segments.push(seg);
@@ -8480,7 +8782,7 @@ function ReplayChart({ feed, closedTrades }) {
 
     // Bias-switch markers
     let prevConfirmed = null;
-    feed.forEach(e => {
+    feedDeduped.forEach(e => {
       const t = toUtcSec(e.niftyTime);
       if (!t) return;
       if (e.confirmedBias !== prevConfirmed && e.switchConfirmed) {
@@ -8691,13 +8993,15 @@ function OptionsReplayTest() {
   const [tradeQuality,         setTradeQuality]         = useState(() => ls('sma_opts_trade_quality',          DEFAULT_TRADE_QUALITY));
   const [trendEntry,           setTrendEntry]           = useState(() => ls('sma_opts_trend_entry',            DEFAULT_TREND_ENTRY));
   const [compressionEntry,     setCompressionEntry]     = useState(() => ls('sma_opts_compression_entry',      DEFAULT_COMPRESSION_ENTRY));
-  const [holdConfig,           setHoldConfig]           = useState(() => ({ ...DEFAULT_HOLD, ...ls('sma_opts_hold_config', {}) }));
-  const [exitConfig,           setExitConfig]           = useState(() => ({ ...DEFAULT_EXIT_CONFIG, ...ls('sma_opts_exit_config', {}) }));
+  const [holdConfig,           setHoldConfig]           = useState(() => ({ ...DEFAULT_HOLD,           ...ls('sma_opts_hold_config',    {}) }));
+  const [exitConfig,           setExitConfig]           = useState(() => ({ ...DEFAULT_EXIT_CONFIG,    ...ls('sma_opts_exit_config',    {}) }));
+  const [penaltyConfig,        setPenaltyConfig]        = useState(() => ({ ...DEFAULT_PENALTY_CONFIG, ...ls('sma_opts_penalty_config',  {}) }));
 
   function updateOptsRisk(key, val) { setOptsRisk(p => ({ ...p, [key]: val })); }
   function updateRangeQuality(key, val) { setRangeQuality(p => ({ ...p, [key]: val })); }
   function updateHoldConfig(key, val) { setHoldConfig(p => ({ ...p, [key]: val })); }
   function updateExitConfig(key, val) { setExitConfig(p => ({ ...p, [key]: val })); }
+  function updatePenaltyConfig(key, val) { setPenaltyConfig(p => ({ ...p, [key]: val })); }
   function updateTradeQuality(key, val) { setTradeQuality(p => ({ ...p, [key]: val })); }
   function updateTrendEntry(key, val) { setTrendEntry(p => ({ ...p, [key]: val })); }
   function updateCompressionEntry(key, val) { setCompressionEntry(p => ({ ...p, [key]: val })); }
@@ -8732,7 +9036,7 @@ function OptionsReplayTest() {
       decisionCfg, selectionCfg, switchCfg,
       optsRegimeCfg, chopRules, tradingRules, regimeRules, regimeStrategyRules,
       optsRisk, rangeQuality, tradeQuality, trendEntry, compressionEntry,
-      holdConfig, exitConfig,
+      holdConfig, exitConfig, penaltyConfig,
     };
   }
 
@@ -8782,6 +9086,7 @@ function OptionsReplayTest() {
     if (c.compressionEntry     !== undefined) setCompressionEntry(c.compressionEntry);
     if (c.holdConfig           !== undefined) setHoldConfig(c.holdConfig);
     if (c.exitConfig           !== undefined) setExitConfig(c.exitConfig);
+    if (c.penaltyConfig        !== undefined) setPenaltyConfig(c.penaltyConfig);
   }
 
   function deletePreset(id) {
@@ -8815,6 +9120,7 @@ function OptionsReplayTest() {
   useEffect(() => { try { localStorage.setItem('sma_opts_compression_entry',  JSON.stringify(compressionEntry));    } catch {} }, [compressionEntry]);
   useEffect(() => { try { localStorage.setItem('sma_opts_hold_config',        JSON.stringify(holdConfig));          } catch {} }, [holdConfig]);
   useEffect(() => { try { localStorage.setItem('sma_opts_exit_config',        JSON.stringify(exitConfig));          } catch {} }, [exitConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_penalty_config',     JSON.stringify(penaltyConfig));       } catch {} }, [penaltyConfig]);
 
   // ── Run state
   const [status,   setStatus]   = useState('idle'); // idle|running|completed|error
@@ -8823,8 +9129,9 @@ function OptionsReplayTest() {
   const [initInfo, setInitInfo] = useState(null);    // { totalCandles, warmupCandles }
   const [error,    setError]    = useState('');
   const [rightTab, setRightTab] = useState('feed');
-  const abortRef = useRef(null);
-  const readerRef = useRef(null);
+  const abortRef     = useRef(null);
+  const readerRef    = useRef(null);
+  const lastRunPcRef = useRef(null);
 
   useEffect(() => () => { abortRef.current?.abort(); }, []);
 
@@ -9065,6 +9372,28 @@ function OptionsReplayTest() {
     ));
     lines.push(blank);
 
+    // ── Penalty Config ───────────────────────────────────────────────────────
+    const csvPc = lastRunPcRef.current || penaltyConfig;
+    lines.push(row('=== Penalty Config (as used in this run) ==='));
+    lines.push(row('Master', csvPc.enabled ? 'ON' : 'OFF'));
+    if (csvPc.enabled) {
+      lines.push(row('Signal Penalty', 'Enabled', 'Value'));
+      lines.push(row('Reversal',        csvPc.reversalEnabled        ? 'ON' : 'OFF', `Max=${csvPc.reversalMax}`));
+      lines.push(row('Overextension',   csvPc.overextensionEnabled   ? 'ON' : 'OFF', `Max=${csvPc.overextensionMax}`));
+      lines.push(row('Same Color',      csvPc.sameColorEnabled       ? 'ON' : 'OFF', `Max=${csvPc.sameColorMax}`));
+      lines.push(row('Mismatch',        csvPc.mismatchEnabled        ? 'ON' : 'OFF', `Scale=${csvPc.mismatchScale}`));
+      lines.push(row('Volatile Option', csvPc.volatileOptionEnabled  ? 'ON' : 'OFF', `Penalty=${csvPc.volatileOptionPenalty}`));
+      lines.push(row('Entry Penalty', 'Enabled', 'Value'));
+      lines.push(row('Move',           csvPc.movePenaltyEnabled         ? 'ON' : 'OFF', csvPc.movePenalty));
+      lines.push(row('VWAP',           csvPc.vwapPenaltyEnabled         ? 'ON' : 'OFF', csvPc.vwapPenalty));
+      lines.push(row('Chop',           csvPc.chopPenaltyEnabled         ? 'ON' : 'OFF', csvPc.chopPenalty));
+      lines.push(row('Range Drifting', csvPc.rangeDriftingEnabled       ? 'ON' : 'OFF', csvPc.rangeDriftingPenalty));
+      lines.push(row('Range Poor Str', csvPc.rangePoorStructureEnabled  ? 'ON' : 'OFF', csvPc.rangePoorStructurePenalty));
+      lines.push(row('Range Choppy',   csvPc.rangeChoppyEnabled         ? 'ON' : 'OFF', csvPc.rangeChoppyPenalty));
+      lines.push(row('Range Size',     csvPc.rangeSizeEnabled           ? 'ON' : 'OFF', csvPc.rangeSizePenalty));
+    }
+    lines.push(blank);
+
     // ── Summary ─────────────────────────────────────────────────────────────
     if (summary) {
       lines.push(row('=== Summary ==='));
@@ -9225,6 +9554,7 @@ function OptionsReplayTest() {
     e.preventDefault();
     if (status === 'running') { stop(); return; }
 
+    lastRunPcRef.current = { ...penaltyConfig };
     setFeed([]); setSummary(null); setInitInfo(null); setError(''); setStatus('running');
 
     // Save to recent dates whenever from == to (single-day replay)
@@ -9409,6 +9739,33 @@ function OptionsReplayTest() {
         deadTradePnlPct:              parseFloat(exitConfig.deadTradePnlPct)              || 2,
         noHopeThresholdPct:           parseFloat(exitConfig.noHopeThresholdPct)           || 1.5,
         noHopeBars:                   parseInt(exitConfig.noHopeBars, 10)                 || 2,
+      },
+      penaltyConfig: {
+        enabled:                   penaltyConfig.enabled,
+        reversalEnabled:           penaltyConfig.reversalEnabled,
+        reversalMax:               parseFloat(penaltyConfig.reversalMax)               || 25,
+        overextensionEnabled:      penaltyConfig.overextensionEnabled,
+        overextensionMax:          parseFloat(penaltyConfig.overextensionMax)          || 30,
+        sameColorEnabled:          penaltyConfig.sameColorEnabled,
+        sameColorMax:              parseFloat(penaltyConfig.sameColorMax)              || 30,
+        mismatchEnabled:           penaltyConfig.mismatchEnabled,
+        mismatchScale:             parseFloat(penaltyConfig.mismatchScale)             || 1.0,
+        volatileOptionEnabled:     penaltyConfig.volatileOptionEnabled,
+        volatileOptionPenalty:     parseFloat(penaltyConfig.volatileOptionPenalty)     || 35,
+        movePenaltyEnabled:        penaltyConfig.movePenaltyEnabled,
+        movePenalty:               parseFloat(penaltyConfig.movePenalty)               || 3,
+        vwapPenaltyEnabled:        penaltyConfig.vwapPenaltyEnabled,
+        vwapPenalty:               parseFloat(penaltyConfig.vwapPenalty)               || 5,
+        chopPenaltyEnabled:        penaltyConfig.chopPenaltyEnabled,
+        chopPenalty:               parseFloat(penaltyConfig.chopPenalty)               || 2,
+        rangeDriftingEnabled:      penaltyConfig.rangeDriftingEnabled,
+        rangeDriftingPenalty:      parseFloat(penaltyConfig.rangeDriftingPenalty)      || 3,
+        rangePoorStructureEnabled: penaltyConfig.rangePoorStructureEnabled,
+        rangePoorStructurePenalty: parseFloat(penaltyConfig.rangePoorStructurePenalty) || 4,
+        rangeChoppyEnabled:        penaltyConfig.rangeChoppyEnabled,
+        rangeChoppyPenalty:        parseFloat(penaltyConfig.rangeChoppyPenalty)        || 2,
+        rangeSizeEnabled:          penaltyConfig.rangeSizeEnabled,
+        rangeSizePenalty:          parseFloat(penaltyConfig.rangeSizePenalty)          || 2,
       },
       speedMultiplier: parseInt(speed, 10) || 1,
       persist: true,
@@ -9818,6 +10175,20 @@ function OptionsReplayTest() {
                   <span style={{ marginRight: 10 }}>dead=<b style={{ color: 'var(--text-primary)' }}>{exitConfig.maxBarsDeadTrade}bars</b></span>
                 </>
               )}
+              {penaltyConfig.enabled && (
+                <>
+                  <span style={{ margin: '0 10px 0 4px', color: 'var(--text-muted)' }}>|</span>
+                  <span style={{ marginRight: 8, fontWeight: 700, color: '#6366f1' }}>Pen:</span>
+                  {penaltyConfig.reversalEnabled       && <span style={{ marginRight: 8 }}>rev≤<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.reversalMax}</b></span>}
+                  {penaltyConfig.overextensionEnabled  && <span style={{ marginRight: 8 }}>ext≤<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.overextensionMax}</b></span>}
+                  {penaltyConfig.sameColorEnabled      && <span style={{ marginRight: 8 }}>col≤<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.sameColorMax}</b></span>}
+                  {penaltyConfig.mismatchEnabled       && <span style={{ marginRight: 8 }}>mis×<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.mismatchScale}</b></span>}
+                  {penaltyConfig.volatileOptionEnabled && <span style={{ marginRight: 8 }}>vol=<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.volatileOptionPenalty}</b></span>}
+                  {penaltyConfig.movePenaltyEnabled    && <span style={{ marginRight: 8 }}>mv=<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.movePenalty}</b></span>}
+                  {penaltyConfig.vwapPenaltyEnabled    && <span style={{ marginRight: 8 }}>vw=<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.vwapPenalty}</b></span>}
+                  {penaltyConfig.chopPenaltyEnabled    && <span style={{ marginRight: 8 }}>chp=<b style={{ color: 'var(--text-primary)' }}>{penaltyConfig.chopPenalty}</b></span>}
+                </>
+              )}
             </div>
             </div>
 
@@ -10074,13 +10445,15 @@ function OptionsReplayTest() {
             setDecisionCfg(DEFAULT_DECISION); setSelectionCfg(DEFAULT_SELECTION); setSwitchCfg(DEFAULT_SWITCH);
             setOptsRegimeCfg(DEFAULT_OPTS_REGIME_CONFIG); setChopRules(DEFAULT_CHOP_RULES); setTradingRules(DEFAULT_TRADING_RULES); setRegimeRules(DEFAULT_REGIME_RULES); setRegimeStrategyRules(DEFAULT_REGIME_STRATEGY_RULES); setOptsRisk(DEFAULT_OPTS_RISK); setRangeQuality(DEFAULT_RANGE_QUALITY);
             setTradeQuality(DEFAULT_TRADE_QUALITY); setTrendEntry(DEFAULT_TREND_ENTRY); setCompressionEntry(DEFAULT_COMPRESSION_ENTRY); setHoldConfig(DEFAULT_HOLD); setExitConfig(DEFAULT_EXIT_CONFIG);
+            setPenaltyConfig(DEFAULT_PENALTY_CONFIG);
             setInterval('MINUTE_5'); setFromDate(''); setToDate(''); setWarmupDays('5'); setSpeed('1'); setQuantity('0'); setCapital('100000');
             ['sma_opts_nifty','sma_opts_ce_pool','sma_opts_pe_pool','sma_opts_interval','sma_opts_from','sma_opts_to',
              'sma_opts_warmup','sma_opts_speed','sma_opts_qty','sma_opts_capital','sma_opts_strategies',
              'sma_opts_decision','sma_opts_selection','sma_opts_switch','sma_opts_regime_cfg',
              'sma_opts_chop_rules','sma_opts_trading_rules','sma_opts_regime_rules',
              'sma_opts_regime_strat_rules','sma_opts_risk','sma_opts_range_quality','sma_opts_trade_quality',
-             'sma_opts_trend_entry','sma_opts_compression_entry','sma_opts_hold_config','sma_opts_exit_config'].forEach(k => localStorage.removeItem(k));
+             'sma_opts_trend_entry','sma_opts_compression_entry','sma_opts_hold_config','sma_opts_exit_config',
+             'sma_opts_penalty_config'].forEach(k => localStorage.removeItem(k));
           }} disabled={isRunning}>
             Reset
           </button>
@@ -10968,6 +11341,69 @@ function OptionsReplayTest() {
                     <input type="number" min="0" step={step}
                       value={exitConfig[key]} disabled={isRunning}
                       onChange={e => updateExitConfig(key, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* ── Penalty Config ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Penalty Config</span>
+            <button type="button" className={`btn-sm ${penaltyConfig.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => updatePenaltyConfig('enabled', !penaltyConfig.enabled)} disabled={isRunning}>
+              {penaltyConfig.enabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          {penaltyConfig.enabled && (
+            <>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#6366f1', marginTop: 12, marginBottom: 6 }}>Signal Penalties</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {[
+                  { label: 'Reversal',        enabledKey: 'reversalEnabled',        valueKey: 'reversalMax',           valueLabel: 'Max',    step: '1'   },
+                  { label: 'Overextension',   enabledKey: 'overextensionEnabled',   valueKey: 'overextensionMax',      valueLabel: 'Max',    step: '1'   },
+                  { label: 'Same Color',      enabledKey: 'sameColorEnabled',       valueKey: 'sameColorMax',          valueLabel: 'Max',    step: '1'   },
+                  { label: 'Mismatch',        enabledKey: 'mismatchEnabled',        valueKey: 'mismatchScale',         valueLabel: 'Scale',  step: '0.1' },
+                  { label: 'Volatile Option', enabledKey: 'volatileOptionEnabled',  valueKey: 'volatileOptionPenalty', valueLabel: 'Penalty',step: '1'   },
+                ].map(({ label, enabledKey, valueKey, valueLabel, step }) => (
+                  <div key={enabledKey} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '3px 0' }}>
+                    <button type="button" className={`btn-sm ${penaltyConfig[enabledKey] ? 'btn-primary' : 'btn-secondary'}`}
+                      style={{ minWidth: 36 }}
+                      onClick={() => updatePenaltyConfig(enabledKey, !penaltyConfig[enabledKey])} disabled={isRunning}>
+                      {penaltyConfig[enabledKey] ? 'ON' : 'OFF'}
+                    </button>
+                    <span style={{ fontSize: 12, width: 130, color: penaltyConfig[enabledKey] ? 'var(--text-primary)' : 'var(--text-muted)' }}>{label}</span>
+                    <label style={{ fontSize: 11, margin: 0, minWidth: 36, color: 'var(--text-secondary)' }}>{valueLabel}</label>
+                    <input type="number" min="0" step={step} value={penaltyConfig[valueKey]}
+                      disabled={isRunning || !penaltyConfig[enabledKey]} style={{ width: 64 }}
+                      onChange={e => updatePenaltyConfig(valueKey, e.target.value)} />
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#6366f1', marginTop: 12, marginBottom: 6 }}>Entry Penalties</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {[
+                  { label: 'Move',               enabledKey: 'movePenaltyEnabled',           valueKey: 'movePenalty',               step: '0.5' },
+                  { label: 'VWAP',               enabledKey: 'vwapPenaltyEnabled',           valueKey: 'vwapPenalty',               step: '0.5' },
+                  { label: 'Chop',               enabledKey: 'chopPenaltyEnabled',           valueKey: 'chopPenalty',               step: '0.5' },
+                  { label: 'Range: Drifting',    enabledKey: 'rangeDriftingEnabled',         valueKey: 'rangeDriftingPenalty',      step: '0.5' },
+                  { label: 'Range: Poor Struct', enabledKey: 'rangePoorStructureEnabled',    valueKey: 'rangePoorStructurePenalty', step: '0.5' },
+                  { label: 'Range: Choppy',      enabledKey: 'rangeChoppyEnabled',           valueKey: 'rangeChoppyPenalty',        step: '0.5' },
+                  { label: 'Range: Size',        enabledKey: 'rangeSizeEnabled',             valueKey: 'rangeSizePenalty',          step: '0.5' },
+                ].map(({ label, enabledKey, valueKey, step }) => (
+                  <div key={enabledKey} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '3px 0' }}>
+                    <button type="button" className={`btn-sm ${penaltyConfig[enabledKey] ? 'btn-primary' : 'btn-secondary'}`}
+                      style={{ minWidth: 36 }}
+                      onClick={() => updatePenaltyConfig(enabledKey, !penaltyConfig[enabledKey])} disabled={isRunning}>
+                      {penaltyConfig[enabledKey] ? 'ON' : 'OFF'}
+                    </button>
+                    <span style={{ fontSize: 12, width: 130, color: penaltyConfig[enabledKey] ? 'var(--text-primary)' : 'var(--text-muted)' }}>{label}</span>
+                    <label style={{ fontSize: 11, margin: 0, minWidth: 36, color: 'var(--text-secondary)' }}>Penalty</label>
+                    <input type="number" min="0" step={step} value={penaltyConfig[valueKey]}
+                      disabled={isRunning || !penaltyConfig[enabledKey]} style={{ width: 64 }}
+                      onChange={e => updatePenaltyConfig(valueKey, e.target.value)} />
                   </div>
                 ))}
               </div>

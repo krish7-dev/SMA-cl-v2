@@ -84,4 +84,7 @@ public class OptionsLiveRequest {
 
     // Smart exit system
     private OptionsReplayRequest.ExitConfig exitConfig = new OptionsReplayRequest.ExitConfig();
+
+    // Penalty config
+    private OptionsReplayRequest.PenaltyConfig penaltyConfig = new OptionsReplayRequest.PenaltyConfig();
 }

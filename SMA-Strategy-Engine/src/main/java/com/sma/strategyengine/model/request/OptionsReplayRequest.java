@@ -1,5 +1,6 @@
 package com.sma.strategyengine.model.request;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.Data;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
@@ -274,6 +275,7 @@ public class OptionsReplayRequest {
 
     @Data
     public static class ExitConfig {
+        @JsonProperty("enabled")
         private boolean enabled = true;
 
         // P1 — Hard Stop Loss (always fires, even inside hold zone)
@@ -330,6 +332,54 @@ public class OptionsReplayRequest {
         // P7 — No-hope (non-TRENDING only)
         private double noHopeThresholdPct        = 1.5;
         private int    noHopeBars                = 2;
+    }
+
+    // Penalty config — master on/off + per-penalty on/off and value overrides
+    private PenaltyConfig penaltyConfig = new PenaltyConfig();
+
+    @Data
+    public static class PenaltyConfig {
+        @JsonProperty("enabled")
+        private boolean enabled = true;
+
+        // ── Signal-level penalties (applied per strategy in StrategyScorer) ──
+        private boolean reversalEnabled          = true;
+        private double  reversalMax              = 25.0;
+
+        private boolean overextensionEnabled     = true;
+        private double  overextensionMax         = 30.0;
+
+        private boolean sameColorEnabled         = true;
+        private double  sameColorMax             = 30.0;
+
+        private boolean mismatchEnabled          = true;
+        /** Scale factor (0.0–2.0) applied to the hardcoded per-strategy mismatch values. */
+        private double  mismatchScale            = 1.0;
+
+        private boolean volatileOptionEnabled    = true;
+        private double  volatileOptionPenalty    = 35.0;
+
+        // ── Entry-level penalties (applied in NiftyDecisionEngine) ──
+        private boolean movePenaltyEnabled       = true;
+        private double  movePenalty              = 3.0;
+
+        private boolean vwapPenaltyEnabled       = true;
+        private double  vwapPenalty              = 5.0;
+
+        private boolean chopPenaltyEnabled       = true;
+        private double  chopPenalty              = 2.0;
+
+        private boolean rangeDriftingEnabled     = true;
+        private double  rangeDriftingPenalty     = 3.0;
+
+        private boolean rangePoorStructureEnabled = true;
+        private double  rangePoorStructurePenalty = 4.0;
+
+        private boolean rangeChoppyEnabled       = true;
+        private double  rangeChoppyPenalty       = 2.0;
+
+        private boolean rangeSizeEnabled         = true;   // covers TOO_NARROW / TOO_WIDE
+        private double  rangeSizePenalty         = 2.0;
     }
 
     private int     speedMultiplier = 1;

@@ -184,6 +184,9 @@ public class OptionsLiveService {
 
         int emittedCount = 0;
 
+        // Last computed regime — updated on each NIFTY candle close, used for tick evaluations
+        volatile String currentRegime = "RANGING";
+
         volatile boolean   stopped    = false;
         volatile Future<?> tickFuture = null;
 
@@ -260,6 +263,10 @@ public class OptionsLiveService {
                 decisionEngine.warmup(warmupCandles);
             }
 
+            // Phase 1b: pre-warm option candle maps with today's historical data
+            // so the selector has price data immediately (before any option ticks arrive)
+            warmupOptionCandles();
+
             // Emit init event
             emitter.send(SseEmitter.event().name("init").data(
                     objectMapper.writeValueAsString(Map.of(
@@ -268,9 +275,62 @@ public class OptionsLiveService {
                             "ceOptions",     cePool.size(),
                             "peOptions",     pePool.size()))));
 
-            // Phase 2: subscribe to tick SSE
+            // Phase 2: subscribe NIFTY + option tokens to Data Engine live stream
+            if (!stopped) {
+                subscribeTokens();
+            }
+
+            // Phase 3: consume tick SSE
             if (!stopped) {
                 tickFuture = executor.submit(this::readTickStream);
+            }
+        }
+
+        // ── token subscription ────────────────────────────────────────────────
+
+        private void subscribeTokens() {
+            List<Map<String, Object>> instruments = new ArrayList<>();
+
+            // NIFTY index
+            if (niftyToken > 0) {
+                instruments.add(Map.of(
+                        "instrumentToken", niftyToken,
+                        "symbol",          req.getNiftySymbol()   != null ? req.getNiftySymbol()   : "NIFTY 50",
+                        "exchange",        req.getNiftyExchange() != null ? req.getNiftyExchange() : "NSE"));
+            }
+
+            // CE + PE options
+            for (OptionsReplayRequest.OptionCandidate c : cePool) {
+                if (c.getInstrumentToken() != null) {
+                    instruments.add(Map.of(
+                            "instrumentToken", c.getInstrumentToken(),
+                            "symbol",          c.getTradingSymbol() != null ? c.getTradingSymbol() : "",
+                            "exchange",        c.getExchange()      != null ? c.getExchange()      : "NFO"));
+                }
+            }
+            for (OptionsReplayRequest.OptionCandidate c : pePool) {
+                if (c.getInstrumentToken() != null) {
+                    instruments.add(Map.of(
+                            "instrumentToken", c.getInstrumentToken(),
+                            "symbol",          c.getTradingSymbol() != null ? c.getTradingSymbol() : "",
+                            "exchange",        c.getExchange()      != null ? c.getExchange()      : "NFO"));
+                }
+            }
+
+            if (instruments.isEmpty()) {
+                log.warn("Options live session {}: no tokens to subscribe", sessionId);
+                return;
+            }
+
+            try {
+                dataEngineClient.subscribe(
+                        req.getUserId(), req.getBrokerName(),
+                        req.getApiKey(), req.getAccessToken(),
+                        instruments);
+                log.info("Options live session {}: subscribed {} token(s)", sessionId, instruments.size());
+            } catch (Exception e) {
+                log.warn("Options live session {}: subscription failed (ticks may not arrive): {}",
+                        sessionId, e.getMessage());
             }
         }
 
@@ -297,12 +357,14 @@ public class OptionsLiveService {
                     Optional.ofNullable(req.getTrendEntryConfig()).orElse(new OptionsReplayRequest.TrendEntryConfig());
             OptionsReplayRequest.CompressionEntryConfig cec =
                     Optional.ofNullable(req.getCompressionEntryConfig()).orElse(new OptionsReplayRequest.CompressionEntryConfig());
+            OptionsReplayRequest.PenaltyConfig pc =
+                    Optional.ofNullable(req.getPenaltyConfig()).orElse(new OptionsReplayRequest.PenaltyConfig());
 
             decisionEngine  = new NiftyDecisionEngine(
-                    strategyRegistry, req.getStrategies(), dc, sc, rr, rsr, cr, rqc, tqc, tec, cec);
+                    strategyRegistry, req.getStrategies(), dc, sc, rr, rsr, cr, rqc, tqc, tec, cec, pc);
 
             // Pass live map by reference — new candles added to liveOptionCandles are visible immediately
-            selectorService = new OptionSelectorService(sel, liveOptionCandles);
+            selectorService = OptionSelectorService.forLive(sel, liveOptionCandles);
 
             // Build a minimal OptionsReplayRequest to satisfy OptionExecutionEngine's constructor
             execEngine = new OptionExecutionEngine(buildExecRequest());
@@ -324,6 +386,53 @@ public class OptionsLiveService {
             r.setExitConfig(req.getExitConfig() != null
                     ? req.getExitConfig() : new OptionsReplayRequest.ExitConfig());
             return r;
+        }
+
+        // ── option candle pre-warm ────────────────────────────────────────────
+
+        /**
+         * Fetches today's historical candles for every CE/PE option token and
+         * seeds {@link #liveOptionCandles} so the selector has price data before
+         * any live option ticks arrive. Failures per token are logged and skipped.
+         */
+        private void warmupOptionCandles() {
+            LocalDateTime todayOpen = LocalDateTime.now(IST)
+                    .withHour(9).withMinute(15).withSecond(0).withNano(0);
+            LocalDateTime now = LocalDateTime.now(IST);
+
+            List<OptionsReplayRequest.OptionCandidate> all = new ArrayList<>();
+            all.addAll(cePool);
+            all.addAll(pePool);
+
+            int loaded = 0;
+            for (OptionsReplayRequest.OptionCandidate c : all) {
+                if (c.getInstrumentToken() == null) continue;
+                try {
+                    List<CandleDto> candles = dataEngineClient.fetchHistory(
+                            new DataEngineClient.HistoryRequest(
+                                    req.getUserId(), req.getBrokerName(),
+                                    req.getApiKey(), req.getAccessToken(),
+                                    c.getInstrumentToken(),
+                                    c.getTradingSymbol() != null ? c.getTradingSymbol() : "",
+                                    c.getExchange()      != null ? c.getExchange()      : "NFO",
+                                    req.getInterval(), todayOpen, now, false));
+
+                    NavigableMap<LocalDateTime, CandleDto> map = liveOptionCandles.get(c.getInstrumentToken());
+                    if (map != null) {
+                        for (CandleDto candle : candles) {
+                            map.put(candle.openTime(), candle);
+                        }
+                        loaded += candles.size();
+                        log.info("Options live session {}: pre-warmed {} candles for {}",
+                                sessionId, candles.size(), c.getTradingSymbol());
+                    }
+                } catch (Exception e) {
+                    log.warn("Options live session {}: option warmup failed for {} ({}): {}",
+                            sessionId, c.getTradingSymbol(), c.getInstrumentToken(), e.getMessage());
+                }
+            }
+            log.info("Options live session {}: option pre-warm complete, {} total candles across {} instruments",
+                    sessionId, loaded, all.size());
         }
 
         // ── tick stream ───────────────────────────────────────────────────────
@@ -427,6 +536,31 @@ public class OptionsLiveService {
             } else {
                 processOptionTick(token, ltp, volumeToday, bucketMs);
             }
+
+            emitTickEvent(token, ltp, epochMs);
+        }
+
+        private void emitTickEvent(long token, double ltp, long epochMs) {
+            try {
+                boolean isNifty = (token == niftyToken);
+                FormingCandle fc = forming.get(token);
+
+                Map<String, Object> evt = new java.util.LinkedHashMap<>();
+                evt.put("token",   token);
+                evt.put("isNifty", isNifty);
+                evt.put("ltp",     ltp);
+                evt.put("timeMs",  epochMs);
+                if (fc != null) {
+                    evt.put("fOpen",  fc.open);
+                    evt.put("fHigh",  fc.high);
+                    evt.put("fLow",   fc.low);
+                    evt.put("fClose", fc.close);
+                }
+                emitter.send(SseEmitter.event().name("tick")
+                        .data(objectMapper.writeValueAsString(evt)));
+            } catch (Exception ignored) {
+                // Don't stop session on tick emit failure
+            }
         }
 
         private void processNiftyTick(double ltp, long volumeToday, long bucketMs) {
@@ -434,13 +568,50 @@ public class OptionsLiveService {
             if (cur == null) {
                 forming.put(niftyToken, new FormingCandle(ltp, volumeToday, bucketMs));
             } else if (bucketMs > cur.startMs) {
+                // Candle closed — push to scorer so next tick evaluation uses updated history
                 CandleDto closed = cur.toCandle(bucketToLocalDateTime(cur.startMs));
                 forming.put(niftyToken, new FormingCandle(ltp, volumeToday, bucketMs));
-                // Snapshot option prices at the moment the NIFTY candle closed
                 snapshotOptionCandles(cur.startMs, closed.openTime());
                 onNiftyCandleClose(closed);
+                // Evaluate the first tick of the new bucket immediately (scorer now includes closed candle)
+                snapshotOptionCandles(bucketMs, bucketToLocalDateTime(bucketMs));
+                emitTickCandleEvent(forming.get(niftyToken), bucketMs);
             } else {
                 cur.update(ltp, volumeToday);
+                // Snapshot current option forming prices so selector sees live prices intra-candle
+                snapshotOptionCandles(bucketMs, bucketToLocalDateTime(bucketMs));
+                emitTickCandleEvent(cur, bucketMs);
+            }
+        }
+
+        /** Full live execution pipeline on every NIFTY tick. */
+        private void emitTickCandleEvent(FormingCandle fc, long bucketMs) {
+            if (decisionEngine == null || selectorService == null || execEngine == null) return;
+            try {
+                LocalDateTime openTime = bucketToLocalDateTime(bucketMs);
+                CandleDto snapshot = fc.toCandle(openTime);
+
+                // Full stateful decision (confirmation state machine runs on every tick)
+                NiftyDecisionResult decision = decisionEngine.evaluateTick(snapshot, currentRegime);
+
+                // Post-process with trading and quality rules
+                applyTradingRules(decision, currentRegime, req.getTradingRules());
+                applyScoreTierRules(decision, currentRegime,
+                        req.getTradeQualityConfig(), execEngine.getBarsSinceLastLoss());
+
+                // Execute
+                double niftyClose = snapshot.close().doubleValue();
+                String action = execEngine.process(decision, selectorService,
+                        cePool, pePool, niftyClose, openTime, snapshot);
+
+                emittedCount++;
+                OptionsReplayCandleEvent event = buildEvent(
+                        emittedCount, snapshot, decision, execEngine, selectorService, openTime, action);
+
+                emitter.send(SseEmitter.event().name("candle")
+                        .data(objectMapper.writeValueAsString(event)));
+            } catch (Exception e) {
+                log.debug("Options live session {}: tick candle emit failed: {}", sessionId, e.getMessage());
             }
         }
 
@@ -482,6 +653,11 @@ public class OptionsLiveService {
 
         // ── candle evaluation ─────────────────────────────────────────────────
 
+        /**
+         * Called when a NIFTY candle closes. Updates the scorer rolling window and
+         * regime so the next tick evaluation runs with fresh closed-candle history.
+         * Execution is driven by {@link #emitTickCandleEvent} on every tick.
+         */
         private void onNiftyCandleClose(CandleDto niftyCandle) {
             if (stopped || decisionEngine == null) return;
 
@@ -491,36 +667,11 @@ public class OptionsLiveService {
             regimeCloses.add(niftyCandle.close().doubleValue());
             keepRegimeBufferBounded();
 
-            // Compute current regime
-            String regime = computeRegime();
+            // Recompute regime with the closed candle included
+            currentRegime = computeRegime();
 
-            // Decision
-            NiftyDecisionResult decision = decisionEngine.evaluate(niftyCandle, regime);
-
-            // Post-process decision with trading and quality rules
-            applyTradingRules(decision, regime, req.getTradingRules());
-            applyScoreTierRules(decision, regime,
-                    req.getTradeQualityConfig(), execEngine.getBarsSinceLastLoss());
-
-            // Execution
-            double        niftyClose = niftyCandle.close().doubleValue();
-            LocalDateTime candleTime = niftyCandle.openTime();
-            String action = execEngine.process(decision, selectorService,
-                    cePool, pePool, niftyClose, candleTime, niftyCandle);
-
-            // Build and emit SSE candle event
-            emittedCount++;
-            OptionsReplayCandleEvent event = buildEvent(
-                    emittedCount, niftyCandle, decision, execEngine, selectorService, candleTime, action);
-
-            try {
-                emitter.send(SseEmitter.event().name("candle")
-                        .data(objectMapper.writeValueAsString(event)));
-            } catch (Exception e) {
-                log.warn("Options live session {}: failed to send candle event: {}",
-                        sessionId, e.getMessage());
-                stop();
-            }
+            // Push closed candle into scorer/VWAP history — no decision or execution here
+            decisionEngine.pushCandle(niftyCandle);
         }
 
         // ── regime detection ──────────────────────────────────────────────────

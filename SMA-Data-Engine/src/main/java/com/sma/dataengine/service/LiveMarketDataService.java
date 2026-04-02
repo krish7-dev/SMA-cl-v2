@@ -80,6 +80,24 @@ public class LiveMarketDataService {
             return a;
         });
 
+        // ticker.connect() is async — wait up to 10 s for the WebSocket handshake to complete
+        if (!adapter.isConnected()) {
+            int waitedMs = 0;
+            while (!adapter.isConnected() && waitedMs < 10_000) {
+                try { Thread.sleep(200); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                waitedMs += 200;
+            }
+            if (!adapter.isConnected()) {
+                activeSessions.remove(sessionKey);   // don't cache a dead session
+                throw new com.sma.dataengine.adapter.MarketDataAdapterException(
+                        "KiteTicker did not connect within 10 s — check apiKey / accessToken");
+            }
+            log.info("KiteTicker connected after {}ms wait", waitedMs);
+        }
+
         List<Long> tokens = request.getInstruments().stream()
                 .map(InstrumentSubscription::getInstrumentToken)
                 .toList();
