@@ -67,6 +67,9 @@ public class OptionExecutionEngine {
     private final OptionsReplayRequest.HoldConfig hc;
     private int consecutiveWeakBars = 0;
 
+    // Candle-bucket dedup — barsInTrade/consecutiveWeakBars only advance once per bucket
+    private LocalDateTime lastBarTime = null;
+
     // Smart exit evaluator
     private final ExitEvaluator exitEval;
 
@@ -150,9 +153,13 @@ public class OptionExecutionEngine {
         execWaitReason  = null;
         holdActive      = false;
 
+        // Advance bar-level counters only once per candle bucket — many ticks can share the same openTime
+        boolean isNewBar = (candleTime != null && !candleTime.equals(lastBarTime));
+        if (isNewBar) lastBarTime = candleTime;
+
         // Update unrealized P&L and bar count (unconditional — option candle absence does not freeze counter)
         if (state != PositionState.FLAT && activeToken != null) {
-            barsInTrade++;
+            if (isNewBar) barsInTrade++;   // candle-based, not tick-based
             CandleDto optCandle = selector.getCandle(activeToken, candleTime);
             if (optCandle != null && optCandle.close() != null) {
                 unrealizedPnl = (optCandle.close().doubleValue() - entryPrice) * quantity;
@@ -168,8 +175,8 @@ public class OptionExecutionEngine {
 
         return switch (state) {
             case FLAT      -> processFlatState(decision, selector, cePool, pePool, niftyClose, candleTime);
-            case LONG_CALL -> processHeldState(decision, selector, candleTime, niftyCandle, PositionState.LONG_CALL);
-            case LONG_PUT  -> processHeldState(decision, selector, candleTime, niftyCandle, PositionState.LONG_PUT);
+            case LONG_CALL -> processHeldState(decision, selector, candleTime, niftyCandle, PositionState.LONG_CALL, isNewBar);
+            case LONG_PUT  -> processHeldState(decision, selector, candleTime, niftyCandle, PositionState.LONG_PUT, isNewBar);
         };
     }
 
@@ -252,7 +259,8 @@ public class OptionExecutionEngine {
                                     OptionSelectorService selector,
                                     LocalDateTime candleTime,
                                     CandleDto niftyCandle,
-                                    PositionState posType) {
+                                    PositionState posType,
+                                    boolean isNewBar) {
 
         NiftyDecisionResult.Bias confirmedBias = decision.getConfirmedBias();
 
@@ -327,7 +335,7 @@ public class OptionExecutionEngine {
             return "HELD";
         }
 
-        consecutiveWeakBars++;
+        if (isNewBar) consecutiveWeakBars++;
         if (consecutiveWeakBars >= hc.getPersistentExitBars()) {
             log.debug("EXIT_PERSISTENT bias={} weakBars={}/{}", confirmedBias, consecutiveWeakBars, hc.getPersistentExitBars());
             String exitReason = (posType == PositionState.LONG_CALL && confirmedBias == NiftyDecisionResult.Bias.BEARISH)
@@ -393,6 +401,7 @@ public class OptionExecutionEngine {
         this.barsInTrade         = 0;
         this.barsSinceLastTrade  = 0;
         this.consecutiveWeakBars = 0;
+        this.lastBarTime         = null; // reset so first tick in same bucket starts bar 1
         this.entryRegime         = regime;
         this.appliedMinHold      = resolveMinHold(regime);
         this.entryTimeStr        = time != null ? time.toString() : null;

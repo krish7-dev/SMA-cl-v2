@@ -1,5 +1,6 @@
 package com.sma.strategyengine.service;
 
+import com.sma.strategyengine.model.request.OptionsReplayRequest;
 import lombok.Builder;
 import lombok.Value;
 
@@ -85,6 +86,12 @@ public class StrategyScorer {
      */
     public ScoreResult score(String strategyType, boolean isBuy,
                              String regime, String instrType) {
+        return score(strategyType, isBuy, regime, instrType, null);
+    }
+
+    public ScoreResult score(String strategyType, boolean isBuy,
+                             String regime, String instrType,
+                             OptionsReplayRequest.PenaltyConfig pc) {
         if (history.size() < 5) {
             return ScoreResult.zero(strategyType);
         }
@@ -98,11 +105,18 @@ public class StrategyScorer {
 
         double base = wt[0] * trend + wt[1] * vol + wt[2] * mom + wt[3] * confidence;
 
-        double revPenalty     = reversalPenalty();
-        double extPenalty     = overextensionPenalty(isBuy);
-        double sameClrPenalty = sameColorPenalty(isBuy);
-        double mismatchPen    = mismatchPenalty(strategyType, instrType);
-        double volOptPenalty  = volatileOptionPenalty(regime, instrType);
+        boolean penaltiesOn = pc == null || pc.isEnabled();
+
+        double revPenalty     = (penaltiesOn && (pc == null || pc.isReversalEnabled()))
+                ? reversalPenalty(pc == null ? 25.0 : pc.getReversalMax()) : 0.0;
+        double extPenalty     = (penaltiesOn && (pc == null || pc.isOverextensionEnabled()))
+                ? overextensionPenalty(isBuy, pc == null ? 30.0 : pc.getOverextensionMax()) : 0.0;
+        double sameClrPenalty = (penaltiesOn && (pc == null || pc.isSameColorEnabled()))
+                ? sameColorPenalty(isBuy, pc == null ? 30.0 : pc.getSameColorMax()) : 0.0;
+        double mismatchPen    = (penaltiesOn && (pc == null || pc.isMismatchEnabled()))
+                ? mismatchPenalty(strategyType, instrType, pc == null ? 1.0 : pc.getMismatchScale()) : 0.0;
+        double volOptPenalty  = (penaltiesOn && (pc == null || pc.isVolatileOptionEnabled()))
+                ? volatileOptionPenalty(regime, instrType, pc == null ? 35.0 : pc.getVolatileOptionPenalty()) : 0.0;
 
         double totalPenalty = revPenalty + extPenalty + sameClrPenalty + mismatchPen + volOptPenalty;
         double total = Math.max(0.0, base - totalPenalty);
@@ -225,7 +239,7 @@ public class StrategyScorer {
      * Reversal penalty: how many sign flips exist in the last 5 close diffs?
      * More flips = choppier = lower quality entry.
      */
-    private double reversalPenalty() {
+    private double reversalPenalty(double max) {
         double[] closes = closes();
         if (closes.length < 6) return 0.0;
         int flips = 0;
@@ -235,9 +249,9 @@ public class StrategyScorer {
             if ((diff > 0 && prevDiff < 0) || (diff < 0 && prevDiff > 0)) flips++;
             prevDiff = diff;
         }
-        if (flips >= 4) return 25.0;
-        if (flips >= 3) return 20.0;
-        if (flips >= 2) return 12.0;
+        if (flips >= 4) return max;
+        if (flips >= 3) return max * 0.80;
+        if (flips >= 2) return max * 0.48;
         return 0.0;
     }
 
@@ -245,7 +259,7 @@ public class StrategyScorer {
      * Overextension penalty: how far is the current close from the VWAP proxy
      * (equal-weighted typical-price mean over last 50 candles)?
      */
-    private double overextensionPenalty(boolean isBuy) {
+    private double overextensionPenalty(boolean isBuy, double max) {
         double[][] hist = historyArray();
         if (hist.length < 10) return 0.0;
         int n = Math.min(hist.length, 50);
@@ -262,10 +276,10 @@ public class StrategyScorer {
         // LONG entry: penalise if price is far ABOVE VWAP (overextended upward)
         // SHORT entry: penalise if price is far BELOW VWAP (overextended downward)
         double ext = isBuy ? pctFromVwap : -pctFromVwap;
-        if (ext > 3.0) return 30.0;
-        if (ext > 2.0) return 22.0;
-        if (ext > 1.5) return 15.0;
-        if (ext > 1.0) return 8.0;
+        if (ext > 3.0) return max;
+        if (ext > 2.0) return max * 0.733;
+        if (ext > 1.5) return max * 0.50;
+        if (ext > 1.0) return max * 0.267;
         return 0.0;
     }
 
@@ -273,7 +287,7 @@ public class StrategyScorer {
      * Same-color candle penalty: 3+ consecutive candles in the same direction
      * suggests exhaustion / late entry.
      */
-    private double sameColorPenalty(boolean isBuy) {
+    private double sameColorPenalty(boolean isBuy, double max) {
         double[][] hist = historyArray();
         if (hist.length < 3) return 0.0;
         int streak = 0;
@@ -284,24 +298,24 @@ public class StrategyScorer {
             if ((isBuy && bullish) || (!isBuy && !bullish)) streak++;
             else break;
         }
-        if (streak >= 5) return 30.0;
-        if (streak >= 4) return 20.0;
-        if (streak >= 3) return 12.0;
+        if (streak >= 5) return max;
+        if (streak >= 4) return max * 0.667;
+        if (streak >= 3) return max * 0.40;
         return 0.0;
     }
 
     /** Penalty for slow/trend strategies used on fast-moving options. */
-    private double mismatchPenalty(String strategyType, String instrType) {
+    private double mismatchPenalty(String strategyType, String instrType, double scale) {
         if (instrType == null) return 0.0;
         Map<String, Double> byType = MISMATCH.get(strategyType);
         if (byType == null) return 0.0;
-        return byType.getOrDefault(instrType.toUpperCase(), 0.0);
+        return byType.getOrDefault(instrType.toUpperCase(), 0.0) * scale;
     }
 
     /** Heavy penalty when trading options in a VOLATILE regime. */
-    private double volatileOptionPenalty(String regime, String instrType) {
+    private double volatileOptionPenalty(String regime, String instrType, double value) {
         if ("VOLATILE".equals(regime) && "OPTION".equalsIgnoreCase(instrType)) {
-            return 35.0;
+            return value;
         }
         return 0.0;
     }

@@ -29,27 +29,24 @@ public class OptionSelectorService {
     // optionCandleMap: token -> (openTime -> CandleDto), sorted for forward-fill lookups
     private final Map<Long, NavigableMap<LocalDateTime, CandleDto>> optionCandleMap;
 
-    public OptionSelectorService(OptionsReplayRequest.SelectionConfig selConfig,
-                                 Map<Long, Map<LocalDateTime, CandleDto>> optionCandleMap) {
-        this.selConfig = selConfig;
-        // Wrap each token's map in a TreeMap for sorted forward-fill lookups
+    /** Replay mode: wraps each token's flat map in a TreeMap for sorted forward-fill lookups. */
+    public static OptionSelectorService forReplay(OptionsReplayRequest.SelectionConfig selConfig,
+                                                  Map<Long, Map<LocalDateTime, CandleDto>> optionCandleMap) {
         Map<Long, NavigableMap<LocalDateTime, CandleDto>> sorted = new java.util.HashMap<>();
-        optionCandleMap.forEach((token, byTime) ->
-                sorted.put(token, new TreeMap<>(byTime)));
-        this.optionCandleMap = sorted;
+        optionCandleMap.forEach((token, byTime) -> sorted.put(token, new TreeMap<>(byTime)));
+        return new OptionSelectorService(selConfig, sorted);
     }
 
-    /**
-     * Live mode constructor — uses the provided pre-sorted map by reference so that
-     * candles added after construction are immediately visible during lookups.
-     *
-     * @param selConfig   premium selection configuration
-     * @param liveSortedMap  token -> NavigableMap(openTime -> candle), updated externally as ticks arrive
-     */
-    public OptionSelectorService(OptionsReplayRequest.SelectionConfig selConfig,
-                                 Map<Long, NavigableMap<LocalDateTime, CandleDto>> liveSortedMap) {
+    /** Live mode: uses the pre-sorted map by reference so new candles are immediately visible. */
+    public static OptionSelectorService forLive(OptionsReplayRequest.SelectionConfig selConfig,
+                                                Map<Long, NavigableMap<LocalDateTime, CandleDto>> liveSortedMap) {
+        return new OptionSelectorService(selConfig, liveSortedMap);
+    }
+
+    private OptionSelectorService(OptionsReplayRequest.SelectionConfig selConfig,
+                                  Map<Long, NavigableMap<LocalDateTime, CandleDto>> sortedMap) {
         this.selConfig = selConfig;
-        this.optionCandleMap = liveSortedMap;
+        this.optionCandleMap = sortedMap;
     }
 
     /**

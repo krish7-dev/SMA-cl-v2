@@ -33,8 +33,8 @@ public class NiftyDecisionEngine {
 
     private final StrategyRegistry                       registry;
     private final List<BacktestRequest.StrategyConfig>   strategies;
-    private final OptionsReplayRequest.DecisionConfig    dc;
-    private final OptionsReplayRequest.SwitchConfig      sc;
+    private final OptionsReplayRequest.DecisionConfig      dc;
+    private final OptionsReplayRequest.SwitchConfig        sc;
     private final OptionsReplayRequest.RegimeRules          rr;
     private final OptionsReplayRequest.RegimeStrategyRules  rsr;
     private final OptionsReplayRequest.ChopRules            cr;
@@ -42,6 +42,7 @@ public class NiftyDecisionEngine {
     private final OptionsReplayRequest.TradeQualityConfig   tqc;
     private final TrendEntryValidator                       tev;
     private final CompressionEntryValidator                 cev;
+    private final OptionsReplayRequest.PenaltyConfig        pc;
 
     // Score that was active when current confirmedBias was locked in (for switch improvement check)
     private double confirmedBiasScore = 0.0;
@@ -64,6 +65,9 @@ public class NiftyDecisionEngine {
     private NiftyDecisionResult.Bias previousBias  = NiftyDecisionResult.Bias.NEUTRAL;
     private NiftyDecisionResult.Bias pendingBias   = null;
     private int    confirmCount    = 0;
+
+    // Candle-bucket dedup for evaluateTick — confirmCount advances only once per bucket
+    private java.time.LocalDateTime lastConfirmBucketTime = null;
 
     // Daily switch counter
     private int    switchCountToday = 0;
@@ -88,6 +92,23 @@ public class NiftyDecisionEngine {
                                OptionsReplayRequest.TradeQualityConfig tradeQualityConfig,
                                OptionsReplayRequest.TrendEntryConfig trendEntryConfig,
                                OptionsReplayRequest.CompressionEntryConfig compressionEntryConfig) {
+        this(registry, strategies, decisionConfig, switchConfig, regimeRules, regimeStrategyRules,
+                chopRules, rangeQualityConfig, tradeQualityConfig, trendEntryConfig,
+                compressionEntryConfig, null);
+    }
+
+    public NiftyDecisionEngine(StrategyRegistry registry,
+                               List<BacktestRequest.StrategyConfig> strategies,
+                               OptionsReplayRequest.DecisionConfig decisionConfig,
+                               OptionsReplayRequest.SwitchConfig switchConfig,
+                               OptionsReplayRequest.RegimeRules regimeRules,
+                               OptionsReplayRequest.RegimeStrategyRules regimeStrategyRules,
+                               OptionsReplayRequest.ChopRules chopRules,
+                               OptionsReplayRequest.RangeQualityConfig rangeQualityConfig,
+                               OptionsReplayRequest.TradeQualityConfig tradeQualityConfig,
+                               OptionsReplayRequest.TrendEntryConfig trendEntryConfig,
+                               OptionsReplayRequest.CompressionEntryConfig compressionEntryConfig,
+                               OptionsReplayRequest.PenaltyConfig penaltyConfig) {
         this.registry   = registry;
         this.strategies = strategies;
         this.dc         = decisionConfig;
@@ -99,6 +120,7 @@ public class NiftyDecisionEngine {
         this.tqc        = tradeQualityConfig != null ? tradeQualityConfig : new OptionsReplayRequest.TradeQualityConfig();
         this.tev        = new TrendEntryValidator(trendEntryConfig);
         this.cev        = new CompressionEntryValidator(compressionEntryConfig);
+        this.pc         = penaltyConfig != null ? penaltyConfig : new OptionsReplayRequest.PenaltyConfig();
 
         for (BacktestRequest.StrategyConfig cfg : strategies) {
             String id = "nifty-opts-" + cfg.getStrategyType() + "-" + System.nanoTime() + "-" + cfg.hashCode();
@@ -129,6 +151,271 @@ public class NiftyDecisionEngine {
     }
 
     // ── Per-candle evaluation ─────────────────────────────────────────────────
+
+    /**
+     * Pushes a CLOSED candle into the scorer rolling window and VWAP.
+     * Call this on each candle close to keep history accurate for live tick evaluation.
+     */
+    public void pushCandle(CandleDto candle) {
+        String dateStr = dayOf(candle);
+        if (!dateStr.equals(currentDate)) {
+            currentDate      = dateStr;
+            switchCountToday = 0;
+            pvSum  = 0;
+            volSum = 0;
+        }
+        pushToScorersAndHistory(candle);
+        updateVwap(candle);
+    }
+
+    /**
+     * Live tick evaluation — runs the full decision and confirmation state machine
+     * against the current forming candle snapshot. Scorer rolling windows are NOT
+     * updated here (only on candle close via {@link #pushCandle}), so strategy signals
+     * reflect closed-candle history while execution reacts to every tick.
+     */
+    public NiftyDecisionResult evaluateTick(CandleDto tickSnapshot, String regime) {
+        double effMinScore    = effectiveMinScore(regime);
+        double effMinScoreGap = effectiveMinScoreGap(regime);
+
+        double close    = tickSnapshot.close().doubleValue();
+        double vwap     = volSum > 0 ? pvSum / volSum : close;
+        double vwapDist = (close - vwap) / vwap * 100.0;
+
+        // ── Evaluate ALL strategies ───────────────────────────────────────────
+        List<ScoredCandidate>                    signalCandidates = new ArrayList<>();
+        List<NiftyDecisionResult.CandidateScore> allCandidates    = new ArrayList<>();
+        Set<String> allowedForThisRegime = allowedForRegime(regime);
+
+        for (BacktestRequest.StrategyConfig cfg : strategies) {
+            String id = instanceIds.get(cfg.getStrategyType());
+            try {
+                if (allowedForThisRegime != null && !allowedForThisRegime.contains(cfg.getStrategyType())) {
+                    StrategyScorer.ScoreResult sr = scorers.get(cfg.getStrategyType())
+                            .score(cfg.getStrategyType(), true, regime, "OPTION", pc);
+                    allCandidates.add(NiftyDecisionResult.CandidateScore.builder()
+                            .strategyType(cfg.getStrategyType()).signal("NONE")
+                            .score(sr.getTotal()).eligible(false)
+                            .eligibilityReason("blocked by regime strategy rule").build());
+                    continue;
+                }
+                StrategyContext ctx    = buildContext(id, cfg, tickSnapshot);
+                StrategyResult  result = registry.resolve(cfg.getStrategyType()).evaluate(ctx);
+                if (!result.isHold()) {
+                    boolean isBuy = result.isBuy();
+                    StrategyScorer.ScoreResult sr = scorers.get(cfg.getStrategyType())
+                            .score(cfg.getStrategyType(), isBuy, regime, "OPTION", pc);
+                    ScoredCandidate sc = new ScoredCandidate(
+                            cfg.getStrategyType(),
+                            isBuy ? StrategyResult.Signal.BUY : StrategyResult.Signal.SELL,
+                            sr.getTotal(), sr);
+                    signalCandidates.add(sc);
+                    allCandidates.add(toCandidateScore(sc, effMinScore));
+                } else {
+                    StrategyScorer.ScoreResult sr = scorers.get(cfg.getStrategyType())
+                            .score(cfg.getStrategyType(), true, regime, "OPTION", pc);
+                    allCandidates.add(holdCandidateScore(cfg.getStrategyType(), sr));
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // ── Pick winner ───────────────────────────────────────────────────────
+        List<ScoredCandidate> sorted = signalCandidates.stream()
+                .sorted((a, b) -> Double.compare(b.score, a.score))
+                .collect(Collectors.toList());
+        ScoredCandidate top1 = sorted.isEmpty()  ? null : sorted.get(0);
+        ScoredCandidate top2 = sorted.size() > 1 ? sorted.get(1) : null;
+        ScoredCandidate winner = signalCandidates.stream()
+                .filter(c -> c.score >= effMinScore)
+                .max(Comparator.comparingDouble(c -> c.score)).orElse(null);
+
+        double winnerScore = winner != null ? winner.score : 0;
+        double secondScore = top2  != null ? top2.score   : 0;
+        double scoreGap    = winnerScore - secondScore;
+
+        // ── Raw bias ──────────────────────────────────────────────────────────
+        NiftyDecisionResult.Bias rawBias = NiftyDecisionResult.Bias.NEUTRAL;
+        if (winner != null && scoreGap >= effMinScoreGap) {
+            rawBias = winner.signal == StrategyResult.Signal.BUY
+                    ? NiftyDecisionResult.Bias.BULLISH : NiftyDecisionResult.Bias.BEARISH;
+        }
+
+        // ── Neutral reason ────────────────────────────────────────────────────
+        String neutralReason = null;
+        if (rawBias == NiftyDecisionResult.Bias.NEUTRAL) {
+            if (signalCandidates.isEmpty())   neutralReason = "NO_SIGNALS";
+            else if (winner == null)           neutralReason = "ALL_SIGNALS_BELOW_SCORE";
+            else                               neutralReason = "SCORE_GAP_TOO_SMALL";
+        }
+
+        // ── Shadow winner ─────────────────────────────────────────────────────
+        String shadowWinner = null; double shadowWinnerScore = 0; String shadowWinnerReasonNotTaken = null;
+        if (top1 != null) {
+            shadowWinner = top1.strategyType; shadowWinnerScore = top1.score;
+            if (rawBias != NiftyDecisionResult.Bias.NEUTRAL) {
+                shadowWinnerReasonNotTaken = "selected as winner";
+            } else if (top1.score < effMinScore) {
+                shadowWinnerReasonNotTaken = String.format("score %.1f < minScore %.1f", top1.score, effMinScore);
+            } else {
+                shadowWinnerReasonNotTaken = String.format("scoreGap %.1f < minScoreGap %.1f",
+                        top1.score - (top2 != null ? top2.score : 0), effMinScoreGap);
+            }
+        } else if (!allCandidates.isEmpty()) {
+            shadowWinnerReasonNotTaken = "all strategies returned HOLD";
+        }
+
+        // ── Entry decision with penalty system ───────────────────────────────
+        double move3 = recentMovePct(3);
+        double move5 = recentMovePct(5);
+        String  block = null; boolean canEnter = false; double penalizedScore = winnerScore;
+
+        if (rawBias == NiftyDecisionResult.Bias.NEUTRAL || winnerScore <= 0) {
+            block = "no directional signal"; canEnter = false;
+        } else if (winnerScore < 15) {
+            block = String.format("score %.1f below absolute floor (15)", winnerScore); canEnter = false;
+        } else {
+            EntryPenalties ep = computeEntryPenalties(move3, move5, Math.abs(vwapDist), regime);
+            penalizedScore = winnerScore + ep.total;
+            penalizedScore = Math.max(penalizedScore, winnerScore * 0.60);
+            if (winnerScore >= dc.getScoreFloorTrigger() && dc.getScoreFloorMin() > 0)
+                penalizedScore = Math.max(penalizedScore, dc.getScoreFloorMin());
+            if (winner != null && "BOLLINGER_REVERSION".equals(winner.strategyType)
+                    && winnerScore >= dc.getBollingerBonusThreshold() && dc.getBollingerBonus() != 0)
+                penalizedScore += dc.getBollingerBonus();
+            boolean rawScoreBypass = dc.getRawScoreBypassThreshold() > 0
+                    && winnerScore >= dc.getRawScoreBypassThreshold()
+                    && scoreGap >= dc.getRawScoreBypassGap();
+            double effectiveScore = Math.max(winnerScore, penalizedScore);
+            if (effectiveScore >= dc.getPenaltyMinScore() || rawScoreBypass) {
+                canEnter = true;
+            } else {
+                canEnter = false; block = ep.blockReason(penalizedScore, dc.getPenaltyMinScore());
+            }
+        }
+
+        // ── Structure validation ──────────────────────────────────────────────
+        // In live/tick mode history only has closed candles — append the forming tick
+        // candle so the validator sees it as the current candle (mirrors replay behaviour
+        // where pushToScorersAndHistory runs before validation).
+        if (canEnter) {
+            List<CandleDto> histList = new ArrayList<>(history);
+            histList.add(tickSnapshot);
+            if ("TRENDING".equals(regime)) {
+                TrendEntryValidator.Result tr = tev.validate(histList, rawBias);
+                if (!tr.isAllowed()) { canEnter = false; block = "TREND:" + tr.getReason(); }
+            } else if ("COMPRESSION".equals(regime)) {
+                CompressionEntryValidator.Result cvr = cev.validate(histList, rawBias);
+                if (!cvr.isAllowed()) { canEnter = false; block = "COMPRESSION:" + cvr.getReason(); }
+            }
+        }
+
+        // ── Trade quality tier ────────────────────────────────────────────────
+        String tradeStrength;
+        if (rawBias == NiftyDecisionResult.Bias.NEUTRAL || winnerScore <= 0 || !canEnter) {
+            tradeStrength = "NONE";
+        } else if (penalizedScore >= tqc.getStrongScoreThreshold()) {
+            tradeStrength = "STRONG";
+        } else if (penalizedScore >= tqc.getNormalScoreThreshold()) {
+            tradeStrength = "NORMAL";
+        } else if (penalizedScore >= dc.getPenaltyMinScore()) {
+            tradeStrength = "WEAK";
+        } else {
+            tradeStrength = "NONE";
+        }
+
+        // ── Confirmation state machine ────────────────────────────────────────
+        int confirmRequired = sc.getSwitchConfirmationCandles();
+        if (tqc.isEnabled()) {
+            if ("RANGING".equals(regime))                                      confirmRequired = tqc.getRangingConfirmCandles();
+            else if ("TRENDING".equals(regime) || "COMPRESSION".equals(regime)) confirmRequired = tqc.getTrendingConfirmCandles();
+        }
+        if (winner != null && "BOLLINGER_REVERSION".equals(winner.strategyType)
+                && dc.getBollingerEarlyEntryMinScore() > 0
+                && winnerScore >= dc.getBollingerEarlyEntryMinScore())
+            confirmRequired = Math.min(confirmRequired, 1);
+
+        boolean switchRequested = rawBias != NiftyDecisionResult.Bias.NEUTRAL && rawBias != confirmedBias;
+        boolean switchConfirmed = false;
+        String  switchReason    = null;
+
+        // Count each candle bucket only once — multiple ticks sharing the same openTime
+        // must not advance the confirmation counter more than once.
+        boolean isNewBucket = (tickSnapshot.openTime() != null
+                && !tickSnapshot.openTime().equals(lastConfirmBucketTime));
+        if (isNewBucket) lastConfirmBucketTime = tickSnapshot.openTime();
+
+        if (rawBias == confirmedBias) {
+            // Already confirmed — reset pending accumulator (fires on every tick to keep state clean)
+            pendingBias = null; confirmCount = 0;
+        } else if (rawBias == NiftyDecisionResult.Bias.NEUTRAL) {
+            if (pendingBias != null && pendingBias != NiftyDecisionResult.Bias.NEUTRAL) {
+                // A directional confirmation is in progress — neutral tick just pauses it.
+                // (no-op: pendingBias and confirmCount unchanged)
+            } else if (isNewBucket) {
+                // Count neutral candle buckets toward de-confirming an existing directional bias
+                if (pendingBias == NiftyDecisionResult.Bias.NEUTRAL) confirmCount++;
+                else { pendingBias = NiftyDecisionResult.Bias.NEUTRAL; confirmCount = 1; }
+                if (confirmCount >= confirmRequired && confirmedBias != NiftyDecisionResult.Bias.NEUTRAL) {
+                    switchConfirmed = true; switchReason = "neutral confirmed — bias invalidated";
+                    previousBias = confirmedBias; confirmedBias = NiftyDecisionResult.Bias.NEUTRAL;
+                    confirmedBiasScore = 0.0; pendingBias = null; confirmCount = 0;
+                }
+            }
+        } else {
+            // Directional signal — advance on every tick for fast entry confirmation
+            if (pendingBias == rawBias) {
+                confirmCount++;
+            } else {
+                // Opposing signal (or first signal) — reset count for new direction
+                pendingBias = rawBias; confirmCount = 1;
+            }
+            boolean scoreImprovementOk = sc.getMinScoreImprovementForSwitch() <= 0
+                    || winnerScore >= confirmedBiasScore + sc.getMinScoreImprovementForSwitch();
+            if (confirmCount >= confirmRequired && winnerScore >= effMinScore
+                    && scoreGap >= effMinScoreGap && scoreImprovementOk) {
+                switchConfirmed = true; switchReason = "bias confirmed for " + confirmCount + " ticks";
+                previousBias = confirmedBias; confirmedBias = rawBias;
+                confirmedBiasScore = winnerScore; pendingBias = null; confirmCount = 0;
+            }
+        }
+
+        String confidence = winnerScore >= 75 ? "HIGH" : winnerScore >= 55 ? "MEDIUM"
+                : winnerScore >= effMinScore ? "LOW" : "NONE";
+
+        return NiftyDecisionResult.builder()
+                .rawBias(rawBias)
+                .confirmedBias(confirmedBias)
+                .previousBias(previousBias)
+                .winnerStrategy(winner != null ? winner.strategyType : null)
+                .winnerScore(winnerScore)
+                .scoreGap(scoreGap)
+                .confidenceLevel(confidence)
+                .regime(regime)
+                .recentMove3(move3)
+                .recentMove5(move5)
+                .distanceFromVwap(vwapDist)
+                .vwap(vwap)
+                .entryAllowed(canEnter)
+                .blockReason(block)
+                .penalizedScore(penalizedScore)
+                .tradeStrength(tradeStrength)
+                .neutralReason(neutralReason)
+                .effectiveMinScore(effMinScore)
+                .effectiveMinScoreGap(effMinScoreGap)
+                .secondStrategy(top2 != null ? top2.strategyType : null)
+                .secondScore(secondScore)
+                .shadowWinner(shadowWinner)
+                .shadowWinnerScore(shadowWinnerScore)
+                .shadowWinnerReasonNotTaken(shadowWinnerReasonNotTaken)
+                .switchRequested(switchRequested)
+                .switchConfirmed(switchConfirmed)
+                .confirmCount(confirmCount)
+                .confirmRequired(confirmRequired)
+                .switchReason(switchReason)
+                .switchCountToday(switchCountToday)
+                .candidates(allCandidates)
+                .build();
+    }
 
     public NiftyDecisionResult evaluate(CandleDto candle, String regime) {
         // Reset daily state at day boundary
@@ -163,7 +450,7 @@ public class NiftyDecisionEngine {
                 // Skip strategies blocked by regime strategy rules
                 if (allowedForThisRegime != null && !allowedForThisRegime.contains(cfg.getStrategyType())) {
                     StrategyScorer.ScoreResult sr = scorers.get(cfg.getStrategyType())
-                            .score(cfg.getStrategyType(), true, regime, "OPTION");
+                            .score(cfg.getStrategyType(), true, regime, "OPTION", pc);
                     NiftyDecisionResult.CandidateScore cs = holdCandidateScore(cfg.getStrategyType(), sr);
                     // Override eligibility reason to explain the regime filter
                     allCandidates.add(NiftyDecisionResult.CandidateScore.builder()
@@ -188,7 +475,7 @@ public class NiftyDecisionEngine {
                 if (!result.isHold()) {
                     boolean isBuy = result.isBuy();
                     StrategyScorer.ScoreResult sr = scorers.get(cfg.getStrategyType())
-                            .score(cfg.getStrategyType(), isBuy, regime, "OPTION");
+                            .score(cfg.getStrategyType(), isBuy, regime, "OPTION", pc);
                     ScoredCandidate sc = new ScoredCandidate(
                             cfg.getStrategyType(),
                             isBuy ? StrategyResult.Signal.BUY : StrategyResult.Signal.SELL,
@@ -198,7 +485,7 @@ public class NiftyDecisionEngine {
                 } else {
                     // HOLD: score with BUY direction as a reference (shows what the scorer sees)
                     StrategyScorer.ScoreResult sr = scorers.get(cfg.getStrategyType())
-                            .score(cfg.getStrategyType(), true, regime, "OPTION");
+                            .score(cfg.getStrategyType(), true, regime, "OPTION", pc);
                     allCandidates.add(holdCandidateScore(cfg.getStrategyType(), sr));
                 }
             } catch (Exception e) {
@@ -708,31 +995,43 @@ public class NiftyDecisionEngine {
         EntryPenalties ep = new EntryPenalties();
 
         boolean isRanging = "RANGING".equals(regime);
+        boolean penaltiesOn = pc.isEnabled();
 
-        // Move / over-extension penalty (-3, reduced from -5)
-        if (m3 > dc.getMaxRecentMove3() || m5 > dc.getMaxRecentMove5())
-            ep.add("move", -3);
+        // Move / over-extension penalty
+        if (penaltiesOn && pc.isMovePenaltyEnabled()
+                && (m3 > dc.getMaxRecentMove3() || m5 > dc.getMaxRecentMove5()))
+            ep.add("move", -pc.getMovePenalty());
 
-        // VWAP distance penalty (-5)
-        if (absVwap > dc.getMaxAbsVwapDist())
-            ep.add("vwap", -5);
+        // VWAP distance penalty
+        if (penaltiesOn && pc.isVwapPenaltyEnabled()
+                && absVwap > dc.getMaxAbsVwapDist())
+            ep.add("vwap", -pc.getVwapPenalty());
 
-        // Chop penalty: disabled in RANGING; -2 in other regimes (reduced from -4)
-        if (!isRanging && dc.isChopFilter() && isChopFilterActiveForRegime(regime)
+        // Chop penalty: disabled in RANGING
+        if (penaltiesOn && pc.isChopPenaltyEnabled()
+                && !isRanging && dc.isChopFilter() && isChopFilterActiveForRegime(regime)
                 && isChoppy(chopFlipRatioForRegime(regime)))
-            ep.add("chop", -2);
+            ep.add("chop", -pc.getChopPenalty());
 
         // Range quality penalties (RANGING only)
         if (isRanging) {
             RangeQualityFilter.Result rq = rqf.evaluate(history);
             if (!rq.isAllowed()) {
                 String reason = rq.getReason();
-                double penalty = reason.startsWith("RANGE_DRIFTING")       ? -3   // 50% cut from -5 (RANGING fix)
-                               : reason.startsWith("RANGE_POOR_STRUCTURE") ? -4
-                               : reason.startsWith("RANGE_CHOPPY")         ? -2   // halved (chop reduced in RANGING)
-                               : -2; // TOO_NARROW, TOO_WIDE (reduced from -5)
-                String label = reason.contains(":") ? reason.substring(0, reason.indexOf(':')) : reason;
-                ep.add(label.toLowerCase().replace("range_", ""), penalty);
+                double penalty;
+                if (reason.startsWith("RANGE_DRIFTING")) {
+                    penalty = (penaltiesOn && pc.isRangeDriftingEnabled()) ? -pc.getRangeDriftingPenalty() : 0;
+                } else if (reason.startsWith("RANGE_POOR_STRUCTURE")) {
+                    penalty = (penaltiesOn && pc.isRangePoorStructureEnabled()) ? -pc.getRangePoorStructurePenalty() : 0;
+                } else if (reason.startsWith("RANGE_CHOPPY")) {
+                    penalty = (penaltiesOn && pc.isRangeChoppyEnabled()) ? -pc.getRangeChoppyPenalty() : 0;
+                } else {
+                    penalty = (penaltiesOn && pc.isRangeSizeEnabled()) ? -pc.getRangeSizePenalty() : 0; // TOO_NARROW, TOO_WIDE
+                }
+                if (penalty != 0) {
+                    String label = reason.contains(":") ? reason.substring(0, reason.indexOf(':')) : reason;
+                    ep.add(label.toLowerCase().replace("range_", ""), penalty);
+                }
             }
         }
 
