@@ -3,12 +3,15 @@ package com.sma.strategyengine.service.options;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sma.strategyengine.client.DataEngineClient;
 import com.sma.strategyengine.client.DataEngineClient.CandleDto;
+import com.sma.strategyengine.entity.LiveSnapshotRecord;
 import com.sma.strategyengine.model.request.BacktestRequest;
 import com.sma.strategyengine.model.request.OptionsLiveRequest;
 import com.sma.strategyengine.model.request.OptionsReplayRequest;
 import com.sma.strategyengine.model.response.OptionsReplayCandleEvent;
+import com.sma.strategyengine.repository.LiveSnapshotRepository;
 import com.sma.strategyengine.service.MarketRegimeDetector;
 import com.sma.strategyengine.strategy.StrategyRegistry;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -26,6 +29,7 @@ import java.net.http.HttpResponse;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 /**
@@ -50,9 +54,10 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class OptionsLiveService {
 
-    private final StrategyRegistry  strategyRegistry;
-    private final DataEngineClient  dataEngineClient;
-    private final ObjectMapper      objectMapper;
+    private final StrategyRegistry      strategyRegistry;
+    private final DataEngineClient      dataEngineClient;
+    private final ObjectMapper          objectMapper;
+    private final LiveSnapshotRepository snapshotRepository;
 
     @Value("${strategy.data-engine.base-url:http://localhost:9005}")
     private String dataEngineBaseUrl;
@@ -80,44 +85,135 @@ public class OptionsLiveService {
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    public String start(OptionsLiveRequest req, SseEmitter emitter) {
+    /**
+     * Starts a background trading session. Returns the sessionId immediately.
+     * The session runs independently — no SSE emitter is required to keep it alive.
+     * Persists the request config to DB so the session can be listed after restart.
+     */
+    public String start(OptionsLiveRequest req) {
+        // One live session per (userId, brokerName) — stop any prior one first
+        String key = req.getUserId() + "::" + req.getBrokerName().toLowerCase();
+        sessions.values().stream()
+                .filter(s -> key.equals(s.userId + "::" + s.req.getBrokerName().toLowerCase()))
+                .map(s -> s.sessionId)
+                .forEach(this::stopSession);
+
         String sessionId = UUID.randomUUID().toString();
-        LiveOptionsSession session = new LiveOptionsSession(sessionId, req, emitter);
+        LiveOptionsSession session = new LiveOptionsSession(sessionId, req);
         sessions.put(sessionId, session);
 
-        emitter.onCompletion(() -> cleanup(sessionId));
-        emitter.onError(e -> cleanup(sessionId));
+        // Persist config so the UI can discover active sessions after reconnect
+        persistSnapshot(sessionId, req);
 
         executor.execute(() -> {
             try {
                 session.run();
             } catch (Exception e) {
                 log.error("Options live session {} failed: {}", sessionId, e.getMessage(), e);
-                cleanup(sessionId);
-                try { emitter.completeWithError(e); } catch (Exception ignored) {}
+                stopSession(sessionId);
+                session.broadcastError(e.getMessage());
             }
         });
 
-        log.info("Options live session {} started: interval={}, CE={}, PE={}",
+        log.info("Options live session {} started (background): interval={}, CE={}, PE={}",
                 sessionId, req.getInterval(),
                 req.getCeOptions() != null ? req.getCeOptions().size() : 0,
                 req.getPeOptions() != null ? req.getPeOptions().size() : 0);
         return sessionId;
     }
 
-    public SseEmitter getEmitter(String sessionId) {
-        LiveOptionsSession s = sessions.get(sessionId);
-        return s != null ? s.emitter : null;
+    /**
+     * Attaches a new SSE emitter to an already-running session.
+     * Replays the last {@code BUFFER_SIZE} candle events so the UI catches up immediately.
+     * The session continues running if the client disconnects — only {@link #stop} kills it.
+     */
+    public SseEmitter attach(String sessionId) {
+        LiveOptionsSession session = sessions.get(sessionId);
+        if (session == null) return null;
+
+        SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
+
+        // Client disconnect removes emitter but does NOT stop the session
+        emitter.onCompletion(() -> session.removeEmitter(emitter));
+        emitter.onError(e  -> session.removeEmitter(emitter));
+
+        // Replay recent events so the UI sees current state on reconnect
+        session.replayBufferTo(emitter);
+
+        session.addEmitter(emitter);
+        log.info("Options live session {}: UI client attached ({} connected)",
+                sessionId, session.emitterCount());
+        return emitter;
     }
 
+    /**
+     * Explicitly stops a session. This is the ONLY way a session terminates other than
+     * a fatal error inside the session thread.
+     */
     public void stop(String sessionId) {
-        cleanup(sessionId);
-        log.info("Options live session {} stopped", sessionId);
+        stopSession(sessionId);
+        deleteSnapshot(sessionId);
+        log.info("Options live session {} stopped by request", sessionId);
     }
 
-    private void cleanup(String sessionId) {
+    /** Returns a snapshot of all active session IDs and their userId. */
+    public List<Map<String, String>> listSessions() {
+        return sessions.values().stream()
+                .map(s -> Map.of(
+                        "sessionId",  s.sessionId,
+                        "userId",     s.userId,
+                        "brokerName", s.req.getBrokerName(),
+                        "interval",   s.req.getInterval(),
+                        "startedAt",  s.startedAt.toString(),
+                        "emitters",   String.valueOf(s.emitterCount())))
+                .collect(Collectors.toList());
+    }
+
+    /** Returns the active sessionId for a given userId, or null if none running. */
+    public String activeSessionForUser(String userId) {
+        return sessions.values().stream()
+                .filter(s -> userId.equals(s.userId))
+                .map(s -> s.sessionId)
+                .findFirst().orElse(null);
+    }
+
+    private void stopSession(String sessionId) {
         LiveOptionsSession session = sessions.remove(sessionId);
         if (session != null) session.stop();
+    }
+
+    private void persistSnapshot(String sessionId, OptionsLiveRequest req) {
+        try {
+            String json = objectMapper.writeValueAsString(req);
+            LiveSnapshotRecord rec = snapshotRepository
+                    .findByUserIdAndBrokerName(req.getUserId(), req.getBrokerName())
+                    .orElse(new LiveSnapshotRecord());
+            rec.setUserId(req.getUserId());
+            rec.setBrokerName(req.getBrokerName());
+            rec.setSessionId(sessionId);
+            rec.setSavedAt(Instant.now());
+            rec.setStateJson(json);
+            snapshotRepository.save(rec);
+        } catch (Exception e) {
+            log.warn("Options live session {}: failed to persist snapshot: {}", sessionId, e.getMessage());
+        }
+    }
+
+    private void deleteSnapshot(String sessionId) {
+        try {
+            sessions.values().stream()
+                    .filter(s -> sessionId.equals(s.sessionId))
+                    .findFirst()
+                    .ifPresent(s -> snapshotRepository
+                            .deleteByUserIdAndBrokerName(s.userId, s.req.getBrokerName()));
+            // Also delete if session already removed from map
+            snapshotRepository.findAll().stream()
+                    .filter(r -> sessionId.equals(r.getSessionId()))
+                    .forEach(r -> snapshotRepository.deleteByUserIdAndBrokerName(
+                            r.getUserId(), r.getBrokerName()));
+        } catch (Exception e) {
+            log.warn("Options live session {}: failed to delete snapshot: {}", sessionId, e.getMessage());
+        }
     }
 
     // ── FormingCandle ─────────────────────────────────────────────────────────
@@ -150,12 +246,24 @@ public class OptionsLiveService {
 
     // ── LiveOptionsSession ────────────────────────────────────────────────────
 
+    /** How many recent candle events to buffer for late-joining / reconnecting UIs. */
+    private static final int BUFFER_SIZE = 200;
+
     private class LiveOptionsSession {
 
         final String              sessionId;
+        @Getter final String      userId;
         final OptionsLiveRequest  req;
-        final SseEmitter          emitter;
         final long                ivMs;
+        final Instant             startedAt = Instant.now();
+
+        // Fan-out emitters — any number of UI clients can watch simultaneously.
+        // The session keeps running when zero clients are connected.
+        private final CopyOnWriteArrayList<SseEmitter> emitters = new CopyOnWriteArrayList<>();
+
+        // Ring buffer of recent serialised candle-event strings for reconnecting UIs.
+        private final Deque<String[]> eventBuffer = new ArrayDeque<>(BUFFER_SIZE);
+        private final Object bufferLock = new Object();
 
         // Instrument sets
         final long        niftyToken;
@@ -190,13 +298,55 @@ public class OptionsLiveService {
         volatile boolean   stopped    = false;
         volatile Future<?> tickFuture = null;
 
+        // ── emitter management ────────────────────────────────────────────────
+
+        void addEmitter(SseEmitter e)    { emitters.add(e); }
+        void removeEmitter(SseEmitter e) { emitters.remove(e); }
+        int  emitterCount()              { return emitters.size(); }
+
+        /** Replays buffered events to a freshly attached emitter so it sees recent state. */
+        void replayBufferTo(SseEmitter e) {
+            List<String[]> snapshot;
+            synchronized (bufferLock) { snapshot = new ArrayList<>(eventBuffer); }
+            for (String[] ev : snapshot) {
+                try { e.send(SseEmitter.event().name(ev[0]).data(ev[1])); }
+                catch (Exception ignored) { break; }
+            }
+        }
+
+        /** Broadcasts an error message to all connected UIs (session keeps running). */
+        void broadcastError(String message) {
+            broadcast("error", message);
+        }
+
+        /** Sends a named event to all connected emitters; silently removes dead ones. */
+        private void broadcast(String eventName, String data) {
+            // Buffer the event for late-joining UIs (candle events only)
+            if ("candle".equals(eventName) || "init".equals(eventName)) {
+                synchronized (bufferLock) {
+                    if (eventBuffer.size() >= BUFFER_SIZE) eventBuffer.pollFirst();
+                    eventBuffer.addLast(new String[]{ eventName, data });
+                }
+            }
+            if (emitters.isEmpty()) return;
+            List<SseEmitter> dead = null;
+            for (SseEmitter e : emitters) {
+                try { e.send(SseEmitter.event().name(eventName).data(data)); }
+                catch (Exception ex) {
+                    if (dead == null) dead = new ArrayList<>();
+                    dead.add(e);
+                }
+            }
+            if (dead != null) emitters.removeAll(dead);
+        }
+
         // ── constructor ───────────────────────────────────────────────────────
 
-        LiveOptionsSession(String sessionId, OptionsLiveRequest req, SseEmitter emitter) {
-            this.sessionId = sessionId;
-            this.req       = req;
-            this.emitter   = emitter;
-            this.ivMs      = INTERVAL_MS.getOrDefault(req.getInterval(), 300_000L);
+        LiveOptionsSession(String sessionId, OptionsLiveRequest req) {
+            this.sessionId  = sessionId;
+            this.userId     = req.getUserId();
+            this.req        = req;
+            this.ivMs       = INTERVAL_MS.getOrDefault(req.getInterval(), 300_000L);
             this.niftyToken = req.getNiftyInstrumentToken() != null
                     ? req.getNiftyInstrumentToken() : -1L;
 
@@ -267,13 +417,16 @@ public class OptionsLiveService {
             // so the selector has price data immediately (before any option ticks arrive)
             warmupOptionCandles();
 
-            // Emit init event
-            emitter.send(SseEmitter.event().name("init").data(
-                    objectMapper.writeValueAsString(Map.of(
-                            "sessionId",     sessionId,
-                            "warmupCandles", warmupCandles.size(),
-                            "ceOptions",     cePool.size(),
-                            "peOptions",     pePool.size()))));
+            // Broadcast init event (buffered so reconnecting UIs see it immediately)
+            try {
+                broadcast("init", objectMapper.writeValueAsString(Map.of(
+                        "sessionId",     sessionId,
+                        "warmupCandles", warmupCandles.size(),
+                        "ceOptions",     cePool.size(),
+                        "peOptions",     pePool.size())));
+            } catch (Exception e) {
+                log.warn("Options live session {}: init event serialisation failed: {}", sessionId, e.getMessage());
+            }
 
             // Phase 2: subscribe NIFTY + option tokens to Data Engine live stream
             if (!stopped) {
@@ -541,6 +694,7 @@ public class OptionsLiveService {
         }
 
         private void emitTickEvent(long token, double ltp, long epochMs) {
+            if (emitters.isEmpty()) return; // no UI connected — skip tick serialisation
             try {
                 boolean isNifty = (token == niftyToken);
                 FormingCandle fc = forming.get(token);
@@ -556,11 +710,18 @@ public class OptionsLiveService {
                     evt.put("fLow",   fc.low);
                     evt.put("fClose", fc.close);
                 }
-                emitter.send(SseEmitter.event().name("tick")
-                        .data(objectMapper.writeValueAsString(evt)));
-            } catch (Exception ignored) {
-                // Don't stop session on tick emit failure
-            }
+                // Tick events are NOT buffered — high-frequency, no replay needed
+                String json = objectMapper.writeValueAsString(evt);
+                List<SseEmitter> dead = null;
+                for (SseEmitter e : emitters) {
+                    try { e.send(SseEmitter.event().name("tick").data(json)); }
+                    catch (Exception ex) {
+                        if (dead == null) dead = new ArrayList<>();
+                        dead.add(e);
+                    }
+                }
+                if (dead != null) emitters.removeAll(dead);
+            } catch (Exception ignored) {}
         }
 
         private void processNiftyTick(double ltp, long volumeToday, long bucketMs) {
@@ -608,8 +769,7 @@ public class OptionsLiveService {
                 OptionsReplayCandleEvent event = buildEvent(
                         emittedCount, snapshot, decision, execEngine, selectorService, openTime, action);
 
-                emitter.send(SseEmitter.event().name("candle")
-                        .data(objectMapper.writeValueAsString(event)));
+                broadcast("candle", objectMapper.writeValueAsString(event));
             } catch (Exception e) {
                 log.debug("Options live session {}: tick candle emit failed: {}", sessionId, e.getMessage());
             }
@@ -710,6 +870,11 @@ public class OptionsLiveService {
             stopped = true;
             if (tickFuture != null) tickFuture.cancel(true);
             if (decisionEngine != null) decisionEngine.cleanup();
+            // Complete all connected UI emitters so browsers know the session ended
+            for (SseEmitter e : emitters) {
+                try { e.complete(); } catch (Exception ignored) {}
+            }
+            emitters.clear();
         }
 
         // ── event builder ─────────────────────────────────────────────────────

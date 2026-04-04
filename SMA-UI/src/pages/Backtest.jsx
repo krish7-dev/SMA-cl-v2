@@ -7,7 +7,7 @@ import {
   startReplayEval,
   startLiveEval, stopLiveEval,
   startOptionsReplayEval,
-  startOptionsLiveEval, streamOptionsLiveEval, stopOptionsLiveEval,
+  startOptionsLiveEval, streamOptionsLiveEval, stopOptionsLiveEval, getActiveOptionsLiveSession,
 } from '../services/api';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { useSession } from '../context/SessionContext';
@@ -1153,9 +1153,56 @@ function OptionsLiveTest() {
   }
 
   function deletePreset(id) {
+    const preset = presets.find(p => p.id === id);
+    if (!window.confirm(`Delete preset "${preset?.name}"?`)) return;
     const next = presets.filter(p => p.id !== id);
     setPresets(next);
     try { localStorage.setItem('sma_opts_presets', JSON.stringify(next)); } catch {}
+  }
+
+  function downloadPreset(preset) {
+    const blob = new Blob([JSON.stringify(preset, null, 2)], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `preset-${preset.name.replace(/[^a-z0-9]/gi, '_')}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function downloadAllPresets() {
+    const blob = new Blob([JSON.stringify(presets, null, 2)], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = 'sma_opts_presets.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function uploadPresets(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const parsed = JSON.parse(ev.target.result);
+        // Accept a single preset object or an array of presets
+        const incoming = Array.isArray(parsed) ? parsed : [parsed];
+        if (!incoming.every(p => p.id && p.name && p.config)) {
+          alert('Invalid preset file — each preset must have id, name, and config fields.');
+          return;
+        }
+        // Merge: keep existing presets, add uploaded ones (skip duplicates by id)
+        const existingIds = new Set(presets.map(p => p.id));
+        const toAdd = incoming.filter(p => !existingIds.has(p.id));
+        const next  = [...toAdd, ...presets];
+        setPresets(next);
+        try { localStorage.setItem('sma_opts_presets', JSON.stringify(next)); } catch {}
+      } catch { alert('Failed to parse preset file — must be valid JSON.'); }
+    };
+    reader.readAsText(file);
+    e.target.value = ''; // reset so same file can be uploaded again
   }
 
   // ── Persist to localStorage
@@ -1197,11 +1244,60 @@ function OptionsLiveTest() {
   const sessionIdRef  = useRef(null);
   const lastRunPcRef  = useRef(null);
 
-  useEffect(() => () => {
-    abortRef.current?.abort();
-    const sid = sessionIdRef.current;
-    if (sid) stopOptionsLiveEval(sid).catch(() => {});
-  }, []);
+  // On mount: check if a session is already running for this user and auto-reconnect to it.
+  useEffect(() => {
+    if (!session?.userId) return;
+    getActiveOptionsLiveSession(session.userId).then(sid => {
+      if (sid) {
+        sessionIdRef.current = sid;
+        setSessionId(sid);
+        // Auto-attach SSE so the feed starts populating immediately
+        const ctrl = new AbortController();
+        abortRef.current = ctrl;
+        setStatus('running');
+        streamOptionsLiveEval(sid, ctrl.signal).then(async response => {
+          if (!response?.body) return;
+          const reader = response.body.getReader();
+          readerRef.current = reader;
+          const decoder = new TextDecoder();
+          let buffer = '';
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              const parts = buffer.split('\n\n');
+              buffer = parts.pop();
+              for (const part of parts) {
+                let evtName = null, data = null;
+                for (const line of part.split('\n')) {
+                  if (line.startsWith('event:')) evtName = line.slice(6).trim();
+                  else if (line.startsWith('data:')) data = line.slice(5).trim();
+                }
+                if (!evtName || !data) continue;
+                if (evtName === 'error') { setError(data.replace(/^"|"$/g, '')); setStatus('error'); return; }
+                try {
+                  const parsed = JSON.parse(data);
+                  if (evtName === 'init')        setInitInfo(parsed);
+                  else if (evtName === 'candle') setFeed(prev => [...prev.slice(-499), parsed]);
+                  else if (evtName === 'tick')   setLiveTicks(prev => ({ ...prev, [parsed.token]: parsed }));
+                } catch {}
+              }
+            }
+          } catch (err) {
+            if (err.name !== 'AbortError') { setError(err.message); setStatus('error'); }
+            else setStatus('idle');
+            return;
+          }
+          // Stream ended cleanly (server stopped the session)
+          sessionIdRef.current = null; setSessionId(null); setStatus('idle');
+        }).catch(() => { setStatus('idle'); });
+      }
+    }).catch(() => {});
+
+    // On unmount: only abort the SSE stream — do NOT stop the backend session.
+    return () => { abortRef.current?.abort(); };
+  }, [session?.userId]);
 
   // ── Pool helpers
   function updatePoolInst(pool, setPool, id, patch) { setPool(p => p.map(i => i.id === id ? { ...i, ...patch } : i)); }
@@ -1212,8 +1308,10 @@ function OptionsLiveTest() {
   function updateStratParam(idx, key, val)   { setStrategies(p => p.map((s, i) => i === idx ? { ...s, parameters: { ...s.parameters, [key]: val } } : s)); }
 
   async function handleStop() {
+    // Abort the local SSE reader first so the stream loop exits
     abortRef.current?.abort();
     try { readerRef.current?.cancel(); } catch {}
+    // Explicitly stop the backend session — this is the ONLY action that terminates it
     const sid = sessionIdRef.current;
     if (sid) {
       try { await stopOptionsLiveEval(sid); } catch {}
@@ -1440,7 +1538,7 @@ function OptionsLiveTest() {
       sessionIdRef.current = sid;
       setSessionId(sid);
 
-      // Step 2: stream SSE
+      // Step 2: attach SSE listener (session already running in backend)
       const ctrl = new AbortController();
       abortRef.current = ctrl;
       const response = await streamOptionsLiveEval(sid, ctrl.signal);
@@ -1475,14 +1573,59 @@ function OptionsLiveTest() {
           } catch {}
         }
       }
+      // SSE stream ended — session was stopped by server (explicit DELETE)
+      sessionIdRef.current = null;
+      setSessionId(null);
       setStatus('idle');
     } catch (err) {
       if (err.name === 'AbortError') { setStatus('idle'); return; }
       setError(err.message);
       setStatus('error');
-    } finally {
-      sessionIdRef.current = null;
-      setSessionId(null);
+      // Don't null sessionId here — the backend session may still be running.
+      // The user can reconnect via handleReconnect or stop it via handleStop.
+    }
+  }
+
+  // Reconnect SSE to an already-running backend session without restarting it
+  async function handleReconnect() {
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    setError(''); setStatus('running');
+    try {
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+      const response = await streamOptionsLiveEval(sid, ctrl.signal);
+      if (!response.body) throw new Error('No response body');
+      const reader = response.body.getReader();
+      readerRef.current = reader;
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop();
+        for (const part of parts) {
+          let evtName = null, data = null;
+          for (const line of part.split('\n')) {
+            if (line.startsWith('event:')) evtName = line.slice(6).trim();
+            else if (line.startsWith('data:')) data = line.slice(5).trim();
+          }
+          if (!evtName || !data) continue;
+          if (evtName === 'error') { setError(data.replace(/^"|"$/g, '')); setStatus('error'); return; }
+          try {
+            const parsed = JSON.parse(data);
+            if (evtName === 'init')        setInitInfo(parsed);
+            else if (evtName === 'candle') setFeed(prev => [...prev.slice(-499), parsed]);
+            else if (evtName === 'tick')   setLiveTicks(prev => ({ ...prev, [parsed.token]: parsed }));
+          } catch {}
+        }
+      }
+      sessionIdRef.current = null; setSessionId(null); setStatus('idle');
+    } catch (err) {
+      if (err.name === 'AbortError') { setStatus('idle'); return; }
+      setError(err.message); setStatus('error');
     }
   }
 
@@ -1954,6 +2097,12 @@ function OptionsLiveTest() {
           <button type="submit" className="btn-primary" disabled={!canRun && !isRunning}>
             {isRunning ? 'Stop Live Session' : 'Start Options Live'}
           </button>
+          {/* Reconnect re-attaches the SSE listener to the running backend session without restarting it */}
+          {!isRunning && sessionId && (
+            <button type="button" className="btn-secondary" onClick={handleReconnect}>
+              Reconnect
+            </button>
+          )}
           <button type="button" className="btn-secondary" onClick={() => {
             setFeed([]); setInitInfo(null); setError(''); setStatus('idle');
             setNifty({ symbol: '', exchange: 'NSE', instrumentToken: '' });
@@ -1985,12 +2134,23 @@ function OptionsLiveTest() {
 
         {/* ── Presets ── */}
         <div className="card bt-opts-card">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: presets.length > 0 || showPresetSave ? 12 : 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: presets.length > 0 || showPresetSave ? 12 : 0, flexWrap: 'wrap' }}>
             <span className="bt-section-title" style={{ marginBottom: 0 }}>Config Presets</span>
-            <button type="button" className="btn-secondary btn-xs" style={{ marginLeft: 'auto' }}
-              onClick={() => setShowPresetSave(s => !s)} disabled={isRunning}>
-              {showPresetSave ? 'Cancel' : '+ Save Current'}
-            </button>
+            <div style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+              {presets.length > 0 && (
+                <button type="button" className="btn-secondary btn-xs" onClick={downloadAllPresets} title="Export all presets as JSON">
+                  Export All
+                </button>
+              )}
+              <label className="btn-secondary btn-xs" style={{ cursor: 'pointer', marginBottom: 0 }} title="Import presets from JSON file">
+                Import
+                <input type="file" accept=".json" style={{ display: 'none' }} onChange={uploadPresets} />
+              </label>
+              <button type="button" className="btn-secondary btn-xs"
+                onClick={() => setShowPresetSave(s => !s)} disabled={isRunning}>
+                {showPresetSave ? 'Cancel' : '+ Save Current'}
+              </button>
+            </div>
           </div>
 
           {showPresetSave && (
@@ -2059,6 +2219,12 @@ function OptionsLiveTest() {
                       onClick={() => applyPreset(preset)} disabled={isRunning}
                       title="Apply this preset to current config">
                       Apply
+                    </button>
+                    <button type="button" className="btn-secondary btn-xs"
+                      onClick={() => downloadPreset(preset)}
+                      title="Download this preset as JSON"
+                      style={{ fontSize: 10 }}>
+                      Export
                     </button>
                     <button type="button" className="btn-secondary btn-xs"
                       onClick={() => deletePreset(preset.id)}
@@ -9090,9 +9256,54 @@ function OptionsReplayTest() {
   }
 
   function deletePreset(id) {
+    const preset = presets.find(p => p.id === id);
+    if (!window.confirm(`Delete preset "${preset?.name}"?`)) return;
     const next = presets.filter(p => p.id !== id);
     setPresets(next);
     try { localStorage.setItem('sma_opts_presets', JSON.stringify(next)); } catch {}
+  }
+
+  function downloadPreset(preset) {
+    const blob = new Blob([JSON.stringify(preset, null, 2)], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `preset-${preset.name.replace(/[^a-z0-9]/gi, '_')}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function downloadAllPresets() {
+    const blob = new Blob([JSON.stringify(presets, null, 2)], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = 'sma_opts_presets.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function uploadPresets(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const parsed = JSON.parse(ev.target.result);
+        const incoming = Array.isArray(parsed) ? parsed : [parsed];
+        if (!incoming.every(p => p.id && p.name && p.config)) {
+          alert('Invalid preset file — each preset must have id, name, and config fields.');
+          return;
+        }
+        const existingIds = new Set(presets.map(p => p.id));
+        const toAdd = incoming.filter(p => !existingIds.has(p.id));
+        const next  = [...toAdd, ...presets];
+        setPresets(next);
+        try { localStorage.setItem('sma_opts_presets', JSON.stringify(next)); } catch {}
+      } catch { alert('Failed to parse preset file — must be valid JSON.'); }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
   }
 
   // ── Recent replay dates ──────────────────────────────────────────────────
@@ -10468,12 +10679,23 @@ function OptionsReplayTest() {
 
         {/* ── Presets ── */}
         <div className="card bt-opts-card">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: presets.length > 0 || showPresetSave ? 12 : 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: presets.length > 0 || showPresetSave ? 12 : 0, flexWrap: 'wrap' }}>
             <span className="bt-section-title" style={{ marginBottom: 0 }}>Config Presets</span>
-            <button type="button" className="btn-secondary btn-xs" style={{ marginLeft: 'auto' }}
-              onClick={() => setShowPresetSave(s => !s)} disabled={isRunning}>
-              {showPresetSave ? 'Cancel' : '+ Save Current'}
-            </button>
+            <div style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+              {presets.length > 0 && (
+                <button type="button" className="btn-secondary btn-xs" onClick={downloadAllPresets} title="Export all presets as JSON">
+                  Export All
+                </button>
+              )}
+              <label className="btn-secondary btn-xs" style={{ cursor: 'pointer', marginBottom: 0 }} title="Import presets from JSON file">
+                Import
+                <input type="file" accept=".json" style={{ display: 'none' }} onChange={uploadPresets} />
+              </label>
+              <button type="button" className="btn-secondary btn-xs"
+                onClick={() => setShowPresetSave(s => !s)} disabled={isRunning}>
+                {showPresetSave ? 'Cancel' : '+ Save Current'}
+              </button>
+            </div>
           </div>
 
           {showPresetSave && (
@@ -10542,6 +10764,12 @@ function OptionsReplayTest() {
                       onClick={() => applyPreset(preset)} disabled={isRunning}
                       title="Apply this preset to current config">
                       Apply
+                    </button>
+                    <button type="button" className="btn-secondary btn-xs"
+                      onClick={() => downloadPreset(preset)}
+                      title="Download this preset as JSON"
+                      style={{ fontSize: 10 }}>
+                      Export
                     </button>
                     <button type="button" className="btn-secondary btn-xs"
                       onClick={() => deletePreset(preset.id)}
