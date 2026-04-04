@@ -377,3 +377,17 @@ export async function stopOptionsLiveEval(sessionId) {
     { method: 'DELETE' },
   );
 }
+
+/**
+ * Returns the active sessionId for a given userId, or null if none running.
+ */
+export async function getActiveOptionsLiveSession(userId) {
+  try {
+    const res = await request(
+      `${STRATEGY_API}/api/v1/strategy/options-live/active/${encodeURIComponent(userId)}`,
+    );
+    return res?.data?.sessionId ?? null;
+  } catch {
+    return null; // 404 = no active session
+  }
+}

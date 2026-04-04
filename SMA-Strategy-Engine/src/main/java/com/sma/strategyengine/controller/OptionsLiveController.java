@@ -10,24 +10,26 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.util.List;
 import java.util.Map;
 
 /**
  * REST + SSE endpoints for live NIFTY-driven options evaluation.
  *
  * <pre>
- * POST   /api/v1/strategy/options-live/evaluate          — start session, returns sessionId
- * GET    /api/v1/strategy/options-live/stream/{sessionId} — SSE stream of candle events
- * DELETE /api/v1/strategy/options-live/{sessionId}        — stop session
+ * POST   /api/v1/strategy/options-live/evaluate              — start background session, returns sessionId
+ * GET    /api/v1/strategy/options-live/stream/{sessionId}    — attach SSE listener (UI only)
+ * GET    /api/v1/strategy/options-live/sessions              — list all active sessions
+ * GET    /api/v1/strategy/options-live/active/{userId}       — get active sessionId for a user
+ * DELETE /api/v1/strategy/options-live/{sessionId}           — stop session entirely
  * </pre>
  *
- * <p>Usage flow:
- * <ol>
- *   <li>POST /evaluate with {@link OptionsLiveRequest} → {@code {"data": {"sessionId": "..."}}}.</li>
- *   <li>Open SSE connection to GET /stream/{sessionId}.</li>
- *   <li>Server emits {@code init} once, then {@code candle} events ({@code OptionsReplayCandleEvent}).</li>
- *   <li>DELETE /{sessionId} to stop the session.</li>
- * </ol>
+ * <p>The session lifecycle is fully decoupled from SSE connections:
+ * <ul>
+ *   <li>POST /evaluate starts the background session and returns immediately.</li>
+ *   <li>GET /stream attaches a monitoring SSE connection; the session keeps running when it closes.</li>
+ *   <li>Only DELETE stops the session.</li>
+ * </ul>
  */
 @Slf4j
 @RestController
@@ -38,38 +40,32 @@ public class OptionsLiveController {
     private final OptionsLiveService optionsLiveService;
 
     /**
-     * Starts a live options evaluation session.
-     * Returns a sessionId; client must then connect to the stream endpoint.
+     * Starts a live options background session.
+     * Returns immediately with a sessionId — the session runs independently of this HTTP connection.
+     * One session per (userId, brokerName) — starting a new one stops the previous one.
      */
     @PostMapping("/evaluate")
     public ResponseEntity<ApiResponse<Map<String, String>>> start(
             @RequestBody OptionsLiveRequest req) {
 
-        log.info("Options live evaluate: interval={}, strategies={}, CE={}, PE={}",
-                req.getInterval(),
+        log.info("Options live start: userId={} broker={} interval={} strategies={} CE={} PE={}",
+                req.getUserId(), req.getBrokerName(), req.getInterval(),
                 req.getStrategies() != null ? req.getStrategies().size() : 0,
                 req.getCeOptions()  != null ? req.getCeOptions().size()  : 0,
                 req.getPeOptions()  != null ? req.getPeOptions().size()  : 0);
 
-        SseEmitter emitter   = new SseEmitter(Long.MAX_VALUE);
-        String     sessionId = optionsLiveService.start(req, emitter);
-
+        String sessionId = optionsLiveService.start(req);
         return ResponseEntity.ok(ApiResponse.ok(Map.of("sessionId", sessionId)));
     }
 
     /**
-     * SSE stream for a live options session.
-     *
-     * <p>Events:
-     * <ul>
-     *   <li>{@code init}   — session metadata (sessionId, warmupCandles, ceOptions, peOptions).</li>
-     *   <li>{@code candle} — {@code OptionsReplayCandleEvent} JSON on each NIFTY candle close.</li>
-     *   <li>{@code error}  — if the session terminates unexpectedly.</li>
-     * </ul>
+     * Attaches a UI SSE listener to a running session.
+     * Replays the last N candle events so the UI catches up immediately.
+     * Closing this stream does NOT stop the session — only DELETE does.
      */
     @GetMapping(value = "/stream/{sessionId}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter stream(@PathVariable String sessionId) {
-        SseEmitter emitter = optionsLiveService.getEmitter(sessionId);
+        SseEmitter emitter = optionsLiveService.attach(sessionId);
         if (emitter == null) {
             SseEmitter dead = new SseEmitter(0L);
             try {
@@ -83,7 +79,29 @@ public class OptionsLiveController {
     }
 
     /**
-     * Stops a live options evaluation session.
+     * Lists all currently active sessions.
+     */
+    @GetMapping("/sessions")
+    public ResponseEntity<ApiResponse<List<Map<String, String>>>> listSessions() {
+        return ResponseEntity.ok(ApiResponse.ok(optionsLiveService.listSessions()));
+    }
+
+    /**
+     * Returns the active sessionId for a given userId, or 404 if none running.
+     */
+    @GetMapping("/active/{userId}")
+    public ResponseEntity<ApiResponse<Map<String, String>>> activeSession(
+            @PathVariable String userId) {
+        String sessionId = optionsLiveService.activeSessionForUser(userId);
+        if (sessionId == null) {
+            return ResponseEntity.status(404)
+                    .body(ApiResponse.error("No active session for user: " + userId));
+        }
+        return ResponseEntity.ok(ApiResponse.ok(Map.of("sessionId", sessionId)));
+    }
+
+    /**
+     * Stops a live session entirely. The session will not restart automatically.
      */
     @DeleteMapping("/{sessionId}")
     public ResponseEntity<ApiResponse<Void>> stop(@PathVariable String sessionId) {
