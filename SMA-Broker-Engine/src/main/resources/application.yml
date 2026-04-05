@@ -1,17 +1,17 @@
 server:
-  port: 9003
+  port: ${SERVER_PORT:9003}
 
 spring:
   application:
     name: sma-broker-engine
 
   datasource:
-    url: jdbc:postgresql://aws-1-ap-northeast-1.pooler.supabase.com:5432/postgres?sslmode=require
-    username: postgres.ubcfqlqowoybswafwyun
-    password: SMARootKrishna
+    url: ${DB_URL}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
     hikari:
-      maximum-pool-size: 10
+      maximum-pool-size: ${DB_POOL_MAX:10}
       minimum-idle: 2
       connection-timeout: 30000
       idle-timeout: 600000
@@ -24,7 +24,7 @@ spring:
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
-        format_sql: true
+        format_sql: false
 
   flyway:
     enabled: true
@@ -37,15 +37,21 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        include: health,info
   endpoint:
     health:
-      show-details: always
+      show-details: when-authorized
 
 broker:
   encryption:
-    secret-key: ${ENCRYPTION_SECRET_KEY:changeme-32-char-secret-key-here!}
+    secret-key: ${ENCRYPTION_SECRET_KEY}
     algorithm: AES/GCM/NoPadding
+
+# CORS — comma-separated list of allowed frontend origins.
+# Dev default allows both CRA and Vite dev servers.
+# Production: set CORS_ALLOWED_ORIGINS to your deployed frontend URL (e.g. https://yourapp.vercel.app)
+cors:
+  allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000,http://localhost:5173}
 
 logging:
   level:

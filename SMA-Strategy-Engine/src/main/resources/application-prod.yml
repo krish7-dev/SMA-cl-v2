@@ -1,0 +1,25 @@
+# ─── Strategy Engine — Production Profile ───────────────────────────────────
+# Activated by: SPRING_PROFILES_ACTIVE=prod
+
+spring:
+  jpa:
+    show-sql: false
+
+cors:
+  allowed-origins: ${CORS_ALLOWED_ORIGINS}
+
+management:
+  endpoint:
+    health:
+      show-details: never
+  endpoints:
+    web:
+      exposure:
+        include: health
+
+logging:
+  level:
+    root: WARN
+    com.sma.strategyengine: INFO
+    org.flywaydb: WARN
+    org.hibernate: WARN
