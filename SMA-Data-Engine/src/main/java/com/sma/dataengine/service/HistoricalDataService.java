@@ -88,7 +88,7 @@ public class HistoricalDataService {
             // Runs in REQUIRES_NEW so a concurrent duplicate-key violation rolls back
             // only the inner transaction and does not poison this one.
             try {
-                self.persistCandles(candles, request.getBrokerName());
+                self.persistCandles(candles, request.getBrokerName(), "HISTORICAL_API");
             } catch (DataIntegrityViolationException e) {
                 log.warn("Concurrent candle insert detected — candles already persisted by another request " +
                          "(provider={}, token={}): {}", request.getBrokerName(),
@@ -126,45 +126,46 @@ public class HistoricalDataService {
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void persistCandles(List<CandleData> candles, String provider) {
+    public void persistCandles(List<CandleData> candles, String provider, String sourceType) {
         if (candles.isEmpty()) return;
 
         // Drop candles whose timestamp could not be parsed (null openTime)
         List<CandleRecord> records = candles.stream()
-                .map(c -> toRecord(c, provider))
+                .map(c -> toRecord(c, provider, sourceType))
                 .filter(r -> r.getOpenTime() != null)
                 .toList();
 
         if (records.isEmpty()) {
-            log.warn("No valid candles to persist after filtering null timestamps (provider={})", provider);
+            log.warn("No valid candles to persist after filtering null timestamps (provider={}, sourceType={})",
+                    provider, sourceType);
             return;
         }
 
-        // Pre-filter records that already exist — avoids unique-constraint violations
-        // which would poison the active PostgreSQL transaction even if caught.
-        LocalDateTime minTime = records.stream().map(CandleRecord::getOpenTime).min(LocalDateTime::compareTo).orElse(null);
-        LocalDateTime maxTime = records.stream().map(CandleRecord::getOpenTime).max(LocalDateTime::compareTo).orElse(null);
-        Long token    = records.get(0).getInstrumentToken();
-        String interval = records.get(0).getInterval();
+        // Pre-filter records that already exist for this (token, interval, provider, sourceType) —
+        // avoids unique-constraint violations which poison the active PostgreSQL transaction.
+        LocalDateTime minTime  = records.stream().map(CandleRecord::getOpenTime).min(LocalDateTime::compareTo).orElse(null);
+        LocalDateTime maxTime  = records.stream().map(CandleRecord::getOpenTime).max(LocalDateTime::compareTo).orElse(null);
+        Long          token    = records.get(0).getInstrumentToken();
+        String        interval = records.get(0).getInterval();
 
         Set<LocalDateTime> existing = new HashSet<>(
-                candleRepository.findOpenTimesInRange(token, interval, provider, minTime, maxTime));
+                candleRepository.findOpenTimesInRange(token, interval, provider, sourceType, minTime, maxTime));
 
         List<CandleRecord> newRecords = records.stream()
                 .filter(r -> !existing.contains(r.getOpenTime()))
                 .toList();
 
         if (newRecords.isEmpty()) {
-            log.info("All {} candles already cached (provider={})", records.size(), provider);
+            log.info("All {} candles already cached (provider={}, sourceType={})", records.size(), provider, sourceType);
             return;
         }
 
         candleRepository.saveAll(newRecords);
-        log.info("Persisted {}/{} candles (provider={}, {} already cached)",
-                newRecords.size(), records.size(), provider, existing.size());
+        log.info("Persisted {}/{} candles (provider={}, sourceType={}, {} already cached)",
+                newRecords.size(), records.size(), provider, sourceType, existing.size());
     }
 
-    private CandleRecord toRecord(CandleData c, String provider) {
+    private CandleRecord toRecord(CandleData c, String provider, String sourceType) {
         return CandleRecord.builder()
                 .instrumentToken(c.getInstrumentToken())
                 .symbol(c.getSymbol())
@@ -178,6 +179,7 @@ public class HistoricalDataService {
                 .volume(c.getVolume() != null ? c.getVolume() : 0L)
                 .openInterest(c.getOpenInterest() != null ? c.getOpenInterest() : 0L)
                 .provider(provider)
+                .sourceType(sourceType)
                 .fetchedAt(Instant.now())
                 .build();
     }
@@ -196,6 +198,7 @@ public class HistoricalDataService {
                 .volume(r.getVolume())
                 .openInterest(r.getOpenInterest())
                 .provider(r.getProvider())
+                .sourceType(r.getSourceType())
                 .build();
     }
 

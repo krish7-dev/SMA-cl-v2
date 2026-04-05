@@ -31,4 +31,13 @@ public class CandleData {
 
     /** Data provider identifier (e.g. "kite"). */
     private String provider;
+
+    /**
+     * How this candle was obtained.
+     * {@code HISTORICAL_API} — fetched from broker REST/CSV API.
+     * {@code LIVE_RECORDED}  — captured from the live WebSocket tick stream.
+     * Defaults to {@code HISTORICAL_API} when not explicitly set.
+     */
+    @Builder.Default
+    private String sourceType = "HISTORICAL_API";
 }

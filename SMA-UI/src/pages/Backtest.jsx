@@ -1049,10 +1049,11 @@ function OptionsLiveTest() {
   const [pePool, setPePool] = useState(() => ls('sma_live_opts_pe_pool', [EMPTY_OPTION_INST()]));
 
   // ── Live settings (no fromDate/toDate/speed)
-  const [interval,   setInterval]   = useState(() => ls('sma_live_opts_interval',   'MINUTE_5'));
-  const [warmupDays, setWarmupDays] = useState(() => ls('sma_live_opts_warmup',      '5'));
-  const [quantity,   setQuantity]   = useState(() => ls('sma_live_opts_qty',         '0'));
-  const [capital,    setCapital]    = useState(() => ls('sma_live_opts_capital',     '100000'));
+  const [interval,      setInterval]      = useState(() => ls('sma_live_opts_interval',   'MINUTE_5'));
+  const [warmupDays,    setWarmupDays]    = useState(() => ls('sma_live_opts_warmup',      '5'));
+  const [quantity,      setQuantity]      = useState(() => ls('sma_live_opts_qty',         '0'));
+  const [capital,       setCapital]       = useState(() => ls('sma_live_opts_capital',     '100000'));
+  const [recordCandles, setRecordCandles] = useState(() => ls('sma_live_opts_record_candles', false));
 
   // ── Strategies
   const [strategies, setStrategies] = useState(() => ls('sma_live_opts_strategies', defaultStrategies()));
@@ -1210,6 +1211,7 @@ function OptionsLiveTest() {
   useEffect(() => { try { localStorage.setItem('sma_live_opts_ce_pool',            JSON.stringify(cePool));              } catch {} }, [cePool]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_pe_pool',            JSON.stringify(pePool));              } catch {} }, [pePool]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_interval',           JSON.stringify(interval));            } catch {} }, [interval]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_record_candles',     JSON.stringify(recordCandles));        } catch {} }, [recordCandles]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_warmup',             JSON.stringify(warmupDays));          } catch {} }, [warmupDays]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_qty',                JSON.stringify(quantity));            } catch {} }, [quantity]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_capital',            JSON.stringify(capital));             } catch {} }, [capital]);
@@ -1341,9 +1343,10 @@ function OptionsLiveTest() {
       niftySymbol:   nifty.symbol   || 'NIFTY 50',
       niftyExchange: nifty.exchange  || 'NSE',
       interval,
-      warmupDays: parseInt(warmupDays, 10) || 5,
-      quantity:   parseInt(quantity,   10) || 0,
+      warmupDays:    parseInt(warmupDays, 10) || 5,
+      quantity:      parseInt(quantity,   10) || 0,
       initialCapital: parseFloat(capital) || 100000,
+      recordCandles,
       ceOptions: cePool.filter(i => i.instrumentToken).map(i => ({
         instrumentToken: parseInt(i.instrumentToken, 10),
         tradingSymbol: i.symbol,
@@ -2260,6 +2263,16 @@ function OptionsLiveTest() {
             <div className="form-group">
               <label>Initial Capital (₹)</label>
               <input type="number" min="0" value={capital} onChange={e => setCapital(e.target.value)} disabled={isRunning} />
+            </div>
+            <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <input type="checkbox" id="liveRecordCandles" checked={recordCandles}
+                onChange={e => setRecordCandles(e.target.checked)} disabled={isRunning} />
+              <label htmlFor="liveRecordCandles" style={{ marginBottom: 0, cursor: 'pointer' }}>
+                Record candles to DB
+                <span style={{ display: 'block', fontSize: 10, color: 'var(--text-muted)', fontWeight: 400 }}>
+                  Saves all closed candles (NIFTY + options) for later replay
+                </span>
+              </label>
             </div>
           </div>
         </div>
