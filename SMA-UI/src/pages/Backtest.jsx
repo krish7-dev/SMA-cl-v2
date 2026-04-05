@@ -1327,6 +1327,11 @@ function OptionsLiveTest() {
     e.preventDefault();
     if (status === 'running') { handleStop(); return; }
 
+    if (!canRun) {
+      setError('Select a NIFTY instrument and at least one CE or PE option before starting.');
+      return;
+    }
+
     lastRunPcRef.current = { ...penaltyConfig };
     setFeed([]); setInitInfo(null); setError(''); setStatus('running'); setLiveTicks({});
 
@@ -2097,7 +2102,7 @@ function OptionsLiveTest() {
         )}
         {error && <div className="error-msg" style={{ marginBottom: 12 }}>{error}</div>}
         <div className="form-actions" style={{ marginBottom: 16 }}>
-          <button type="submit" className="btn-primary" disabled={!canRun && !isRunning}>
+          <button type="submit" className="btn-primary" disabled={false}>
             {isRunning ? 'Stop Live Session' : 'Start Options Live'}
           </button>
           {/* Reconnect re-attaches the SSE listener to the running backend session without restarting it */}
