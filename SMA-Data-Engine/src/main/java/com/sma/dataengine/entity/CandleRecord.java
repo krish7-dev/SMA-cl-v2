@@ -17,8 +17,8 @@ import java.time.LocalDateTime;
 @Table(
     name = "candle_data",
     uniqueConstraints = @UniqueConstraint(
-        name  = "uq_candle_token_interval_time_provider",
-        columnNames = {"instrument_token", "interval", "open_time", "provider"}
+        name  = "uq_candle_token_interval_time_provider_source",
+        columnNames = {"instrument_token", "interval", "open_time", "provider", "source_type"}
     ),
     indexes = {
         @Index(name = "idx_candle_token_interval_time", columnList = "instrument_token, interval, open_time"),
@@ -76,6 +76,15 @@ public class CandleRecord {
     /** Data provider identifier (e.g. "kite"). */
     @Column(name = "provider", nullable = false, length = 50)
     private String provider;
+
+    /**
+     * How this candle was obtained.
+     * {@code HISTORICAL_API}  — fetched from broker REST/CSV API.
+     * {@code LIVE_RECORDED}   — captured in real-time from the live WebSocket tick stream.
+     */
+    @Column(name = "source_type", nullable = false, length = 20)
+    @Builder.Default
+    private String sourceType = "HISTORICAL_API";
 
     @CreationTimestamp
     @Column(name = "fetched_at", nullable = false, updatable = false)

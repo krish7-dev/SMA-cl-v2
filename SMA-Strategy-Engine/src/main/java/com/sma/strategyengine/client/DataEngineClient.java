@@ -164,6 +164,77 @@ public class DataEngineClient {
         }
     }
 
+    /**
+     * Sends a batch of live-recorded candles to the Data Engine ingest endpoint.
+     * Called by {@link com.sma.strategyengine.service.options.LiveCandleBuffer} — never on the hot tick path.
+     *
+     * @throws DataEngineException on HTTP error or network failure (caller handles retries)
+     */
+    public void ingestLiveCandles(String runId, String provider,
+                                  List<com.sma.strategyengine.service.options.LiveCandleBuffer.BufferedCandle> batch) {
+        try {
+            // Build the LiveCandleIngestRequest payload
+            List<Map<String, Object>> candlePayloads = batch.stream().map(c -> {
+                Map<String, Object> m = new java.util.LinkedHashMap<>();
+                m.put("instrumentToken", c.instrumentToken());
+                m.put("symbol",          c.symbol());
+                m.put("exchange",        c.exchange());
+                m.put("interval",        intervalFromKite(c.interval()));
+                m.put("openTime",        c.openTime().toString());
+                m.put("open",            c.open());
+                m.put("high",            c.high());
+                m.put("low",             c.low());
+                m.put("close",           c.close());
+                m.put("volume",          c.volume());
+                m.put("openInterest",    0L);
+                m.put("provider",        provider);
+                m.put("sourceType",      "LIVE_RECORDED");
+                return m;
+            }).collect(java.util.stream.Collectors.toList());
+
+            Map<String, Object> body = new java.util.LinkedHashMap<>();
+            body.put("runId",      runId);
+            body.put("provider",   provider);
+            body.put("sourceType", "LIVE_RECORDED");
+            body.put("candles",    candlePayloads);
+
+            String json = mapper.writeValueAsString(body);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl + "/api/v1/data/candles/ingest"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(json))
+                    .timeout(Duration.ofSeconds(30))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                throw new DataEngineException(
+                        "Ingest returned HTTP " + response.statusCode() + ": " + response.body());
+            }
+        } catch (DataEngineException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new DataEngineException("Failed to ingest live candles: " + e.getMessage(), e);
+        }
+    }
+
+    /** Converts a Kite interval string (e.g. "5minute") back to the Strategy Engine enum name (e.g. "MINUTE_5"). */
+    private static String intervalFromKite(String kiteValue) {
+        return switch (kiteValue) {
+            case "minute"   -> "MINUTE_1";
+            case "3minute"  -> "MINUTE_3";
+            case "5minute"  -> "MINUTE_5";
+            case "10minute" -> "MINUTE_10";
+            case "15minute" -> "MINUTE_15";
+            case "30minute" -> "MINUTE_30";
+            case "60minute" -> "MINUTE_60";
+            case "day"      -> "DAY";
+            default         -> kiteValue;
+        };
+    }
+
     // ─── Exception ────────────────────────────────────────────────────────────
 
     public static class DataEngineException extends RuntimeException {

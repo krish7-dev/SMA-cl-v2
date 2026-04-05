@@ -298,6 +298,9 @@ public class OptionsLiveService {
         volatile boolean   stopped    = false;
         volatile Future<?> tickFuture = null;
 
+        // Live candle persistence buffer — null when recordCandles=false
+        final LiveCandleBuffer candleBuffer;
+
         // ── emitter management ────────────────────────────────────────────────
 
         void addEmitter(SseEmitter e)    { emitters.add(e); }
@@ -367,6 +370,26 @@ public class OptionsLiveService {
             for (Long token : optionTokens) {
                 liveOptionCandles.put(token, new TreeMap<>());
             }
+
+            // Candle recording buffer — only allocated when the user opts in
+            candleBuffer = req.isRecordCandles()
+                    ? new LiveCandleBuffer(sessionId, req.getBrokerName().toLowerCase(), dataEngineClient)
+                    : null;
+        }
+
+        /** Kite interval string for the configured interval — used by the candle buffer. */
+        private String kiteIntervalValue() {
+            return switch (req.getInterval()) {
+                case "MINUTE_1"  -> "minute";
+                case "MINUTE_3"  -> "3minute";
+                case "MINUTE_5"  -> "5minute";
+                case "MINUTE_10" -> "10minute";
+                case "MINUTE_15" -> "15minute";
+                case "MINUTE_30" -> "30minute";
+                case "MINUTE_60" -> "60minute";
+                case "DAY"       -> "day";
+                default          -> "5minute";
+            };
         }
 
         // ── run ───────────────────────────────────────────────────────────────
@@ -733,6 +756,12 @@ public class OptionsLiveService {
                 CandleDto closed = cur.toCandle(bucketToLocalDateTime(cur.startMs));
                 forming.put(niftyToken, new FormingCandle(ltp, volumeToday, bucketMs));
                 snapshotOptionCandles(cur.startMs, closed.openTime());
+                // Record NIFTY candle if opted in
+                if (candleBuffer != null) {
+                    candleBuffer.add(niftyToken,
+                            req.getNiftySymbol(), req.getNiftyExchange(),
+                            kiteIntervalValue(), closed);
+                }
                 onNiftyCandleClose(closed);
                 // Evaluate the first tick of the new bucket immediately (scorer now includes closed candle)
                 snapshotOptionCandles(bucketMs, bucketToLocalDateTime(bucketMs));
@@ -785,6 +814,12 @@ public class OptionsLiveService {
                 forming.put(token, new FormingCandle(ltp, volumeToday, bucketMs));
                 NavigableMap<LocalDateTime, CandleDto> map = liveOptionCandles.get(token);
                 if (map != null) map.put(closed.openTime(), closed);
+                // Record option candle if opted in
+                if (candleBuffer != null) {
+                    String sym = resolveOptionSymbol(token);
+                    String exch = resolveOptionExchange(token);
+                    candleBuffer.add(token, sym, exch, kiteIntervalValue(), closed);
+                }
             } else {
                 cur.update(ltp, volumeToday);
             }
@@ -870,11 +905,39 @@ public class OptionsLiveService {
             stopped = true;
             if (tickFuture != null) tickFuture.cancel(true);
             if (decisionEngine != null) decisionEngine.cleanup();
+            // Flush any remaining buffered candles before shutting down
+            if (candleBuffer != null) candleBuffer.stop();
             // Complete all connected UI emitters so browsers know the session ended
             for (SseEmitter e : emitters) {
                 try { e.complete(); } catch (Exception ignored) {}
             }
             emitters.clear();
+        }
+
+        /** Returns the trading symbol for an option token, or empty string if not found. */
+        private String resolveOptionSymbol(long token) {
+            for (OptionsReplayRequest.OptionCandidate c : cePool) {
+                if (c.getInstrumentToken() != null && c.getInstrumentToken() == token)
+                    return c.getTradingSymbol() != null ? c.getTradingSymbol() : "";
+            }
+            for (OptionsReplayRequest.OptionCandidate c : pePool) {
+                if (c.getInstrumentToken() != null && c.getInstrumentToken() == token)
+                    return c.getTradingSymbol() != null ? c.getTradingSymbol() : "";
+            }
+            return "";
+        }
+
+        /** Returns the exchange for an option token, defaulting to "NFO". */
+        private String resolveOptionExchange(long token) {
+            for (OptionsReplayRequest.OptionCandidate c : cePool) {
+                if (c.getInstrumentToken() != null && c.getInstrumentToken() == token)
+                    return c.getExchange() != null ? c.getExchange() : "NFO";
+            }
+            for (OptionsReplayRequest.OptionCandidate c : pePool) {
+                if (c.getInstrumentToken() != null && c.getInstrumentToken() == token)
+                    return c.getExchange() != null ? c.getExchange() : "NFO";
+            }
+            return "NFO";
         }
 
         // ── event builder ─────────────────────────────────────────────────────

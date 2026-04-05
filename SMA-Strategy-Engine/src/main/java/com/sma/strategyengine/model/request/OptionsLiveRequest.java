@@ -39,6 +39,14 @@ public class OptionsLiveRequest {
     private int        quantity       = 0;
     private BigDecimal initialCapital = BigDecimal.valueOf(100_000);
 
+    /**
+     * When true, every closed candle (NIFTY + all subscribed option tokens) is persisted
+     * to the Data Engine candle_data table with sourceType=LIVE_RECORDED.
+     * This allows the session to be replayed later via Options Replay.
+     * Defaults to false — opt-in to avoid unnecessary DB writes.
+     */
+    private boolean recordCandles = false;
+
     // Strategies (evaluated on NIFTY only)
     private List<BacktestRequest.StrategyConfig> strategies;
     private BacktestRequest.RegimeConfig         regimeConfig;
