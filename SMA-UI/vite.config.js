@@ -7,17 +7,17 @@ export default defineConfig({
     port: 3000,
     proxy: {
       '/broker': {
-        target: 'http://13.63.53.146:9003',
+        target: 'http://localhost:9003',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/broker/, ''),
       },
       '/execution': {
-        target: 'http://13.63.53.146:9004',
+        target: 'http://localhost:9004',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/execution/, ''),
       },
       '/data-api': {
-        target: 'http://13.63.53.146:9005',
+        target: 'http://localhost:9005',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/data-api/, ''),
         // No timeout for SSE long-lived connections
@@ -25,14 +25,14 @@ export default defineConfig({
         proxyTimeout: 0,
       },
       '/strategy-api': {
-        target: 'http://13.63.53.146:9006',
+        target: 'http://localhost:9006',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/strategy-api/, ''),
         timeout: 0,
         proxyTimeout: 0,
       },
       '/strategy': {
-        target: 'http://13.63.53.146:9006',
+        target: 'http://localhost:9006',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/strategy/, ''),
         // Backtest on sub-15min intervals can take several minutes to fetch + persist candles
