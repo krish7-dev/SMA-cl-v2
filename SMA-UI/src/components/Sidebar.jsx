@@ -15,10 +15,10 @@ const NAV_ITEMS = [
 ];
 
 const SWAGGER_LINKS = [
-  { label: 'Broker Engine',    port: 9003 },
-  { label: 'Execution Engine', port: 9004 },
-  { label: 'Data Engine',      port: 9005 },
-  { label: 'Strategy Engine',  port: 9006 },
+  { label: 'Broker Engine',    path: '/api/broker' },
+  { label: 'Execution Engine', path: '/api/execution' },
+  { label: 'Data Engine',      path: '/api/data' },
+  { label: 'Strategy Engine',  path: '/api/strategy' },
 ];
 
 export default function Sidebar() {
@@ -67,10 +67,10 @@ export default function Sidebar() {
 
       <div className="sidebar-section-title">Swagger UI</div>
       <div className="sidebar-swagger">
-        {SWAGGER_LINKS.map(({ label, port }) => (
+        {SWAGGER_LINKS.map(({ label, path }) => (
           <a
-            key={port}
-            href={`http://localhost:${port}/swagger-ui/index.html`}
+            key={path}
+            href={`${path}/swagger-ui/index.html`}
             target="_blank"
             rel="noopener noreferrer"
             className="swagger-link"

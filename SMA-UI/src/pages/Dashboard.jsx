@@ -83,21 +83,21 @@ export default function Dashboard() {
         <p>Open each service's Swagger UI to explore and test endpoints interactively.</p>
         <div className="swagger-cards">
           {[
-            { name: 'Broker Engine',    port: 9003, desc: 'Auth, orders, portfolio, margins' },
-            { name: 'Execution Engine', port: 9004, desc: 'Order routing and execution' },
-            { name: 'Data Engine',      port: 9005, desc: 'Market data, ticks, candles' },
-            { name: 'Strategy Engine',  port: 9006, desc: 'Signal generation, strategy eval' },
-          ].map(({ name, port, desc }) => (
+            { name: 'Broker Engine',    path: '/api/broker',    desc: 'Auth, orders, portfolio, margins' },
+            { name: 'Execution Engine', path: '/api/execution', desc: 'Order routing and execution' },
+            { name: 'Data Engine',      path: '/api/data',      desc: 'Market data, ticks, candles' },
+            { name: 'Strategy Engine',  path: '/api/strategy',  desc: 'Signal generation, strategy eval' },
+          ].map(({ name, path, desc }) => (
             <a
-              key={port}
-              href={`http://localhost:${port}/swagger-ui/index.html`}
+              key={path}
+              href={`${path}/swagger-ui/index.html`}
               target="_blank"
               rel="noopener noreferrer"
               className="swagger-card card"
             >
               <div className="sw-card-name">{name}</div>
               <div className="sw-card-desc">{desc}</div>
-              <div className="sw-card-port">:{port} ↗</div>
+              <div className="sw-card-port">{path} ↗</div>
             </a>
           ))}
         </div>
@@ -140,7 +140,7 @@ function ServiceCard({ svc }) {
       )}
 
       <a
-        href={`http://localhost:${svc.port}/swagger-ui/index.html`}
+        href={`${svc.prefix}/swagger-ui/index.html`}
         target="_blank"
         rel="noopener noreferrer"
         className="hc-swagger-link"
