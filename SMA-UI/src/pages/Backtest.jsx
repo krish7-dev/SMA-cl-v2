@@ -1053,7 +1053,7 @@ function OptionsLiveTest() {
   const [warmupDays,    setWarmupDays]    = useState(() => ls('sma_live_opts_warmup',      '5'));
   const [quantity,      setQuantity]      = useState(() => ls('sma_live_opts_qty',         '0'));
   const [capital,       setCapital]       = useState(() => ls('sma_live_opts_capital',     '100000'));
-  const [recordCandles, setRecordCandles] = useState(() => ls('sma_live_opts_record_candles', false));
+  const [recordCandles, setRecordCandles] = useState(() => ls('sma_live_opts_record_candles', true));
 
   // ── Strategies
   const [strategies, setStrategies] = useState(() => ls('sma_live_opts_strategies', defaultStrategies()));
