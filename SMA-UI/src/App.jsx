@@ -15,7 +15,7 @@ import './App.css';
 export default function App() {
   return (
     <div className="app-layout">
-      {/* Hide sidebar on the callback page — it's a standalone OAuth landing */}
+      {/* Hide sidebar on the callback page — it's a standalone OAuth landing  */}
       <Routes>
         <Route path="/callback" element={<KiteCallback />} />
         <Route
