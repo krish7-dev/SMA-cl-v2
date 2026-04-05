@@ -269,7 +269,7 @@ export default function BrokerAccounts() {
         </div>
         <p className="section-hint" style={{ marginBottom: 12 }}>
           Enter your API key to build the Kite login URL. After login, Kite redirects to
-          <code> localhost:3000/callback</code> which auto-saves your session.
+          <code> /callback</code> which auto-saves your session.
         </p>
         <div className="kite-url-row">
           <div style={{ flex: 1 }}>
