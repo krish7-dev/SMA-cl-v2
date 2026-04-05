@@ -1,4 +1,4 @@
-package com.sma.dataengine.config;
+package com.sma.executionengine.config;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Configuration;

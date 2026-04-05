@@ -1,17 +1,17 @@
 server:
-  port: 9005
+  port: ${SERVER_PORT:9005}
 
 spring:
   application:
     name: sma-data-engine
 
   datasource:
-    url: jdbc:postgresql://aws-1-ap-northeast-1.pooler.supabase.com:5432/postgres?sslmode=require
-    username: postgres.ubcfqlqowoybswafwyun
-    password: SMARootKrishna
+    url: ${DB_URL}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
     hikari:
-      maximum-pool-size: 10
+      maximum-pool-size: ${DB_POOL_MAX:10}
       minimum-idle: 2
       connection-timeout: 30000
 
@@ -36,24 +36,25 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        include: health,info
   endpoint:
     health:
-      show-details: always
+      show-details: when-authorized
+
+# CORS — comma-separated list of allowed frontend origins.
+cors:
+  allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000,http://localhost:5173}
 
 logging:
   level:
     com.sma.dataengine: INFO
     com.zerodhatech: WARN
 
-# ─── Data Engine — Replay Configuration ────────────────────────────────────────
+# ─── Data Engine — Replay Configuration ─────────────────────────────────────
 data:
   replay:
-    # Thread pool size for concurrent replay sessions
-    scheduler-pool-size: 4
-    # Max candles to load into memory per replay session
+    scheduler-pool-size: ${DATA_REPLAY_POOL_SIZE:4}
     max-candles-per-session: 100000
 
-  # Broker Engine base URL — used for future inter-service calls (e.g. token resolution)
   broker-engine:
-    base-url: ${BROKER_ENGINE_URL:http://localhost:9003}
+    base-url: ${BROKER_ENGINE_URL:http://127.0.0.1:9003}
