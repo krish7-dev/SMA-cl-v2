@@ -301,6 +301,9 @@ public class OptionsLiveService {
         // Live candle persistence buffer — null when recordCandles=false
         final LiveCandleBuffer candleBuffer;
 
+        // Live tick persistence buffer — null when recordTicks=false
+        final LiveTickBuffer tickBuffer;
+
         // ── emitter management ────────────────────────────────────────────────
 
         void addEmitter(SseEmitter e)    { emitters.add(e); }
@@ -374,6 +377,11 @@ public class OptionsLiveService {
             // Candle recording buffer — only allocated when the user opts in
             candleBuffer = req.isRecordCandles()
                     ? new LiveCandleBuffer(sessionId, req.getBrokerName().toLowerCase(), dataEngineClient)
+                    : null;
+
+            // Tick recording buffer — only allocated when the user opts in
+            tickBuffer = req.isRecordTicks()
+                    ? new LiveTickBuffer(sessionId, req.getBrokerName().toLowerCase(), dataEngineClient)
                     : null;
         }
 
@@ -714,6 +722,14 @@ public class OptionsLiveService {
             }
 
             emitTickEvent(token, ltp, epochMs);
+
+            // Record raw tick if opted in
+            if (tickBuffer != null) {
+                boolean isNifty = (token == niftyToken);
+                String sym  = isNifty ? req.getNiftySymbol()   : resolveOptionSymbol(token);
+                String exch = isNifty ? req.getNiftyExchange()  : resolveOptionExchange(token);
+                tickBuffer.add(token, sym, exch, ltp, volumeToday, epochMs);
+            }
         }
 
         private void emitTickEvent(long token, double ltp, long epochMs) {
@@ -905,8 +921,9 @@ public class OptionsLiveService {
             stopped = true;
             if (tickFuture != null) tickFuture.cancel(true);
             if (decisionEngine != null) decisionEngine.cleanup();
-            // Flush any remaining buffered candles before shutting down
+            // Flush any remaining buffered candles/ticks before shutting down
             if (candleBuffer != null) candleBuffer.stop();
+            if (tickBuffer  != null) tickBuffer.stop();
             // Complete all connected UI emitters so browsers know the session ended
             for (SseEmitter e : emitters) {
                 try { e.complete(); } catch (Exception ignored) {}

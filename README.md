@@ -73,3 +73,96 @@ A Java Spring Boot microservices-based algorithmic trading platform.
 
 Each service requires its own `.env` or environment variables for database and secrets configuration.
 Refer to each service's `application.yml` for required variables.
+
+---
+
+## EC2 Deployment
+
+### Prerequisites
+- PEM key at `G:\AWS\sma-key.pem`
+- EC2 instance at `13.63.53.146`
+- Scripts `deploy.sh` and `restart.sh` in project root
+
+### 1. Build JARs locally (Windows terminal)
+
+```cmd
+cd g:\SMA-claude-v2\SMA-Broker-Engine && mvn clean package -DskipTests
+cd g:\SMA-claude-v2\SMA-Execution-Engine && mvn clean package -DskipTests
+cd g:\SMA-claude-v2\SMA-Data-Engine && mvn clean package -DskipTests
+cd g:\SMA-claude-v2\SMA-Strategy-Engine && mvn clean package -DskipTests
+```
+
+### 2. Upload JARs to EC2 (Git Bash)
+
+```bash
+# Upload all 4 services
+bash G:/SMA-claude-v2/deploy.sh
+
+# Upload specific services only
+bash G:/SMA-claude-v2/deploy.sh data strategy
+```
+
+### 3. Upload restart script (first time only)
+
+```bash
+scp -i "G:/AWS/sma-key.pem" G:/SMA-claude-v2/restart.sh ubuntu@13.63.53.146:~/restart.sh
+ssh -i "G:/AWS/sma-key.pem" ubuntu@13.63.53.146 "chmod +x ~/restart.sh"
+```
+
+### 4. Restart services on EC2
+
+SSH into EC2, then:
+
+```bash
+# Restart all services (broker → data → execution → strategy)
+~/restart.sh
+
+# Restart specific services
+~/restart.sh data strategy
+
+# Restart a single service
+~/restart.sh data
+```
+
+### 5. Check logs on EC2
+
+```bash
+tail -f ~/logs/broker.log
+tail -f ~/logs/data.log
+tail -f ~/logs/execution.log
+tail -f ~/logs/strategy.log
+```
+
+### EC2 File Structure
+
+```
+~/
+├── app/
+│   ├── broker/    sma-broker-engine-0.0.1-SNAPSHOT.jar
+│   ├── execution/ sma-execution-engine-0.0.1-SNAPSHOT.jar
+│   ├── data/      sma-data-engine-0.0.1-SNAPSHOT.jar
+│   └── strategy/  sma-strategy-engine-0.0.1-SNAPSHOT.jar
+├── env/
+│   ├── broker.env
+│   ├── execution.env
+│   ├── data.env
+│   └── strategy.env
+├── logs/
+│   ├── broker.log
+│   ├── execution.log
+│   ├── data.log
+│   └── strategy.log
+└── restart.sh
+```
+
+---
+
+## UI Deployment (Vercel)
+
+The React UI (`SMA-UI/`) is deployed to [https://sma-cl-v2.vercel.app](https://sma-cl-v2.vercel.app).
+
+- Vercel rewrites in `SMA-UI/vercel.json` proxy all `/api/*` requests to EC2 backends
+- Environment variables are set in `SMA-UI/.env.production`
+- Kite OAuth redirect URL must be set to `https://sma-cl-v2.vercel.app/callback` in the Kite developer console
+
+To redeploy UI: push to `main` branch — Vercel auto-deploys.

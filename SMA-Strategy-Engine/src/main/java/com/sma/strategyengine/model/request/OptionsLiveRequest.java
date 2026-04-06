@@ -47,6 +47,13 @@ public class OptionsLiveRequest {
      */
     private boolean recordCandles = false;
 
+    /**
+     * When true, every raw tick (LTP update) for NIFTY and all subscribed option tokens
+     * is persisted to the Data Engine tick_data table.
+     * Enables sub-candle intra-session analysis later.
+     */
+    private boolean recordTicks = false;
+
     // Strategies (evaluated on NIFTY only)
     private List<BacktestRequest.StrategyConfig> strategies;
     private BacktestRequest.RegimeConfig         regimeConfig;

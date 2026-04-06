@@ -1054,6 +1054,7 @@ function OptionsLiveTest() {
   const [quantity,      setQuantity]      = useState(() => ls('sma_live_opts_qty',         '0'));
   const [capital,       setCapital]       = useState(() => ls('sma_live_opts_capital',     '100000'));
   const [recordCandles, setRecordCandles] = useState(() => ls('sma_live_opts_record_candles', true));
+  const [recordTicks,   setRecordTicks]   = useState(() => ls('sma_live_opts_record_ticks',   true));
 
   // ── Strategies
   const [strategies, setStrategies] = useState(() => ls('sma_live_opts_strategies', defaultStrategies()));
@@ -1212,6 +1213,7 @@ function OptionsLiveTest() {
   useEffect(() => { try { localStorage.setItem('sma_live_opts_pe_pool',            JSON.stringify(pePool));              } catch {} }, [pePool]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_interval',           JSON.stringify(interval));            } catch {} }, [interval]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_record_candles',     JSON.stringify(recordCandles));        } catch {} }, [recordCandles]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_record_ticks',       JSON.stringify(recordTicks));          } catch {} }, [recordTicks]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_warmup',             JSON.stringify(warmupDays));          } catch {} }, [warmupDays]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_qty',                JSON.stringify(quantity));            } catch {} }, [quantity]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_capital',            JSON.stringify(capital));             } catch {} }, [capital]);
@@ -1352,6 +1354,7 @@ function OptionsLiveTest() {
       quantity:      parseInt(quantity,   10) || 0,
       initialCapital: parseFloat(capital) || 100000,
       recordCandles,
+      recordTicks,
       ceOptions: cePool.filter(i => i.instrumentToken).map(i => ({
         instrumentToken: parseInt(i.instrumentToken, 10),
         tradingSymbol: i.symbol,
@@ -2276,6 +2279,16 @@ function OptionsLiveTest() {
                 Record candles to DB
                 <span style={{ display: 'block', fontSize: 10, color: 'var(--text-muted)', fontWeight: 400 }}>
                   Saves all closed candles (NIFTY + options) for later replay
+                </span>
+              </label>
+            </div>
+            <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <input type="checkbox" id="liveRecordTicks" checked={recordTicks}
+                onChange={e => setRecordTicks(e.target.checked)} disabled={isRunning} />
+              <label htmlFor="liveRecordTicks" style={{ marginBottom: 0, cursor: 'pointer' }}>
+                Record raw ticks to DB
+                <span style={{ display: 'block', fontSize: 10, color: 'var(--text-muted)', fontWeight: 400 }}>
+                  Saves every LTP update (NIFTY + options) for sub-candle analysis
                 </span>
               </label>
             </div>
