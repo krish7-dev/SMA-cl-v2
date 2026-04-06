@@ -176,6 +176,45 @@
   opacity: 0.5;
 }
 
+/* Compact health bar — sits just below the brand */
+.sidebar-health-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.shb-item {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  cursor: default;
+}
+
+.shb-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.shb-up .shb-dot      { background: var(--success); animation: pulse 2s infinite; }
+.shb-down .shb-dot    { background: #ef4444; }
+.shb-warn .shb-dot    { background: #f59e0b; }
+.shb-unknown .shb-dot { background: var(--text-muted); }
+
+.shb-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+
+.shb-up .shb-label      { color: var(--success); }
+.shb-down .shb-label    { color: #ef4444; }
+.shb-warn .shb-label    { color: #f59e0b; }
+.shb-unknown .shb-label { color: var(--text-muted); }
+
 .sidebar-footer {
   margin-top: auto;
   padding: 12px 20px;

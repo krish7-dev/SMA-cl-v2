@@ -4,7 +4,8 @@
       "Bash(ls -lh /g/SMA-claude-v2/SMA-Strategy-Engine/src/main/java/com/sma/strategyengine/strategy/*.java)",
       "Bash(npm install lightweight-charts)",
       "Bash(npm list lightweight-charts)",
-      "Bash(node -e \"const lc = require\\(''g:/SMA-claude-v2/SMA-UI/node_modules/lightweight-charts''\\); console.log\\(Object.keys\\(lc\\).filter\\(k => !k.startsWith\\(''_''\\)\\).join\\(''\\\\n''\\)\\)\")"
+      "Bash(node -e \"const lc = require\\(''g:/SMA-claude-v2/SMA-UI/node_modules/lightweight-charts''\\); console.log\\(Object.keys\\(lc\\).filter\\(k => !k.startsWith\\(''_''\\)\\).join\\(''\\\\n''\\)\\)\")",
+      "Bash('/c/Program Files/JetBrains/IntelliJ IDEA Community Edition 2025.1.1.1/plugins/maven/lib/maven3/bin/mvn' clean package -DskipTests -f g:/SMA-claude-v2/SMA-Broker-Engine/pom.xml)"
     ]
   }
 }

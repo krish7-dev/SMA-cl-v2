@@ -1,5 +1,7 @@
 import { NavLink } from 'react-router-dom';
+import { useState, useEffect } from 'react';
 import { useSession } from '../context/SessionContext';
+import { fetchAllHealthStatuses } from '../services/api';
 import './Sidebar.css';
 
 const NAV_ITEMS = [
@@ -21,14 +23,56 @@ const SWAGGER_LINKS = [
   { label: 'Strategy Engine',  path: '/api/strategy' },
 ];
 
+const HEALTH_SERVICES = [
+  { name: 'Broker',    abbr: 'B', prefix: '/api/broker' },
+  { name: 'Execution', abbr: 'E', prefix: '/api/execution' },
+  { name: 'Data',      abbr: 'D', prefix: '/api/data' },
+  { name: 'Strategy',  abbr: 'S', prefix: '/api/strategy' },
+];
+
 export default function Sidebar() {
   const { session, isActive } = useSession();
+  const [health, setHealth] = useState({});
+
+  useEffect(() => {
+    async function check() {
+      const results = await Promise.all(
+        HEALTH_SERVICES.map(async svc => {
+          try {
+            const res = await fetch(`${svc.prefix}/actuator/health`);
+            const data = await res.json();
+            return [svc.name, data?.status === 'UP' ? 'UP' : 'DEGRADED'];
+          } catch {
+            return [svc.name, 'DOWN'];
+          }
+        })
+      );
+      setHealth(Object.fromEntries(results));
+    }
+    check();
+    const id = setInterval(check, 30_000);
+    return () => clearInterval(id);
+  }, []);
 
   return (
     <aside className="sidebar">
       <div className="sidebar-brand">
         <span className="brand-mark">SMA</span>
         <span className="brand-sub">Trading Platform</span>
+      </div>
+
+      {/* Service health bar */}
+      <div className="sidebar-health-bar">
+        {HEALTH_SERVICES.map(svc => {
+          const status = health[svc.name];
+          const cls = status === 'UP' ? 'shb-up' : status === 'DOWN' ? 'shb-down' : status === 'DEGRADED' ? 'shb-warn' : 'shb-unknown';
+          return (
+            <div key={svc.name} className={`shb-item ${cls}`} title={`${svc.name}: ${status || 'checking…'}`}>
+              <span className={`shb-dot ${cls}`} />
+              <span className="shb-label">{svc.abbr}</span>
+            </div>
+          );
+        })}
       </div>
 
       {/* Session status pill */}
