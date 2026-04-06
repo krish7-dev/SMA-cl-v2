@@ -1,6 +1,7 @@
 package com.sma.strategyengine.client;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.sma.strategyengine.service.options.LiveTickBuffer;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -217,6 +218,51 @@ public class DataEngineClient {
             throw e;
         } catch (Exception e) {
             throw new DataEngineException("Failed to ingest live candles: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Sends a batch of raw live ticks to the Data Engine tick ingest endpoint.
+     * Called by {@link com.sma.strategyengine.service.options.LiveTickBuffer}.
+     */
+    public void ingestLiveTicks(String sessionId, String provider,
+                                List<com.sma.strategyengine.service.options.LiveTickBuffer.BufferedTick> batch) {
+        try {
+            List<Map<String, Object>> tickPayloads = batch.stream().map(t -> {
+                Map<String, Object> m = new java.util.LinkedHashMap<>();
+                m.put("instrumentToken", t.instrumentToken());
+                m.put("symbol",          t.symbol());
+                m.put("exchange",        t.exchange());
+                m.put("ltp",             t.ltp());
+                m.put("volume",          t.volume());
+                m.put("tickTime",        LiveTickBuffer.epochToIstString(t.epochMs()));
+                return m;
+            }).collect(java.util.stream.Collectors.toList());
+
+            Map<String, Object> body = new java.util.LinkedHashMap<>();
+            body.put("sessionId", sessionId);
+            body.put("provider",  provider);
+            body.put("ticks",     tickPayloads);
+
+            String json = mapper.writeValueAsString(body);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl + "/api/v1/data/ticks/ingest"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(json))
+                    .timeout(Duration.ofSeconds(30))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                throw new DataEngineException(
+                        "Tick ingest returned HTTP " + response.statusCode() + ": " + response.body());
+            }
+        } catch (DataEngineException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new DataEngineException("Failed to ingest live ticks: " + e.getMessage(), e);
         }
     }
 
