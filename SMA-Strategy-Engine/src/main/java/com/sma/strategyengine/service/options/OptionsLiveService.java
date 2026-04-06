@@ -15,6 +15,7 @@ import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
@@ -177,6 +178,19 @@ public class OptionsLiveService {
                 .findFirst().orElse(null);
     }
 
+    /**
+     * Sends an SSE comment (":ping") to all connected emitters every 15 seconds.
+     * Keeps the Vercel proxy connection alive — without this, Vercel's reverse proxy
+     * closes idle SSE streams after ~30 seconds of no data.
+     */
+    @Scheduled(fixedDelay = 15_000)
+    public void heartbeat() {
+        if (sessions.isEmpty()) return;
+        for (LiveOptionsSession session : sessions.values()) {
+            session.sendHeartbeat();
+        }
+    }
+
     private void stopSession(String sessionId) {
         LiveOptionsSession session = sessions.remove(sessionId);
         if (session != null) session.stop();
@@ -309,6 +323,20 @@ public class OptionsLiveService {
         void addEmitter(SseEmitter e)    { emitters.add(e); }
         void removeEmitter(SseEmitter e) { emitters.remove(e); }
         int  emitterCount()              { return emitters.size(); }
+
+        /** Sends an SSE comment to all emitters to prevent proxy timeout on idle connections. */
+        void sendHeartbeat() {
+            if (emitters.isEmpty()) return;
+            List<SseEmitter> dead = null;
+            for (SseEmitter e : emitters) {
+                try { e.send(SseEmitter.event().comment("ping")); }
+                catch (Exception ex) {
+                    if (dead == null) dead = new ArrayList<>();
+                    dead.add(e);
+                }
+            }
+            if (dead != null) emitters.removeAll(dead);
+        }
 
         /** Replays buffered events to a freshly attached emitter so it sees recent state. */
         void replayBufferTo(SseEmitter e) {
