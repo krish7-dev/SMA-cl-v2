@@ -81,6 +81,8 @@ public class LiveCandleBuffer {
     public void add(long instrumentToken, String symbol, String exchange,
                     String intervalKiteValue, CandleDto candle) {
         if (stopped) return;
+        log.info("LiveCandleBuffer [{}]: queuing candle token={} symbol={} openTime={} close={}",
+                runId.substring(0, 8), instrumentToken, symbol, candle.openTime(), candle.close());
         queue.offer(new BufferedCandle(
                 instrumentToken, symbol, exchange, intervalKiteValue,
                 candle.openTime(), candle.open().doubleValue(), candle.high().doubleValue(),
@@ -119,7 +121,7 @@ public class LiveCandleBuffer {
     private void sendWithRetry(List<BufferedCandle> batch, int attempt) {
         try {
             dataEngineClient.ingestLiveCandles(runId, provider, batch);
-            log.debug("LiveCandleBuffer: flushed {} candles (runId={})", batch.size(), runId);
+            log.info("LiveCandleBuffer: flushed {} candles to DB (runId={})", batch.size(), runId);
         } catch (Exception e) {
             if (attempt < MAX_RETRIES) {
                 long delayMs = 1000L * (long) Math.pow(2, attempt - 1); // 1s, 2s, 4s

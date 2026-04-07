@@ -20,8 +20,8 @@ import java.util.concurrent.*;
 @Slf4j
 public class LiveTickBuffer {
 
-    private static final int  BATCH_SIZE        = 200;
-    private static final long FLUSH_INTERVAL_MS = 5_000L;
+    private static final int  BATCH_SIZE        = 50;
+    private static final long FLUSH_INTERVAL_MS = 10_000L;
     private static final int  MAX_RETRIES       = 3;
 
     private final String           sessionId;

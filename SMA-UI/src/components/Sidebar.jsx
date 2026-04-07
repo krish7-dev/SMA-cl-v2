@@ -23,31 +23,21 @@ const SWAGGER_LINKS = [
   { label: 'Strategy Engine',  path: '/api/strategy' },
 ];
 
-const HEALTH_SERVICES = [
-  { name: 'Broker',    abbr: 'B', prefix: '/api/broker' },
-  { name: 'Execution', abbr: 'E', prefix: '/api/execution' },
-  { name: 'Data',      abbr: 'D', prefix: '/api/data' },
-  { name: 'Strategy',  abbr: 'S', prefix: '/api/strategy' },
-];
+const HEALTH_ABBR = {
+  'Broker Engine':    { abbr: 'B' },
+  'Execution Engine': { abbr: 'E' },
+  'Data Engine':      { abbr: 'D' },
+  'Strategy Engine':  { abbr: 'S' },
+};
 
 export default function Sidebar() {
   const { session, isActive } = useSession();
-  const [health, setHealth] = useState({});
+  const [health, setHealth] = useState([]);
 
   useEffect(() => {
     async function check() {
-      const results = await Promise.all(
-        HEALTH_SERVICES.map(async svc => {
-          try {
-            const res = await fetch(`${svc.prefix}/actuator/health`);
-            const data = await res.json();
-            return [svc.name, data?.status === 'UP' ? 'UP' : 'DEGRADED'];
-          } catch {
-            return [svc.name, 'DOWN'];
-          }
-        })
-      );
-      setHealth(Object.fromEntries(results));
+      const results = await fetchAllHealthStatuses();
+      setHealth(results);
     }
     check();
     const id = setInterval(check, 30_000);
@@ -63,16 +53,22 @@ export default function Sidebar() {
 
       {/* Service health bar */}
       <div className="sidebar-health-bar">
-        {HEALTH_SERVICES.map(svc => {
-          const status = health[svc.name];
-          const cls = status === 'UP' ? 'shb-up' : status === 'DOWN' ? 'shb-down' : status === 'DEGRADED' ? 'shb-warn' : 'shb-unknown';
+        {health.map(svc => {
+          const abbr = HEALTH_ABBR[svc.name]?.abbr || svc.name[0];
+          const cls = svc.status === 'UP' ? 'shb-up' : svc.status === 'DOWN' ? 'shb-down' : svc.status === 'DEGRADED' ? 'shb-warn' : 'shb-unknown';
           return (
-            <div key={svc.name} className={`shb-item ${cls}`} title={`${svc.name}: ${status || 'checking…'}`}>
+            <div key={svc.name} className={`shb-item ${cls}`} title={`${svc.name}: ${svc.status || 'checking…'}`}>
               <span className={`shb-dot ${cls}`} />
-              <span className="shb-label">{svc.abbr}</span>
+              <span className="shb-label">{abbr}</span>
             </div>
           );
         })}
+        {health.length === 0 && ['B','E','D','S'].map(a => (
+          <div key={a} className="shb-item shb-unknown">
+            <span className="shb-dot shb-unknown" />
+            <span className="shb-label">{a}</span>
+          </div>
+        ))}
       </div>
 
       {/* Session status pill */}

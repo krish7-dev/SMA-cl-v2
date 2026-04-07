@@ -35,6 +35,10 @@ restart_service() {
   local env="${ENVS[$svc]}"
   local port="${PORTS[$svc]}"
 
+  local jar_path=~/app/$svc/$jar
+  local build_time=$(stat -c '%y' "$jar_path" 2>/dev/null | cut -d'.' -f1 || echo "unknown")
+  echo "--- [$svc] JAR last modified: $build_time"
+
   echo "--- Stopping $svc..."
   pkill -f "$jar" 2>/dev/null || true
   sleep 2
