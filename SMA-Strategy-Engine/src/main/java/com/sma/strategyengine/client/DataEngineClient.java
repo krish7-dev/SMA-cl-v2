@@ -140,7 +140,7 @@ public class DataEngineClient {
             body.put("apiKey",       apiKey);
             body.put("accessToken",  accessToken);
             body.put("instruments",  tokens);
-            body.put("mode",         "LTP");
+            body.put("mode",         "QUOTE");
 
             String json = mapper.writeValueAsString(body);
 
@@ -250,7 +250,7 @@ public class DataEngineClient {
                     .uri(URI.create(baseUrl + "/api/v1/data/ticks/ingest"))
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(json))
-                    .timeout(Duration.ofSeconds(30))
+                    .timeout(Duration.ofSeconds(60))
                     .build();
 
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
