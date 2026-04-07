@@ -1,9 +1,9 @@
 {
   "rewrites": [
-    { "source": "/api/broker/:path*",    "destination": "http://13.63.53.146:9003/:path*" },
-    { "source": "/api/execution/:path*", "destination": "http://13.63.53.146:9004/:path*" },
-    { "source": "/api/data/:path*",      "destination": "http://13.63.53.146:9005/:path*" },
-    { "source": "/api/strategy/:path*",  "destination": "http://13.63.53.146:9006/:path*" },
+    { "source": "/api/broker/:path*",    "destination": "http://16.16.119.222:9003/:path*" },
+    { "source": "/api/execution/:path*", "destination": "http://16.16.119.222:9004/:path*" },
+    { "source": "/api/data/:path*",      "destination": "http://16.16.119.222:9005/:path*" },
+    { "source": "/api/strategy/:path*",  "destination": "http://16.16.119.222:9006/:path*" },
     { "source": "/(.*)",                 "destination": "/index.html" }
   ]
 }

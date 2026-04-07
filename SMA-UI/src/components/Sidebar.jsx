@@ -30,6 +30,10 @@ const HEALTH_ABBR = {
   'Strategy Engine':  { abbr: 'S' },
 };
 
+const backendHost = import.meta.env.VITE_BACKEND_HOST || 'http://localhost';
+const ENV_LABEL = backendHost.includes('localhost') ? 'LOCAL' : 'EC2';
+const ENV_CLASS = backendHost.includes('localhost') ? 'env-local' : 'env-ec2';
+
 export default function Sidebar() {
   const { session, isActive } = useSession();
   const [health, setHealth] = useState([]);
@@ -69,6 +73,7 @@ export default function Sidebar() {
             <span className="shb-label">{a}</span>
           </div>
         ))}
+        <span className={`env-badge ${ENV_CLASS}`}>{ENV_LABEL}</span>
       </div>
 
       {/* Session status pill */}
