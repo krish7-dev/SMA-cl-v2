@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # restart.sh — Restart one or more SMA services on EC2
-# Upload this to EC2: scp -i "G:/AWS/sma-key.pem" restart.sh ubuntu@13.63.53.146:~/restart.sh
+# Upload this to EC2: scp -i "G:/AWS/sma-key.pem" restart.sh ubuntu@16.16.206.197:~/restart.sh
 # Usage:
 #   ./restart.sh              — restart all 4 services in order
 #   ./restart.sh data         — restart only data engine
@@ -36,7 +36,7 @@ restart_service() {
   local port="${PORTS[$svc]}"
 
   local jar_path=~/app/$svc/$jar
-  local build_time=$(stat -c '%y' "$jar_path" 2>/dev/null | cut -d'.' -f1 || echo "unknown")
+  local build_time=$(TZ='Asia/Kolkata' date -d "$(stat -c '%y' "$jar_path" 2>/dev/null)" '+%Y-%m-%d %H:%M:%S IST' 2>/dev/null || echo "unknown")
   echo "--- [$svc] JAR last modified: $build_time"
 
   echo "--- Stopping $svc..."

@@ -7,9 +7,12 @@
 
 set -e
 
-PEM="G:/AWS/sma-key.pem"
-HOST="ubuntu@13.63.53.146"
-BASE="G:/SMA-claude-v2"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/ec2.conf"
+
+HOST="$EC2_USER@$EC2_IP"
+PEM="$EC2_PEM"
+BASE="$SCRIPT_DIR"
 
 declare -A JARS=(
   [broker]="SMA-Broker-Engine/target/sma-broker-engine-0.0.1-SNAPSHOT.jar:app/broker/sma-broker-engine-0.0.1-SNAPSHOT.jar"
