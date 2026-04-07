@@ -126,7 +126,8 @@ public class SseStreamController {
         payload.put("open",            t.getOpenPrice()         != null ? t.getOpenPrice()         : 0);
         payload.put("high",            t.getHighPrice()         != null ? t.getHighPrice()         : 0);
         payload.put("low",             t.getLowPrice()          != null ? t.getLowPrice()          : 0);
-        payload.put("change",          t.getChangePercent()     != null ? t.getChangePercent()     : 0);
+        payload.put("change",          t.getChangePercent()       != null ? t.getChangePercent()       : 0);
+        payload.put("volume",          t.getVolumeTradedToday()   != null ? t.getVolumeTradedToday()   : 0L);
         payload.put("timestamp",       t.getTimestamp() != null ? t.getTimestamp().toString() : null);
         payload.put("replay",          t.isReplay());
         payload.put("sessionId",       t.getReplaySessionId() != null ? t.getReplaySessionId() : "");
