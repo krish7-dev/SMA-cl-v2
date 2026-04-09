@@ -47,6 +47,7 @@ public class SessionResultController {
         private Object  config;        // raw JSON object — serialised to string
         private Object  closedTrades;  // raw JSON array
         private Object  feed;          // raw JSON array
+        private Object  ticks;         // raw JSON array of tick events ({token, ltp, timeMs})
         private Object  summary;       // raw JSON object
     }
 
@@ -60,6 +61,7 @@ public class SessionResultController {
             String configJson       = req.getConfig()       != null ? objectMapper.writeValueAsString(req.getConfig())       : null;
             String closedTradesJson = req.getClosedTrades()  != null ? objectMapper.writeValueAsString(req.getClosedTrades())  : null;
             String feedJson         = req.getFeed()          != null ? objectMapper.writeValueAsString(req.getFeed())          : null;
+            String ticksJson        = req.getTicks()         != null ? objectMapper.writeValueAsString(req.getTicks())         : null;
             String summaryJson      = req.getSummary()       != null ? objectMapper.writeValueAsString(req.getSummary())       : null;
 
             LocalDate date = null;
@@ -78,6 +80,7 @@ public class SessionResultController {
                     .configJson(configJson)
                     .closedTradesJson(closedTradesJson)
                     .feedJson(feedJson)
+                    .ticksJson(ticksJson)
                     .summaryJson(summaryJson)
                     .savedAt(Instant.now())
                     .build();
