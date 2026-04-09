@@ -384,4 +384,14 @@ public class OptionsReplayRequest {
 
     private int     speedMultiplier = 1;
     private boolean persist         = true;
+
+    // Trading hours filtering
+    private TradingHoursConfig tradingHoursConfig;
+
+    @Data
+    public static class TradingHoursConfig {
+        private boolean enabled = true;
+        /** Minutes before 15:30 to stop new entries (manage existing positions only). */
+        private int noNewEntriesMinutesBeforeClose = 15;
+    }
 }

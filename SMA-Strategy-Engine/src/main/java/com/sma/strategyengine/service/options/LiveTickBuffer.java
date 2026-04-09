@@ -22,7 +22,7 @@ public class LiveTickBuffer {
 
     private static final int  BATCH_SIZE        = 50;
     private static final long FLUSH_INTERVAL_MS = 10_000L;
-    private static final int  MAX_RETRIES       = 3;
+    private static final int  MAX_RETRIES       = 10;
 
     private final String           sessionId;
     private final String           provider;
@@ -85,7 +85,7 @@ public class LiveTickBuffer {
             log.debug("LiveTickBuffer: flushed {} ticks (sessionId={})", batch.size(), sessionId);
         } catch (Exception e) {
             if (attempt < MAX_RETRIES) {
-                long delayMs = 1000L * (long) Math.pow(2, attempt - 1);
+                long delayMs = Math.min(1000L * (long) Math.pow(2, attempt - 1), 10_000L);
                 log.warn("LiveTickBuffer: ingest attempt {}/{} failed (sessionId={}), retrying in {}ms: {}",
                         attempt, MAX_RETRIES, sessionId, delayMs, e.getMessage());
                 try { Thread.sleep(delayMs); } catch (InterruptedException ie) {
