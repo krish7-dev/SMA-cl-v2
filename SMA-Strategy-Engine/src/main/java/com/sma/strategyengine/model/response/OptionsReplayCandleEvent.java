@@ -34,6 +34,11 @@ public class OptionsReplayCandleEvent {
     private String  blockReason;
     /** Execution-layer wait reason (e.g. no option data, no premium, cooldown). Separate from decision blockReason. */
     private String  execWaitReason;
+
+    /** Market phase: PRE_MARKET | TRADING | CLOSING | CLOSED */
+    private String  marketPhase;
+    /** false in PRE_MARKET and CLOSING phases — no new entries allowed */
+    private boolean tradable;
     private double  penalizedScore;
 
     /** Trade quality tier: STRONG / NORMAL / WEAK / NONE */

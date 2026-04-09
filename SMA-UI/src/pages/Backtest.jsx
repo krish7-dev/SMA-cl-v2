@@ -7,7 +7,9 @@ import {
   startReplayEval,
   startLiveEval, stopLiveEval,
   startOptionsReplayEval,
+  listTickSessions, startTickReplayEval, streamTickReplayEval, stopTickReplayEval,
   startOptionsLiveEval, streamOptionsLiveEval, stopOptionsLiveEval, getActiveOptionsLiveSession,
+  saveSessionResult, listSessionResults, getSessionResult, deleteSessionResult,
 } from '../services/api';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { useSession } from '../context/SessionContext';
@@ -1013,7 +1015,9 @@ export default function Backtest() {
           ['replay',          'Replay Test'],
           ['live',            'Live Test'],
           ['options-replay',  'Options Replay Test'],
+          ['tick-replay',     'Tick Replay Test'],
           ['options-live',    'Options Live Test'],
+          ['compare',         'Compare'],
         ].map(([key, label]) => (
           <button
             key={key}
@@ -1029,7 +1033,9 @@ export default function Backtest() {
       {tab === 'replay'         && <ReplayTest />}
       {tab === 'live'           && <LiveTest />}
       {tab === 'options-replay' && <OptionsReplayTest />}
+      {tab === 'tick-replay'    && <TickReplayTest />}
       {tab === 'options-live'   && <OptionsLiveTest />}
+      {tab === 'compare'        && <SessionCompare />}
     </div>
   );
 }
@@ -1053,8 +1059,10 @@ function OptionsLiveTest() {
   const [warmupDays,    setWarmupDays]    = useState(() => ls('sma_live_opts_warmup',      '5'));
   const [quantity,      setQuantity]      = useState(() => ls('sma_live_opts_qty',         '0'));
   const [capital,       setCapital]       = useState(() => ls('sma_live_opts_capital',     '100000'));
-  const [recordCandles, setRecordCandles] = useState(() => ls('sma_live_opts_record_candles', true));
-  const [recordTicks,   setRecordTicks]   = useState(() => ls('sma_live_opts_record_ticks',   true));
+  const [recordCandles,       setRecordCandles]       = useState(() => ls('sma_live_opts_record_candles', true));
+  const [recordTicks,         setRecordTicks]         = useState(() => ls('sma_live_opts_record_ticks',   true));
+  const [tradingHoursEnabled, setTradingHoursEnabled] = useState(() => ls('sma_live_opts_trading_hours_on', true));
+  const [closeoutMins,        setCloseoutMins]        = useState(() => ls('sma_live_opts_closeout_mins', '15'));
 
   // ── Strategies
   const [strategies, setStrategies] = useState(() => ls('sma_live_opts_strategies', defaultStrategies()));
@@ -1214,6 +1222,8 @@ function OptionsLiveTest() {
   useEffect(() => { try { localStorage.setItem('sma_live_opts_interval',           JSON.stringify(interval));            } catch {} }, [interval]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_record_candles',     JSON.stringify(recordCandles));        } catch {} }, [recordCandles]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_record_ticks',       JSON.stringify(recordTicks));          } catch {} }, [recordTicks]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_trading_hours_on',   JSON.stringify(tradingHoursEnabled));  } catch {} }, [tradingHoursEnabled]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_closeout_mins',      JSON.stringify(closeoutMins));         } catch {} }, [closeoutMins]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_warmup',             JSON.stringify(warmupDays));          } catch {} }, [warmupDays]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_qty',                JSON.stringify(quantity));            } catch {} }, [quantity]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_capital',            JSON.stringify(capital));             } catch {} }, [capital]);
@@ -1240,6 +1250,7 @@ function OptionsLiveTest() {
   const [sessionId, setSessionId] = useState(null);
   const [feed,      setFeed]      = useState([]);
   const [initInfo,  setInitInfo]  = useState(null);
+  const [warnings,  setWarnings]  = useState([]);
   const [error,     setError]     = useState('');
   const [rightTab,  setRightTab]  = useState('feed');
   const [liveTicks, setLiveTicks] = useState({});   // token -> {ltp, isNifty, fOpen, fHigh, fLow, fClose, timeMs}
@@ -1247,6 +1258,15 @@ function OptionsLiveTest() {
   const readerRef     = useRef(null);
   const sessionIdRef  = useRef(null);
   const lastRunPcRef  = useRef(null);
+  const lastPayloadRef = useRef(null);
+  // Accumulates raw tick events for post-session comparison. Capped at 10 000 to limit payload size.
+  const ticksRef = useRef([]);
+
+  // ── Save to Compare state
+  const [showSavePanel, setShowSavePanel] = useState(false);
+  const [saveLabel,     setSaveLabel]     = useState('');
+  const [saveStatus,    setSaveStatus]    = useState('idle'); // idle|saving|saved|error
+  const [saveError,     setSaveError]     = useState('');
 
   // On mount: check if a session is already running for this user and auto-reconnect to it.
   useEffect(() => {
@@ -1280,6 +1300,7 @@ function OptionsLiveTest() {
                 }
                 if (!evtName || !data) continue;
                 if (evtName === 'error') { setError(data.replace(/^"|"$/g, '')); setStatus('error'); return; }
+                if (evtName === 'warning') { setWarnings(prev => [...prev, data.replace(/^"|"$/g, '')]); continue; }
                 try {
                   const parsed = JSON.parse(data);
                   if (evtName === 'init')        setInitInfo(parsed);
@@ -1335,7 +1356,8 @@ function OptionsLiveTest() {
     }
 
     lastRunPcRef.current = { ...penaltyConfig };
-    setFeed([]); setInitInfo(null); setError(''); setStatus('running'); setLiveTicks({});
+    setFeed([]); setInitInfo(null); setWarnings([]); setError(''); setStatus('running'); setLiveTicks({});
+    setShowSavePanel(false); setSaveStatus('idle');
 
     const enabledStrats = strategies
       .filter(s => s.enabled)
@@ -1539,7 +1561,13 @@ function OptionsLiveTest() {
         rangeSizeEnabled:          penaltyConfig.rangeSizeEnabled,
         rangeSizePenalty:          parseFloat(penaltyConfig.rangeSizePenalty)          || 2,
       },
+      tradingHoursConfig: {
+        enabled: tradingHoursEnabled,
+        noNewEntriesMinutesBeforeClose: parseInt(closeoutMins, 10) || 15,
+      },
     };
+    lastPayloadRef.current = payload;
+    ticksRef.current = [];
 
     try {
       // Step 1: start session
@@ -1576,11 +1604,15 @@ function OptionsLiveTest() {
             setStatus('error');
             return;
           }
+          if (evtName === 'warning') { setWarnings(prev => [...prev, data.replace(/^"|"$/g, '')]); continue; }
           try {
             const parsed = JSON.parse(data);
             if (evtName === 'init')   setInitInfo(parsed);
             else if (evtName === 'candle') setFeed(prev => [...prev.slice(-499), parsed]);
-            else if (evtName === 'tick')   setLiveTicks(prev => ({ ...prev, [parsed.token]: parsed }));
+            else if (evtName === 'tick') {
+              setLiveTicks(prev => ({ ...prev, [parsed.token]: parsed }));
+              if (ticksRef.current.length < 10000) ticksRef.current.push(parsed);
+            }
           } catch {}
         }
       }
@@ -1625,6 +1657,7 @@ function OptionsLiveTest() {
           }
           if (!evtName || !data) continue;
           if (evtName === 'error') { setError(data.replace(/^"|"$/g, '')); setStatus('error'); return; }
+          if (evtName === 'warning') { setWarnings(prev => [...prev, data.replace(/^"|"$/g, '')]); continue; }
           try {
             const parsed = JSON.parse(data);
             if (evtName === 'init')        setInitInfo(parsed);
@@ -1637,6 +1670,40 @@ function OptionsLiveTest() {
     } catch (err) {
       if (err.name === 'AbortError') { setStatus('idle'); return; }
       setError(err.message); setStatus('error');
+    }
+  }
+
+  async function handleSaveToCompare() {
+    setSaveStatus('saving'); setSaveError('');
+    try {
+      const lastEvt = feed[feed.length - 1];
+      const trades  = lastEvt?.closedTrades || [];
+      const wins    = trades.filter(t => t.pnl > 0).length;
+      const sid     = sessionIdRef.current || sessionId || Date.now().toString();
+      await saveSessionResult({
+        sessionId:   sid,
+        type:        'LIVE',
+        userId:      session.userId,
+        brokerName:  session.brokerName,
+        sessionDate: new Date().toISOString().slice(0, 10),
+        label:       saveLabel || new Date().toISOString().slice(0, 10),
+        config:      lastPayloadRef.current,
+        closedTrades: trades,
+        feed,
+        ticks: ticksRef.current,
+        summary: {
+          trades:       trades.length,
+          realizedPnl:  lastEvt?.realizedPnl  ?? 0,
+          winRate:      trades.length > 0 ? wins / trades.length : 0,
+          finalCapital: (lastEvt?.capital ?? parseFloat(capital)) || 100000,
+        },
+      });
+      setSaveStatus('saved');
+      setShowSavePanel(false);
+      setSaveLabel('');
+    } catch (e) {
+      setSaveStatus('error');
+      setSaveError(e.message);
     }
   }
 
@@ -1713,9 +1780,10 @@ function OptionsLiveTest() {
     if (feed.length > 0) {
       const n2 = v => v != null ? Number(v).toFixed(2) : '';
       lines.push(row('=== Per-Candle Feed ==='));
-      lines.push(row('Time', 'NIFTY Close', 'Regime', 'Raw Bias', 'Conf Bias', 'Winner', 'Score', 'Gap', '2nd', '2nd Score', 'Neutral Reason', 'State', 'Action', 'Exit Reason', 'Hold Active', 'uPnL', 'rPnL', 'Capital', 'Option', 'Opt Close', 'Block', 'Exec Wait'));
+      lines.push(row('Time', 'Phase', 'Tradable', 'NIFTY Close', 'Regime', 'Raw Bias', 'Conf Bias', 'Winner', 'Score', 'Gap', '2nd', '2nd Score', 'Neutral Reason', 'State', 'Action', 'Exit Reason', 'Hold Active', 'uPnL', 'rPnL', 'Capital', 'Option', 'Opt Close', 'Block', 'Exec Wait'));
       feed.forEach(e => lines.push(row(
         (e.niftyTime || '').slice(0, 19),
+        e.marketPhase || 'TRADING', e.tradable !== false ? 'Yes' : 'No',
         n2(e.niftyClose), e.regime || '', e.niftyBias || '', e.confirmedBias || '',
         e.winnerStrategy || '', n2(e.winnerScore), n2(e.scoreGap),
         e.secondStrategy || '', n2(e.secondScore),
@@ -1787,18 +1855,46 @@ function OptionsLiveTest() {
           {[['feed','Feed'],['chart','Chart'],['pnl','P&L'],['portfolio','Portfolio'],['details','Details']].map(([k, l]) => (
             <button key={k} className={`bt-live-tab-btn ${rightTab === k ? 'active' : ''}`} onClick={() => setRightTab(k)}>{l}</button>
           ))}
-          {feed.length > 0 && (
-            <>
-              <button type="button" className="btn-secondary btn-xs" style={{ marginLeft: 'auto' }} onClick={copyFeed}>
-                {copied ? 'Copied!' : 'Copy Feed'}
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+            {feed.length > 0 && (
+              <>
+                <button type="button" className="btn-secondary btn-xs" onClick={copyFeed}>
+                  {copied ? 'Copied!' : 'Copy Feed'}
+                </button>
+                <button type="button" className="btn-secondary btn-xs" onClick={downloadCSV}>Download CSV</button>
+                <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                  {feed.length} candles · {closedTrades.length} trades
+                </span>
+              </>
+            )}
+            {!isRunning && (
+              <button type="button" className="btn-secondary btn-xs"
+                onClick={() => { setShowSavePanel(s => !s); setSaveLabel('Live ' + new Date().toISOString().slice(0, 10)); setSaveStatus('idle'); setSaveError(''); }}>
+                {showSavePanel ? 'Cancel' : 'Save to Compare'}
               </button>
-              <button type="button" className="btn-secondary btn-xs" onClick={downloadCSV}>Download CSV</button>
-              <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
-                {feed.length} candles · {closedTrades.length} trades
-              </span>
-            </>
-          )}
+            )}
+            {saveStatus === 'saved' && !showSavePanel && (
+              <span style={{ fontSize: 11, color: '#22c55e' }}>Saved!</span>
+            )}
+          </div>
         </div>
+
+        {showSavePanel && !isRunning && (
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12, padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 6 }}>
+            <div className="form-group" style={{ flex: '1 1 200px', marginBottom: 0 }}>
+              <label style={{ fontSize: 11 }}>Label</label>
+              <input type="text" value={saveLabel} onChange={e => setSaveLabel(e.target.value)}
+                placeholder="e.g. Live Apr 10" maxLength={80} style={{ fontSize: 12 }} />
+            </div>
+            <button type="button" className="btn-primary btn-xs" style={{ flexShrink: 0, alignSelf: 'flex-end', marginBottom: 1 }}
+              onClick={handleSaveToCompare} disabled={saveStatus === 'saving'}>
+              {saveStatus === 'saving' ? 'Saving...' : 'Save'}
+            </button>
+            <button type="button" className="btn-secondary btn-xs" style={{ alignSelf: 'flex-end', marginBottom: 1 }}
+              onClick={() => setShowSavePanel(false)}>Cancel</button>
+            {saveStatus === 'error' && <span style={{ fontSize: 11, color: '#ef4444' }}>{saveError}</span>}
+          </div>
+        )}
 
         {/* P&L strip */}
         {lastEvt && (() => {
@@ -1927,7 +2023,7 @@ function OptionsLiveTest() {
                   <table className="bt-opts-feed-table">
                     <thead>
                       <tr>
-                        <th>Time</th><th>NIFTY</th><th>Regime</th><th>Bias</th><th>Conf</th>
+                        <th>Time</th><th>Phase</th><th>NIFTY</th><th>Regime</th><th>Bias</th><th>Conf</th>
                         <th>Winner</th><th>Score</th><th>PenScore</th><th>Str</th><th>2nd</th><th>Gap</th>
                         <th>Shadow</th><th>NeutralReason</th>
                         <th title="Consecutive candles seen">Cnf</th><th title="Candles required">Req</th>
@@ -1938,8 +2034,20 @@ function OptionsLiveTest() {
                     </thead>
                     <tbody>
                       {[...feed].reverse().map((evt, i) => (
-                        <tr key={i}>
+                        <tr key={i} style={{
+                          background:
+                            evt.marketPhase === 'PRE_MARKET' ? 'rgba(148,163,184,0.06)' :
+                            evt.marketPhase === 'CLOSING'    ? 'rgba(249,115,22,0.06)'  :
+                            evt.marketPhase === 'CLOSED'     ? 'rgba(239,68,68,0.06)'   :
+                            evt.action === 'ENTERED'         ? 'rgba(34,197,94,0.06)'   :
+                            evt.action === 'EXITED'          ? 'rgba(249,115,22,0.06)'  : undefined
+                        }}>
                           <td className="de-mono">{(evt.niftyTime || '').slice(0, 16)}</td>
+                          <td style={{ fontSize: 10, color:
+                            evt.marketPhase === 'PRE_MARKET' ? '#94a3b8' :
+                            evt.marketPhase === 'CLOSING'    ? '#f97316' :
+                            evt.marketPhase === 'CLOSED'     ? '#ef4444' : undefined
+                          }}>{evt.marketPhase || 'TRADING'}</td>
                           <td>{fmt2(evt.niftyClose)}</td>
                           <td>{evt.regime || '—'}</td>
                           <td style={{ color: evt.niftyBias === 'BULLISH' ? '#22c55e' : evt.niftyBias === 'BEARISH' ? '#ef4444' : undefined }}>{evt.niftyBias || '—'}</td>
@@ -2104,6 +2212,11 @@ function OptionsLiveTest() {
           </div>
         )}
         {error && <div className="error-msg" style={{ marginBottom: 12 }}>{error}</div>}
+        {warnings.length > 0 && warnings.map((w, i) => (
+          <div key={i} style={{ marginBottom: 8, padding: '8px 12px', background: 'rgba(245,158,11,0.12)', border: '1px solid #f59e0b', borderRadius: 6, fontSize: 12, color: '#f59e0b' }}>
+            ⚠ {w}
+          </div>
+        ))}
         <div className="form-actions" style={{ marginBottom: 16 }}>
           <button type="submit" className="btn-primary" disabled={false}>
             {isRunning ? 'Stop Live Session' : 'Start Options Live'}
@@ -2115,7 +2228,7 @@ function OptionsLiveTest() {
             </button>
           )}
           <button type="button" className="btn-secondary" onClick={() => {
-            setFeed([]); setInitInfo(null); setError(''); setStatus('idle');
+            setFeed([]); setInitInfo(null); setWarnings([]); setError(''); setStatus('idle');
             setNifty({ symbol: '', exchange: 'NSE', instrumentToken: '' });
             setCePool([EMPTY_OPTION_INST()]); setPePool([EMPTY_OPTION_INST()]);
             setStrategies(defaultStrategies());
@@ -2127,13 +2240,15 @@ function OptionsLiveTest() {
             setCompressionEntry(DEFAULT_COMPRESSION_ENTRY); setHoldConfig(DEFAULT_HOLD); setExitConfig(DEFAULT_EXIT_CONFIG);
             setPenaltyConfig(DEFAULT_PENALTY_CONFIG);
             setInterval('MINUTE_5'); setWarmupDays('5'); setQuantity('0'); setCapital('100000');
+            setTradingHoursEnabled(true); setCloseoutMins('15');
             ['sma_live_opts_nifty','sma_live_opts_ce_pool','sma_live_opts_pe_pool','sma_live_opts_interval',
              'sma_live_opts_warmup','sma_live_opts_qty','sma_live_opts_capital','sma_live_opts_strategies',
              'sma_live_opts_decision','sma_live_opts_selection','sma_live_opts_switch','sma_live_opts_regime_cfg',
              'sma_live_opts_chop_rules','sma_live_opts_trading_rules','sma_live_opts_regime_rules',
              'sma_live_opts_regime_strat_rules','sma_live_opts_risk','sma_live_opts_range_quality',
              'sma_live_opts_trade_quality','sma_live_opts_trend_entry','sma_live_opts_compression_entry',
-             'sma_live_opts_hold_config','sma_live_opts_exit_config','sma_live_opts_penalty_config'].forEach(k => localStorage.removeItem(k));
+             'sma_live_opts_hold_config','sma_live_opts_exit_config','sma_live_opts_penalty_config',
+             'sma_live_opts_trading_hours_on','sma_live_opts_closeout_mins'].forEach(k => localStorage.removeItem(k));
           }} disabled={isRunning}>Reset</button>
           {status === 'error' && <span className="badge badge-danger">Error</span>}
           {feed.length > 0 && (
@@ -2291,6 +2406,37 @@ function OptionsLiveTest() {
                   Saves every LTP update (NIFTY + options) for sub-candle analysis
                 </span>
               </label>
+            </div>
+            <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                <label style={{ marginBottom: 0 }}>Trading Hours Filter</label>
+                <button type="button" className={`btn-sm ${tradingHoursEnabled ? 'btn-primary' : 'btn-secondary'}`}
+                  onClick={() => setTradingHoursEnabled(v => !v)} disabled={isRunning}>
+                  {tradingHoursEnabled ? 'ON' : 'OFF'}
+                </button>
+                {tradingHoursEnabled && (
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                    PRE_MARKET &lt;9:15 → no entries &nbsp;|&nbsp; TRADING 9:15–{
+                      (() => {
+                        const m = parseInt(closeoutMins, 10) || 0;
+                        if (m <= 0) return '15:30';
+                        const total = 15 * 60 + 30 - m;
+                        return `${String(Math.floor(total / 60)).padStart(2,'0')}:${String(total % 60).padStart(2,'0')}`;
+                      })()
+                    } &nbsp;|&nbsp; CLOSING → manage only &nbsp;|&nbsp; CLOSED 15:30 → force-close
+                  </span>
+                )}
+              </div>
+              {tradingHoursEnabled && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
+                  <label style={{ marginBottom: 0, whiteSpace: 'nowrap', fontSize: 12 }} title="Stop new entries this many minutes before 15:30 (0 = no closing window)">
+                    Closeout Window (min before 15:30)
+                  </label>
+                  <input type="number" min="0" max="60" value={closeoutMins}
+                    onChange={e => setCloseoutMins(e.target.value)} disabled={isRunning}
+                    style={{ width: 70 }} />
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -11705,6 +11851,2315 @@ function OptionsReplayTest() {
         </div>
 
       </form>
+    </div>
+  );
+}
+
+
+function TickReplayTest() {
+  const ls = (key, def) => { try { const s = localStorage.getItem(key); if (!s) return def; const v = JSON.parse(s); return (Array.isArray(def) && !Array.isArray(v)) ? def : v; } catch { return def; } };
+
+  const [sessions,        setSessions]        = useState([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [sessionsError,   setSessionsError]   = useState('');
+  const [sessionId,       setSessionId]       = useState(() => ls('sma_tick_session_id', ''));
+  const [userId,          setUserId]          = useState(() => ls('sma_tick_user_id',    ''));
+  const [brokerName,      setBrokerName]      = useState(() => ls('sma_tick_broker',     'kite'));
+  const [warmupDays,      setWarmupDays]      = useState(() => ls('sma_tick_warmup_days','5'));
+  const [niftyToken,    setNiftyToken]    = useState(() => ls('sma_tick_nifty_token',    ''));
+  const [niftySymbol,   setNiftySymbol]   = useState(() => ls('sma_tick_nifty_symbol',   'NIFTY 50'));
+  const [niftyExchange, setNiftyExchange] = useState(() => ls('sma_tick_nifty_exchange', 'NSE'));
+  const [cePool, setCePool] = useState(() => ls('sma_tick_ce_pool', [EMPTY_OPTION_INST()]));
+  const [pePool, setPePool] = useState(() => ls('sma_tick_pe_pool', [EMPTY_OPTION_INST()]));
+  const [interval, setInterval] = useState(() => ls('sma_tick_interval', 'MINUTE_5'));
+  const [fromDate, setFromDate] = useState(() => ls('sma_tick_from',     ''));
+  const [toDate,   setToDate]   = useState(() => ls('sma_tick_to',       ''));
+  const [speed,              setSpeed]              = useState(() => ls('sma_tick_speed',              '0'));
+  const [tradingHoursEnabled, setTradingHoursEnabled] = useState(() => ls('sma_tick_trading_hours_on',  true));
+  const [closeoutMins,        setCloseoutMins]        = useState(() => ls('sma_tick_closeout_mins',     '15'));
+  const [quantity, setQuantity] = useState(() => ls('sma_tick_qty',      '0'));
+  const [capital,  setCapital]  = useState(() => ls('sma_tick_capital',  '100000'));
+  const [strategies, setStrategies] = useState(() => ls('sma_tick_strategies', defaultStrategies()));
+  const [decisionCfg,         setDecisionCfg]         = useState(() => ls('sma_tick_decision',            DEFAULT_DECISION));
+  const [selectionCfg,        setSelectionCfg]        = useState(() => ls('sma_tick_selection',           DEFAULT_SELECTION));
+  const [switchCfg,           setSwitchCfg]           = useState(() => ls('sma_tick_switch',              DEFAULT_SWITCH));
+  const [optsRegimeCfg,       setOptsRegimeCfg]       = useState(() => ls('sma_tick_regime_cfg',          DEFAULT_OPTS_REGIME_CONFIG));
+  const [chopRules,           setChopRules]           = useState(() => ls('sma_tick_chop_rules',          DEFAULT_CHOP_RULES));
+  const [tradingRules,        setTradingRules]        = useState(() => ls('sma_tick_trading_rules',       DEFAULT_TRADING_RULES));
+  const [regimeRules,         setRegimeRules]         = useState(() => ls('sma_tick_regime_rules',        DEFAULT_REGIME_RULES));
+  const [regimeStrategyRules, setRegimeStrategyRules] = useState(() => ls('sma_tick_regime_strat_rules',  DEFAULT_REGIME_STRATEGY_RULES));
+  const [optsRisk,            setOptsRisk]            = useState(() => ls('sma_tick_risk',                DEFAULT_OPTS_RISK));
+  const [rangeQuality,        setRangeQuality]        = useState(() => ls('sma_tick_range_quality',       DEFAULT_RANGE_QUALITY));
+  const [tradeQuality,        setTradeQuality]        = useState(() => ls('sma_tick_trade_quality',       DEFAULT_TRADE_QUALITY));
+  const [trendEntry,          setTrendEntry]          = useState(() => ls('sma_tick_trend_entry',         DEFAULT_TREND_ENTRY));
+  const [compressionEntry,    setCompressionEntry]    = useState(() => ls('sma_tick_compression_entry',   DEFAULT_COMPRESSION_ENTRY));
+  const [holdConfig,          setHoldConfig]          = useState(() => ({ ...DEFAULT_HOLD,           ...ls('sma_tick_hold_config',    {}) }));
+  const [exitConfig,          setExitConfig]          = useState(() => ({ ...DEFAULT_EXIT_CONFIG,    ...ls('sma_tick_exit_config',    {}) }));
+  const [penaltyConfig,       setPenaltyConfig]       = useState(() => ({ ...DEFAULT_PENALTY_CONFIG, ...ls('sma_tick_penalty_config',  {}) }));
+
+  function updateOptsRisk(key, val)         { setOptsRisk(p        => ({ ...p, [key]: val })); }
+  function updateRangeQuality(key, val)     { setRangeQuality(p    => ({ ...p, [key]: val })); }
+  function updateHoldConfig(key, val)       { setHoldConfig(p      => ({ ...p, [key]: val })); }
+  function updateExitConfig(key, val)       { setExitConfig(p      => ({ ...p, [key]: val })); }
+  function updatePenaltyConfig(key, val)    { setPenaltyConfig(p   => ({ ...p, [key]: val })); }
+  function updateTradeQuality(key, val)     { setTradeQuality(p    => ({ ...p, [key]: val })); }
+  function updateTrendEntry(key, val)       { setTrendEntry(p      => ({ ...p, [key]: val })); }
+  function updateCompressionEntry(key, val) { setCompressionEntry(p=> ({ ...p, [key]: val })); }
+
+  useEffect(() => { try { localStorage.setItem('sma_tick_session_id',        JSON.stringify(sessionId));          } catch {} }, [sessionId]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_user_id',           JSON.stringify(userId));             } catch {} }, [userId]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_broker',            JSON.stringify(brokerName));         } catch {} }, [brokerName]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_warmup_days',       JSON.stringify(warmupDays));         } catch {} }, [warmupDays]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_nifty_token',       JSON.stringify(niftyToken));         } catch {} }, [niftyToken]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_nifty_symbol',      JSON.stringify(niftySymbol));        } catch {} }, [niftySymbol]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_nifty_exchange',    JSON.stringify(niftyExchange));      } catch {} }, [niftyExchange]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_ce_pool',           JSON.stringify(cePool));             } catch {} }, [cePool]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_pe_pool',           JSON.stringify(pePool));             } catch {} }, [pePool]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_interval',          JSON.stringify(interval));           } catch {} }, [interval]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_from',              JSON.stringify(fromDate));           } catch {} }, [fromDate]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_to',                JSON.stringify(toDate));             } catch {} }, [toDate]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_speed',             JSON.stringify(speed));                  } catch {} }, [speed]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_trading_hours_on',  JSON.stringify(tradingHoursEnabled));    } catch {} }, [tradingHoursEnabled]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_closeout_mins',     JSON.stringify(closeoutMins));           } catch {} }, [closeoutMins]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_qty',               JSON.stringify(quantity));           } catch {} }, [quantity]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_capital',           JSON.stringify(capital));            } catch {} }, [capital]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_strategies',        JSON.stringify(strategies));         } catch {} }, [strategies]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_decision',          JSON.stringify(decisionCfg));        } catch {} }, [decisionCfg]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_selection',         JSON.stringify(selectionCfg));       } catch {} }, [selectionCfg]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_switch',            JSON.stringify(switchCfg));          } catch {} }, [switchCfg]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_regime_cfg',        JSON.stringify(optsRegimeCfg));      } catch {} }, [optsRegimeCfg]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_chop_rules',        JSON.stringify(chopRules));          } catch {} }, [chopRules]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_trading_rules',     JSON.stringify(tradingRules));       } catch {} }, [tradingRules]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_regime_rules',      JSON.stringify(regimeRules));        } catch {} }, [regimeRules]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_regime_strat_rules',JSON.stringify(regimeStrategyRules));} catch {} }, [regimeStrategyRules]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_risk',              JSON.stringify(optsRisk));           } catch {} }, [optsRisk]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_range_quality',     JSON.stringify(rangeQuality));       } catch {} }, [rangeQuality]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_trade_quality',     JSON.stringify(tradeQuality));       } catch {} }, [tradeQuality]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_trend_entry',       JSON.stringify(trendEntry));         } catch {} }, [trendEntry]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_compression_entry', JSON.stringify(compressionEntry));   } catch {} }, [compressionEntry]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_hold_config',       JSON.stringify(holdConfig));         } catch {} }, [holdConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_exit_config',       JSON.stringify(exitConfig));         } catch {} }, [exitConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_penalty_config',    JSON.stringify(penaltyConfig));      } catch {} }, [penaltyConfig]);
+
+  // ── Config presets (shared sma_opts_presets key — same presets across Live/Replay/Tick) ──
+  const [presets,           setPresets]           = useState(() => { try { return JSON.parse(localStorage.getItem('sma_opts_presets') || '[]'); } catch { return []; } });
+  const [presetName,        setPresetName]        = useState('');
+  const [presetDescription, setPresetDescription] = useState('');
+  const [showPresetSave,    setShowPresetSave]    = useState(false);
+
+  function capturePresetConfig() {
+    return {
+      interval, quantity, capital,
+      strategies,
+      decisionCfg, selectionCfg, switchCfg,
+      optsRegimeCfg, chopRules, tradingRules, regimeRules, regimeStrategyRules,
+      optsRisk, rangeQuality, tradeQuality, trendEntry, compressionEntry,
+      holdConfig, exitConfig, penaltyConfig,
+    };
+  }
+
+  const selectedPresetId = (() => {
+    const current = JSON.stringify(capturePresetConfig());
+    return presets.find(p => {
+      const { nifty: _n, cePool: _ce, pePool: _pe, warmupDays: _w, ...presetCmp } = p.config;
+      return JSON.stringify(presetCmp) === current;
+    })?.id ?? null;
+  })();
+
+  function savePreset() {
+    if (!presetName.trim()) return;
+    const preset = { id: Date.now().toString(), name: presetName.trim(), description: presetDescription.trim(), createdAt: new Date().toISOString(), config: capturePresetConfig() };
+    const next = [preset, ...presets];
+    setPresets(next);
+    try { localStorage.setItem('sma_opts_presets', JSON.stringify(next)); } catch {}
+    setPresetName(''); setPresetDescription(''); setShowPresetSave(false);
+  }
+
+  function applyPreset(preset) {
+    const c = preset.config;
+    if (c.interval            !== undefined) setInterval(c.interval);
+    if (c.quantity            !== undefined) setQuantity(c.quantity);
+    if (c.capital             !== undefined) setCapital(c.capital);
+    if (c.strategies          !== undefined) setStrategies(c.strategies);
+    if (c.decisionCfg         !== undefined) setDecisionCfg(c.decisionCfg);
+    if (c.selectionCfg        !== undefined) setSelectionCfg(c.selectionCfg);
+    if (c.switchCfg           !== undefined) setSwitchCfg(c.switchCfg);
+    if (c.optsRegimeCfg       !== undefined) setOptsRegimeCfg(c.optsRegimeCfg);
+    if (c.chopRules           !== undefined) setChopRules(c.chopRules);
+    if (c.tradingRules        !== undefined) setTradingRules(c.tradingRules);
+    if (c.regimeRules         !== undefined) setRegimeRules(c.regimeRules);
+    if (c.regimeStrategyRules !== undefined) setRegimeStrategyRules(c.regimeStrategyRules);
+    if (c.optsRisk            !== undefined) setOptsRisk(c.optsRisk);
+    if (c.rangeQuality        !== undefined) setRangeQuality(c.rangeQuality);
+    if (c.tradeQuality        !== undefined) setTradeQuality(c.tradeQuality);
+    if (c.trendEntry          !== undefined) setTrendEntry(c.trendEntry);
+    if (c.compressionEntry    !== undefined) setCompressionEntry(c.compressionEntry);
+    if (c.holdConfig          !== undefined) setHoldConfig(c.holdConfig);
+    if (c.exitConfig          !== undefined) setExitConfig(c.exitConfig);
+    if (c.penaltyConfig       !== undefined) setPenaltyConfig(c.penaltyConfig);
+  }
+
+  function deletePreset(id) {
+    const preset = presets.find(p => p.id === id);
+    if (!window.confirm(`Delete preset "${preset?.name}"?`)) return;
+    const next = presets.filter(p => p.id !== id);
+    setPresets(next);
+    try { localStorage.setItem('sma_opts_presets', JSON.stringify(next)); } catch {}
+  }
+
+  function downloadPreset(preset) {
+    const blob = new Blob([JSON.stringify(preset, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url;
+    a.download = `preset-${preset.name.replace(/[^a-z0-9]/gi, '_')}.json`;
+    a.click(); URL.revokeObjectURL(url);
+  }
+
+  function downloadAllPresets() {
+    const blob = new Blob([JSON.stringify(presets, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url;
+    a.download = 'sma_opts_presets.json';
+    a.click(); URL.revokeObjectURL(url);
+  }
+
+  function uploadPresets(e) {
+    const file = e.target.files?.[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const parsed = JSON.parse(ev.target.result);
+        const incoming = Array.isArray(parsed) ? parsed : [parsed];
+        if (!incoming.every(p => p.id && p.name && p.config)) { alert('Invalid preset file — each preset must have id, name, and config fields.'); return; }
+        const existingIds = new Set(presets.map(p => p.id));
+        const next = [...incoming.filter(p => !existingIds.has(p.id)), ...presets];
+        setPresets(next);
+        try { localStorage.setItem('sma_opts_presets', JSON.stringify(next)); } catch {}
+      } catch { alert('Failed to parse preset file — must be valid JSON.'); }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  }
+
+  const [status,          setStatus]          = useState('idle'); // idle|running|completed|error
+  const [feed,            setFeed]            = useState([]);
+  const [summary,         setSummary]         = useState(null);
+  const [initInfo,        setInitInfo]        = useState(null);
+  const [error,           setError]           = useState('');
+  const [warnings,        setWarnings]        = useState([]);
+  const [rightTab,        setRightTab]        = useState('feed');
+  const [feedExpanded,    setFeedExpanded]    = useState(false);
+  const [liveTicks,       setLiveTicks]       = useState({});
+  const [replaySessionId, setReplaySessionId] = useState(null);
+  const abortRef         = useRef(null);
+  const readerRef        = useRef(null);
+  const replaySessionRef = useRef(null);
+  const lastPayloadRef   = useRef(null);
+  // Accumulates raw tick events for post-session comparison. Capped at 10 000 to limit payload size.
+  const ticksRef         = useRef([]);
+
+  // ── Save to Compare state
+  const [showSavePanel, setShowSavePanel] = useState(false);
+  const [saveLabel,     setSaveLabel]     = useState('');
+  const [saveStatus,    setSaveStatus]    = useState('idle'); // idle|saving|saved|error
+  const [saveError,     setSaveError]     = useState('');
+
+  useEffect(() => () => { abortRef.current?.abort(); }, []);
+
+  useEffect(() => {
+    setSessionsLoading(true);
+    setSessionsError('');
+    listTickSessions()
+      .then(res => { const list = res?.data ?? res ?? []; setSessions(Array.isArray(list) ? list : []); })
+      .catch(e => setSessionsError(e.message))
+      .finally(() => setSessionsLoading(false));
+  }, []);
+
+  function updatePoolInst(pool, setPool, id, patch) { setPool(p => p.map(i => i.id === id ? { ...i, ...patch } : i)); }
+  function addPoolInst(setPool)              { setPool(p => [...p, EMPTY_OPTION_INST()]); }
+  function removePoolInst(pool, setPool, id) { setPool(p => p.length > 1 ? p.filter(i => i.id !== id) : p); }
+  function updateStrategy(idx, patch)        { setStrategies(p => p.map((s, i) => i === idx ? { ...s, ...patch } : s)); }
+  function updateStratParam(idx, key, val)   { setStrategies(p => p.map((s, i) => i === idx ? { ...s, parameters: { ...s.parameters, [key]: val } } : s)); }
+
+  async function handleStop() {
+    abortRef.current?.abort();
+    try { readerRef.current?.cancel(); } catch {}
+    const sid = replaySessionRef.current;
+    if (sid) {
+      try { await stopTickReplayEval(sid); } catch {}
+      replaySessionRef.current = null;
+      setReplaySessionId(null);
+    }
+    setStatus('idle');
+  }
+
+  function downloadCSV() {
+    const q    = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const row  = (...cols) => cols.map(q).join(',');
+    const blank = '';
+    const lines = [];
+    const n2    = v => v != null ? Number(v).toFixed(2) : '';
+
+    // ── Run Config ──────────────────────────────────────────────────────────
+    lines.push(row('=== Run Config ==='));
+    lines.push(row('Session ID', 'NIFTY Token', 'NIFTY Symbol', 'Exchange', 'Interval', 'From', 'To', 'Speed', 'Quantity', 'Capital'));
+    lines.push(row(sessionId, niftyToken, niftySymbol, niftyExchange, interval, fromDate || '—', toDate || '—', speed, quantity, capital));
+    lines.push(blank);
+
+    // ── CE Pool ─────────────────────────────────────────────────────────────
+    lines.push(row('=== CE Options Pool ==='));
+    lines.push(row('Token', 'Symbol', 'Exchange'));
+    cePool.filter(i => i.instrumentToken).forEach(i => lines.push(row(i.instrumentToken, i.symbol, i.exchange)));
+    lines.push(blank);
+
+    // ── PE Pool ─────────────────────────────────────────────────────────────
+    lines.push(row('=== PE Options Pool ==='));
+    lines.push(row('Token', 'Symbol', 'Exchange'));
+    pePool.filter(i => i.instrumentToken).forEach(i => lines.push(row(i.instrumentToken, i.symbol, i.exchange)));
+    lines.push(blank);
+
+    // ── Strategies ──────────────────────────────────────────────────────────
+    lines.push(row('=== Strategies ==='));
+    lines.push(row('Strategy Type', 'Enabled', 'Parameters'));
+    strategies.forEach(s => lines.push(row(s.strategyType, s.enabled ? 'Yes' : 'No', JSON.stringify(s.parameters || {}))));
+    lines.push(blank);
+
+    // ── Decision Config ─────────────────────────────────────────────────────
+    lines.push(row('=== Decision Config ==='));
+    lines.push(row('Min Score', 'Penalty Min Score', 'Min Score Gap', 'Max Recent Move 3%', 'Max Recent Move 5%',
+      'Max VWAP Dist%', 'Min Bars Since Trade', 'Chop Filter', 'Chop Lookback'));
+    lines.push(row(
+      decisionCfg.minScore, decisionCfg.penaltyMinScore, decisionCfg.minScoreGap,
+      decisionCfg.maxRecentMove3, decisionCfg.maxRecentMove5,
+      decisionCfg.maxAbsVwapDist, decisionCfg.minBarsSinceTrade,
+      decisionCfg.chopFilter ? 'Yes' : 'No', decisionCfg.chopLookback,
+    ));
+    lines.push(blank);
+
+    // ── Chop Filter Regime Rules ─────────────────────────────────────────────
+    lines.push(row('=== Chop Filter Regime Rules ==='));
+    lines.push(row('Enabled', 'Regime', 'Filter', 'Flip Ratio'));
+    lines.push(row(chopRules.enabled ? 'Yes' : 'No'));
+    if (chopRules.enabled) {
+      [['RANGING', 'ranging'], ['TRENDING', 'trending'], ['COMPRESSION', 'compression'], ['VOLATILE', 'volatile']].forEach(([label, rk]) =>
+        lines.push(row('', label, chopRules[rk].filterEnabled ? 'ON' : 'Disabled', chopRules[rk].filterEnabled ? chopRules[rk].flipRatio : '—'))
+      );
+    }
+    lines.push(blank);
+
+    // ── Market Regime Detection ──────────────────────────────────────────────
+    lines.push(row('=== Market Regime Detection ==='));
+    lines.push(row('Enabled', 'ADX Period', 'ATR Period', 'ADX Trend Threshold', 'ATR Volatile %', 'ATR Compression %'));
+    lines.push(row(
+      optsRegimeCfg.enabled ? 'Yes' : 'No',
+      optsRegimeCfg.adxPeriod, optsRegimeCfg.atrPeriod,
+      optsRegimeCfg.adxTrendThreshold, optsRegimeCfg.atrVolatilePct, optsRegimeCfg.atrCompressionPct,
+    ));
+    lines.push(blank);
+
+    // ── Selection Config ────────────────────────────────────────────────────
+    lines.push(row('=== Selection Config ==='));
+    lines.push(row('Min Premium', 'Max Premium'));
+    lines.push(row(selectionCfg.minPremium, selectionCfg.maxPremium));
+    lines.push(blank);
+
+    // ── Switch Config ───────────────────────────────────────────────────────
+    lines.push(row('=== Switch Config ==='));
+    lines.push(row('Switch Confirmation Candles', 'Max Switches Per Day'));
+    lines.push(row(switchCfg.switchConfirmationCandles, switchCfg.maxSwitchesPerDay));
+    lines.push(blank);
+
+    // ── Trading Rules ────────────────────────────────────────────────────────
+    lines.push(row('=== Trading Rules ==='));
+    lines.push(row('Enabled', 'No Trade in RANGING', 'No Trade in VOLATILE', 'No Same-Candle Reversal'));
+    lines.push(row(
+      tradingRules.enabled ? 'Yes' : 'No',
+      tradingRules.rangingNoTrade       ? 'ON' : 'OFF',
+      tradingRules.volatileNoTrade      ? 'ON' : 'OFF',
+      tradingRules.noSameCandleReversal ? 'ON' : 'OFF',
+    ));
+    lines.push(blank);
+
+    // ── Regime Score Rules ───────────────────────────────────────────────────
+    lines.push(row('=== Regime Score Rules ==='));
+    lines.push(row('Enabled', 'RANGING Min Score', 'RANGING Min Score Gap', 'TRENDING Min Score', 'TRENDING Min Score Gap', 'COMPRESSION Min Score', 'COMPRESSION Min Score Gap'));
+    lines.push(row(
+      regimeRules.enabled ? 'Yes' : 'No',
+      regimeRules.rangingMinScore,     regimeRules.rangingMinScoreGap,
+      regimeRules.trendingMinScore,    regimeRules.trendingMinScoreGap,
+      regimeRules.compressionMinScore, regimeRules.compressionMinScoreGap,
+    ));
+    lines.push(blank);
+
+    // ── Regime Strategy Rules ────────────────────────────────────────────────
+    lines.push(row('=== Regime Strategy Rules ==='));
+    lines.push(row('Enabled'));
+    lines.push(row(regimeStrategyRules.enabled ? 'Yes' : 'No'));
+    if (regimeStrategyRules.enabled) {
+      lines.push(blank);
+      lines.push(row('Regime', 'Filter Enabled', 'Allowed Strategies'));
+      [
+        ['RANGING',     regimeStrategyRules.ranging],
+        ['TRENDING',    regimeStrategyRules.trending],
+        ['COMPRESSION', regimeStrategyRules.compression],
+        ['VOLATILE',    regimeStrategyRules.volatile],
+      ].forEach(([label, cfg]) =>
+        lines.push(row(label, cfg.enabled ? 'Yes' : 'No', cfg.enabled ? (cfg.allowed.join(', ') || 'none selected') : 'all allowed'))
+      );
+    }
+    lines.push(blank);
+
+    // ── Range Quality Filter ─────────────────────────────────────────────────
+    lines.push(row('=== Range Quality Filter (RANGING only) ==='));
+    lines.push(row('Enabled', 'Lookback Bars', 'Min Upper Touches', 'Min Lower Touches',
+      'Band Touch Tol%', 'Min Range Width%', 'Max Range Width%',
+      'Max Drift Ratio', 'Chop Flip Limit', 'Chop Check'));
+    lines.push(row(
+      rangeQuality.enabled ? 'Yes' : 'No',
+      rangeQuality.lookbackBars, rangeQuality.minUpperTouches, rangeQuality.minLowerTouches,
+      rangeQuality.bandTouchTolerancePct, rangeQuality.minRangeWidthPct, rangeQuality.maxRangeWidthPct,
+      rangeQuality.maxDirectionalDriftPctOfRange, rangeQuality.chopFlipRatioLimit,
+      rangeQuality.enableChopCheck ? 'Yes' : 'No',
+    ));
+    lines.push(blank);
+
+    // ── Risk Management ─────────────────────────────────────────────────────
+    lines.push(row('=== Risk Management ==='));
+    lines.push(row('Enabled', 'Stop Loss %', 'Take Profit %', 'Max Risk / Trade %', 'Daily Loss Cap %', 'Cooldown Candles'));
+    lines.push(row(
+      optsRisk.enabled ? 'Yes' : 'No',
+      optsRisk.stopLossPct, optsRisk.takeProfitPct,
+      optsRisk.maxRiskPerTradePct, optsRisk.dailyLossCapPct, optsRisk.cooldownCandles,
+    ));
+    lines.push(blank);
+
+    // ── Trade Quality ────────────────────────────────────────────────────────
+    lines.push(row('=== Trade Quality ==='));
+    lines.push(row('Enabled', 'Strong Score ≥', 'Normal Score ≥', 'Weak Loss Cooldown', 'Block Weak in RANGING', 'RANGING Confirm', 'TRENDING Confirm'));
+    lines.push(row(
+      tradeQuality.enabled ? 'Yes' : 'No',
+      tradeQuality.strongScoreThreshold, tradeQuality.normalScoreThreshold,
+      tradeQuality.weakTradeLossCooldown, tradeQuality.blockWeakInRanging ? 'Yes' : 'No',
+      tradeQuality.rangingConfirmCandles, tradeQuality.trendingConfirmCandles,
+    ));
+    lines.push(blank);
+
+    // ── Trending Entry Structure ─────────────────────────────────────────────
+    lines.push(row('=== Trending Entry Structure (TRENDING only) ==='));
+    lines.push(row('Enabled', 'Breakout Lookback', 'Min Body %', 'Weak Body %', 'EMA Period'));
+    lines.push(row(
+      trendEntry.enabled ? 'Yes' : 'No',
+      trendEntry.breakoutLookback, trendEntry.minBodyPct, trendEntry.weakBodyPct, trendEntry.ema9Period,
+    ));
+    lines.push(blank);
+
+    // ── Compression Entry Structure ──────────────────────────────────────────
+    lines.push(row('=== Compression Entry Structure (COMPRESSION only) ==='));
+    lines.push(row('Enabled', 'Range Lookback', 'Long Zone Max', 'Short Zone Min', 'No-Trade Min', 'No-Trade Max', 'Reject Breakout'));
+    lines.push(row(
+      compressionEntry.enabled ? 'Yes' : 'No',
+      compressionEntry.rangeLookback, compressionEntry.longZoneMax, compressionEntry.shortZoneMin,
+      compressionEntry.noTradeZoneMin, compressionEntry.noTradeZoneMax,
+      compressionEntry.rejectBreakoutCandle ? 'Yes' : 'No',
+    ));
+    lines.push(blank);
+
+    // ── Hold Config ─────────────────────────────────────────────────────────
+    lines.push(row('=== Minimum Hold Period ==='));
+    lines.push(row('Enabled', 'Default Min Hold', 'RANGING Min Hold', 'TRENDING Min Hold', 'Strong Opp Score', 'Persistent Exit Bars'));
+    lines.push(row(
+      holdConfig.enabled ? 'Yes' : 'No',
+      holdConfig.defaultMinHoldBars, holdConfig.rangingMinHoldBars, holdConfig.trendingMinHoldBars,
+      holdConfig.strongOppositeScore, holdConfig.persistentExitBars,
+    ));
+    lines.push(blank);
+
+    // ── Exit System ──────────────────────────────────────────────────────────
+    lines.push(row('=== Exit System ==='));
+    lines.push(row('Enabled', 'Hard Stop %', 'Hold Zone %',
+      'Lock1 Trigger %', 'Lock1 Floor %', 'Lock2 Trigger %', 'Lock2 Floor %',
+      'Trail Trigger %', 'Trail Factor',
+      'Structure Lookback',
+      'Score Abs Min', 'Bias Exit', 'Strong Exit Score',
+      'Trend Strong Mode Threshold %',
+      'Max Bars No Improvement', 'Stagnation Bars', 'Max Bars RANGING',
+      'Max Bars Dead Trade', 'Dead Trade PnL %',
+      'No-Hope Threshold %', 'No-Hope Bars'));
+    lines.push(row(
+      exitConfig.enabled ? 'Yes' : 'No',
+      exitConfig.hardStopPct, exitConfig.holdZonePct,
+      exitConfig.lock1TriggerPct, exitConfig.lock1FloorPct,
+      exitConfig.lock2TriggerPct, exitConfig.lock2FloorPct,
+      exitConfig.trailTriggerPct, exitConfig.trailFactor,
+      exitConfig.structureLookback,
+      exitConfig.scoreAbsoluteMin,
+      exitConfig.biasExitEnabled ? 'Yes' : 'No', exitConfig.strongExitScore,
+      exitConfig.trendStrongModeThresholdPct,
+      exitConfig.maxBarsNoImprovement, exitConfig.stagnationBars, exitConfig.maxBarsRanging,
+      exitConfig.maxBarsDeadTrade, exitConfig.deadTradePnlPct,
+      exitConfig.noHopeThresholdPct, exitConfig.noHopeBars,
+    ));
+    lines.push(blank);
+
+    // ── Penalty Config ───────────────────────────────────────────────────────
+    lines.push(row('=== Penalty Config ==='));
+    lines.push(row('Master', penaltyConfig.enabled ? 'ON' : 'OFF'));
+    if (penaltyConfig.enabled) {
+      lines.push(row('Signal Penalty', 'Enabled', 'Value'));
+      lines.push(row('Reversal',        penaltyConfig.reversalEnabled        ? 'ON' : 'OFF', `Max=${penaltyConfig.reversalMax}`));
+      lines.push(row('Overextension',   penaltyConfig.overextensionEnabled   ? 'ON' : 'OFF', `Max=${penaltyConfig.overextensionMax}`));
+      lines.push(row('Same Color',      penaltyConfig.sameColorEnabled       ? 'ON' : 'OFF', `Max=${penaltyConfig.sameColorMax}`));
+      lines.push(row('Mismatch',        penaltyConfig.mismatchEnabled        ? 'ON' : 'OFF', `Scale=${penaltyConfig.mismatchScale}`));
+      lines.push(row('Volatile Option', penaltyConfig.volatileOptionEnabled  ? 'ON' : 'OFF', `Penalty=${penaltyConfig.volatileOptionPenalty}`));
+      lines.push(row('Entry Penalty', 'Enabled', 'Value'));
+      lines.push(row('Move',           penaltyConfig.movePenaltyEnabled         ? 'ON' : 'OFF', penaltyConfig.movePenalty));
+      lines.push(row('VWAP',           penaltyConfig.vwapPenaltyEnabled         ? 'ON' : 'OFF', penaltyConfig.vwapPenalty));
+      lines.push(row('Chop',           penaltyConfig.chopPenaltyEnabled         ? 'ON' : 'OFF', penaltyConfig.chopPenalty));
+      lines.push(row('Range Drifting', penaltyConfig.rangeDriftingEnabled       ? 'ON' : 'OFF', penaltyConfig.rangeDriftingPenalty));
+      lines.push(row('Range Poor Str', penaltyConfig.rangePoorStructureEnabled  ? 'ON' : 'OFF', penaltyConfig.rangePoorStructurePenalty));
+      lines.push(row('Range Choppy',   penaltyConfig.rangeChoppyEnabled         ? 'ON' : 'OFF', penaltyConfig.rangeChoppyPenalty));
+      lines.push(row('Range Size',     penaltyConfig.rangeSizeEnabled           ? 'ON' : 'OFF', penaltyConfig.rangeSizePenalty));
+    }
+    lines.push(blank);
+
+    // ── Summary ─────────────────────────────────────────────────────────────
+    if (summary) {
+      lines.push(row('=== Summary ==='));
+      lines.push(row('Total Trades', 'Realized P&L', 'Final Capital'));
+      lines.push(row(summary.totalTrades, summary.realizedPnl, summary.finalCapital));
+      lines.push(blank);
+    }
+
+    // ── Closed Trades ───────────────────────────────────────────────────────
+    const ct = feed[feed.length - 1]?.closedTrades || summary?.closedTrades || [];
+    if (ct.length > 0) {
+      lines.push(row('=== Closed Trades ==='));
+      lines.push(row('Entry Time', 'Exit Time', 'Type', 'Symbol', 'Strike', 'Expiry',
+        'Entry Px', 'Exit Px', 'Qty', 'P&L', 'P&L %', 'Bars', 'Exit Reason', 'Capital After'));
+      ct.forEach(t => lines.push(row(
+        (t.entryTime || '').slice(0, 16), (t.exitTime || '').slice(0, 16),
+        t.optionType, t.tradingSymbol, t.strike, t.expiry,
+        t.entryPrice != null ? Number(t.entryPrice).toFixed(2) : '',
+        t.exitPrice  != null ? Number(t.exitPrice).toFixed(2)  : '',
+        t.quantity,
+        t.pnl    != null ? Number(t.pnl).toFixed(2)    : '',
+        t.pnlPct != null ? Number(t.pnlPct).toFixed(2) : '',
+        t.barsInTrade, t.exitReason,
+        t.capitalAfter != null ? Number(t.capitalAfter).toFixed(2) : '',
+      )));
+      lines.push(blank);
+    }
+
+    // ── Per-Candle Feed ─────────────────────────────────────────────────────
+    if (feed.length > 0) {
+      lines.push(row('=== Per-Candle Feed ==='));
+      lines.push(row(
+        'Candle #', 'Total Candles',
+        'Time', 'Phase', 'Tradable',
+        'NIFTY Open', 'NIFTY High', 'NIFTY Low', 'NIFTY Close', 'NIFTY Volume',
+        'Regime', 'Raw Bias', 'Prev Bias', 'Conf Bias',
+        'Winner Strategy', 'Winner Score', 'Score Gap', 'Confidence',
+        '2nd Strategy', '2nd Score',
+        'Neutral Reason',
+        'Shadow Winner', 'Shadow Score', 'Shadow Not-Taken Reason',
+        'Recent Move 3%', 'Recent Move 5%', 'VWAP Dist%',
+        'Entry Allowed', 'Block Reason', 'Exec Wait Reason',
+        'Switch Requested', 'Switch Confirmed', 'Switch Reason', 'Switch Count Today', 'Confirm Count', 'Confirm Required',
+        'Bars Since Trade',
+        'Candidates',
+        'Position State', 'Desired Side', 'Action', 'Exit Reason',
+        'Entry Regime', 'Applied Min Hold', 'Hold Active',
+        'Peak PnL %', 'Profit Lock Floor %', 'In Hold Zone', 'In Strong Trend Mode',
+        'Selected Symbol', 'Option Type', 'Strike', 'Expiry',
+        'Entry Price', 'Exit Price', 'Bars In Trade',
+        'uPnL', 'rPnL', 'Total PnL', 'Capital',
+        'Option Time', 'Option Open', 'Option High', 'Option Low', 'Option Close', 'Option Volume',
+      ));
+      feed.forEach(e => lines.push(row(
+        e.emitted ?? '', e.total ?? '',
+        (e.niftyTime || '').slice(0, 19),
+        e.marketPhase || 'TRADING', e.tradable ? 'Yes' : 'No',
+        n2(e.niftyOpen), n2(e.niftyHigh), n2(e.niftyLow), n2(e.niftyClose),
+        e.niftyVolume ?? '',
+        e.regime || '', e.niftyBias || '', e.previousNiftyBias || '', e.confirmedBias || '',
+        e.winnerStrategy || '', n2(e.winnerScore), n2(e.scoreGap),
+        e.confidenceLevel || '',
+        e.secondStrategy || '', n2(e.secondScore),
+        e.neutralReason || '',
+        e.shadowWinner || '', n2(e.shadowWinnerScore), e.shadowWinnerReasonNotTaken || '',
+        n2(e.recentMove3), n2(e.recentMove5), n2(e.distanceFromVwap),
+        e.entryAllowed ? 'Yes' : 'No', e.blockReason || '', e.execWaitReason || '',
+        e.switchRequested ? 'Yes' : 'No', e.switchConfirmed ? 'Yes' : 'No',
+        e.switchReason || '', e.switchCountToday ?? '', e.confirmCount ?? '', e.confirmRequired ?? '',
+        e.barsSinceLastTrade ?? '',
+        (e.candidates || []).map(c =>
+          `${c.strategyType}:${c.signal}:${Number(c.score).toFixed(1)}:${c.eligible ? 'ok' : 'blocked'}${c.eligibilityReason ? '(' + c.eligibilityReason + ')' : ''}`
+        ).join(' | '),
+        e.positionState || '', e.desiredSide || '', e.action || '', e.exitReason || '',
+        e.entryRegime || '', e.appliedMinHold ?? '', e.holdActive ? 'Yes' : 'No',
+        n2(e.peakPnlPct), n2(e.profitLockFloor),
+        e.inHoldZone ? 'Yes' : 'No', e.inStrongTrendMode ? 'Yes' : 'No',
+        e.selectedTradingSymbol || '', e.selectedOptionType || '',
+        e.selectedStrike ?? '', e.selectedExpiry || '',
+        n2(e.entryPrice), n2(e.exitPrice), e.barsInTrade ?? '',
+        n2(e.unrealizedPnl), n2(e.realizedPnl), n2(e.totalPnl), n2(e.capital),
+        (e.optionTime || '').slice(0, 19),
+        n2(e.optionOpen), n2(e.optionHigh), n2(e.optionLow), n2(e.optionClose),
+        e.optionVolume ?? '',
+      )));
+
+      // ── Per-Candidate Pipeline Breakdown ────────────────────────────────
+      const strategyTypes = [...new Set(feed.flatMap(e => (e.candidates || []).map(c => c.strategyType)))];
+      if (strategyTypes.length > 0) {
+        lines.push(blank);
+        lines.push(row('=== Candidate Score Pipeline Breakdown ==='));
+        lines.push(row(
+          'Time', 'Strategy', 'Signal',
+          'Base Score', 'Trend', 'Volatility', 'Momentum', 'Confidence',
+          'Pen Reversal', 'Pen Overextension', 'Pen SameColor', 'Pen Mismatch', 'Pen VolatileOpt',
+          'Total Penalty', 'Final Score', 'Eligible', 'Eligibility Reason',
+        ));
+        feed.forEach(e => {
+          (e.candidates || []).forEach(c => {
+            lines.push(row(
+              (e.niftyTime || '').slice(0, 19),
+              c.strategyType, c.signal,
+              n2(c.baseScore),
+              n2(c.trendComponent), n2(c.volatilityComponent),
+              n2(c.momentumComponent), n2(c.confidenceComponent),
+              n2(c.penaltyReversal), n2(c.penaltyOverextension), n2(c.penaltySameColor),
+              n2(c.penaltyMismatch), n2(c.penaltyVolatileOption),
+              n2(c.totalPenalty), n2(c.score),
+              c.eligible ? 'Yes' : 'No', c.eligibilityReason || '',
+            ));
+          });
+        });
+      }
+    }
+
+    const csv  = lines.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url;
+    a.download = `tick_replay_${sessionId || 'data'}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function handleSaveToCompare() {
+    setSaveStatus('saving'); setSaveError('');
+    try {
+      const lastEvt    = feed[feed.length - 1];
+      const trades     = lastEvt?.closedTrades || summary?.closedTrades || [];
+      const wins       = trades.filter(t => t.pnl > 0).length;
+      const replayDate = fromDate || new Date().toISOString().slice(0, 10);
+      await saveSessionResult({
+        sessionId:   (replaySessionRef.current || replaySessionId || Date.now().toString()),
+        type:        'TICK_REPLAY',
+        userId:      userId || undefined,
+        brokerName:  brokerName || 'kite',
+        sessionDate: replayDate,
+        label:       saveLabel || replayDate,
+        config:      lastPayloadRef.current,
+        closedTrades: trades,
+        feed,
+        ticks: ticksRef.current,
+        summary: {
+          trades:       trades.length,
+          realizedPnl:  (lastEvt?.realizedPnl ?? summary?.realizedPnl ?? 0),
+          winRate:      trades.length > 0 ? wins / trades.length : 0,
+          finalCapital: (lastEvt?.capital ?? summary?.finalCapital ?? parseFloat(capital) ?? 0) || 100000,
+        },
+      });
+      setSaveStatus('saved');
+      setShowSavePanel(false);
+      setSaveLabel('');
+    } catch (e) {
+      setSaveStatus('error');
+      setSaveError(e.message);
+    }
+  }
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    if (status === 'running') { handleStop(); return; }
+    setFeed([]); setSummary(null); setInitInfo(null); setError(''); setWarnings([]); setLiveTicks({});
+    setStatus('running');
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    const enabledStrats = strategies.filter(s => s.enabled).map(s => ({ strategyType: s.strategyType, parameters: s.parameters }));
+    const payload = {
+      sessionId, interval,
+      userId:     userId     || undefined,
+      brokerName: brokerName || undefined,
+      warmupDays: parseInt(warmupDays, 10) || 0,
+      fromDate: fromDate || undefined,
+      toDate:   toDate   || undefined,
+      niftyInstrumentToken: niftyToken ? parseInt(niftyToken, 10) : undefined,
+      niftySymbol: niftySymbol || 'NIFTY 50', niftyExchange: niftyExchange || 'NSE',
+      quantity: parseInt(quantity, 10) || 0, initialCapital: parseFloat(capital) || 100000, speedMultiplier: parseFloat(speed) || 0,
+      ceOptions: cePool.filter(i => i.instrumentToken).map(i => ({ instrumentToken: parseInt(i.instrumentToken, 10), tradingSymbol: i.symbol, exchange: i.exchange })),
+      peOptions: pePool.filter(i => i.instrumentToken).map(i => ({ instrumentToken: parseInt(i.instrumentToken, 10), tradingSymbol: i.symbol, exchange: i.exchange })),
+      strategies: enabledStrats,
+      decisionConfig: {
+        minScore: parseFloat(decisionCfg.minScore)||40, minScoreGap: parseFloat(decisionCfg.minScoreGap)||8,
+        maxRecentMove3: parseFloat(decisionCfg.maxRecentMove3)||1.5, maxRecentMove5: parseFloat(decisionCfg.maxRecentMove5)||2.5,
+        maxAbsVwapDist: parseFloat(decisionCfg.maxAbsVwapDist)||1.5, minBarsSinceTrade: parseInt(decisionCfg.minBarsSinceTrade,10)||3,
+        chopFilter: decisionCfg.chopFilter, chopLookback: parseInt(decisionCfg.chopLookback,10)||8,
+        penaltyMinScore: parseFloat(decisionCfg.penaltyMinScore)||25,
+        scoreFloorTrigger: parseFloat(decisionCfg.scoreFloorTrigger)||35, scoreFloorMin: parseFloat(decisionCfg.scoreFloorMin)||25,
+        bollingerBonusThreshold: parseFloat(decisionCfg.bollingerBonusThreshold)||35, bollingerBonus: parseFloat(decisionCfg.bollingerBonus)||0,
+        earlyEntryRisingBars: parseInt(decisionCfg.earlyEntryRisingBars,10)||0,
+        rawScoreBypassThreshold: parseFloat(decisionCfg.rawScoreBypassThreshold)||0, rawScoreBypassGap: parseFloat(decisionCfg.rawScoreBypassGap)||3,
+        bollingerEarlyEntryMinScore: parseFloat(decisionCfg.bollingerEarlyEntryMinScore)||0,
+      },
+      selectionConfig: { minPremium: parseFloat(selectionCfg.minPremium)||50, maxPremium: parseFloat(selectionCfg.maxPremium)||300 },
+      switchConfig: { switchConfirmationCandles: parseInt(switchCfg.switchConfirmationCandles,10)||2, maxSwitchesPerDay: parseInt(switchCfg.maxSwitchesPerDay,10)||3, minScoreImprovementForSwitch: parseFloat(switchCfg.minScoreImprovementForSwitch)||0 },
+      regimeConfig: optsRegimeCfg.enabled ? { enabled:true, adxPeriod: parseInt(optsRegimeCfg.adxPeriod,10)||14, atrPeriod: parseInt(optsRegimeCfg.atrPeriod,10)||14, adxTrendThreshold: parseFloat(optsRegimeCfg.adxTrendThreshold)||25, atrVolatilePct: parseFloat(optsRegimeCfg.atrVolatilePct)||2.0, atrCompressionPct: parseFloat(optsRegimeCfg.atrCompressionPct)||0.5 } : { enabled: false },
+      regimeRules: { enabled: regimeRules.enabled, rangingMinScore: parseFloat(regimeRules.rangingMinScore)||35, rangingMinScoreGap: parseFloat(regimeRules.rangingMinScoreGap)||6, trendingMinScore: parseFloat(regimeRules.trendingMinScore)||25, trendingMinScoreGap: parseFloat(regimeRules.trendingMinScoreGap)||3, compressionMinScore: parseFloat(regimeRules.compressionMinScore)||25, compressionMinScoreGap: parseFloat(regimeRules.compressionMinScoreGap)||3 },
+      chopRules: { enabled: chopRules.enabled, ...Object.fromEntries(['ranging','trending','compression','volatile'].map(rk => [rk==='volatile'?'volatileRegime':rk, { filterEnabled: chopRules[rk].filterEnabled, flipRatio: parseFloat(chopRules[rk].flipRatio)||0.65 }])) },
+      tradingRules: { enabled: tradingRules.enabled, rangingNoTrade: tradingRules.rangingNoTrade, volatileNoTrade: tradingRules.volatileNoTrade, noSameCandleReversal: tradingRules.noSameCandleReversal },
+      regimeStrategyRules: { enabled: regimeStrategyRules.enabled, ranging: regimeStrategyRules.ranging.enabled?regimeStrategyRules.ranging.allowed:[], trending: regimeStrategyRules.trending.enabled?regimeStrategyRules.trending.allowed:[], compression: regimeStrategyRules.compression.enabled?regimeStrategyRules.compression.allowed:[], volatileRegime: regimeStrategyRules.volatile.enabled?regimeStrategyRules.volatile.allowed:[] },
+      riskConfig: optsRisk.enabled ? { enabled:true, stopLossPct: parseFloat(optsRisk.stopLossPct)||0, takeProfitPct: parseFloat(optsRisk.takeProfitPct)||0, maxRiskPerTradePct: parseFloat(optsRisk.maxRiskPerTradePct)||0, dailyLossCapPct: parseFloat(optsRisk.dailyLossCapPct)||0, cooldownCandles: parseInt(optsRisk.cooldownCandles,10)||0 } : { enabled: false },
+      rangeQualityConfig: rangeQuality.enabled ? { enabled:true, lookbackBars: parseInt(rangeQuality.lookbackBars,10)||10, minUpperTouches: parseInt(rangeQuality.minUpperTouches,10)||2, minLowerTouches: parseInt(rangeQuality.minLowerTouches,10)||2, bandTouchTolerancePct: parseFloat(rangeQuality.bandTouchTolerancePct)||0.15, minRangeWidthPct: parseFloat(rangeQuality.minRangeWidthPct)||0.3, maxRangeWidthPct: parseFloat(rangeQuality.maxRangeWidthPct)||3.0, maxDirectionalDriftPctOfRange: parseFloat(rangeQuality.maxDirectionalDriftPctOfRange)||0.6, chopFlipRatioLimit: parseFloat(rangeQuality.chopFlipRatioLimit)||0.65, enableChopCheck: rangeQuality.enableChopCheck } : { enabled: false },
+      tradeQualityConfig: tradeQuality.enabled ? { enabled:true, strongScoreThreshold: parseFloat(tradeQuality.strongScoreThreshold)||40, normalScoreThreshold: parseFloat(tradeQuality.normalScoreThreshold)||32, weakTradeLossCooldown: parseInt(tradeQuality.weakTradeLossCooldown,10)||5, blockWeakInRanging: tradeQuality.blockWeakInRanging, weakRangingMinScore: parseFloat(tradeQuality.weakRangingMinScore)||28, weakRangingMinGap: parseFloat(tradeQuality.weakRangingMinGap)||3, rangingConfirmCandles: parseInt(tradeQuality.rangingConfirmCandles,10)||2, trendingConfirmCandles: parseInt(tradeQuality.trendingConfirmCandles,10)||1 } : { enabled: false },
+      trendEntryConfig: trendEntry.enabled ? { enabled:true, breakoutLookback: parseInt(trendEntry.breakoutLookback,10)||5, minBodyPct: parseFloat(trendEntry.minBodyPct)||45, weakBodyPct: parseFloat(trendEntry.weakBodyPct)||20, ema9Period: parseInt(trendEntry.ema9Period,10)||9 } : { enabled: false },
+      compressionEntryConfig: compressionEntry.enabled ? { enabled:true, rangeLookback: parseInt(compressionEntry.rangeLookback,10)||10, longZoneMax: parseFloat(compressionEntry.longZoneMax)||0.2, shortZoneMin: parseFloat(compressionEntry.shortZoneMin)||0.8, noTradeZoneMin: parseFloat(compressionEntry.noTradeZoneMin)||0.4, noTradeZoneMax: parseFloat(compressionEntry.noTradeZoneMax)||0.6, rejectBreakoutCandle: compressionEntry.rejectBreakoutCandle } : { enabled: false },
+      holdConfig: { enabled: holdConfig.enabled, defaultMinHoldBars: parseInt(holdConfig.defaultMinHoldBars,10)||3, rangingMinHoldBars: parseInt(holdConfig.rangingMinHoldBars,10)||4, trendingMinHoldBars: parseInt(holdConfig.trendingMinHoldBars,10)||2, strongOppositeScore: parseFloat(holdConfig.strongOppositeScore)||35, persistentExitBars: parseInt(holdConfig.persistentExitBars,10)||2 },
+      exitConfig: { enabled: exitConfig.enabled, hardStopPct: parseFloat(exitConfig.hardStopPct)||7, holdZonePct: parseFloat(exitConfig.holdZonePct)||5, lock1TriggerPct: parseFloat(exitConfig.lock1TriggerPct)||5, lock1FloorPct: parseFloat(exitConfig.lock1FloorPct)||2, lock2TriggerPct: parseFloat(exitConfig.lock2TriggerPct)||10, lock2FloorPct: parseFloat(exitConfig.lock2FloorPct)||5, trailTriggerPct: parseFloat(exitConfig.trailTriggerPct)||15, trailFactor: parseFloat(exitConfig.trailFactor)||0.4, firstMoveBars: parseInt(exitConfig.firstMoveBars,10)||0, firstMoveLockPct: parseFloat(exitConfig.firstMoveLockPct)||0.5, structureLookback: parseInt(exitConfig.structureLookback,10)||5, scoreDropFactor: parseFloat(exitConfig.scoreDropFactor)||0, scoreAbsoluteMin: parseFloat(exitConfig.scoreAbsoluteMin)||0, biasExitEnabled: exitConfig.biasExitEnabled, strongExitScore: parseFloat(exitConfig.strongExitScore)||40, trendStrongModeThresholdPct: parseFloat(exitConfig.trendStrongModeThresholdPct)||5, maxBarsNoImprovement: parseInt(exitConfig.maxBarsNoImprovement,10)||3, stagnationBars: parseInt(exitConfig.stagnationBars,10)||2, maxBarsRanging: parseInt(exitConfig.maxBarsRanging,10)||6, maxBarsDeadTrade: parseInt(exitConfig.maxBarsDeadTrade,10)||10, deadTradePnlPct: parseFloat(exitConfig.deadTradePnlPct)||2, noHopeThresholdPct: parseFloat(exitConfig.noHopeThresholdPct)||1.5, noHopeBars: parseInt(exitConfig.noHopeBars,10)||2 },
+      penaltyConfig: { enabled: penaltyConfig.enabled, reversalEnabled: penaltyConfig.reversalEnabled, reversalMax: parseFloat(penaltyConfig.reversalMax)||25, overextensionEnabled: penaltyConfig.overextensionEnabled, overextensionMax: parseFloat(penaltyConfig.overextensionMax)||30, sameColorEnabled: penaltyConfig.sameColorEnabled, sameColorMax: parseFloat(penaltyConfig.sameColorMax)||30, mismatchEnabled: penaltyConfig.mismatchEnabled, mismatchScale: parseFloat(penaltyConfig.mismatchScale)||1.0, volatileOptionEnabled: penaltyConfig.volatileOptionEnabled, volatileOptionPenalty: parseFloat(penaltyConfig.volatileOptionPenalty)||35, movePenaltyEnabled: penaltyConfig.movePenaltyEnabled, movePenalty: parseFloat(penaltyConfig.movePenalty)||3, vwapPenaltyEnabled: penaltyConfig.vwapPenaltyEnabled, vwapPenalty: parseFloat(penaltyConfig.vwapPenalty)||5, chopPenaltyEnabled: penaltyConfig.chopPenaltyEnabled, chopPenalty: parseFloat(penaltyConfig.chopPenalty)||2, rangeDriftingEnabled: penaltyConfig.rangeDriftingEnabled, rangeDriftingPenalty: parseFloat(penaltyConfig.rangeDriftingPenalty)||3, rangePoorStructureEnabled: penaltyConfig.rangePoorStructureEnabled, rangePoorStructurePenalty: parseFloat(penaltyConfig.rangePoorStructurePenalty)||4, rangeChoppyEnabled: penaltyConfig.rangeChoppyEnabled, rangeChoppyPenalty: parseFloat(penaltyConfig.rangeChoppyPenalty)||2, rangeSizeEnabled: penaltyConfig.rangeSizeEnabled, rangeSizePenalty: parseFloat(penaltyConfig.rangeSizePenalty)||2 },
+      tradingHoursConfig: { enabled: tradingHoursEnabled, noNewEntriesMinutesBeforeClose: parseInt(closeoutMins, 10) || 15 },
+    };
+    lastPayloadRef.current = payload;
+    ticksRef.current = [];
+    setShowSavePanel(false); setSaveStatus('idle');
+    try {
+      // Step 1: start the background session
+      const res = await startTickReplayEval(payload);
+      const sid = res?.data?.sessionId;
+      if (!sid) throw new Error('No sessionId returned from server');
+      replaySessionRef.current = sid;
+      setReplaySessionId(sid);
+
+      // Step 2: attach SSE stream
+      const response = await streamTickReplayEval(sid, ctrl.signal);
+      if (!response.body) throw new Error('No response body');
+      const reader  = response.body.getReader();
+      readerRef.current = reader;
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop();
+        for (const part of parts) {
+          let evtName = null, data = null;
+          for (const line of part.split('\n')) {
+            if (line.startsWith('event:')) evtName = line.slice(6).trim();
+            else if (line.startsWith('data:')) data = line.slice(5).trim();
+          }
+          if (!evtName || !data) continue;
+          if (evtName === 'error')   { setError(data.replace(/^"|"$/g, '')); setStatus('error'); return; }
+          if (evtName === 'warning') { setWarnings(prev => [...prev, data.replace(/^"|"$/g, '')]); continue; }
+          try {
+            const parsed = JSON.parse(data);
+            if      (evtName === 'init')    setInitInfo(parsed);
+            else if (evtName === 'tick') {
+              setLiveTicks(prev => ({ ...prev, [parsed.token]: parsed }));
+              if (ticksRef.current.length < 10000) ticksRef.current.push(parsed);
+            }
+            else if (evtName === 'candle')  setFeed(prev => [...prev.slice(-499), parsed]);
+            else if (evtName === 'summary') setSummary(parsed);
+          } catch {}
+        }
+      }
+      replaySessionRef.current = null;
+      setReplaySessionId(null);
+      setStatus('completed');
+    } catch (err) {
+      if (err.name === 'AbortError') { setStatus('idle'); return; }
+      setError(err.message); setStatus('error');
+    }
+  }
+
+  const isRunning    = status === 'running';
+  const lastEvt      = feed[feed.length - 1];
+  const closedTrades = lastEvt?.closedTrades || summary?.closedTrades || [];
+  const selectedSession = sessions.find(s => s.sessionId === sessionId);
+
+  // Warn if any configured token is not present in the selected session's tick data
+  const sessionTokenSet = new Set(
+    (selectedSession?.instrumentTokens || []).map(t => String(t))
+  );
+  const missingTokens = (() => {
+    if (!selectedSession) return [];
+    const missing = [];
+    if (niftyToken && !sessionTokenSet.has(String(niftyToken)))
+      missing.push({ label: 'NIFTY', token: niftyToken });
+    cePool.filter(i => i.instrumentToken).forEach(i => {
+      if (!sessionTokenSet.has(String(i.instrumentToken)))
+        missing.push({ label: `CE ${i.symbol || i.instrumentToken}`, token: i.instrumentToken });
+    });
+    pePool.filter(i => i.instrumentToken).forEach(i => {
+      if (!sessionTokenSet.has(String(i.instrumentToken)))
+        missing.push({ label: `PE ${i.symbol || i.instrumentToken}`, token: i.instrumentToken });
+    });
+    return missing;
+  })();
+
+  const canRun = !!sessionId && !!niftyToken &&
+    (cePool.some(i => i.instrumentToken) || pePool.some(i => i.instrumentToken)) &&
+    missingTokens.length === 0;
+
+  return (
+    <div>
+      <div className="card bt-opts-card" style={{ marginBottom: 16 }}>
+        <div className="bt-live-right-tabs" style={{ marginBottom: 14 }}>
+          {[['feed','Feed'],['pnl','P&L'],['portfolio','Portfolio']].map(([k, l]) => (
+            <button key={k} className={`bt-live-tab-btn ${rightTab === k ? 'active' : ''}`} onClick={() => setRightTab(k)}>{l}</button>
+          ))}
+          {feed.length > 0 && <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-secondary)' }}>{feed.length} candles · {closedTrades.length} trades</span>}
+        </div>
+
+        {(lastEvt || summary) && (() => {
+          const totalPnl = lastEvt?.totalPnl ?? summary?.totalPnl;
+          const realizedPnl = lastEvt?.realizedPnl ?? summary?.realizedPnl;
+          const unrealPnl = lastEvt?.unrealizedPnl;
+          const cap = lastEvt?.capital ?? summary?.finalCapital;
+          const trades = closedTrades.length;
+          const wins = closedTrades.filter(t => t.pnl > 0).length;
+          const losses = closedTrades.filter(t => t.pnl < 0).length;
+          const winRate = trades > 0 ? (wins / trades * 100).toFixed(1) + '%' : '—';
+          return (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 12px', marginBottom: 12, padding: '8px 12px', background: 'var(--bg-secondary)', borderRadius: 6, borderLeft: '3px solid ' + (totalPnl > 0 ? '#22c55e' : totalPnl < 0 ? '#ef4444' : 'var(--border)') }}>
+              {[['Total P&L',totalPnl,true,true],['Realized',realizedPnl,true,false],['Unrealized',unrealPnl,true,false],['Capital',cap,false,false],['Trades',trades,false,false],['W/L',`${wins}/${losses}`,false,false],['Win Rate',winRate,false,false]].map(([lbl,val,isPnl,bold]) => (
+                <div key={lbl} style={{ fontSize: 11 }}>
+                  <div style={{ color: 'var(--text-muted)', marginBottom: 1 }}>{lbl}</div>
+                  <div style={{ fontWeight: bold?800:700, fontSize: bold?13:11, ...(isPnl && val!=null ? pnlStyle(val) : {}) }}>{val!=null ? (typeof val==='number' ? fmt2(val) : val) : '—'}</div>
+                </div>
+              ))}
+            </div>
+          );
+        })()}
+
+        {rightTab === 'feed' && (
+          <>
+            {lastEvt && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 18px', marginBottom: 14, padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 6 }}>
+                {[
+                  ['Position',lastEvt.positionState, lastEvt.positionState==='LONG_CALL'?'#22c55e':lastEvt.positionState==='LONG_PUT'?'#ef4444':undefined],
+                  ['Bias',lastEvt.niftyBias, lastEvt.niftyBias==='BULLISH'?'#22c55e':lastEvt.niftyBias==='BEARISH'?'#ef4444':undefined],
+                  ['ConfBias',lastEvt.confirmedBias, lastEvt.confirmedBias==='BULLISH'?'#22c55e':lastEvt.confirmedBias==='BEARISH'?'#ef4444':undefined],
+                  ['Action',lastEvt.action, lastEvt.action==='ENTERED'?'#22c55e':lastEvt.action==='EXITED'||lastEvt.action==='FORCE_CLOSED'?'#f97316':undefined],
+                  ['Winner',lastEvt.winnerStrategy||(lastEvt.shadowWinner&&`(${lastEvt.shadowWinner})`),undefined],
+                  ['Score',fmt2(lastEvt.winnerScore||lastEvt.shadowWinnerScore),undefined],
+                  ['Gap',fmt2(lastEvt.scoreGap),undefined],
+                  ['Neutral',lastEvt.neutralReason||'—',lastEvt.neutralReason?'#f59e0b':undefined],
+                  ['uPnL',fmt2(lastEvt.unrealizedPnl),lastEvt.unrealizedPnl>0?'#22c55e':lastEvt.unrealizedPnl<0?'#ef4444':undefined],
+                  ['rPnL',fmt2(lastEvt.realizedPnl),lastEvt.realizedPnl>0?'#22c55e':lastEvt.realizedPnl<0?'#ef4444':undefined],
+                  ['Capital',fmt2(lastEvt.capital),undefined],
+                  ['Block',lastEvt.blockReason||'—',lastEvt.blockReason?'#ef4444':undefined],
+                ].map(([lbl,val,color]) => (
+                  <div key={lbl} style={{ fontSize: 11 }}><div style={{ color: 'var(--text-secondary)' }}>{lbl}</div><div style={{ fontWeight: 700, color }}>{val||'—'}</div></div>
+                ))}
+              </div>
+            )}
+            {/* Live ticker strip — shows latest LTP per token during replay */}
+            {Object.keys(liveTicks).length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10, padding: '8px 12px', background: 'var(--bg-secondary)', borderRadius: 6, border: '1px solid var(--border-color)' }}>
+                {Object.values(liveTicks)
+                  .sort((a, b) => (b.isNifty ? 1 : 0) - (a.isNifty ? 1 : 0))
+                  .map(t => {
+                    const sym = t.isNifty
+                      ? (niftySymbol || 'NIFTY')
+                      : ([...cePool, ...pePool].find(c => c.instrumentToken && parseInt(c.instrumentToken, 10) === t.token)?.symbol || t.token);
+                    const isCe = !t.isNifty && cePool.some(c => c.instrumentToken && parseInt(c.instrumentToken, 10) === t.token);
+                    const isPe = !t.isNifty && pePool.some(c => c.instrumentToken && parseInt(c.instrumentToken, 10) === t.token);
+                    const color = t.isNifty ? '#e2e8f0' : isCe ? '#22c55e' : isPe ? '#ef4444' : '#94a3b8';
+                    return (
+                      <div key={t.token} style={{ fontSize: 11, minWidth: 120, padding: '4px 8px', background: 'var(--bg-primary)', borderRadius: 4, border: `1px solid ${color}33` }}>
+                        <div style={{ fontWeight: 700, color, marginBottom: 2 }}>{sym}</div>
+                        <div style={{ fontSize: 13, fontWeight: 800, color }}>₹{Number(t.ltp).toFixed(2)}</div>
+                        {t.fOpen != null && (
+                          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
+                            O:{Number(t.fOpen).toFixed(1)} H:{Number(t.fHigh).toFixed(1)} L:{Number(t.fLow).toFixed(1)}
+                          </div>
+                        )}
+                        <div style={{ fontSize: 9, color: 'var(--text-muted)' }}>{new Date(t.timeMs).toLocaleTimeString('en-IN')}</div>
+                      </div>
+                    );
+                  })}
+              </div>
+            )}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+              <button type="button" className="btn-secondary btn-xs" onClick={downloadCSV}>Download CSV</button>
+              {feed.length > 0 && (
+                <button type="button" className="btn-secondary btn-xs" onClick={() => setFeedExpanded(x => !x)}>
+                  {feedExpanded ? 'Collapse' : 'Expand'}
+                </button>
+              )}
+              <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                Session: <b style={{ color: 'var(--text-primary)' }}>{sessionId||'—'}</b>{' · '}<b style={{ color: 'var(--text-primary)' }}>{interval}</b>{niftyToken && <span> · NIFTY={niftyToken}</span>}
+                {replaySessionId && <span style={{ marginLeft: 8, color: '#22c55e', fontWeight: 700 }}>● REPLAY sid={replaySessionId.slice(0, 8)}</span>}
+              </span>
+            </div>
+            {feed.length > 0 && (
+              <div style={{ overflowX: 'auto' }}>
+                <table className="bt-table">
+                  <thead><tr><th>#</th><th>Time</th><th>Phase</th><th>NIFTY</th><th>Regime</th><th>Bias</th><th>ConfBias</th><th>Winner</th><th>Score</th><th>Gap</th><th>NeutralRsn</th><th>State</th><th>Action</th><th>ExitRsn</th><th>Option</th><th>OptPx</th><th>uPnL</th><th>rPnL</th><th>Capital</th></tr></thead>
+                  <tbody>
+                    {(feedExpanded ? [...feed].reverse() : [...feed].reverse().slice(0, 5)).map((e, i) => (
+                      <tr key={i} style={{ background:
+                        e.marketPhase === 'PRE_MARKET' ? 'rgba(148,163,184,0.06)' :
+                        e.marketPhase === 'CLOSING'    ? 'rgba(249,115,22,0.06)'  :
+                        e.marketPhase === 'CLOSED'     ? 'rgba(239,68,68,0.06)'   :
+                        e.action === 'ENTERED'         ? 'rgba(34,197,94,0.06)'   :
+                        e.action === 'EXITED' || e.action === 'FORCE_CLOSED' ? 'rgba(249,115,22,0.06)' : undefined }}>
+                        <td style={{ fontSize:10, color:'var(--text-muted)' }}>{e.emitted}</td>
+                        <td style={{ fontSize:11, whiteSpace:'nowrap' }}>{(e.niftyTime||'').slice(11,16)}</td>
+                        <td style={{ fontSize:10, color: e.marketPhase==='PRE_MARKET'?'#94a3b8':e.marketPhase==='CLOSING'?'#f97316':e.marketPhase==='CLOSED'?'#ef4444':undefined }}>{e.marketPhase||'TRADING'}</td>
+                        <td>{e.niftyClose!=null?Number(e.niftyClose).toFixed(0):'—'}</td>
+                        <td style={{ fontSize:10 }}>{e.regime}</td>
+                        <td style={{ color:e.niftyBias==='BULLISH'?'#22c55e':e.niftyBias==='BEARISH'?'#ef4444':undefined }}>{e.niftyBias||'—'}</td>
+                        <td style={{ color:e.confirmedBias==='BULLISH'?'#22c55e':e.confirmedBias==='BEARISH'?'#ef4444':undefined }}>{e.confirmedBias||'—'}</td>
+                        <td style={{ fontSize:10 }}>{e.winnerStrategy||(e.shadowWinner?`(${e.shadowWinner})`:'—')}</td>
+                        <td>{e.winnerScore!=null?Number(e.winnerScore).toFixed(1):'—'}</td>
+                        <td>{e.scoreGap!=null?Number(e.scoreGap).toFixed(1):'—'}</td>
+                        <td style={{ fontSize:10, color:'#f59e0b' }}>{e.neutralReason||'—'}</td>
+                        <td style={{ fontSize:10 }}>{e.positionState}</td>
+                        <td style={{ fontSize:10, color:e.action==='ENTERED'?'#22c55e':e.action==='EXITED'||e.action==='FORCE_CLOSED'?'#f97316':undefined }}>{e.action||'—'}</td>
+                        <td style={{ fontSize:10 }}>{e.exitReason||'—'}</td>
+                        <td style={{ fontSize:10 }}>{e.selectedTradingSymbol||'—'}</td>
+                        <td>{e.optionClose!=null?Number(e.optionClose).toFixed(2):'—'}</td>
+                        <td style={e.unrealizedPnl!=null?pnlStyle(e.unrealizedPnl):{}}>{fmt2(e.unrealizedPnl)}</td>
+                        <td style={e.realizedPnl!=null?pnlStyle(e.realizedPnl):{}}>{fmt2(e.realizedPnl)}</td>
+                        <td>{e.capital!=null?Number(e.capital).toFixed(0):'—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {feed.length===0 && !isRunning && <p style={{ fontSize:12, color:'var(--text-muted)', textAlign:'center', padding:'24px 0' }}>No data yet. Select a session and start the replay.</p>}
+          </>
+        )}
+
+        {rightTab === 'pnl' && (
+          summary ? (
+            <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(160px, 1fr))', gap:12 }}>
+              {[['Total Trades',summary.totalTrades,false],['Realized P&L',summary.realizedPnl,true],['Final Capital',summary.finalCapital,false]].map(([lbl,val,isPnl]) => (
+                <div key={lbl} style={{ padding:'12px 14px', background:'var(--bg-secondary)', borderRadius:6 }}>
+                  <div style={{ fontSize:11, color:'var(--text-muted)', marginBottom:4 }}>{lbl}</div>
+                  <div style={{ fontSize:18, fontWeight:800, ...(isPnl&&val!=null?pnlStyle(val):{}) }}>{val!=null?(typeof val==='number'?fmt2(val):val):'—'}</div>
+                </div>
+              ))}
+            </div>
+          ) : <p style={{ fontSize:12, color:'var(--text-muted)', textAlign:'center', padding:'24px 0' }}>Summary available after replay completes.</p>
+        )}
+
+        {rightTab === 'portfolio' && (
+          closedTrades.length > 0 ? (
+            <div style={{ overflowX:'auto' }}>
+              <table className="bt-table">
+                <thead><tr><th>Entry</th><th>Exit</th><th>Type</th><th>Symbol</th><th>Strike</th><th>Expiry</th><th>Entry Px</th><th>Exit Px</th><th>Qty</th><th>P&L</th><th>P&L%</th><th>Bars</th><th>Exit Reason</th><th>Capital After</th></tr></thead>
+                <tbody>
+                  {closedTrades.map((t,i) => (
+                    <tr key={i}>
+                      <td style={{ fontSize:11 }}>{(t.entryTime||'').slice(11,16)}</td>
+                      <td style={{ fontSize:11 }}>{(t.exitTime||'').slice(11,16)}</td>
+                      <td style={{ color:t.optionType==='CE'?'#22c55e':'#ef4444', fontWeight:700 }}>{t.optionType}</td>
+                      <td style={{ fontSize:10 }}>{t.tradingSymbol}</td>
+                      <td>{t.strike}</td><td style={{ fontSize:10 }}>{t.expiry}</td>
+                      <td>{fmt2(t.entryPrice)}</td><td>{fmt2(t.exitPrice)}</td><td>{t.quantity}</td>
+                      <td style={pnlStyle(t.pnl)}>{fmt2(t.pnl)}</td>
+                      <td style={pnlStyle(t.pnlPct)}>{t.pnlPct!=null?`${Number(t.pnlPct).toFixed(1)}%`:'—'}</td>
+                      <td>{t.barsInTrade}</td><td style={{ fontSize:10 }}>{t.exitReason}</td><td>{fmt2(t.capitalAfter)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : <p style={{ fontSize:12, color:'var(--text-muted)', textAlign:'center', padding:'24px 0' }}>No closed trades yet.</p>
+        )}
+      </div>
+
+      <form onSubmit={handleSubmit}>
+        {missingTokens.length > 0 && (
+          <div style={{ marginBottom:12, padding:'8px 12px', background:'rgba(239,68,68,0.1)', border:'1px solid rgba(239,68,68,0.4)', borderRadius:6, fontSize:12, color:'#ef4444' }}>
+            <strong>Token mismatch</strong> — the following tokens are not in the selected session and will return no data:
+            <ul style={{ margin:'4px 0 0 16px', padding:0 }}>
+              {missingTokens.map(({ label, token }) => (
+                <li key={token}>{label} ({token})</li>
+              ))}
+            </ul>
+            Select tokens that appear in the session's instrument list above.
+          </div>
+        )}
+        {initInfo && (
+          <div style={{ fontSize:12, color:'var(--text-secondary)', marginBottom:8, padding:'6px 10px', background:'var(--bg-secondary)', borderRadius:4 }}>
+            Session loaded — <strong>{initInfo.totalTicks??'?'}</strong> ticks
+            {initInfo.warmupCandles > 0 && <span> · <strong style={{ color:'#22c55e' }}>{initInfo.warmupCandles}</strong> warmup candles</span>}
+            {initInfo.warmupCandles === 0 && parseInt(warmupDays,10) > 0 && <span style={{ color:'#f59e0b' }}> · warmup: cold start</span>}
+          </div>
+        )}
+        {warnings.length > 0 && warnings.map((w, i) => (
+          <div key={i} style={{ fontSize:12, color:'#f59e0b', marginBottom:6, padding:'6px 10px', background:'rgba(245,158,11,0.08)', border:'1px solid rgba(245,158,11,0.3)', borderRadius:4 }}>
+            ⚠ {w}
+          </div>
+        ))}
+        {error && <div className="error-msg" style={{ marginBottom:12 }}>{error}</div>}
+        <div className="form-actions" style={{ marginBottom:16 }}>
+          <button type="submit" className="btn-primary" disabled={!canRun && !isRunning}>{isRunning ? 'Stop Replay' : 'Start Tick Replay'}</button>
+          <button type="button" className="btn-secondary" disabled={isRunning} onClick={() => {
+            setFeed([]); setSummary(null); setError(''); setWarnings([]); setStatus('idle');
+            setSessionId(''); setNiftyToken(''); setNiftySymbol('NIFTY 50'); setNiftyExchange('NSE');
+            setCePool([EMPTY_OPTION_INST()]); setPePool([EMPTY_OPTION_INST()]); setStrategies(defaultStrategies());
+            setDecisionCfg(DEFAULT_DECISION); setSelectionCfg(DEFAULT_SELECTION); setSwitchCfg(DEFAULT_SWITCH);
+            setOptsRegimeCfg(DEFAULT_OPTS_REGIME_CONFIG); setChopRules(DEFAULT_CHOP_RULES); setTradingRules(DEFAULT_TRADING_RULES);
+            setRegimeRules(DEFAULT_REGIME_RULES); setRegimeStrategyRules(DEFAULT_REGIME_STRATEGY_RULES);
+            setOptsRisk(DEFAULT_OPTS_RISK); setRangeQuality(DEFAULT_RANGE_QUALITY); setTradeQuality(DEFAULT_TRADE_QUALITY);
+            setTrendEntry(DEFAULT_TREND_ENTRY); setCompressionEntry(DEFAULT_COMPRESSION_ENTRY);
+            setHoldConfig(DEFAULT_HOLD); setExitConfig(DEFAULT_EXIT_CONFIG); setPenaltyConfig(DEFAULT_PENALTY_CONFIG);
+            setInterval('MINUTE_5'); setFromDate(''); setToDate(''); setSpeed('0'); setTradingHoursEnabled(true); setCloseoutMins('15'); setWarmupDays('5'); setUserId(''); setBrokerName('kite'); setQuantity('0'); setCapital('100000');
+            ['sma_tick_session_id','sma_tick_user_id','sma_tick_broker','sma_tick_warmup_days','sma_tick_nifty_token','sma_tick_nifty_symbol','sma_tick_nifty_exchange','sma_tick_ce_pool','sma_tick_pe_pool','sma_tick_interval','sma_tick_from','sma_tick_to','sma_tick_speed','sma_tick_trading_hours_on','sma_tick_closeout_mins','sma_tick_qty','sma_tick_capital','sma_tick_strategies','sma_tick_decision','sma_tick_selection','sma_tick_switch','sma_tick_regime_cfg','sma_tick_chop_rules','sma_tick_trading_rules','sma_tick_regime_rules','sma_tick_regime_strat_rules','sma_tick_risk','sma_tick_range_quality','sma_tick_trade_quality','sma_tick_trend_entry','sma_tick_compression_entry','sma_tick_hold_config','sma_tick_exit_config','sma_tick_penalty_config'].forEach(k => localStorage.removeItem(k));
+          }}>Reset</button>
+          {status==='completed' && <span className="badge badge-success">Completed</span>}
+          {status==='error'     && <span className="badge badge-danger">Error</span>}
+          {(status === 'completed' || (status === 'idle' && feed.length > 0)) && (
+            <button type="button" className="btn-secondary btn-xs" style={{ marginLeft: 8 }}
+              onClick={() => { setShowSavePanel(s => !s); setSaveLabel('Replay ' + (fromDate || new Date().toISOString().slice(0, 10))); setSaveStatus('idle'); setSaveError(''); }}>
+              {showSavePanel ? 'Cancel Save' : 'Save to Compare'}
+            </button>
+          )}
+          {saveStatus === 'saved' && !showSavePanel && (
+            <span style={{ fontSize: 11, color: '#22c55e', marginLeft: 8 }}>Saved!</span>
+          )}
+        </div>
+
+        {showSavePanel && (
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12, padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 6 }}>
+            <div className="form-group" style={{ flex: '1 1 200px', marginBottom: 0 }}>
+              <label style={{ fontSize: 11 }}>Label</label>
+              <input type="text" value={saveLabel} onChange={e => setSaveLabel(e.target.value)}
+                placeholder="e.g. Tick Replay Jan 15" maxLength={80} style={{ fontSize: 12 }} />
+            </div>
+            <button type="button" className="btn-primary btn-xs" style={{ flexShrink: 0, alignSelf: 'flex-end', marginBottom: 1 }}
+              onClick={handleSaveToCompare} disabled={saveStatus === 'saving'}>
+              {saveStatus === 'saving' ? 'Saving...' : 'Save'}
+            </button>
+            {saveStatus === 'error' && <span style={{ fontSize: 11, color: '#ef4444' }}>{saveError}</span>}
+          </div>
+        )}
+
+        {/* ── Presets ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: presets.length > 0 || showPresetSave ? 12 : 0, flexWrap: 'wrap' }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Config Presets</span>
+            <div style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+              {presets.length > 0 && (
+                <button type="button" className="btn-secondary btn-xs" onClick={downloadAllPresets} title="Export all presets as JSON">Export All</button>
+              )}
+              <label className="btn-secondary btn-xs" style={{ cursor: 'pointer', marginBottom: 0 }} title="Import presets from JSON file">
+                Import
+                <input type="file" accept=".json" style={{ display: 'none' }} onChange={uploadPresets} />
+              </label>
+              <button type="button" className="btn-secondary btn-xs" onClick={() => setShowPresetSave(s => !s)} disabled={isRunning}>
+                {showPresetSave ? 'Cancel' : '+ Save Current'}
+              </button>
+            </div>
+          </div>
+          {showPresetSave && (
+            <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', marginBottom: 14, padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 6 }}>
+              <div className="form-group" style={{ flex: '1 1 160px', marginBottom: 0 }}>
+                <label style={{ fontSize: 11 }}>Preset Name *</label>
+                <input type="text" value={presetName} onChange={e => setPresetName(e.target.value)} placeholder="e.g. Conservative RANGING" maxLength={60} style={{ fontSize: 12 }} />
+              </div>
+              <div className="form-group" style={{ flex: '2 1 240px', marginBottom: 0 }}>
+                <label style={{ fontSize: 11 }}>Description (optional)</label>
+                <input type="text" value={presetDescription} onChange={e => setPresetDescription(e.target.value)} placeholder="e.g. High score threshold, no RANGING trades" maxLength={160} style={{ fontSize: 12 }} />
+              </div>
+              <button type="button" className="btn-primary btn-xs" style={{ flexShrink: 0, marginBottom: 1 }} onClick={savePreset} disabled={!presetName.trim()}>Save</button>
+            </div>
+          )}
+          {presets.length === 0 && !showPresetSave && (
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>No presets saved yet. Click <b>+ Save Current</b> to save your active configuration as a preset.</p>
+          )}
+          {presets.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+              {presets.map(preset => (
+                <div key={preset.id} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '8px 10px', background: selectedPresetId === preset.id ? 'rgba(99,102,241,0.12)' : 'var(--bg-secondary)', borderRadius: 6, border: selectedPresetId === preset.id ? '1px solid #6366f1' : '1px solid var(--border)', maxWidth: 320, minWidth: 180 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 700, fontSize: 12, color: selectedPresetId === preset.id ? '#818cf8' : 'var(--text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {selectedPresetId === preset.id && <span style={{ marginRight: 4 }}>●</span>}{preset.name}
+                    </div>
+                    {preset.description && <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 2, overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{preset.description}</div>}
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>{new Date(preset.createdAt).toLocaleDateString()}</div>
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flexShrink: 0 }}>
+                    <button type="button" className="btn-primary btn-xs" onClick={() => applyPreset(preset)} disabled={isRunning} title="Apply this preset">Apply</button>
+                    <button type="button" className="btn-secondary btn-xs" onClick={() => downloadPreset(preset)} title="Download as JSON" style={{ fontSize: 10 }}>Export</button>
+                    <button type="button" className="btn-secondary btn-xs" onClick={() => deletePreset(preset.id)} title="Delete preset" style={{ fontSize: 10 }}>Delete</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Session Picker ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Tick Session</span>
+          <p className="bt-section-sub" style={{ marginBottom:10 }}>Select a recorded live tick session to replay through the strategy pipeline.</p>
+          {sessionsLoading && <p style={{ fontSize:12, color:'var(--text-muted)' }}>Loading sessions…</p>}
+          {sessionsError   && <p style={{ fontSize:12, color:'#ef4444' }}>Failed to load sessions: {sessionsError}</p>}
+          {!sessionsLoading && sessions.length===0 && !sessionsError && <p style={{ fontSize:12, color:'var(--text-muted)' }}>No tick sessions found. Run a live options session first.</p>}
+          {sessions.length > 0 && (
+            <div className="form-group" style={{ maxWidth:560 }}>
+              <label>Session</label>
+              <select value={sessionId} onChange={e => setSessionId(e.target.value)} disabled={isRunning}>
+                <option value="">— Select a session —</option>
+                {sessions.map(s => (
+                  <option key={s.sessionId} value={s.sessionId}>
+                    {s.sessionId} · {s.firstTick?s.firstTick.slice(0,16).replace('T',' '):'?'} → {s.lastTick?s.lastTick.slice(0,16).replace('T',' '):'?'} · {s.tickCount?.toLocaleString()} ticks
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          {selectedSession && (
+            <div style={{ marginTop:8, padding:'8px 12px', background:'var(--bg-secondary)', borderRadius:6, fontSize:11 }}>
+              <div style={{ marginBottom:4 }}><b style={{ color:'var(--text-primary)' }}>Tokens in session:</b> <span style={{ color:'var(--text-secondary)' }}>{(selectedSession.instrumentTokens||[]).join(', ')||'—'}</span></div>
+              <div style={{ color:'var(--text-muted)' }}>Enter the NIFTY token (e.g. 256265) and CE/PE option tokens from this list below.</div>
+            </div>
+          )}
+        </div>
+
+        {/* ── Session Settings ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Session Settings</span>
+          <div className="bt-form-grid">
+            <div className="form-group"><label>Interval</label><select value={interval} onChange={e => setInterval(e.target.value)} disabled={isRunning}>{OPT_INTERVALS.map(([v,l]) => <option key={v} value={v}>{l}</option>)}</select></div>
+            <div className="form-group"><label title="0 = max speed, 1 = real-time, 2 = 2× faster than real time">Speed Multiplier</label><input type="number" min="0" step="0.1" value={speed} onChange={e => setSpeed(e.target.value)} disabled={isRunning} /></div>
+            <div className="form-group"><label title="Days of NIFTY candles to load before the session — primes indicators and regime (0 = cold start)">Warmup Days</label><input type="number" min="0" max="30" value={warmupDays} onChange={e => setWarmupDays(e.target.value)} disabled={isRunning} /></div>
+            <div className="form-group"><label title="User ID for warmup candle fetch (auto-resolved if blank)">User ID (warmup)</label><input type="text" value={userId} onChange={e => setUserId(e.target.value)} disabled={isRunning} placeholder="e.g. user1" /></div>
+            <div className="form-group"><label title="Broker name for warmup candle fetch">Broker (warmup)</label><select value={brokerName} onChange={e => setBrokerName(e.target.value)} disabled={isRunning}><option value="kite">Kite</option><option value="">Auto</option></select></div>
+            <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                <label style={{ marginBottom: 0 }}>Trading Hours Filter</label>
+                <button type="button" className={`btn-sm ${tradingHoursEnabled ? 'btn-primary' : 'btn-secondary'}`}
+                  onClick={() => setTradingHoursEnabled(v => !v)} disabled={isRunning}>
+                  {tradingHoursEnabled ? 'ON' : 'OFF'}
+                </button>
+                {tradingHoursEnabled && (
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                    PRE_MARKET &lt;9:15 → no entries &nbsp;|&nbsp; TRADING 9:15–{
+                      (() => {
+                        const m = parseInt(closeoutMins, 10) || 0;
+                        if (m <= 0) return '15:30';
+                        const total = 15 * 60 + 30 - m;
+                        return `${String(Math.floor(total / 60)).padStart(2,'0')}:${String(total % 60).padStart(2,'0')}`;
+                      })()
+                    } &nbsp;|&nbsp; CLOSING → manage only &nbsp;|&nbsp; CLOSED 15:30 → force-close
+                  </span>
+                )}
+              </div>
+              {tradingHoursEnabled && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
+                  <label style={{ marginBottom: 0, whiteSpace: 'nowrap', fontSize: 12 }} title="Stop new entries this many minutes before 15:30 (0 = no closing window)">
+                    Closeout Window (min before 15:30)
+                  </label>
+                  <input type="number" min="0" max="60" value={closeoutMins}
+                    onChange={e => setCloseoutMins(e.target.value)} disabled={isRunning}
+                    style={{ width: 70 }} />
+                </div>
+              )}
+            </div>
+            <div className="form-group"><label>Quantity (lots)</label><input type="number" min="0" value={quantity} onChange={e => setQuantity(e.target.value)} disabled={isRunning} /></div>
+            <div className="form-group"><label>Initial Capital (₹)</label><input type="number" min="0" value={capital} onChange={e => setCapital(e.target.value)} disabled={isRunning} /></div>
+            <div className="form-group"><label title="Optional — replay only ticks from this time (IST)">From (optional)</label><input type="datetime-local" value={fromDate} onChange={e => setFromDate(e.target.value)} disabled={isRunning} /></div>
+            <div className="form-group"><label title="Optional — replay only ticks up to this time (IST)">To (optional)</label><input type="datetime-local" value={toDate} onChange={e => setToDate(e.target.value)} disabled={isRunning} /></div>
+          </div>
+        </div>
+
+        {/* ── Instrument Assignment ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Instrument Assignment</span>
+          <p className="bt-section-sub" style={{ marginBottom: 12 }}>
+            Click a token to assign it as NIFTY, CE, or PE. Tokens from the selected session are listed below.
+          </p>
+
+          {/* ── Available tokens from session ── */}
+          {selectedSession && (selectedSession.instrumentTokens || []).length > 0 ? (
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }}>Available tokens — click to assign:</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {(selectedSession.instrumentTokens || []).map(tok => {
+                  const tokStr   = String(tok);
+                  const symName  = selectedSession.tokenSymbols?.[tok] || selectedSession.tokenSymbols?.[tokStr];
+                  const isNifty  = niftyToken === tokStr;
+                  const inCe     = cePool.some(i => i.instrumentToken === tokStr);
+                  const inPe     = pePool.some(i => i.instrumentToken === tokStr);
+                  const roleTag  = isNifty ? 'NIFTY' : inCe ? 'CE' : inPe ? 'PE' : null;
+                  const color    = isNifty ? '#6366f1' : inCe ? '#22c55e' : inPe ? '#ef4444' : undefined;
+                  return (
+                    <div key={tok} style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px', borderRadius: 6, background: color ? `${color}1a` : 'var(--bg-secondary)', border: `1px solid ${color || 'var(--border)'}`, fontSize: 12 }}>
+                      <div>
+                        {symName && <div style={{ fontWeight: 700, color: color || 'var(--text-primary)', fontSize: 12, lineHeight: 1.2 }}>{symName}</div>}
+                        <div style={{ fontSize: 10, color: color ? `${color}cc` : 'var(--text-muted)', lineHeight: 1.2 }}>{tokStr}</div>
+                      </div>
+                      {roleTag && <span style={{ fontSize: 10, color, fontWeight: 700, marginLeft: 2 }}>{roleTag}</span>}
+                      {!isRunning && (
+                        <div style={{ display: 'flex', gap: 3, marginLeft: 4 }}>
+                          <button type="button" title="Set as NIFTY"
+                            style={{ fontSize: 10, padding: '1px 5px', borderRadius: 3, border: '1px solid #6366f1', background: isNifty ? '#6366f1' : 'transparent', color: isNifty ? '#fff' : '#6366f1', cursor: 'pointer' }}
+                            onClick={() => { if (isNifty) { setNiftyToken(''); } else { setNiftyToken(tokStr); if (symName) setNiftySymbol(symName); } }}>
+                            {isNifty ? '✓ NIFTY' : 'NIFTY'}
+                          </button>
+                          <button type="button" title="Add to CE pool"
+                            style={{ fontSize: 10, padding: '1px 5px', borderRadius: 3, border: '1px solid #22c55e', background: inCe ? '#22c55e' : 'transparent', color: inCe ? '#fff' : '#22c55e', cursor: 'pointer' }}
+                            onClick={() => {
+                              if (inCe) { setCePool(p => p.filter(i => i.instrumentToken !== tokStr)); }
+                              else { setCePool(p => { const empty = p.find(i => !i.instrumentToken); return empty ? p.map(i => i.id === empty.id ? { ...i, instrumentToken: tokStr, symbol: symName || '', exchange: 'NFO' } : i) : [...p, { ...EMPTY_OPTION_INST(), instrumentToken: tokStr, symbol: symName || '', exchange: 'NFO' }]; }); }
+                            }}>
+                            {inCe ? '✓ CE' : '+ CE'}
+                          </button>
+                          <button type="button" title="Add to PE pool"
+                            style={{ fontSize: 10, padding: '1px 5px', borderRadius: 3, border: '1px solid #ef4444', background: inPe ? '#ef4444' : 'transparent', color: inPe ? '#fff' : '#ef4444', cursor: 'pointer' }}
+                            onClick={() => {
+                              if (inPe) { setPePool(p => p.filter(i => i.instrumentToken !== tokStr)); }
+                              else { setPePool(p => { const empty = p.find(i => !i.instrumentToken); return empty ? p.map(i => i.id === empty.id ? { ...i, instrumentToken: tokStr, symbol: symName || '', exchange: 'NFO' } : i) : [...p, { ...EMPTY_OPTION_INST(), instrumentToken: tokStr, symbol: symName || '', exchange: 'NFO' }]; }); }
+                            }}>
+                            {inPe ? '✓ PE' : '+ PE'}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
+            !selectedSession && <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12 }}>Select a session above to see available tokens.</p>
+          )}
+
+          {/* ── NIFTY assignment summary ── */}
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: 0.5 }}>NIFTY (Decision Source)</div>
+            {niftyToken ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 10px', background: 'rgba(99,102,241,0.08)', border: '1px solid #6366f1', borderRadius: 6, fontSize: 12 }}>
+                <span style={{ fontWeight: 700, color: '#818cf8' }}>Token {niftyToken}</span>
+                <input type="text" value={niftySymbol} onChange={e => setNiftySymbol(e.target.value)} disabled={isRunning}
+                  placeholder="Symbol (e.g. NIFTY 50)" style={{ fontSize: 11, padding: '2px 6px', flex: 1, maxWidth: 160, borderRadius: 4, border: '1px solid var(--border)', background: 'var(--bg-primary)', color: 'var(--text-primary)' }} />
+                <input type="text" value={niftyExchange} onChange={e => setNiftyExchange(e.target.value)} disabled={isRunning}
+                  placeholder="NSE" style={{ fontSize: 11, padding: '2px 6px', width: 60, borderRadius: 4, border: '1px solid var(--border)', background: 'var(--bg-primary)', color: 'var(--text-primary)' }} />
+                {!isRunning && <button type="button" onClick={() => setNiftyToken('')} style={{ fontSize: 11, color: '#ef4444', background: 'none', border: 'none', cursor: 'pointer', padding: '0 4px' }}>✕</button>}
+              </div>
+            ) : (
+              <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>Not assigned — click NIFTY on a token above.</p>
+            )}
+          </div>
+
+          {/* ── CE pool summary ── */}
+          {[{ label: 'CE Pool', pool: cePool, setPool: setCePool, color: '#22c55e' }, { label: 'PE Pool', pool: pePool, setPool: setPePool, color: '#ef4444' }].map(({ label, pool, setPool, color }) => (
+            <div key={label} style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: 0.5 }}>{label}</div>
+              {pool.filter(i => i.instrumentToken).length === 0 ? (
+                <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>None assigned — click + {label.split(' ')[0]} on tokens above.</p>
+              ) : (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {pool.filter(i => i.instrumentToken).map(inst => (
+                    <div key={inst.id} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px', borderRadius: 6, background: `${color}1a`, border: `1px solid ${color}`, fontSize: 12 }}>
+                      <span style={{ fontWeight: 700, color }}>{inst.instrumentToken}</span>
+                      <input type="text" value={inst.symbol} onChange={e => updatePoolInst(pool, setPool, inst.id, { symbol: e.target.value })} disabled={isRunning}
+                        placeholder="Symbol" style={{ fontSize: 11, padding: '1px 5px', width: 130, borderRadius: 3, border: '1px solid var(--border)', background: 'var(--bg-primary)', color: 'var(--text-primary)' }} />
+                      {!isRunning && <button type="button" onClick={() => setPool(p => p.filter(i => i.id !== inst.id))} style={{ fontSize: 11, color: '#ef4444', background: 'none', border: 'none', cursor: 'pointer', padding: '0 2px' }}>✕</button>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* ── Decision Config ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Decision Config</span>
+          <div className="bt-form-grid" style={{ marginTop:8 }}>
+            {[['minScore','Min Score',''],['minScoreGap','Min Score Gap',''],['penaltyMinScore','Penalty Min Score',''],['maxRecentMove3','Max 3-bar Move %',''],['maxRecentMove5','Max 5-bar Move %',''],['maxAbsVwapDist','Max VWAP Dist %',''],['minBarsSinceTrade','Min Bars Since Trade',''],['chopLookback','Chop Lookback',''],['scoreFloorTrigger','Score Floor Trigger',''],['scoreFloorMin','Score Floor Min',''],['bollingerBonusThreshold','BOLLINGER Bonus Trigger',''],['bollingerBonus','BOLLINGER Bonus Pts',''],['earlyEntryRisingBars','Early Entry Rising Bars',''],['rawScoreBypassThreshold','Raw Score Bypass Threshold',''],['rawScoreBypassGap','Raw Score Bypass Gap',''],['bollingerEarlyEntryMinScore','BOLLINGER Early Entry Score','']].map(([key,lbl,hint]) => (
+              <div key={key} className="form-group" title={hint}><label>{lbl}</label><input type="number" step="any" value={decisionCfg[key]} onChange={e => setDecisionCfg(p => ({ ...p, [key]: e.target.value }))} disabled={isRunning} /></div>
+            ))}
+            <div className="form-group"><label>Chop Filter</label><select value={decisionCfg.chopFilter?'on':'off'} onChange={e => setDecisionCfg(p => ({ ...p, chopFilter: e.target.value==='on' }))} disabled={isRunning}><option value="on">ON</option><option value="off">OFF</option></select></div>
+          </div>
+        </div>
+
+        {/* ── Chop Filter Regime Rules ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+            <span className="bt-section-title" style={{ marginBottom:0 }}>Chop Filter Regime Rules</span>
+            <button type="button" className={`btn-sm ${chopRules.enabled?'btn-primary':'btn-secondary'}`} onClick={() => setChopRules(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>{chopRules.enabled?'ON':'OFF'}</button>
+          </div>
+          {chopRules.enabled && (
+            <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(220px, 1fr))', gap:12 }}>
+              {[{key:'ranging',label:'RANGING',color:'#f59e0b'},{key:'trending',label:'TRENDING',color:'#22c55e'},{key:'compression',label:'COMPRESSION',color:'#0ea5e9'},{key:'volatile',label:'VOLATILE',color:'#ef4444'}].map(({ key:rk, label, color }) => (
+                <div key={rk} style={{ padding:'10px 14px', background:'var(--bg-secondary)', borderRadius:7, borderLeft:`3px solid ${color}` }}>
+                  <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:8 }}>
+                    <span style={{ fontSize:11, fontWeight:700, color }}>{label}</span>
+                    <button type="button" disabled={isRunning} className={`btn-xs ${chopRules[rk].filterEnabled?'btn-primary':'btn-secondary'}`} onClick={() => setChopRules(p => ({ ...p, [rk]: { ...p[rk], filterEnabled: !p[rk].filterEnabled } }))}>{chopRules[rk].filterEnabled?'ON':'OFF'}</button>
+                  </div>
+                  {chopRules[rk].filterEnabled && <div className="form-group" style={{ marginBottom:0 }}><label>Flip Ratio</label><input type="number" min="0.1" max="1.0" step="0.05" disabled={isRunning} value={chopRules[rk].flipRatio} onChange={e => setChopRules(p => ({ ...p, [rk]: { ...p[rk], flipRatio: e.target.value } }))} /></div>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Market Regime Detection ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+            <span className="bt-section-title" style={{ marginBottom:0 }}>Market Regime Detection</span>
+            <button type="button" className={`btn-sm ${optsRegimeCfg.enabled?'btn-primary':'btn-secondary'}`} onClick={() => setOptsRegimeCfg(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>{optsRegimeCfg.enabled?'ON':'OFF'}</button>
+          </div>
+          {optsRegimeCfg.enabled && (
+            <div className="bt-form-grid">
+              {[['adxPeriod','ADX Period',2,null,1],['atrPeriod','ATR Period',2,null,1],['adxTrendThreshold','ADX Trend Threshold',1,100,0.5],['atrVolatilePct','ATR Volatile %',0,null,0.1],['atrCompressionPct','ATR Compression %',0,null,0.05]].map(([key,lbl,min,max,step]) => (
+                <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} max={max??undefined} step={step} value={optsRegimeCfg[key]} onChange={e => setOptsRegimeCfg(p => ({ ...p, [key]: e.target.value }))} disabled={isRunning} /></div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Selection Config ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Selection Config</span>
+          <div className="bt-form-grid" style={{ marginTop:8 }}>
+            <div className="form-group"><label>Min Premium (₹)</label><input type="number" step="any" value={selectionCfg.minPremium} onChange={e => setSelectionCfg(p => ({ ...p, minPremium: e.target.value }))} disabled={isRunning} /></div>
+            <div className="form-group"><label>Max Premium (₹)</label><input type="number" step="any" value={selectionCfg.maxPremium} onChange={e => setSelectionCfg(p => ({ ...p, maxPremium: e.target.value }))} disabled={isRunning} /></div>
+          </div>
+        </div>
+
+        {/* ── Switch Config ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Switch Config</span>
+          <div className="bt-form-grid" style={{ marginTop:8 }}>
+            <div className="form-group"><label>Switch Confirmation Candles</label><input type="number" min="0" value={switchCfg.switchConfirmationCandles} onChange={e => setSwitchCfg(p => ({ ...p, switchConfirmationCandles: e.target.value }))} disabled={isRunning} /></div>
+            <div className="form-group"><label>Max Switches Per Day</label><input type="number" min="0" value={switchCfg.maxSwitchesPerDay} onChange={e => setSwitchCfg(p => ({ ...p, maxSwitchesPerDay: e.target.value }))} disabled={isRunning} /></div>
+            <div className="form-group"><label>Min Score Improvement</label><input type="number" step="any" value={switchCfg.minScoreImprovementForSwitch} onChange={e => setSwitchCfg(p => ({ ...p, minScoreImprovementForSwitch: e.target.value }))} disabled={isRunning} /></div>
+          </div>
+        </div>
+
+        {/* ── Trading Rules ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+            <span className="bt-section-title" style={{ marginBottom:0 }}>Trading Rules</span>
+            <button type="button" className={`btn-sm ${tradingRules.enabled?'btn-primary':'btn-secondary'}`} onClick={() => setTradingRules(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>{tradingRules.enabled?'ON':'OFF'}</button>
+          </div>
+          {tradingRules.enabled && (
+            <div style={{ display:'flex', flexWrap:'wrap', gap:12 }}>
+              {[['rangingNoTrade','No Trade in RANGING'],['volatileNoTrade','No Trade in VOLATILE'],['noSameCandleReversal','No Same-Candle Reversal']].map(([key,lbl]) => (
+                <label key={key} style={{ display:'flex', alignItems:'center', gap:6, fontSize:13, cursor:'pointer' }}><input type="checkbox" checked={!!tradingRules[key]} onChange={e => setTradingRules(p => ({ ...p, [key]: e.target.checked }))} disabled={isRunning} />{lbl}</label>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Regime Score Rules ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+            <span className="bt-section-title" style={{ marginBottom:0 }}>Regime Score Rules</span>
+            <button type="button" className={`btn-sm ${regimeRules.enabled?'btn-primary':'btn-secondary'}`} onClick={() => setRegimeRules(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>{regimeRules.enabled?'ON':'OFF'}</button>
+          </div>
+          {regimeRules.enabled && (
+            <div className="bt-form-grid">
+              {[['rangingMinScore','RANGING Min Score','#f59e0b'],['rangingMinScoreGap','RANGING Min Gap','#f59e0b'],['trendingMinScore','TRENDING Min Score','#22c55e'],['trendingMinScoreGap','TRENDING Min Gap','#22c55e'],['compressionMinScore','COMPRESSION Min Score','#0ea5e9'],['compressionMinScoreGap','COMPRESSION Min Gap','#0ea5e9']].map(([key,lbl,color]) => (
+                <div key={key} className="form-group"><label style={{ color }}>{lbl}</label><input type="number" step="any" value={regimeRules[key]} onChange={e => setRegimeRules(p => ({ ...p, [key]: e.target.value }))} disabled={isRunning} /></div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Regime Strategy Rules ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+            <span className="bt-section-title" style={{ marginBottom:0 }}>Regime Strategy Rules</span>
+            <button type="button" className={`btn-sm ${regimeStrategyRules.enabled?'btn-primary':'btn-secondary'}`} onClick={() => setRegimeStrategyRules(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>{regimeStrategyRules.enabled?'ON':'OFF'}</button>
+          </div>
+          {regimeStrategyRules.enabled && (
+            <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(220px, 1fr))', gap:12 }}>
+              {[{key:'ranging',label:'RANGING',color:'#f59e0b'},{key:'trending',label:'TRENDING',color:'#22c55e'},{key:'compression',label:'COMPRESSION',color:'#0ea5e9'},{key:'volatile',label:'VOLATILE',color:'#ef4444'}].map(({ key:rk, label, color }) => (
+                <div key={rk} style={{ padding:'10px 14px', background:'var(--bg-secondary)', borderRadius:7, borderLeft:`3px solid ${color}` }}>
+                  <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:8 }}>
+                    <span style={{ fontSize:11, fontWeight:700, color }}>{label}</span>
+                    <button type="button" disabled={isRunning} className={`btn-xs ${regimeStrategyRules[rk].enabled?'btn-primary':'btn-secondary'}`} onClick={() => setRegimeStrategyRules(p => ({ ...p, [rk]: { ...p[rk], enabled: !p[rk].enabled } }))}>{regimeStrategyRules[rk].enabled?'Filter ON':'All Allowed'}</button>
+                  </div>
+                  {regimeStrategyRules[rk].enabled && (
+                    <div style={{ display:'flex', flexWrap:'wrap', gap:6 }}>
+                      {strategies.filter(s => s.enabled).map(s => (
+                        <label key={s.strategyType} style={{ display:'flex', alignItems:'center', gap:4, fontSize:11, cursor:'pointer' }}>
+                          <input type="checkbox" checked={regimeStrategyRules[rk].allowed.includes(s.strategyType)} onChange={e => { const next = e.target.checked ? [...regimeStrategyRules[rk].allowed, s.strategyType] : regimeStrategyRules[rk].allowed.filter(x => x!==s.strategyType); setRegimeStrategyRules(p => ({ ...p, [rk]: { ...p[rk], allowed: next } })); }} disabled={isRunning} />
+                          {s.strategyType.replace(/_/g,' ')}
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Risk Management ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+            <span className="bt-section-title" style={{ marginBottom:0 }}>Risk Management</span>
+            <button type="button" className={`btn-sm ${optsRisk.enabled?'btn-primary':'btn-secondary'}`} onClick={() => setOptsRisk(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>{optsRisk.enabled?'ON':'OFF'}</button>
+          </div>
+          {optsRisk.enabled && (
+            <div className="bt-form-grid">
+              {[['stopLossPct','Stop Loss %',0,null,0.1],['takeProfitPct','Take Profit %',0,null,0.1],['maxRiskPerTradePct','Max Risk / Trade %',0,null,0.1],['dailyLossCapPct','Daily Loss Cap %',0,null,0.1],['cooldownCandles','Cooldown Candles',0,null,1]].map(([key,lbl,min,max,step]) => (
+                <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} step={step} value={optsRisk[key]} onChange={e => updateOptsRisk(key, e.target.value)} disabled={isRunning} /></div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Range Quality Filter ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+            <span className="bt-section-title" style={{ marginBottom:0 }}>Range Quality Filter</span>
+            <button type="button" className={`btn-sm ${rangeQuality.enabled?'btn-primary':'btn-secondary'}`} onClick={() => setRangeQuality(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>{rangeQuality.enabled?'ON':'OFF'}</button>
+          </div>
+          {rangeQuality.enabled && (
+            <div className="bt-form-grid">
+              {[['lookbackBars','Lookback Bars',1,null,1],['minUpperTouches','Min Upper Touches',0,null,1],['minLowerTouches','Min Lower Touches',0,null,1],['bandTouchTolerancePct','Band Touch Tol %',0,null,0.01],['minRangeWidthPct','Min Range Width %',0,null,0.01],['maxRangeWidthPct','Max Range Width %',0,null,0.1],['maxDirectionalDriftPctOfRange','Max Drift Ratio',0,1,0.01],['chopFlipRatioLimit','Chop Flip Limit',0,1,0.01]].map(([key,lbl,min,max,step]) => (
+                <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} max={max??undefined} step={step} value={rangeQuality[key]} onChange={e => updateRangeQuality(key, e.target.value)} disabled={isRunning} /></div>
+              ))}
+              <div className="form-group"><label>Chop Check</label><select value={rangeQuality.enableChopCheck?'on':'off'} onChange={e => setRangeQuality(p => ({ ...p, enableChopCheck: e.target.value==='on' }))} disabled={isRunning}><option value="on">ON</option><option value="off">OFF</option></select></div>
+            </div>
+          )}
+        </div>
+
+        {/* ── Trade Quality ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+            <span className="bt-section-title" style={{ marginBottom:0 }}>Trade Quality Filter</span>
+            <button type="button" className={`btn-sm ${tradeQuality.enabled?'btn-primary':'btn-secondary'}`} onClick={() => setTradeQuality(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>{tradeQuality.enabled?'ON':'OFF'}</button>
+          </div>
+          {tradeQuality.enabled && (
+            <div className="bt-form-grid">
+              {[['strongScoreThreshold','Strong Score ≥',0,null,0.5],['normalScoreThreshold','Normal Score ≥',0,null,0.5],['weakTradeLossCooldown','Weak Loss Cooldown',0,null,1],['weakRangingMinScore','Weak RANGING Min Score',0,null,0.5],['weakRangingMinGap','Weak RANGING Min Gap',0,null,0.5],['rangingConfirmCandles','RANGING Confirm Candles',0,null,1],['trendingConfirmCandles','TRENDING Confirm Candles',0,null,1]].map(([key,lbl,min,max,step]) => (
+                <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} step={step} value={tradeQuality[key]} onChange={e => updateTradeQuality(key, e.target.value)} disabled={isRunning} /></div>
+              ))}
+              <div className="form-group"><label>Block Weak in RANGING</label><select value={tradeQuality.blockWeakInRanging?'on':'off'} onChange={e => setTradeQuality(p => ({ ...p, blockWeakInRanging: e.target.value==='on' }))} disabled={isRunning}><option value="on">ON</option><option value="off">OFF</option></select></div>
+            </div>
+          )}
+        </div>
+
+        {/* ── Trending Entry Structure ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+            <span className="bt-section-title" style={{ marginBottom:0 }}>Trending Entry Structure</span>
+            <button type="button" className={`btn-sm ${trendEntry.enabled?'btn-primary':'btn-secondary'}`} onClick={() => setTrendEntry(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>{trendEntry.enabled?'ON':'OFF'}</button>
+          </div>
+          {trendEntry.enabled && (
+            <div className="bt-form-grid">
+              {[['breakoutLookback','Breakout Lookback',1,null,1],['minBodyPct','Min Body %',0,100,1],['weakBodyPct','Weak Body %',0,100,1],['ema9Period','EMA Period',1,null,1]].map(([key,lbl,min,max,step]) => (
+                <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} max={max??undefined} step={step} value={trendEntry[key]} onChange={e => updateTrendEntry(key, e.target.value)} disabled={isRunning} /></div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Compression Entry Structure ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+            <span className="bt-section-title" style={{ marginBottom:0 }}>Compression Entry Structure</span>
+            <button type="button" className={`btn-sm ${compressionEntry.enabled?'btn-primary':'btn-secondary'}`} onClick={() => setCompressionEntry(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>{compressionEntry.enabled?'ON':'OFF'}</button>
+          </div>
+          {compressionEntry.enabled && (
+            <div className="bt-form-grid">
+              {[['rangeLookback','Range Lookback',1,null,1],['longZoneMax','Long Zone Max',0,1,0.01],['shortZoneMin','Short Zone Min',0,1,0.01],['noTradeZoneMin','No-Trade Min',0,1,0.01],['noTradeZoneMax','No-Trade Max',0,1,0.01]].map(([key,lbl,min,max,step]) => (
+                <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} max={max??undefined} step={step} value={compressionEntry[key]} onChange={e => updateCompressionEntry(key, e.target.value)} disabled={isRunning} /></div>
+              ))}
+              <div className="form-group"><label>Reject Breakout Candle</label><select value={compressionEntry.rejectBreakoutCandle?'on':'off'} onChange={e => setCompressionEntry(p => ({ ...p, rejectBreakoutCandle: e.target.value==='on' }))} disabled={isRunning}><option value="on">ON</option><option value="off">OFF</option></select></div>
+            </div>
+          )}
+        </div>
+
+        {/* ── Hold Config ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+            <span className="bt-section-title" style={{ marginBottom:0 }}>Minimum Hold Period</span>
+            <button type="button" className={`btn-sm ${holdConfig.enabled?'btn-primary':'btn-secondary'}`} onClick={() => setHoldConfig(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>{holdConfig.enabled?'ON':'OFF'}</button>
+          </div>
+          {holdConfig.enabled && (
+            <div className="bt-form-grid">
+              {[['defaultMinHoldBars','Default Min Hold',0,null,1],['rangingMinHoldBars','RANGING Min Hold',0,null,1],['trendingMinHoldBars','TRENDING Min Hold',0,null,1],['strongOppositeScore','Strong Opp Score',0,null,0.5],['persistentExitBars','Persistent Exit Bars',0,null,1]].map(([key,lbl,min,max,step]) => (
+                <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} step={step} value={holdConfig[key]} onChange={e => updateHoldConfig(key, e.target.value)} disabled={isRunning} /></div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Exit System ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+            <span className="bt-section-title" style={{ marginBottom:0 }}>Exit System</span>
+            <button type="button" className={`btn-sm ${exitConfig.enabled?'btn-primary':'btn-secondary'}`} onClick={() => setExitConfig(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>{exitConfig.enabled?'ON':'OFF'}</button>
+          </div>
+          {exitConfig.enabled && (
+            <div className="bt-form-grid">
+              {[['hardStopPct','Hard Stop %',0,null,0.1],['holdZonePct','Hold Zone %',0,null,0.1],['lock1TriggerPct','Lock1 Trigger %',0,null,0.1],['lock1FloorPct','Lock1 Floor %',0,null,0.1],['lock2TriggerPct','Lock2 Trigger %',0,null,0.1],['lock2FloorPct','Lock2 Floor %',0,null,0.1],['trailTriggerPct','Trail Trigger %',0,null,0.1],['trailFactor','Trail Factor',0,1,0.05],['firstMoveBars','First Move Bars',0,null,1],['firstMoveLockPct','First Move Lock %',0,null,0.1],['structureLookback','Structure Lookback',1,null,1],['scoreDropFactor','Score Drop Factor',0,null,0.1],['scoreAbsoluteMin','Score Abs Min',0,null,0.5],['strongExitScore','Strong Exit Score',0,null,0.5],['trendStrongModeThresholdPct','Trend Strong Mode %',0,null,0.1],['maxBarsNoImprovement','Max Bars No Improvement',0,null,1],['stagnationBars','Stagnation Bars',0,null,1],['maxBarsRanging','Max Bars RANGING',0,null,1],['maxBarsDeadTrade','Max Bars Dead Trade',0,null,1],['deadTradePnlPct','Dead Trade PnL %',0,null,0.1],['noHopeThresholdPct','No-Hope Threshold %',0,null,0.1],['noHopeBars','No-Hope Bars',0,null,1]].map(([key,lbl,min,max,step]) => (
+                <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} max={max??undefined} step={step} value={exitConfig[key]} onChange={e => updateExitConfig(key, e.target.value)} disabled={isRunning} /></div>
+              ))}
+              <div className="form-group"><label>Bias Exit</label><select value={exitConfig.biasExitEnabled?'on':'off'} onChange={e => setExitConfig(p => ({ ...p, biasExitEnabled: e.target.value==='on' }))} disabled={isRunning}><option value="on">ON</option><option value="off">OFF</option></select></div>
+            </div>
+          )}
+        </div>
+
+        {/* ── Penalty Config ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+            <span className="bt-section-title" style={{ marginBottom:0 }}>Penalty Config</span>
+            <button type="button" className={`btn-sm ${penaltyConfig.enabled?'btn-primary':'btn-secondary'}`} onClick={() => setPenaltyConfig(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>{penaltyConfig.enabled?'ON':'OFF'}</button>
+          </div>
+          {penaltyConfig.enabled && (
+            <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(240px, 1fr))', gap:10 }}>
+              {[{key:'reversalEnabled',maxKey:'reversalMax',label:'Reversal',type:'max'},{key:'overextensionEnabled',maxKey:'overextensionMax',label:'Overextension',type:'max'},{key:'sameColorEnabled',maxKey:'sameColorMax',label:'Same Color',type:'max'},{key:'mismatchEnabled',maxKey:'mismatchScale',label:'Mismatch',type:'scale'},{key:'volatileOptionEnabled',maxKey:'volatileOptionPenalty',label:'Volatile Option',type:'penalty'},{key:'movePenaltyEnabled',maxKey:'movePenalty',label:'Move',type:'penalty'},{key:'vwapPenaltyEnabled',maxKey:'vwapPenalty',label:'VWAP',type:'penalty'},{key:'chopPenaltyEnabled',maxKey:'chopPenalty',label:'Chop',type:'penalty'},{key:'rangeDriftingEnabled',maxKey:'rangeDriftingPenalty',label:'Range Drifting',type:'penalty'},{key:'rangePoorStructureEnabled',maxKey:'rangePoorStructurePenalty',label:'Range Poor Str',type:'penalty'},{key:'rangeChoppyEnabled',maxKey:'rangeChoppyPenalty',label:'Range Choppy',type:'penalty'},{key:'rangeSizeEnabled',maxKey:'rangeSizePenalty',label:'Range Size',type:'penalty'}].map(({ key, maxKey, label, type }) => (
+                <div key={key} style={{ padding:'8px 12px', background:'var(--bg-secondary)', borderRadius:6 }}>
+                  <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:6 }}>
+                    <button type="button" disabled={isRunning} className={`btn-xs ${penaltyConfig[key]?'btn-primary':'btn-secondary'}`} onClick={() => updatePenaltyConfig(key, !penaltyConfig[key])}>{penaltyConfig[key]?'ON':'OFF'}</button>
+                    <span style={{ fontSize:12, fontWeight:700 }}>{label}</span>
+                  </div>
+                  {penaltyConfig[key] && <div className="form-group" style={{ marginBottom:0 }}><label style={{ fontSize:11 }}>{type==='max'?'Max':type==='scale'?'Scale':'Penalty'}</label><input type="number" step="any" value={penaltyConfig[maxKey]} onChange={e => updatePenaltyConfig(maxKey, e.target.value)} disabled={isRunning} /></div>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Strategies ── */}
+        <div className="card bt-opts-card">
+          <span className="bt-section-title">Strategies</span>
+          <div className="bt-variants-grid">
+            {strategies.map((s, idx) => {
+              const color = STRATEGY_COLORS[s.strategyType] || '#6366f1';
+              const paramDefs = PARAM_DEFS[s.strategyType] || [];
+              return (
+                <div key={s.strategyType} className={`bt-variant-card ${!s.enabled?'bt-variant-disabled':''}`} style={{ '--variant-color': color }}>
+                  <div className="bt-variant-header">
+                    <label className="bt-variant-toggle">
+                      <input type="checkbox" checked={s.enabled} onChange={e => updateStrategy(idx, { enabled: e.target.checked })} disabled={isRunning} />
+                      <span className="bt-variant-index" style={{ background: color }}>{s.strategyType.replace(/_/g,' ')}</span>
+                    </label>
+                  </div>
+                  {s.enabled && paramDefs.length > 0 && (
+                    <div className="bt-params-block">
+                      {paramDefs.map(def => (
+                        <div key={def.key} className="bt-param-row">
+                          <label className="bt-param-label" title={def.hint}>{def.label}</label>
+                          <input type="number" className="bt-param-input" value={s.parameters[def.key]||''} onChange={e => updateStratParam(idx, def.key, e.target.value)} placeholder={def.placeholder} disabled={isRunning} />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+      </form>
+    </div>
+  );
+}
+
+// ─── Tab: Session Compare ─────────────────────────────────────────────────────
+
+function SessionCompare() {
+  const [sessions,     setSessions]     = useState([]);
+  const [loading,      setLoading]      = useState(false);
+  const [loadError,    setLoadError]    = useState('');
+  const [filterType,   setFilterType]   = useState('');
+  const [filterUserId, setFilterUserId] = useState('');
+  const [selA,         setSelA]         = useState(null);
+  const [selB,         setSelB]         = useState(null);
+  const [resultA,      setResultA]      = useState(null);
+  const [resultB,      setResultB]      = useState(null);
+  const [comparing,    setComparing]    = useState(false);
+  const [compareErr,   setCompareErr]   = useState('');
+  const [deleting,     setDeleting]     = useState(null);
+  const [compareTab,   setCompareTab]   = useState('summary');
+
+  // ── Session management ────────────────────────────────────────────────────
+  function loadSessions(userId, type) {
+    setLoading(true); setLoadError('');
+    listSessionResults(userId || undefined, type || undefined)
+      .then(res => setSessions(res?.data ?? []))
+      .catch(e => setLoadError(e.message))
+      .finally(() => setLoading(false));
+  }
+  useEffect(() => { loadSessions(filterUserId, filterType); }, []);
+
+  async function handleCompare() {
+    if (!selA || !selB) return;
+    setComparing(true); setCompareErr(''); setResultA(null); setResultB(null);
+    try {
+      const [rA, rB] = await Promise.all([getSessionResult(selA), getSessionResult(selB)]);
+      setResultA(rA?.data ?? null);
+      setResultB(rB?.data ?? null);
+    } catch (e) { setCompareErr(e.message); }
+    finally { setComparing(false); }
+  }
+
+  async function handleDelete(sid) {
+    setDeleting(sid);
+    try {
+      await deleteSessionResult(sid);
+      setSessions(prev => prev.filter(s => s.sessionId !== sid));
+      if (selA === sid) setSelA(null);
+      if (selB === sid) setSelB(null);
+      if (resultA?.sessionId === sid) setResultA(null);
+      if (resultB?.sessionId === sid) setResultB(null);
+    } catch {}
+    setDeleting(null);
+  }
+
+  // ── Parse stored JSON blobs ───────────────────────────────────────────────
+  function parseFeed(r)    { try { return r?.feedJson         ? JSON.parse(r.feedJson)         : []; } catch { return []; } }
+  function parseTrades(r)  { try { return r?.closedTradesJson ? JSON.parse(r.closedTradesJson) : []; } catch { return []; } }
+  function parseTicks(r)   { try { return r?.ticksJson        ? JSON.parse(r.ticksJson)        : []; } catch { return []; } }
+  function parseSummary(r) { try { return r?.summaryJson      ? JSON.parse(r.summaryJson)      : null; } catch { return null; } }
+  function parseConfig(r)  { try { return r?.configJson       ? JSON.parse(r.configJson)       : null; } catch { return null; } }
+
+  const feedA   = parseFeed(resultA),   feedB   = parseFeed(resultB);
+  const tradesA = parseTrades(resultA), tradesB = parseTrades(resultB);
+  const ticksA  = parseTicks(resultA),  ticksB  = parseTicks(resultB);
+  const sumA    = parseSummary(resultA),sumB    = parseSummary(resultB);
+  const cfgA    = parseConfig(resultA), cfgB    = parseConfig(resultB);
+
+  // ── Comparison tolerances — tune to adjust matching sensitivity ───────────
+  const TICK_TOL_MS    = 2000;          // ±2 s  : network/replay jitter
+  const TRADE_TOL_MS   = 5 * 60 * 1000;// ±5 min: same-instrument nearest entry
+  const OHLC_TOL       = 0.05;         // 5 paise: price rounding noise
+  const SCORE_TOL      = 0.5;          // 0.5 pt: floating-point noise in scores
+
+  // ── 1. Tick comparison ───────────────────────────────────────────────────
+  // Strategy: group by token, sort by timeMs, greedy nearest-neighbour match
+  // within TICK_TOL_MS. Each tick is consumed at most once.
+  const tickComparison = (() => {
+    if (!ticksA.length && !ticksB.length) return { rows: [], stats: {}, matchPct: null };
+    const groupA = new Map(), groupB = new Map();
+    for (const t of ticksA) { if (!groupA.has(t.token)) groupA.set(t.token, []); groupA.get(t.token).push(t); }
+    for (const t of ticksB) { if (!groupB.has(t.token)) groupB.set(t.token, []); groupB.get(t.token).push(t); }
+    const allTokens = new Set([...groupA.keys(), ...groupB.keys()]);
+    const rows = [], stats = {};
+    let totalMatched = 0;
+    for (const token of allTokens) {
+      const as = [...(groupA.get(token) || [])].sort((x,y) => x.timeMs - y.timeMs);
+      const bs = [...(groupB.get(token) || [])].sort((x,y) => x.timeMs - y.timeMs);
+      const usedB = new Set();
+      const tokenRows = [];
+      for (const ta of as) {
+        let bestBi = -1, bestDiff = Infinity;
+        for (let bi = 0; bi < bs.length; bi++) {
+          if (usedB.has(bi)) continue;
+          const diff = Math.abs(bs[bi].timeMs - ta.timeMs);
+          if (diff <= TICK_TOL_MS && diff < bestDiff) { bestDiff = diff; bestBi = bi; }
+          if (bs[bi].timeMs > ta.timeMs + TICK_TOL_MS) break;
+        }
+        if (bestBi >= 0) {
+          usedB.add(bestBi);
+          const tb = bs[bestBi];
+          const priceDiff = tb.ltp - ta.ltp;
+          tokenRows.push({ matchType: Math.abs(priceDiff) > OHLC_TOL ? 'PRICE_MISMATCH' : 'MATCHED',
+            token, a: ta, b: tb, timeDiffMs: tb.timeMs - ta.timeMs, priceDiff });
+          totalMatched++;
+        } else {
+          tokenRows.push({ matchType: 'LIVE_ONLY', token, a: ta, b: null, timeDiffMs: null, priceDiff: null });
+        }
+      }
+      for (let bi = 0; bi < bs.length; bi++) {
+        if (!usedB.has(bi)) tokenRows.push({ matchType: 'REPLAY_ONLY', token, a: null, b: bs[bi], timeDiffMs: null, priceDiff: null });
+      }
+      stats[token] = {
+        token,
+        aCount: as.length, bCount: bs.length,
+        matched:      tokenRows.filter(r => r.matchType === 'MATCHED').length,
+        priceMismatch:tokenRows.filter(r => r.matchType === 'PRICE_MISMATCH').length,
+        aOnly:        tokenRows.filter(r => r.matchType === 'LIVE_ONLY').length,
+        bOnly:        tokenRows.filter(r => r.matchType === 'REPLAY_ONLY').length,
+      };
+      rows.push(...tokenRows);
+    }
+    rows.sort((x,y) => (x.a?.timeMs || x.b?.timeMs || 0) - (y.a?.timeMs || y.b?.timeMs || 0));
+    const tot = ticksA.length + ticksB.length;
+    const matchPct = tot > 0 ? (totalMatched * 2 / tot * 100).toFixed(1) : null;
+    return { rows, stats, matchPct };
+  })();
+
+  // ── 2. Candle comparison ─────────────────────────────────────────────────
+  // Strategy: exact lookup by niftyTime ISO string. OHLC compared with OHLC_TOL.
+  const candleComparison = (() => {
+    if (!feedA.length && !feedB.length) return { rows: [], stats: null };
+    const mapA = new Map(feedA.map(e => [e.niftyTime, e]));
+    const mapB = new Map(feedB.map(e => [e.niftyTime, e]));
+    const allTimes = [...new Set([...feedA.map(e => e.niftyTime), ...feedB.map(e => e.niftyTime)])].sort();
+    const rows = allTimes.map(t => {
+      const a = mapA.get(t) || null, b = mapB.get(t) || null;
+      if (!a) return { time: t, a: null, b, matchType: 'REPLAY_ONLY', divergedFields: [] };
+      if (!b) return { time: t, a, b: null, matchType: 'LIVE_ONLY',   divergedFields: [] };
+      const df = [];
+      if (Math.abs((a.niftyOpen  ||0)-(b.niftyOpen  ||0)) > OHLC_TOL) df.push('open');
+      if (Math.abs((a.niftyHigh  ||0)-(b.niftyHigh  ||0)) > OHLC_TOL) df.push('high');
+      if (Math.abs((a.niftyLow   ||0)-(b.niftyLow   ||0)) > OHLC_TOL) df.push('low');
+      if (Math.abs((a.niftyClose ||0)-(b.niftyClose ||0)) > OHLC_TOL) df.push('close');
+      if ((a.niftyVolume||0) !== (b.niftyVolume||0))                   df.push('volume');
+      return { time: t, a, b, matchType: df.length === 0 ? 'EXACT' : 'OHLC_MISMATCH', divergedFields: df };
+    });
+    const exact      = rows.filter(r => r.matchType === 'EXACT').length;
+    const mismatch   = rows.filter(r => r.matchType === 'OHLC_MISMATCH').length;
+    const liveOnly   = rows.filter(r => r.matchType === 'LIVE_ONLY').length;
+    const replayOnly = rows.filter(r => r.matchType === 'REPLAY_ONLY').length;
+    const total = rows.length;
+    return { rows, stats: { total, exact, mismatch, liveOnly, replayOnly, matchPct: total > 0 ? (exact/total*100).toFixed(1) : null } };
+  })();
+
+  // ── 3. Signal comparison ─────────────────────────────────────────────────
+  // Strategy: same time-key as candle comparison. Compares decision-layer fields.
+  const signalComparison = (() => {
+    if (!feedA.length && !feedB.length) return { rows: [], stats: null };
+    const mapA = new Map(feedA.map(e => [e.niftyTime, e]));
+    const mapB = new Map(feedB.map(e => [e.niftyTime, e]));
+    const allTimes = [...new Set([...feedA.map(e => e.niftyTime), ...feedB.map(e => e.niftyTime)])].sort();
+    const rows = allTimes.map(t => {
+      const a = mapA.get(t) || null, b = mapB.get(t) || null;
+      if (!a) return { time: t, a: null, b, matchType: 'REPLAY_ONLY', divergedFields: [] };
+      if (!b) return { time: t, a, b: null, matchType: 'LIVE_ONLY',   divergedFields: [] };
+      const df = [];
+      if (a.regime         !== b.regime)         df.push('regime');
+      if (a.confirmedBias  !== b.confirmedBias)  df.push('confirmedBias');
+      if (a.winnerStrategy !== b.winnerStrategy) df.push('winnerStrategy');
+      if (Math.abs((a.winnerScore||0)-(b.winnerScore||0)) > SCORE_TOL) df.push('winnerScore');
+      if (a.action         !== b.action)         df.push('action');
+      if (a.positionState  !== b.positionState)  df.push('positionState');
+      if (a.exitReason     !== b.exitReason)     df.push('exitReason');
+      return { time: t, a, b, matchType: df.length === 0 ? 'MATCHED' : 'SIGNAL_MISMATCH', divergedFields: df };
+    });
+    const matched    = rows.filter(r => r.matchType === 'MATCHED').length;
+    const mismatch   = rows.filter(r => r.matchType === 'SIGNAL_MISMATCH').length;
+    const liveOnly   = rows.filter(r => r.matchType === 'LIVE_ONLY').length;
+    const replayOnly = rows.filter(r => r.matchType === 'REPLAY_ONLY').length;
+    const total = rows.length;
+    return { rows, stats: { total, matched, mismatch, liveOnly, replayOnly, matchPct: total > 0 ? (matched/total*100).toFixed(1) : null } };
+  })();
+
+  // ── 4. Trade comparison ──────────────────────────────────────────────────
+  // Strategy: greedy nearest entryTime match within TRADE_TOL_MS. Each trade consumed once.
+  const tradeComparison = (() => {
+    if (!tradesA.length && !tradesB.length) return { rows: [], stats: null };
+    const usedB = new Set();
+    const rows = [];
+    for (const ta of tradesA) {
+      const taMs = new Date(ta.entryTime).getTime();
+      let bestIdx = -1, bestDiff = Infinity;
+      tradesB.forEach((tb, i) => {
+        if (usedB.has(i)) return;
+        const diff = Math.abs(new Date(tb.entryTime).getTime() - taMs);
+        if (diff <= TRADE_TOL_MS && diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+      });
+      if (bestIdx >= 0) { usedB.add(bestIdx); rows.push({ matchType: 'BOTH', a: ta, b: tradesB[bestIdx] }); }
+      else rows.push({ matchType: 'LIVE_ONLY', a: ta, b: null });
+    }
+    tradesB.forEach((tb, i) => { if (!usedB.has(i)) rows.push({ matchType: 'REPLAY_ONLY', a: null, b: tb }); });
+    rows.sort((x,y) => ((x.a?.entryTime||x.b?.entryTime||'') > (y.a?.entryTime||y.b?.entryTime||'')) ? 1 : -1);
+    const both       = rows.filter(r => r.matchType === 'BOTH').length;
+    const liveOnly   = rows.filter(r => r.matchType === 'LIVE_ONLY').length;
+    const replayOnly = rows.filter(r => r.matchType === 'REPLAY_ONLY').length;
+    const tot = tradesA.length + tradesB.length;
+    return { rows, stats: { total: rows.length, both, liveOnly, replayOnly, matchPct: tot > 0 ? (both*2/tot*100).toFixed(1) : null } };
+  })();
+
+  // ── 5. Config diff ───────────────────────────────────────────────────────
+  const configDiff = (() => {
+    if (!cfgA || !cfgB) return [];
+    function flat(obj, prefix) {
+      return Object.entries(obj || {}).flatMap(([k, v]) => {
+        const key = prefix ? `${prefix}.${k}` : k;
+        return (v && typeof v === 'object' && !Array.isArray(v)) ? flat(v, key) : [{ key, val: v }];
+      });
+    }
+    const mA = Object.fromEntries(flat(cfgA, '').map(e => [e.key, e.val]));
+    const mB = Object.fromEntries(flat(cfgB, '').map(e => [e.key, e.val]));
+    return [...new Set([...Object.keys(mA), ...Object.keys(mB)])]
+      .filter(k => String(mA[k] ?? '') !== String(mB[k] ?? ''))
+      .map(k => ({ key: k, valA: mA[k], valB: mB[k] }))
+      .sort((x,y) => x.key.localeCompare(y.key));
+  })();
+
+  // ── 6. Divergence trace ──────────────────────────────────────────────────
+  // Walks the comparison chain (TICK → CANDLE → SIGNAL → TRADE) and reports
+  // the first point of divergence at each stage that was detected.
+  const divergenceTrace = (() => {
+    const stages = [];
+    const firstTickDiv = tickComparison.rows.find(r => r.matchType !== 'MATCHED');
+    if (firstTickDiv) stages.push({
+      stage: 'TICK', seqNo: 1,
+      time: new Date(firstTickDiv.a?.timeMs || firstTickDiv.b?.timeMs || 0).toISOString(),
+      matchType: firstTickDiv.matchType, token: String(firstTickDiv.token),
+      explanation: firstTickDiv.matchType === 'LIVE_ONLY'   ? 'Live received a tick that replay did not have' :
+                   firstTickDiv.matchType === 'REPLAY_ONLY' ? 'Replay had a tick not seen in live stream' :
+                   `LTP diverged by ${Number(firstTickDiv.priceDiff||0).toFixed(2)}`,
+    });
+    const firstCandleDiv = candleComparison.rows.find(r => r.matchType !== 'EXACT');
+    if (firstCandleDiv) stages.push({
+      stage: 'CANDLE', seqNo: 2, time: firstCandleDiv.time,
+      matchType: firstCandleDiv.matchType, token: 'NIFTY',
+      explanation: firstCandleDiv.matchType === 'LIVE_ONLY'   ? 'Candle exists only in live feed' :
+                   firstCandleDiv.matchType === 'REPLAY_ONLY' ? 'Candle exists only in replay feed' :
+                   `OHLC fields differ: ${firstCandleDiv.divergedFields.join(', ')}`,
+    });
+    const firstSignalDiv = signalComparison.rows.find(r => r.matchType !== 'MATCHED');
+    if (firstSignalDiv) stages.push({
+      stage: 'SIGNAL', seqNo: 3, time: firstSignalDiv.time,
+      matchType: firstSignalDiv.matchType, token: 'NIFTY',
+      explanation: firstSignalDiv.matchType === 'LIVE_ONLY'   ? 'Signal exists only in live' :
+                   firstSignalDiv.matchType === 'REPLAY_ONLY' ? 'Signal exists only in replay' :
+                   `Decision fields differ: ${firstSignalDiv.divergedFields.join(', ')}`,
+    });
+    const firstTradeDiv = tradeComparison.rows.find(r => r.matchType !== 'BOTH');
+    if (firstTradeDiv) stages.push({
+      stage: 'TRADE', seqNo: 4,
+      time: firstTradeDiv.a?.entryTime || firstTradeDiv.b?.entryTime || '—',
+      matchType: firstTradeDiv.matchType,
+      token: firstTradeDiv.a?.tradingSymbol || firstTradeDiv.b?.tradingSymbol || '—',
+      explanation: firstTradeDiv.matchType === 'LIVE_ONLY' ? 'Trade taken in live but not in replay' : 'Trade taken in replay but not in live',
+    });
+    stages.sort((x,y) => x.seqNo - y.seqNo);
+    return { stages, firstStage: stages[0] || null };
+  })();
+
+  const hasResults = resultA && resultB;
+  const labelA = resultA?.label || resultA?.sessionDate || 'A';
+  const labelB = resultB?.label || resultB?.sessionDate || 'B';
+
+  // ── CSV generation ────────────────────────────────────────────────────────
+  const q2  = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const row2 = (...cols) => cols.map(q2).join(',');
+  const n2c  = v => v != null ? Number(v).toFixed(2) : '';
+
+  function triggerDownload(filename, csv) {
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = filename; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function slug() {
+    return `${(resultA?.label||resultA?.sessionDate||'A').replace(/[^a-z0-9]/gi,'_')}_vs_${(resultB?.label||resultB?.sessionDate||'B').replace(/[^a-z0-9]/gi,'_')}`;
+  }
+
+  function csvSummary() {
+    const lines = [
+      row2('Metric', `A — ${labelA}`, `B — ${labelB}`, 'Diff (B-A)'),
+      row2('Date',          resultA.sessionDate,  resultB.sessionDate,  ''),
+      row2('Type',          resultA.type,         resultB.type,         ''),
+      row2('Trades',        sumA?.trades??'',     sumB?.trades??'',     sumA?.trades!=null&&sumB?.trades!=null?sumB.trades-sumA.trades:''),
+      row2('Realized P&L',  n2c(sumA?.realizedPnl), n2c(sumB?.realizedPnl), sumA?.realizedPnl!=null&&sumB?.realizedPnl!=null?n2c(sumB.realizedPnl-sumA.realizedPnl):''),
+      row2('Win Rate',      sumA?.winRate!=null?`${(sumA.winRate*100).toFixed(1)}%`:'', sumB?.winRate!=null?`${(sumB.winRate*100).toFixed(1)}%`:'', sumA?.winRate!=null&&sumB?.winRate!=null?`${((sumB.winRate-sumA.winRate)*100).toFixed(1)}%`:''),
+      row2('Final Capital', n2c(sumA?.finalCapital), n2c(sumB?.finalCapital), sumA?.finalCapital!=null&&sumB?.finalCapital!=null?n2c(sumB.finalCapital-sumA.finalCapital):''),
+      '',
+      row2('Tick Match %',   tickComparison.matchPct!=null?`${tickComparison.matchPct}%`:'N/A — no ticks captured','',''),
+      row2('Candle Match %', candleComparison.stats?.matchPct!=null?`${candleComparison.stats.matchPct}%`:'','',''),
+      row2('Signal Match %', signalComparison.stats?.matchPct!=null?`${signalComparison.stats.matchPct}%`:'','',''),
+      row2('Trade Match %',  tradeComparison.stats?.matchPct!=null?`${tradeComparison.stats.matchPct}%`:'','',''),
+      '',
+      row2('First Divergence Stage',       divergenceTrace.firstStage?.stage??'NONE','',''),
+      row2('First Divergence Time',        divergenceTrace.firstStage?.time??'—','',''),
+      row2('First Divergence Instrument',  divergenceTrace.firstStage?.token??'—','',''),
+      row2('First Divergence Explanation', divergenceTrace.firstStage?.explanation??'—','',''),
+    ];
+    return lines.join('\n');
+  }
+
+  function csvTicks() {
+    if (!tickComparison.rows.length) return row2('No tick data — enable tick capture before starting session');
+    const lines = [row2('Match Type','Token','A Time (ms)','A LTP','A Volume','B Time (ms)','B LTP','B Volume','Time Diff ms','Price Diff')];
+    for (const r of tickComparison.rows)
+      lines.push(row2(r.matchType, r.token, r.a?.timeMs??'', r.a?.ltp??'', r.a?.volume??'', r.b?.timeMs??'', r.b?.ltp??'', r.b?.volume??'', r.timeDiffMs??'', r.priceDiff!=null?n2c(r.priceDiff):''));
+    return lines.join('\n');
+  }
+
+  function csvCandles() {
+    if (!candleComparison.rows.length) return row2('No candle data');
+    const lines = [row2('Match Type','Diverged Fields','Time','A Open','A High','A Low','A Close','A Volume','B Open','B High','B Low','B Close','B Volume','Delta Close')];
+    for (const r of candleComparison.rows)
+      lines.push(row2(r.matchType, r.divergedFields.join('|'), (r.time||'').slice(0,19),
+        r.a?.niftyOpen??'', r.a?.niftyHigh??'', r.a?.niftyLow??'', r.a?.niftyClose??'', r.a?.niftyVolume??'',
+        r.b?.niftyOpen??'', r.b?.niftyHigh??'', r.b?.niftyLow??'', r.b?.niftyClose??'', r.b?.niftyVolume??'',
+        r.a&&r.b?n2c((r.b.niftyClose||0)-(r.a.niftyClose||0)):''));
+    return lines.join('\n');
+  }
+
+  function csvSignals() {
+    if (!signalComparison.rows.length) return row2('No signal data');
+    const lines = [row2('Match Type','Diverged Fields','Time','A Regime','A Bias','A Winner','A Score','A Action','A State','B Regime','B Bias','B Winner','B Score','B Action','B State','Delta Score')];
+    for (const r of signalComparison.rows)
+      lines.push(row2(r.matchType, r.divergedFields.join('|'), (r.time||'').slice(0,19),
+        r.a?.regime??'', r.a?.confirmedBias??'', r.a?.winnerStrategy??'', r.a?.winnerScore!=null?n2c(r.a.winnerScore):'', r.a?.action??'', r.a?.positionState??'',
+        r.b?.regime??'', r.b?.confirmedBias??'', r.b?.winnerStrategy??'', r.b?.winnerScore!=null?n2c(r.b.winnerScore):'', r.b?.action??'', r.b?.positionState??'',
+        r.a&&r.b?n2c((r.b.winnerScore||0)-(r.a.winnerScore||0)):''));
+    return lines.join('\n');
+  }
+
+  function csvTrades() {
+    if (!tradeComparison.rows.length) return row2('No trade data');
+    const lines = [row2('Match Type','A Entry','A Exit','A Type','A Symbol','A EntPx','A ExtPx','A PnL','A ExitReason','A Bars','B Entry','B Exit','B Type','B Symbol','B EntPx','B ExtPx','B PnL','B ExitReason','B Bars','Delta PnL')];
+    for (const r of tradeComparison.rows) {
+      const diff = r.matchType==='BOTH'&&r.a?.pnl!=null&&r.b?.pnl!=null ? n2c(r.b.pnl-r.a.pnl) : '';
+      lines.push(row2(r.matchType,
+        (r.a?.entryTime||'').slice(0,19),(r.a?.exitTime||'').slice(0,19),
+        r.a?.optionType??'',r.a?.tradingSymbol??'',r.a?.entryPrice!=null?n2c(r.a.entryPrice):'',r.a?.exitPrice!=null?n2c(r.a.exitPrice):'',r.a?.pnl!=null?n2c(r.a.pnl):'',r.a?.exitReason??'',r.a?.barsInTrade??'',
+        (r.b?.entryTime||'').slice(0,19),(r.b?.exitTime||'').slice(0,19),
+        r.b?.optionType??'',r.b?.tradingSymbol??'',r.b?.entryPrice!=null?n2c(r.b.entryPrice):'',r.b?.exitPrice!=null?n2c(r.b.exitPrice):'',r.b?.pnl!=null?n2c(r.b.pnl):'',r.b?.exitReason??'',r.b?.barsInTrade??'',
+        diff));
+    }
+    return lines.join('\n');
+  }
+
+  function csvDivergence() {
+    if (!divergenceTrace.stages.length) return row2('No divergence detected — sessions appear identical');
+    const lines = [row2('Stage','Sequence','First Divergence Time','Instrument','Match Type','Explanation')];
+    for (const s of divergenceTrace.stages)
+      lines.push(row2(s.stage, s.seqNo, s.time, s.token, s.matchType, s.explanation));
+    return lines.join('\n');
+  }
+
+  function csvConfig() {
+    if (!configDiff.length) return row2('Configs are identical');
+    const lines = [row2('Field', `A — ${labelA}`, `B — ${labelB}`)];
+    configDiff.forEach(({ key, valA, valB }) => lines.push(row2(key, String(valA??''), String(valB??''))));
+    return lines.join('\n');
+  }
+
+  function downloadSection(key) {
+    const map = {
+      summary:    ['session_summary',    csvSummary()],
+      ticks:      ['tick_comparison',    csvTicks()],
+      candles:    ['candle_comparison',  csvCandles()],
+      signals:    ['signal_comparison',  csvSignals()],
+      trades:     ['trade_comparison',   csvTrades()],
+      divergence: ['divergence_summary', csvDivergence()],
+      config:     ['config_diff',        csvConfig()],
+    };
+    const [name, csv] = map[key] || [];
+    if (name) triggerDownload(`${name}_${slug()}.csv`, csv);
+  }
+
+  function downloadAll() {
+    ['summary','ticks','candles','signals','trades','divergence','config']
+      .forEach((k, i) => setTimeout(() => downloadSection(k), i * 250));
+  }
+
+  // ── Badge helper ──────────────────────────────────────────────────────────
+  function mtColor(type) {
+    return { MATCHED:'#22c55e', EXACT:'#22c55e', BOTH:'#22c55e', PRICE_MISMATCH:'#f59e0b', OHLC_MISMATCH:'#f59e0b', SIGNAL_MISMATCH:'#f59e0b', LIVE_ONLY:'#6366f1', REPLAY_ONLY:'#10b981' }[type] || 'var(--text-muted)';
+  }
+  function Badge({ type, label }) {
+    return <span style={{ fontWeight:700, fontSize:10, color: mtColor(type) }}>{label ?? type}</span>;
+  }
+
+  const COMPARE_TABS = [['summary','Summary'],['divergence','Divergence'],['ticks','Ticks'],['candles','Candles'],['signals','Signals'],['trades','Trades'],['config','Config']];
+
+  return (
+    <div>
+      {/* Session selector ─────────────────────────────────────────────────── */}
+      <div className="card bt-opts-card" style={{ marginBottom: 16 }}>
+        <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:12, flexWrap:'wrap' }}>
+          <span className="bt-section-title" style={{ marginBottom:0 }}>Saved Sessions</span>
+          <input type="text" value={filterUserId} onChange={e => setFilterUserId(e.target.value)}
+            placeholder="User ID filter" style={{ fontSize:12, width:140 }} />
+          <select value={filterType} onChange={e => setFilterType(e.target.value)} style={{ fontSize:12 }}>
+            <option value="">All types</option>
+            <option value="LIVE">Live</option>
+            <option value="TICK_REPLAY">Tick Replay</option>
+          </select>
+          <button type="button" className="btn-secondary btn-xs" onClick={() => loadSessions(filterUserId, filterType)}>Refresh</button>
+          {loading   && <span style={{ fontSize:11, color:'var(--text-muted)' }}>Loading…</span>}
+          {loadError && <span style={{ fontSize:11, color:'#ef4444' }}>{loadError}</span>}
+        </div>
+
+        {sessions.length === 0 && !loading && (
+          <p style={{ fontSize:12, color:'var(--text-muted)', margin:0 }}>No saved sessions. Use "Save to Compare" in Options Live Test or Tick Replay Test.</p>
+        )}
+        {sessions.length > 0 && (
+          <div style={{ overflowX:'auto' }}>
+            <table className="bt-table" style={{ fontSize:11 }}>
+              <thead><tr><th>Date</th><th>Type</th><th>Label</th><th>User</th><th>Trades</th><th>P&L</th><th>Win%</th><th>Capital</th><th>A</th><th>B</th><th></th></tr></thead>
+              <tbody>
+                {sessions.map(s => {
+                  const sm = (() => { try { return s.summaryJson ? JSON.parse(s.summaryJson) : null; } catch { return null; } })();
+                  const isA = selA === s.sessionId, isB = selB === s.sessionId;
+                  return (
+                    <tr key={s.sessionId} style={{ background: isA?'rgba(99,102,241,0.1)':isB?'rgba(16,185,129,0.1)':undefined }}>
+                      <td>{s.sessionDate}</td>
+                      <td><span style={{ color:s.type==='LIVE'?'#22c55e':'#6366f1', fontWeight:700 }}>{s.type==='LIVE'?'LIVE':'TICK'}</span></td>
+                      <td style={{ maxWidth:140, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{s.label||'—'}</td>
+                      <td>{s.userId||'—'}</td>
+                      <td>{sm?.trades??'—'}</td>
+                      <td style={sm?.realizedPnl!=null?pnlStyle(sm.realizedPnl):{}}>{sm?.realizedPnl!=null?fmt2(sm.realizedPnl):'—'}</td>
+                      <td>{sm?.winRate!=null?`${(sm.winRate*100).toFixed(1)}%`:'—'}</td>
+                      <td>{sm?.finalCapital!=null?fmt2(sm.finalCapital):'—'}</td>
+                      <td><button type="button" className={`btn-xs ${isA?'btn-primary':'btn-secondary'}`} onClick={() => setSelA(isA?null:s.sessionId)}>{isA?'A ✓':'A'}</button></td>
+                      <td><button type="button" className={`btn-xs ${isB?'btn-primary':'btn-secondary'}`} style={isB?{background:'#10b981',borderColor:'#10b981'}:{}} onClick={() => setSelB(isB?null:s.sessionId)}>{isB?'B ✓':'B'}</button></td>
+                      <td><button type="button" className="btn-xs btn-danger" disabled={deleting===s.sessionId} onClick={() => handleDelete(s.sessionId)}>✕</button></td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <div style={{ marginTop:14, display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' }}>
+          <button type="button" className="btn-primary" onClick={handleCompare}
+            disabled={!selA || !selB || comparing || selA === selB}>
+            {comparing ? 'Loading…' : 'Compare A vs B'}
+          </button>
+          {selA && <span style={{ fontSize:11 }}>A: <b style={{ color:'#6366f1' }}>{sessions.find(s=>s.sessionId===selA)?.label||selA}</b></span>}
+          {selB && <span style={{ fontSize:11 }}>B: <b style={{ color:'#10b981' }}>{sessions.find(s=>s.sessionId===selB)?.label||selB}</b></span>}
+          {compareErr && <span style={{ fontSize:11, color:'#ef4444' }}>{compareErr}</span>}
+        </div>
+      </div>
+
+      {hasResults && (
+        <>
+          {/* Results toolbar ─────────────────────────────────────────────── */}
+          <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:12, flexWrap:'wrap' }}>
+            <div className="bt-live-right-tabs" style={{ flex:1, flexWrap:'wrap' }}>
+              {COMPARE_TABS.map(([k,l]) => (
+                <button key={k} className={`bt-live-tab-btn ${compareTab===k?'active':''}`} onClick={() => setCompareTab(k)}>{l}</button>
+              ))}
+            </div>
+            <button type="button" className="btn-secondary btn-xs" onClick={() => downloadSection(compareTab)} title="Download current tab as CSV">⬇ CSV</button>
+            <button type="button" className="btn-secondary btn-xs" onClick={downloadAll} title="Download all 7 CSVs">⬇ All CSVs</button>
+          </div>
+
+          {/* ── Summary ──────────────────────────────────────────────────── */}
+          {compareTab === 'summary' && (
+            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
+              <span className="bt-section-title">Session Summary</span>
+              <table className="bt-table" style={{ fontSize:12 }}>
+                <thead><tr><th>Metric</th><th style={{ color:'#6366f1' }}>A — {labelA}</th><th style={{ color:'#10b981' }}>B — {labelB}</th><th>Diff (B−A)</th></tr></thead>
+                <tbody>
+                  {[['Date', resultA.sessionDate, resultB.sessionDate, null],
+                    ['Type', resultA.type,        resultB.type,        null],
+                    ['Trades', sumA?.trades, sumB?.trades, sumA?.trades!=null&&sumB?.trades!=null?sumB.trades-sumA.trades:null],
+                    ['Realized P&L', sumA?.realizedPnl, sumB?.realizedPnl, sumA?.realizedPnl!=null&&sumB?.realizedPnl!=null?sumB.realizedPnl-sumA.realizedPnl:null],
+                    ['Win Rate', sumA?.winRate!=null?`${(sumA.winRate*100).toFixed(1)}%`:null, sumB?.winRate!=null?`${(sumB.winRate*100).toFixed(1)}%`:null, sumA?.winRate!=null&&sumB?.winRate!=null?`${((sumB.winRate-sumA.winRate)*100).toFixed(1)}%`:null],
+                    ['Final Capital', sumA?.finalCapital, sumB?.finalCapital, sumA?.finalCapital!=null&&sumB?.finalCapital!=null?sumB.finalCapital-sumA.finalCapital:null],
+                  ].map(([lbl,vA,vB,diff]) => (
+                    <tr key={lbl}>
+                      <td style={{ fontWeight:700 }}>{lbl}</td>
+                      <td style={typeof vA==='number'?pnlStyle(vA):{}}>{typeof vA==='number'?fmt2(vA):(vA??'—')}</td>
+                      <td style={typeof vB==='number'?pnlStyle(vB):{}}>{typeof vB==='number'?fmt2(vB):(vB??'—')}</td>
+                      <td style={typeof diff==='number'?pnlStyle(diff):{}}>{diff!=null?(typeof diff==='number'?(diff>0?'+':'')+fmt2(diff):diff):'—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              <div style={{ marginTop:16 }}>
+                <span className="bt-section-title" style={{ fontSize:12 }}>Match Rates by Stage</span>
+                <table className="bt-table" style={{ fontSize:11, marginTop:6 }}>
+                  <thead><tr><th>Stage</th><th>A Count</th><th>B Count</th><th>Matched</th><th>Mismatch</th><th>A-only</th><th>B-only</th><th>Match %</th></tr></thead>
+                  <tbody>
+                    {[
+                      ['Ticks',   ticksA.length||0,  ticksB.length||0,  tickComparison.rows.filter(r=>r.matchType==='MATCHED').length,  tickComparison.rows.filter(r=>r.matchType==='PRICE_MISMATCH').length, tickComparison.rows.filter(r=>r.matchType==='LIVE_ONLY').length,  tickComparison.rows.filter(r=>r.matchType==='REPLAY_ONLY').length,  tickComparison.matchPct],
+                      ['Candles', feedA.length,       feedB.length,       candleComparison.stats?.exact??0,  candleComparison.stats?.mismatch??0,  candleComparison.stats?.liveOnly??0,  candleComparison.stats?.replayOnly??0,  candleComparison.stats?.matchPct],
+                      ['Signals', feedA.length,       feedB.length,       signalComparison.stats?.matched??0, signalComparison.stats?.mismatch??0,  signalComparison.stats?.liveOnly??0,  signalComparison.stats?.replayOnly??0, signalComparison.stats?.matchPct],
+                      ['Trades',  tradesA.length,     tradesB.length,     tradeComparison.stats?.both??0,    null,                                  tradeComparison.stats?.liveOnly??0,   tradeComparison.stats?.replayOnly??0,  tradeComparison.stats?.matchPct],
+                    ].map(([lbl,ac,bc,matched,mism,ao,bo,pct]) => (
+                      <tr key={lbl}>
+                        <td style={{ fontWeight:700 }}>{lbl}</td>
+                        <td>{ac}</td><td>{bc}</td><td>{matched}</td>
+                        <td style={{ color: mism>0?'#f59e0b':undefined }}>{mism??'—'}</td>
+                        <td style={{ color: ao>0?'#6366f1':undefined }}>{ao}</td>
+                        <td style={{ color: bo>0?'#10b981':undefined }}>{bo}</td>
+                        <td style={{ fontWeight:700, color: pct==null?'var(--text-muted)':parseFloat(pct)>=99?'#22c55e':parseFloat(pct)>=90?'#f59e0b':'#ef4444' }}>
+                          {pct!=null?`${pct}%`:<span style={{ color:'var(--text-muted)',fontSize:10 }}>N/A</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* ── Divergence ───────────────────────────────────────────────── */}
+          {compareTab === 'divergence' && (
+            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
+              <span className="bt-section-title">Divergence Trace — chain: Tick → Candle → Signal → Trade</span>
+              {divergenceTrace.stages.length === 0
+                ? <p style={{ fontSize:12, color:'#22c55e', margin:0 }}>No divergence detected across all stages. Sessions appear identical.</p>
+                : <>
+                  {divergenceTrace.firstStage && (
+                    <div style={{ padding:'10px 14px', background:'rgba(245,158,11,0.1)', borderLeft:'3px solid #f59e0b', borderRadius:4, marginBottom:14, fontSize:12 }}>
+                      <b>First divergence: {divergenceTrace.firstStage.stage}</b> at{' '}
+                      <b>{(divergenceTrace.firstStage.time||'').slice(0,19)}</b> on{' '}
+                      <b>{divergenceTrace.firstStage.token}</b> — {divergenceTrace.firstStage.explanation}
+                    </div>
+                  )}
+                  <table className="bt-table" style={{ fontSize:12 }}>
+                    <thead><tr><th>#</th><th>Stage</th><th>First Divergence Time</th><th>Instrument</th><th>Type</th><th>Explanation</th></tr></thead>
+                    <tbody>
+                      {divergenceTrace.stages.map(s => (
+                        <tr key={s.stage}>
+                          <td>{s.seqNo}</td>
+                          <td style={{ fontWeight:700 }}>{s.stage}</td>
+                          <td style={{ fontFamily:'monospace', fontSize:11 }}>{(s.time||'').slice(0,19)}</td>
+                          <td>{s.token}</td>
+                          <td><Badge type={s.matchType} /></td>
+                          <td style={{ fontSize:11 }}>{s.explanation}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </>
+              }
+            </div>
+          )}
+
+          {/* ── Ticks ────────────────────────────────────────────────────── */}
+          {compareTab === 'ticks' && (
+            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
+              <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:10 }}>
+                <span className="bt-section-title" style={{ marginBottom:0 }}>Tick Comparison</span>
+                <span style={{ fontSize:11, color:'var(--text-muted)' }}>Matching: per-instrument, nearest timestamp ±{TICK_TOL_MS/1000}s tolerance</span>
+              </div>
+              {tickComparison.rows.length === 0
+                ? <p style={{ fontSize:12, color:'var(--text-muted)', margin:0 }}>No tick data stored. Ticks are captured automatically from the next session onwards (up to 10 000 per session).</p>
+                : <>
+                  <div style={{ overflowX:'auto', marginBottom:12 }}>
+                    <table className="bt-table" style={{ fontSize:11 }}>
+                      <thead><tr><th>Token</th><th>A Ticks</th><th>B Ticks</th><th>Matched</th><th>Price Mismatch</th><th>A-only</th><th>B-only</th><th>Match %</th></tr></thead>
+                      <tbody>
+                        {Object.values(tickComparison.stats).map(s => (
+                          <tr key={s.token}>
+                            <td style={{ fontFamily:'monospace' }}>{s.token}</td>
+                            <td>{s.aCount}</td><td>{s.bCount}</td><td>{s.matched}</td>
+                            <td style={{ color:s.priceMismatch>0?'#f59e0b':undefined }}>{s.priceMismatch}</td>
+                            <td style={{ color:s.aOnly>0?'#6366f1':undefined }}>{s.aOnly}</td>
+                            <td style={{ color:s.bOnly>0?'#10b981':undefined }}>{s.bOnly}</td>
+                            <td style={{ fontWeight:700 }}>{Math.max(s.aCount,s.bCount)>0?(s.matched/Math.max(s.aCount,s.bCount)*100).toFixed(1)+'%':'—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div style={{ overflowX:'auto', maxHeight:380, overflowY:'auto' }}>
+                    <table className="bt-table" style={{ fontSize:10 }}>
+                      <thead><tr><th>Match</th><th>Token</th><th>A Time</th><th>A LTP</th><th>B Time</th><th>B LTP</th><th>Δt ms</th><th>ΔLTP</th></tr></thead>
+                      <tbody>
+                        {tickComparison.rows.slice(0, 1000).map((r, i) => (
+                          <tr key={i} style={{ background:r.matchType==='PRICE_MISMATCH'?'rgba(245,158,11,0.08)':r.matchType!=='MATCHED'?'rgba(99,102,241,0.06)':undefined }}>
+                            <td><Badge type={r.matchType} label={r.matchType==='MATCHED'?'✓':r.matchType==='PRICE_MISMATCH'?'PRICE':r.matchType==='LIVE_ONLY'?'A-only':'B-only'} /></td>
+                            <td style={{ fontFamily:'monospace', fontSize:9 }}>{r.token}</td>
+                            <td style={{ fontFamily:'monospace', fontSize:9 }}>{r.a?new Date(r.a.timeMs).toISOString().slice(11,23):'—'}</td>
+                            <td>{r.a?.ltp!=null?n2c(r.a.ltp):'—'}</td>
+                            <td style={{ fontFamily:'monospace', fontSize:9 }}>{r.b?new Date(r.b.timeMs).toISOString().slice(11,23):'—'}</td>
+                            <td>{r.b?.ltp!=null?n2c(r.b.ltp):'—'}</td>
+                            <td style={{ color:Math.abs(r.timeDiffMs||0)>500?'#f59e0b':undefined }}>{r.timeDiffMs??'—'}</td>
+                            <td style={{ color:Math.abs(r.priceDiff||0)>OHLC_TOL?'#f59e0b':undefined }}>{r.priceDiff!=null?n2c(r.priceDiff):'—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {tickComparison.rows.length > 1000 && (
+                    <p style={{ fontSize:11, color:'var(--text-muted)', margin:'6px 0 0' }}>Showing first 1 000 of {tickComparison.rows.length} rows — download CSV for full data.</p>
+                  )}
+                </>
+              }
+            </div>
+          )}
+
+          {/* ── Candles ──────────────────────────────────────────────────── */}
+          {compareTab === 'candles' && (
+            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
+              <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:10 }}>
+                <span className="bt-section-title" style={{ marginBottom:0 }}>Candle Comparison — NIFTY OHLCV</span>
+                {candleComparison.stats && (
+                  <span style={{ fontSize:11, color:'var(--text-muted)' }}>
+                    {candleComparison.stats.total} candles · {candleComparison.stats.exact} exact · {candleComparison.stats.mismatch} OHLC mismatch · {candleComparison.stats.liveOnly} live-only · {candleComparison.stats.replayOnly} replay-only
+                  </span>
+                )}
+              </div>
+              <div style={{ overflowX:'auto', maxHeight:480, overflowY:'auto' }}>
+                <table className="bt-table" style={{ fontSize:10 }}>
+                  <thead>
+                    <tr><th>Match</th><th>Diverged</th><th>Time</th>
+                      <th style={{ color:'#6366f1' }}>AO</th><th style={{ color:'#6366f1' }}>AH</th><th style={{ color:'#6366f1' }}>AL</th><th style={{ color:'#6366f1' }}>AC</th><th style={{ color:'#6366f1' }}>AV</th>
+                      <th style={{ color:'#10b981' }}>BO</th><th style={{ color:'#10b981' }}>BH</th><th style={{ color:'#10b981' }}>BL</th><th style={{ color:'#10b981' }}>BC</th><th style={{ color:'#10b981' }}>BV</th>
+                      <th>ΔClose</th></tr>
+                  </thead>
+                  <tbody>
+                    {candleComparison.rows.map((r, i) => (
+                      <tr key={i} style={{ background:r.matchType==='OHLC_MISMATCH'?'rgba(245,158,11,0.1)':r.matchType!=='EXACT'?'rgba(99,102,241,0.06)':undefined }}>
+                        <td><Badge type={r.matchType} label={r.matchType==='EXACT'?'✓':r.matchType==='OHLC_MISMATCH'?'OHLC':r.matchType==='LIVE_ONLY'?'A-only':'B-only'} /></td>
+                        <td style={{ color:'#f59e0b', fontSize:9 }}>{r.divergedFields.join(',')}</td>
+                        <td style={{ fontFamily:'monospace', fontSize:9 }}>{(r.time||'').slice(11,16)}</td>
+                        <td>{r.a?.niftyOpen!=null?n2c(r.a.niftyOpen):'—'}</td>
+                        <td>{r.a?.niftyHigh!=null?n2c(r.a.niftyHigh):'—'}</td>
+                        <td>{r.a?.niftyLow!=null?n2c(r.a.niftyLow):'—'}</td>
+                        <td>{r.a?.niftyClose!=null?n2c(r.a.niftyClose):'—'}</td>
+                        <td style={{ fontSize:9 }}>{r.a?.niftyVolume??'—'}</td>
+                        <td>{r.b?.niftyOpen!=null?n2c(r.b.niftyOpen):'—'}</td>
+                        <td>{r.b?.niftyHigh!=null?n2c(r.b.niftyHigh):'—'}</td>
+                        <td>{r.b?.niftyLow!=null?n2c(r.b.niftyLow):'—'}</td>
+                        <td>{r.b?.niftyClose!=null?n2c(r.b.niftyClose):'—'}</td>
+                        <td style={{ fontSize:9 }}>{r.b?.niftyVolume??'—'}</td>
+                        <td style={{ color:r.a&&r.b&&Math.abs((r.b.niftyClose||0)-(r.a.niftyClose||0))>OHLC_TOL?'#f59e0b':undefined }}>
+                          {r.a&&r.b?n2c((r.b.niftyClose||0)-(r.a.niftyClose||0)):'—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* ── Signals ──────────────────────────────────────────────────── */}
+          {compareTab === 'signals' && (
+            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
+              <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:10 }}>
+                <span className="bt-section-title" style={{ marginBottom:0 }}>Signal Comparison — regime · bias · winner · action</span>
+                {signalComparison.stats && (
+                  <span style={{ fontSize:11, color:'var(--text-muted)' }}>
+                    {signalComparison.stats.total} evals · {signalComparison.stats.matched} matched · {signalComparison.stats.mismatch} mismatched
+                  </span>
+                )}
+              </div>
+              <div style={{ overflowX:'auto', maxHeight:480, overflowY:'auto' }}>
+                <table className="bt-table" style={{ fontSize:10 }}>
+                  <thead>
+                    <tr><th>Match</th><th>Diverged</th><th>Time</th>
+                      <th style={{ color:'#6366f1' }}>A Regime</th><th style={{ color:'#6366f1' }}>A Bias</th><th style={{ color:'#6366f1' }}>A Winner</th><th style={{ color:'#6366f1' }}>A Score</th><th style={{ color:'#6366f1' }}>A Action</th><th style={{ color:'#6366f1' }}>A State</th>
+                      <th style={{ color:'#10b981' }}>B Regime</th><th style={{ color:'#10b981' }}>B Bias</th><th style={{ color:'#10b981' }}>B Winner</th><th style={{ color:'#10b981' }}>B Score</th><th style={{ color:'#10b981' }}>B Action</th><th style={{ color:'#10b981' }}>B State</th>
+                      <th>ΔScore</th></tr>
+                  </thead>
+                  <tbody>
+                    {signalComparison.rows.map((r, i) => (
+                      <tr key={i} style={{ background:r.matchType==='SIGNAL_MISMATCH'?'rgba(245,158,11,0.1)':r.matchType!=='MATCHED'?'rgba(99,102,241,0.06)':undefined }}>
+                        <td><Badge type={r.matchType} label={r.matchType==='MATCHED'?'✓':r.matchType==='SIGNAL_MISMATCH'?'⚡':'—'} /></td>
+                        <td style={{ color:'#f59e0b', fontSize:9 }}>{r.divergedFields.join(',')}</td>
+                        <td style={{ fontFamily:'monospace', fontSize:9 }}>{(r.time||'').slice(11,16)}</td>
+                        <td>{r.a?.regime||'—'}</td>
+                        <td style={{ color:r.a?.confirmedBias==='BULLISH'?'#22c55e':r.a?.confirmedBias==='BEARISH'?'#ef4444':undefined }}>{r.a?.confirmedBias||'—'}</td>
+                        <td>{r.a?.winnerStrategy||'—'}</td>
+                        <td>{r.a?.winnerScore!=null?Number(r.a.winnerScore).toFixed(1):'—'}</td>
+                        <td style={{ color:r.a?.action==='ENTERED'?'#22c55e':r.a?.action?.includes('EXIT')||r.a?.action?.includes('CLOSE')?'#f97316':undefined }}>{r.a?.action||'—'}</td>
+                        <td>{r.a?.positionState||'—'}</td>
+                        <td>{r.b?.regime||'—'}</td>
+                        <td style={{ color:r.b?.confirmedBias==='BULLISH'?'#22c55e':r.b?.confirmedBias==='BEARISH'?'#ef4444':undefined }}>{r.b?.confirmedBias||'—'}</td>
+                        <td>{r.b?.winnerStrategy||'—'}</td>
+                        <td>{r.b?.winnerScore!=null?Number(r.b.winnerScore).toFixed(1):'—'}</td>
+                        <td style={{ color:r.b?.action==='ENTERED'?'#22c55e':r.b?.action?.includes('EXIT')||r.b?.action?.includes('CLOSE')?'#f97316':undefined }}>{r.b?.action||'—'}</td>
+                        <td>{r.b?.positionState||'—'}</td>
+                        <td style={{ color:r.a&&r.b&&Math.abs((r.b.winnerScore||0)-(r.a.winnerScore||0))>SCORE_TOL?'#f59e0b':undefined }}>
+                          {r.a&&r.b?n2c((r.b.winnerScore||0)-(r.a.winnerScore||0)):'—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* ── Trades ───────────────────────────────────────────────────── */}
+          {compareTab === 'trades' && (
+            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
+              <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:10 }}>
+                <span className="bt-section-title" style={{ marginBottom:0 }}>Trade Comparison</span>
+                {tradeComparison.stats && (
+                  <span style={{ fontSize:11, color:'var(--text-muted)' }}>
+                    {tradeComparison.stats.both} both · {tradeComparison.stats.liveOnly} live-only · {tradeComparison.stats.replayOnly} replay-only
+                  </span>
+                )}
+              </div>
+              {tradeComparison.rows.length === 0
+                ? <p style={{ fontSize:12, color:'var(--text-muted)', margin:0 }}>No trades in either session.</p>
+                : <div style={{ overflowX:'auto' }}>
+                  <table className="bt-table" style={{ fontSize:11 }}>
+                    <thead>
+                      <tr><th>Match</th>
+                        <th style={{ color:'#6366f1' }}>A Entry</th><th style={{ color:'#6366f1' }}>A Type</th><th style={{ color:'#6366f1' }}>A Symbol</th><th style={{ color:'#6366f1' }}>A EntPx</th><th style={{ color:'#6366f1' }}>A ExtPx</th><th style={{ color:'#6366f1' }}>A P&L</th><th style={{ color:'#6366f1' }}>A Exit</th><th style={{ color:'#6366f1' }}>A Bars</th>
+                        <th style={{ color:'#10b981' }}>B Entry</th><th style={{ color:'#10b981' }}>B Type</th><th style={{ color:'#10b981' }}>B Symbol</th><th style={{ color:'#10b981' }}>B EntPx</th><th style={{ color:'#10b981' }}>B ExtPx</th><th style={{ color:'#10b981' }}>B P&L</th><th style={{ color:'#10b981' }}>B Exit</th><th style={{ color:'#10b981' }}>B Bars</th>
+                        <th>ΔP&L</th></tr>
+                    </thead>
+                    <tbody>
+                      {tradeComparison.rows.map((r, i) => {
+                        const pnlDiff = r.matchType==='BOTH'&&r.a?.pnl!=null&&r.b?.pnl!=null?r.b.pnl-r.a.pnl:null;
+                        return (
+                          <tr key={i} style={{ background:r.matchType==='LIVE_ONLY'?'rgba(99,102,241,0.07)':r.matchType==='REPLAY_ONLY'?'rgba(16,185,129,0.07)':undefined }}>
+                            <td><Badge type={r.matchType} label={r.matchType==='BOTH'?'✓ BOTH':r.matchType==='LIVE_ONLY'?'A ONLY':'B ONLY'} /></td>
+                            <td style={{ fontFamily:'monospace', fontSize:10 }}>{(r.a?.entryTime||'').slice(11,16)||'—'}</td>
+                            <td>{r.a?.optionType||'—'}</td>
+                            <td style={{ fontSize:10 }}>{r.a?.tradingSymbol||'—'}</td>
+                            <td>{r.a?.entryPrice!=null?n2c(r.a.entryPrice):'—'}</td>
+                            <td>{r.a?.exitPrice!=null?n2c(r.a.exitPrice):'—'}</td>
+                            <td style={r.a?.pnl!=null?pnlStyle(r.a.pnl):{}}>{r.a?.pnl!=null?fmt2(r.a.pnl):'—'}</td>
+                            <td style={{ fontSize:10 }}>{r.a?.exitReason||'—'}</td>
+                            <td>{r.a?.barsInTrade??'—'}</td>
+                            <td style={{ fontFamily:'monospace', fontSize:10 }}>{(r.b?.entryTime||'').slice(11,16)||'—'}</td>
+                            <td>{r.b?.optionType||'—'}</td>
+                            <td style={{ fontSize:10 }}>{r.b?.tradingSymbol||'—'}</td>
+                            <td>{r.b?.entryPrice!=null?n2c(r.b.entryPrice):'—'}</td>
+                            <td>{r.b?.exitPrice!=null?n2c(r.b.exitPrice):'—'}</td>
+                            <td style={r.b?.pnl!=null?pnlStyle(r.b.pnl):{}}>{r.b?.pnl!=null?fmt2(r.b.pnl):'—'}</td>
+                            <td style={{ fontSize:10 }}>{r.b?.exitReason||'—'}</td>
+                            <td>{r.b?.barsInTrade??'—'}</td>
+                            <td style={pnlDiff!=null?pnlStyle(pnlDiff):{}}>{pnlDiff!=null?(pnlDiff>0?'+':'')+fmt2(pnlDiff):'—'}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              }
+            </div>
+          )}
+
+          {/* ── Config ───────────────────────────────────────────────────── */}
+          {compareTab === 'config' && (
+            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
+              <span className="bt-section-title">Config Differences {configDiff.length>0?`(${configDiff.length})`:''}</span>
+              {configDiff.length === 0
+                ? <p style={{ fontSize:12, color:'#22c55e', margin:0 }}>Configs are identical.</p>
+                : <div style={{ overflowX:'auto' }}>
+                  <table className="bt-table" style={{ fontSize:11 }}>
+                    <thead><tr><th>Field</th><th style={{ color:'#6366f1' }}>A — {labelA}</th><th style={{ color:'#10b981' }}>B — {labelB}</th></tr></thead>
+                    <tbody>
+                      {configDiff.map(({ key, valA, valB }) => (
+                        <tr key={key} style={{ background:'rgba(245,158,11,0.08)' }}>
+                          <td style={{ fontFamily:'monospace', fontSize:10 }}>{key}</td>
+                          <td>{String(valA??'—')}</td>
+                          <td>{String(valB??'—')}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              }
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }

@@ -1,0 +1,136 @@
+package com.sma.strategyengine.controller;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sma.strategyengine.entity.SessionResultRecord;
+import com.sma.strategyengine.model.response.ApiResponse;
+import com.sma.strategyengine.repository.SessionResultRepository;
+import lombok.Data;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.Instant;
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Endpoints for persisting and retrieving session comparison results.
+ *
+ * <pre>
+ * POST   /api/v1/strategy/session-results               — save a session result
+ * GET    /api/v1/strategy/session-results?userId=&type= — list results (metadata only)
+ * GET    /api/v1/strategy/session-results/{sessionId}   — get full result (with feed + trades)
+ * DELETE /api/v1/strategy/session-results/{sessionId}   — delete
+ * </pre>
+ */
+@Slf4j
+@RestController
+@RequestMapping("/api/v1/strategy/session-results")
+@RequiredArgsConstructor
+public class SessionResultController {
+
+    private final SessionResultRepository repository;
+    private final ObjectMapper            objectMapper;
+
+    // ── Request DTO ───────────────────────────────────────────────────────────
+
+    @Data
+    public static class SaveRequest {
+        private String  sessionId;
+        private String  type;          // "LIVE" | "TICK_REPLAY"
+        private String  userId;
+        private String  brokerName;
+        private String  sessionDate;   // ISO date "2024-01-15" — parsed to LocalDate
+        private String  label;
+        private Object  config;        // raw JSON object — serialised to string
+        private Object  closedTrades;  // raw JSON array
+        private Object  feed;          // raw JSON array
+        private Object  ticks;         // raw JSON array of tick events ({token, ltp, timeMs})
+        private Object  summary;       // raw JSON object
+    }
+
+    // ── Endpoints ─────────────────────────────────────────────────────────────
+
+    @PostMapping
+    public ResponseEntity<ApiResponse<Map<String, String>>> save(
+            @RequestBody SaveRequest req) {
+
+        try {
+            String configJson       = req.getConfig()       != null ? objectMapper.writeValueAsString(req.getConfig())       : null;
+            String closedTradesJson = req.getClosedTrades()  != null ? objectMapper.writeValueAsString(req.getClosedTrades())  : null;
+            String feedJson         = req.getFeed()          != null ? objectMapper.writeValueAsString(req.getFeed())          : null;
+            String ticksJson        = req.getTicks()         != null ? objectMapper.writeValueAsString(req.getTicks())         : null;
+            String summaryJson      = req.getSummary()       != null ? objectMapper.writeValueAsString(req.getSummary())       : null;
+
+            LocalDate date = null;
+            if (req.getSessionDate() != null && !req.getSessionDate().isBlank()) {
+                try { date = LocalDate.parse(req.getSessionDate()); } catch (Exception ignored) {}
+            }
+            if (date == null) date = LocalDate.now();
+
+            SessionResultRecord record = SessionResultRecord.builder()
+                    .sessionId(req.getSessionId())
+                    .type(req.getType())
+                    .userId(req.getUserId())
+                    .brokerName(req.getBrokerName())
+                    .sessionDate(date)
+                    .label(req.getLabel())
+                    .configJson(configJson)
+                    .closedTradesJson(closedTradesJson)
+                    .feedJson(feedJson)
+                    .ticksJson(ticksJson)
+                    .summaryJson(summaryJson)
+                    .savedAt(Instant.now())
+                    .build();
+
+            repository.save(record);
+            log.info("Session result saved: sessionId={} type={} userId={} label={}",
+                    req.getSessionId(), req.getType(), req.getUserId(), req.getLabel());
+
+            return ResponseEntity.ok(ApiResponse.ok(Map.of("sessionId", req.getSessionId())));
+
+        } catch (Exception e) {
+            log.error("Failed to save session result {}: {}", req.getSessionId(), e.getMessage());
+            return ResponseEntity.internalServerError()
+                    .body(ApiResponse.error("Failed to save: " + e.getMessage()));
+        }
+    }
+
+    @GetMapping
+    public ResponseEntity<ApiResponse<List<SessionResultRecord>>> list(
+            @RequestParam(required = false) String userId,
+            @RequestParam(required = false) String type) {
+
+        List<SessionResultRecord> results;
+        if (userId != null && !userId.isBlank()) {
+            results = (type != null && !type.isBlank())
+                    ? repository.findMetadataByUserIdAndType(userId, type)
+                    : repository.findMetadataByUserId(userId);
+        } else {
+            results = (type != null && !type.isBlank())
+                    ? repository.findMetadataByType(type)
+                    : repository.findAllMetadata();
+        }
+        return ResponseEntity.ok(ApiResponse.ok(results));
+    }
+
+    @GetMapping("/{sessionId}")
+    public ResponseEntity<ApiResponse<SessionResultRecord>> get(
+            @PathVariable String sessionId) {
+
+        return repository.findById(sessionId)
+                .map(r -> ResponseEntity.ok(ApiResponse.ok(r)))
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    @DeleteMapping("/{sessionId}")
+    public ResponseEntity<ApiResponse<Void>> delete(
+            @PathVariable String sessionId) {
+
+        repository.deleteBySessionId(sessionId);
+        log.info("Session result deleted: sessionId={}", sessionId);
+        return ResponseEntity.ok(ApiResponse.ok(null));
+    }
+}
