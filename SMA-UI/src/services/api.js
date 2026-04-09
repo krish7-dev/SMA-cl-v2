@@ -334,6 +334,65 @@ export async function startOptionsReplayEval(config, signal) {
   return res;
 }
 
+// ─── Strategy Engine — Tick Replay Eval ──────────────────────────────────────
+
+/**
+ * Lists all recorded tick sessions from the Data Engine.
+ * Returns ApiResponse<List<TickSessionInfo>>.
+ */
+export async function listTickSessions() {
+  return request(`${DATA}/api/v1/data/ticks/sessions`);
+}
+
+/**
+ * Starts a tick replay background session.
+ * Returns { data: { sessionId: "..." } }
+ */
+export async function startTickReplayEval(config) {
+  return request(`${STRATEGY_API}/api/v1/strategy/tick-replay/evaluate`, {
+    method: 'POST',
+    body: config,
+  });
+}
+
+/**
+ * Opens the SSE stream for a tick replay session.
+ * Returns a fetch Response whose body is a text/event-stream.
+ * Events: "init", "tick", "candle", "summary", "error".
+ */
+export async function streamTickReplayEval(sessionId, signal) {
+  const res = await fetch(
+    `${STRATEGY_API}/api/v1/strategy/tick-replay/stream/${encodeURIComponent(sessionId)}`,
+    { headers: { Accept: 'text/event-stream' }, signal },
+  );
+  if (!res.ok) {
+    let errorMsg = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      errorMsg = err.message || err.error || errorMsg;
+    } catch (_) {}
+    throw new Error(errorMsg);
+  }
+  return res;
+}
+
+/**
+ * Stops a tick replay session early.
+ */
+export async function stopTickReplayEval(sessionId) {
+  return request(
+    `${STRATEGY_API}/api/v1/strategy/tick-replay/${encodeURIComponent(sessionId)}`,
+    { method: 'DELETE' },
+  );
+}
+
+/**
+ * Lists all currently active (running) tick replay sessions.
+ */
+export async function listActiveTickReplays() {
+  return request(`${STRATEGY_API}/api/v1/strategy/tick-replay/sessions`);
+}
+
 // ─── Strategy Engine — Options Live Eval ──────────────────────────────────────
 
 /**
@@ -390,4 +449,25 @@ export async function getActiveOptionsLiveSession(userId) {
   } catch {
     return null; // 404 = no active session
   }
+}
+
+// ─── Strategy Engine — Session Results ───────────────────────────────────────
+
+export async function saveSessionResult(data) {
+  return request(`${STRATEGY_API}/api/v1/strategy/session-results`, { method: 'POST', body: data });
+}
+
+export async function listSessionResults(userId, type) {
+  const params = new URLSearchParams();
+  if (userId) params.set('userId', userId);
+  if (type)   params.set('type', type);
+  return request(`${STRATEGY_API}/api/v1/strategy/session-results?${params}`);
+}
+
+export async function getSessionResult(sessionId) {
+  return request(`${STRATEGY_API}/api/v1/strategy/session-results/${encodeURIComponent(sessionId)}`);
+}
+
+export async function deleteSessionResult(sessionId) {
+  return request(`${STRATEGY_API}/api/v1/strategy/session-results/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
 }

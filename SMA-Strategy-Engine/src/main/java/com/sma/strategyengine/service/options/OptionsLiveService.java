@@ -63,7 +63,9 @@ public class OptionsLiveService {
     @Value("${strategy.data-engine.base-url:http://localhost:9005}")
     private String dataEngineBaseUrl;
 
-    private static final ZoneId IST = ZoneId.of("Asia/Kolkata");
+    private static final ZoneId      IST          = ZoneId.of("Asia/Kolkata");
+    private static final LocalTime   MARKET_OPEN  = LocalTime.of(9, 15);
+    private static final LocalTime   MARKET_CLOSE = LocalTime.of(15, 30);
 
     private static final Map<String, Long> INTERVAL_MS = Map.of(
             "MINUTE_1",   60_000L,
@@ -309,6 +311,10 @@ public class OptionsLiveService {
         // Last computed regime — updated on each NIFTY candle close, used for tick evaluations
         volatile String currentRegime = "RANGING";
 
+        // Market hours config — resolved from request in run()
+        int     closeoutMins = 0;
+        boolean marketClosed = false;
+
         volatile boolean   stopped    = false;
         volatile Future<?> tickFuture = null;
 
@@ -355,8 +361,8 @@ public class OptionsLiveService {
 
         /** Sends a named event to all connected emitters; silently removes dead ones. */
         private void broadcast(String eventName, String data) {
-            // Buffer the event for late-joining UIs (candle events only)
-            if ("candle".equals(eventName) || "init".equals(eventName)) {
+            // Buffer the event for late-joining UIs (candle, init, warning events)
+            if ("candle".equals(eventName) || "init".equals(eventName) || "warning".equals(eventName)) {
                 synchronized (bufferLock) {
                     if (eventBuffer.size() >= BUFFER_SIZE) eventBuffer.pollFirst();
                     eventBuffer.addLast(new String[]{ eventName, data });
@@ -471,6 +477,12 @@ public class OptionsLiveService {
             if (!warmupCandles.isEmpty()) {
                 decisionEngine.warmup(warmupCandles);
             }
+
+            // Resolve trading hours config
+            OptionsReplayRequest.TradingHoursConfig thc =
+                    Optional.ofNullable(req.getTradingHoursConfig())
+                            .orElse(new OptionsReplayRequest.TradingHoursConfig());
+            closeoutMins = thc.isEnabled() ? thc.getNoNewEntriesMinutesBeforeClose() : 0;
 
             // Phase 1b: pre-warm option candle maps with today's historical data
             // so the selector has price data immediately (before any option ticks arrive)
@@ -791,7 +803,27 @@ public class OptionsLiveService {
             } catch (Exception ignored) {}
         }
 
+        private String marketPhase(LocalDateTime bucketLDT) {
+            LocalTime t = bucketLDT.toLocalTime();
+            if (t.isBefore(MARKET_OPEN))   return "PRE_MARKET";
+            if (!t.isBefore(MARKET_CLOSE)) return "CLOSED";
+            if (closeoutMins > 0 && !t.isBefore(MARKET_CLOSE.minusMinutes(closeoutMins))) return "CLOSING";
+            return "TRADING";
+        }
+
         private void processNiftyTick(double ltp, long volumeToday, long bucketMs) {
+            LocalDateTime bucketLDT = bucketToLocalDateTime(bucketMs);
+            String  phase   = marketPhase(bucketLDT);
+            boolean tradable = "TRADING".equals(phase);
+
+            // Force-close once when market crosses 15:30
+            if ("CLOSED".equals(phase) && !marketClosed) {
+                marketClosed = true;
+                if (execEngine != null && execEngine.getState() != OptionExecutionEngine.PositionState.FLAT) {
+                    execEngine.forceClose(selectorService, bucketLDT);
+                }
+            }
+
             FormingCandle cur = forming.get(niftyToken);
             if (cur == null) {
                 forming.put(niftyToken, new FormingCandle(ltp, volumeToday, bucketMs));
@@ -809,23 +841,24 @@ public class OptionsLiveService {
                 onNiftyCandleClose(closed);
                 // Evaluate the first tick of the new bucket immediately (scorer now includes closed candle)
                 snapshotOptionCandles(bucketMs, bucketToLocalDateTime(bucketMs));
-                emitTickCandleEvent(forming.get(niftyToken), bucketMs);
+                emitTickCandleEvent(forming.get(niftyToken), bucketMs, phase, tradable);
             } else {
                 cur.update(ltp, volumeToday);
                 // Snapshot current option forming prices so selector sees live prices intra-candle
                 snapshotOptionCandles(bucketMs, bucketToLocalDateTime(bucketMs));
-                emitTickCandleEvent(cur, bucketMs);
+                emitTickCandleEvent(cur, bucketMs, phase, tradable);
             }
         }
 
         /** Full live execution pipeline on every NIFTY tick. */
-        private void emitTickCandleEvent(FormingCandle fc, long bucketMs) {
+        private void emitTickCandleEvent(FormingCandle fc, long bucketMs,
+                                         String marketPhase, boolean tradable) {
             if (decisionEngine == null || selectorService == null || execEngine == null) return;
             try {
                 LocalDateTime openTime = bucketToLocalDateTime(bucketMs);
                 CandleDto snapshot = fc.toCandle(openTime);
 
-                // Full stateful decision (confirmation state machine runs on every tick)
+                // Full stateful decision (confirmation state machine runs on every tick — all phases)
                 NiftyDecisionResult decision = decisionEngine.evaluateTick(snapshot, currentRegime);
 
                 // Post-process with trading and quality rules
@@ -833,14 +866,27 @@ public class OptionsLiveService {
                 applyScoreTierRules(decision, currentRegime,
                         req.getTradeQualityConfig(), execEngine.getBarsSinceLastLoss());
 
-                // Execute
+                // Gate execution by market phase
                 double niftyClose = snapshot.close().doubleValue();
-                String action = execEngine.process(decision, selectorService,
-                        cePool, pePool, niftyClose, openTime, snapshot);
+                String action;
+                if ("CLOSED".equals(marketPhase)) {
+                    // Force-close already handled in processNiftyTick; skip further process()
+                    action = execEngine.getState() != OptionExecutionEngine.PositionState.FLAT
+                            ? execEngine.process(decision, selectorService, cePool, pePool, niftyClose, openTime, snapshot)
+                            : "—";
+                } else if (!tradable && execEngine.getState() == OptionExecutionEngine.PositionState.FLAT) {
+                    // PRE_MARKET or CLOSING with no open position — no new entries
+                    action = "HOLD";
+                } else {
+                    // TRADING, or in-position during CLOSING (manage/exit)
+                    action = execEngine.process(decision, selectorService,
+                            cePool, pePool, niftyClose, openTime, snapshot);
+                }
 
                 emittedCount++;
                 OptionsReplayCandleEvent event = buildEvent(
-                        emittedCount, snapshot, decision, execEngine, selectorService, openTime, action);
+                        emittedCount, snapshot, decision, execEngine, selectorService,
+                        openTime, action, marketPhase, tradable);
 
                 broadcast("candle", objectMapper.writeValueAsString(event));
             } catch (Exception e) {
@@ -990,7 +1036,8 @@ public class OptionsLiveService {
         private OptionsReplayCandleEvent buildEvent(int emitted,
                 CandleDto nifty, NiftyDecisionResult decision,
                 OptionExecutionEngine exec, OptionSelectorService selector,
-                LocalDateTime candleTime, String action) {
+                LocalDateTime candleTime, String action,
+                String marketPhase, boolean tradable) {
 
             CandleDto optCandle = exec.getActiveToken() != null
                     ? selector.getCandle(exec.getActiveToken(), candleTime) : null;
@@ -1020,6 +1067,8 @@ public class OptionsLiveService {
                     .entryAllowed(decision.isEntryAllowed())
                     .blockReason(decision.getBlockReason())
                     .execWaitReason(exec.getExecWaitReason())
+                    .marketPhase(marketPhase)
+                    .tradable(tradable)
                     .penalizedScore(decision.getPenalizedScore())
                     .tradeStrength(decision.getTradeStrength())
                     .neutralReason(decision.getNeutralReason())

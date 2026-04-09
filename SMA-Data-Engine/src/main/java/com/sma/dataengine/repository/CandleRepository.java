@@ -76,4 +76,16 @@ public interface CandleRepository extends JpaRepository<CandleRecord, Long> {
             @Param("from")       LocalDateTime from,
             @Param("to")         LocalDateTime to
     );
+
+    /**
+     * Returns one symbol name per instrument token — used to label tokens in the tick replay UI.
+     * Returns Object[]{instrumentToken, symbol} rows, one per distinct token.
+     */
+    @Query("""
+            SELECT c.instrumentToken, MIN(c.symbol)
+            FROM CandleRecord c
+            WHERE c.instrumentToken IN :tokens AND c.symbol IS NOT NULL
+            GROUP BY c.instrumentToken
+            """)
+    List<Object[]> findSymbolsByTokens(@Param("tokens") List<Long> tokens);
 }

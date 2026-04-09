@@ -266,6 +266,97 @@ public class DataEngineClient {
         }
     }
 
+    // ─── Tick Replay ──────────────────────────────────────────────────────────
+
+    /** Tick session metadata returned by GET /api/v1/data/ticks/sessions. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record TickSessionInfo(
+            String        sessionId,
+            LocalDateTime firstTick,
+            LocalDateTime lastTick,
+            long          tickCount,
+            List<Long>    instrumentTokens) {}
+
+    /** A single raw tick entry returned by POST /api/v1/data/ticks/query. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record TickEntry(
+            long   instrumentToken,
+            double ltp,
+            long   volume,
+            long   tickTimeMs) {}
+
+    /** Request body for POST /api/v1/data/ticks/query. */
+    public record TickQueryPayload(
+            String        sessionId,
+            List<Long>    tokens,
+            LocalDateTime fromDate,
+            LocalDateTime toDate) {}
+
+    /**
+     * Lists all recorded tick sessions from the Data Engine (newest first).
+     * Returns empty list on any error.
+     */
+    @SuppressWarnings("unchecked")
+    public List<TickSessionInfo> listTickSessions() {
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl + "/api/v1/data/ticks/sessions"))
+                    .header("Accept", "application/json")
+                    .GET()
+                    .timeout(Duration.ofSeconds(30))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                log.warn("listTickSessions: HTTP {}", response.statusCode());
+                return List.of();
+            }
+            Map<String, Object> envelope = mapper.readValue(response.body(), new TypeReference<>() {});
+            Object dataNode = envelope.get("data");
+            if (dataNode == null) return List.of();
+            return mapper.convertValue(dataNode, new TypeReference<List<TickSessionInfo>>() {});
+        } catch (Exception e) {
+            log.warn("listTickSessions failed: {}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * Fetches raw ticks for the given session and token list, sorted by tick_time.
+     *
+     * @throws DataEngineException on HTTP error or network failure
+     */
+    public List<TickEntry> fetchSessionTicks(TickQueryPayload req) {
+        try {
+            String body = mapper.writeValueAsString(req);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl + "/api/v1/data/ticks/query"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .timeout(Duration.ofSeconds(120))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                throw new DataEngineException(
+                        "Tick query returned HTTP " + response.statusCode() + ": " + response.body());
+            }
+
+            Map<String, Object> envelope = mapper.readValue(response.body(), new TypeReference<>() {});
+            Object dataNode = envelope.get("data");
+            if (dataNode == null) return List.of();
+            return mapper.convertValue(dataNode, new TypeReference<List<TickEntry>>() {});
+
+        } catch (DataEngineException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new DataEngineException("Failed to fetch session ticks: " + e.getMessage(), e);
+        }
+    }
+
+    // ─── Internal helpers ─────────────────────────────────────────────────────
+
     /** Converts a Kite interval string (e.g. "5minute") back to the Strategy Engine enum name (e.g. "MINUTE_5"). */
     private static String intervalFromKite(String kiteValue) {
         return switch (kiteValue) {

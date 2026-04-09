@@ -102,4 +102,7 @@ public class OptionsLiveRequest {
 
     // Penalty config
     private OptionsReplayRequest.PenaltyConfig penaltyConfig = new OptionsReplayRequest.PenaltyConfig();
+
+    // Trading hours filtering
+    private OptionsReplayRequest.TradingHoursConfig tradingHoursConfig;
 }
