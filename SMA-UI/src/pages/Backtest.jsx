@@ -1259,6 +1259,8 @@ function OptionsLiveTest() {
   const sessionIdRef  = useRef(null);
   const lastRunPcRef  = useRef(null);
   const lastPayloadRef = useRef(null);
+  // Accumulates raw tick events for post-session comparison. Capped at 10 000 to limit payload size.
+  const ticksRef = useRef([]);
 
   // ── Save to Compare state
   const [showSavePanel, setShowSavePanel] = useState(false);
@@ -1565,6 +1567,7 @@ function OptionsLiveTest() {
       },
     };
     lastPayloadRef.current = payload;
+    ticksRef.current = [];
 
     try {
       // Step 1: start session
@@ -1606,7 +1609,10 @@ function OptionsLiveTest() {
             const parsed = JSON.parse(data);
             if (evtName === 'init')   setInitInfo(parsed);
             else if (evtName === 'candle') setFeed(prev => [...prev.slice(-499), parsed]);
-            else if (evtName === 'tick')   setLiveTicks(prev => ({ ...prev, [parsed.token]: parsed }));
+            else if (evtName === 'tick') {
+              setLiveTicks(prev => ({ ...prev, [parsed.token]: parsed }));
+              if (ticksRef.current.length < 10000) ticksRef.current.push(parsed);
+            }
           } catch {}
         }
       }
@@ -1684,6 +1690,7 @@ function OptionsLiveTest() {
         config:      lastPayloadRef.current,
         closedTrades: trades,
         feed,
+        ticks: ticksRef.current,
         summary: {
           trades:       trades.length,
           realizedPnl:  lastEvt?.realizedPnl  ?? 0,
@@ -12048,6 +12055,8 @@ function TickReplayTest() {
   const readerRef        = useRef(null);
   const replaySessionRef = useRef(null);
   const lastPayloadRef   = useRef(null);
+  // Accumulates raw tick events for post-session comparison. Capped at 10 000 to limit payload size.
+  const ticksRef         = useRef([]);
 
   // ── Save to Compare state
   const [showSavePanel, setShowSavePanel] = useState(false);
@@ -12455,6 +12464,7 @@ function TickReplayTest() {
         config:      lastPayloadRef.current,
         closedTrades: trades,
         feed,
+        ticks: ticksRef.current,
         summary: {
           trades:       trades.length,
           realizedPnl:  (lastEvt?.realizedPnl ?? summary?.realizedPnl ?? 0),
@@ -12522,6 +12532,7 @@ function TickReplayTest() {
       tradingHoursConfig: { enabled: tradingHoursEnabled, noNewEntriesMinutesBeforeClose: parseInt(closeoutMins, 10) || 15 },
     };
     lastPayloadRef.current = payload;
+    ticksRef.current = [];
     setShowSavePanel(false); setSaveStatus('idle');
     try {
       // Step 1: start the background session
@@ -12556,7 +12567,10 @@ function TickReplayTest() {
           try {
             const parsed = JSON.parse(data);
             if      (evtName === 'init')    setInitInfo(parsed);
-            else if (evtName === 'tick')    setLiveTicks(prev => ({ ...prev, [parsed.token]: parsed }));
+            else if (evtName === 'tick') {
+              setLiveTicks(prev => ({ ...prev, [parsed.token]: parsed }));
+              if (ticksRef.current.length < 10000) ticksRef.current.push(parsed);
+            }
             else if (evtName === 'candle')  setFeed(prev => [...prev.slice(-499), parsed]);
             else if (evtName === 'summary') setSummary(parsed);
           } catch {}
@@ -13377,7 +13391,9 @@ function SessionCompare() {
   const [comparing,    setComparing]    = useState(false);
   const [compareErr,   setCompareErr]   = useState('');
   const [deleting,     setDeleting]     = useState(null);
+  const [compareTab,   setCompareTab]   = useState('summary');
 
+  // ── Session management ────────────────────────────────────────────────────
   function loadSessions(userId, type) {
     setLoading(true); setLoadError('');
     listSessionResults(userId || undefined, type || undefined)
@@ -13385,7 +13401,6 @@ function SessionCompare() {
       .catch(e => setLoadError(e.message))
       .finally(() => setLoading(false));
   }
-
   useEffect(() => { loadSessions(filterUserId, filterType); }, []);
 
   async function handleCompare() {
@@ -13412,160 +13427,356 @@ function SessionCompare() {
     setDeleting(null);
   }
 
-  function parseFeed(r)    { try { return r?.feedJson          ? JSON.parse(r.feedJson)          : []; } catch { return []; } }
-  function parseTrades(r)  { try { return r?.closedTradesJson  ? JSON.parse(r.closedTradesJson)  : []; } catch { return []; } }
-  function parseSummary(r) { try { return r?.summaryJson       ? JSON.parse(r.summaryJson)       : null; } catch { return null; } }
-  function parseConfig(r)  { try { return r?.configJson        ? JSON.parse(r.configJson)        : null; } catch { return null; } }
+  // ── Parse stored JSON blobs ───────────────────────────────────────────────
+  function parseFeed(r)    { try { return r?.feedJson         ? JSON.parse(r.feedJson)         : []; } catch { return []; } }
+  function parseTrades(r)  { try { return r?.closedTradesJson ? JSON.parse(r.closedTradesJson) : []; } catch { return []; } }
+  function parseTicks(r)   { try { return r?.ticksJson        ? JSON.parse(r.ticksJson)        : []; } catch { return []; } }
+  function parseSummary(r) { try { return r?.summaryJson      ? JSON.parse(r.summaryJson)      : null; } catch { return null; } }
+  function parseConfig(r)  { try { return r?.configJson       ? JSON.parse(r.configJson)       : null; } catch { return null; } }
 
   const feedA   = parseFeed(resultA),   feedB   = parseFeed(resultB);
   const tradesA = parseTrades(resultA), tradesB = parseTrades(resultB);
+  const ticksA  = parseTicks(resultA),  ticksB  = parseTicks(resultB);
   const sumA    = parseSummary(resultA),sumB    = parseSummary(resultB);
   const cfgA    = parseConfig(resultA), cfgB    = parseConfig(resultB);
 
-  const interleavedFeed = (() => {
-    if (!feedA.length && !feedB.length) return [];
+  // ── Comparison tolerances — tune to adjust matching sensitivity ───────────
+  const TICK_TOL_MS    = 2000;          // ±2 s  : network/replay jitter
+  const TRADE_TOL_MS   = 5 * 60 * 1000;// ±5 min: same-instrument nearest entry
+  const OHLC_TOL       = 0.05;         // 5 paise: price rounding noise
+  const SCORE_TOL      = 0.5;          // 0.5 pt: floating-point noise in scores
+
+  // ── 1. Tick comparison ───────────────────────────────────────────────────
+  // Strategy: group by token, sort by timeMs, greedy nearest-neighbour match
+  // within TICK_TOL_MS. Each tick is consumed at most once.
+  const tickComparison = (() => {
+    if (!ticksA.length && !ticksB.length) return { rows: [], stats: {}, matchPct: null };
+    const groupA = new Map(), groupB = new Map();
+    for (const t of ticksA) { if (!groupA.has(t.token)) groupA.set(t.token, []); groupA.get(t.token).push(t); }
+    for (const t of ticksB) { if (!groupB.has(t.token)) groupB.set(t.token, []); groupB.get(t.token).push(t); }
+    const allTokens = new Set([...groupA.keys(), ...groupB.keys()]);
+    const rows = [], stats = {};
+    let totalMatched = 0;
+    for (const token of allTokens) {
+      const as = [...(groupA.get(token) || [])].sort((x,y) => x.timeMs - y.timeMs);
+      const bs = [...(groupB.get(token) || [])].sort((x,y) => x.timeMs - y.timeMs);
+      const usedB = new Set();
+      const tokenRows = [];
+      for (const ta of as) {
+        let bestBi = -1, bestDiff = Infinity;
+        for (let bi = 0; bi < bs.length; bi++) {
+          if (usedB.has(bi)) continue;
+          const diff = Math.abs(bs[bi].timeMs - ta.timeMs);
+          if (diff <= TICK_TOL_MS && diff < bestDiff) { bestDiff = diff; bestBi = bi; }
+          if (bs[bi].timeMs > ta.timeMs + TICK_TOL_MS) break;
+        }
+        if (bestBi >= 0) {
+          usedB.add(bestBi);
+          const tb = bs[bestBi];
+          const priceDiff = tb.ltp - ta.ltp;
+          tokenRows.push({ matchType: Math.abs(priceDiff) > OHLC_TOL ? 'PRICE_MISMATCH' : 'MATCHED',
+            token, a: ta, b: tb, timeDiffMs: tb.timeMs - ta.timeMs, priceDiff });
+          totalMatched++;
+        } else {
+          tokenRows.push({ matchType: 'LIVE_ONLY', token, a: ta, b: null, timeDiffMs: null, priceDiff: null });
+        }
+      }
+      for (let bi = 0; bi < bs.length; bi++) {
+        if (!usedB.has(bi)) tokenRows.push({ matchType: 'REPLAY_ONLY', token, a: null, b: bs[bi], timeDiffMs: null, priceDiff: null });
+      }
+      stats[token] = {
+        token,
+        aCount: as.length, bCount: bs.length,
+        matched:      tokenRows.filter(r => r.matchType === 'MATCHED').length,
+        priceMismatch:tokenRows.filter(r => r.matchType === 'PRICE_MISMATCH').length,
+        aOnly:        tokenRows.filter(r => r.matchType === 'LIVE_ONLY').length,
+        bOnly:        tokenRows.filter(r => r.matchType === 'REPLAY_ONLY').length,
+      };
+      rows.push(...tokenRows);
+    }
+    rows.sort((x,y) => (x.a?.timeMs || x.b?.timeMs || 0) - (y.a?.timeMs || y.b?.timeMs || 0));
+    const tot = ticksA.length + ticksB.length;
+    const matchPct = tot > 0 ? (totalMatched * 2 / tot * 100).toFixed(1) : null;
+    return { rows, stats, matchPct };
+  })();
+
+  // ── 2. Candle comparison ─────────────────────────────────────────────────
+  // Strategy: exact lookup by niftyTime ISO string. OHLC compared with OHLC_TOL.
+  const candleComparison = (() => {
+    if (!feedA.length && !feedB.length) return { rows: [], stats: null };
     const mapA = new Map(feedA.map(e => [e.niftyTime, e]));
     const mapB = new Map(feedB.map(e => [e.niftyTime, e]));
     const allTimes = [...new Set([...feedA.map(e => e.niftyTime), ...feedB.map(e => e.niftyTime)])].sort();
-    return allTimes.map(t => {
+    const rows = allTimes.map(t => {
       const a = mapA.get(t) || null, b = mapB.get(t) || null;
-      const diverged = a && b && (
-        a.regime !== b.regime || a.confirmedBias !== b.confirmedBias ||
-        a.winnerStrategy !== b.winnerStrategy || a.action !== b.action ||
-        a.positionState !== b.positionState
-      );
-      return { time: t, a, b, diverged };
+      if (!a) return { time: t, a: null, b, matchType: 'REPLAY_ONLY', divergedFields: [] };
+      if (!b) return { time: t, a, b: null, matchType: 'LIVE_ONLY',   divergedFields: [] };
+      const df = [];
+      if (Math.abs((a.niftyOpen  ||0)-(b.niftyOpen  ||0)) > OHLC_TOL) df.push('open');
+      if (Math.abs((a.niftyHigh  ||0)-(b.niftyHigh  ||0)) > OHLC_TOL) df.push('high');
+      if (Math.abs((a.niftyLow   ||0)-(b.niftyLow   ||0)) > OHLC_TOL) df.push('low');
+      if (Math.abs((a.niftyClose ||0)-(b.niftyClose ||0)) > OHLC_TOL) df.push('close');
+      if ((a.niftyVolume||0) !== (b.niftyVolume||0))                   df.push('volume');
+      return { time: t, a, b, matchType: df.length === 0 ? 'EXACT' : 'OHLC_MISMATCH', divergedFields: df };
     });
+    const exact      = rows.filter(r => r.matchType === 'EXACT').length;
+    const mismatch   = rows.filter(r => r.matchType === 'OHLC_MISMATCH').length;
+    const liveOnly   = rows.filter(r => r.matchType === 'LIVE_ONLY').length;
+    const replayOnly = rows.filter(r => r.matchType === 'REPLAY_ONLY').length;
+    const total = rows.length;
+    return { rows, stats: { total, exact, mismatch, liveOnly, replayOnly, matchPct: total > 0 ? (exact/total*100).toFixed(1) : null } };
   })();
 
+  // ── 3. Signal comparison ─────────────────────────────────────────────────
+  // Strategy: same time-key as candle comparison. Compares decision-layer fields.
+  const signalComparison = (() => {
+    if (!feedA.length && !feedB.length) return { rows: [], stats: null };
+    const mapA = new Map(feedA.map(e => [e.niftyTime, e]));
+    const mapB = new Map(feedB.map(e => [e.niftyTime, e]));
+    const allTimes = [...new Set([...feedA.map(e => e.niftyTime), ...feedB.map(e => e.niftyTime)])].sort();
+    const rows = allTimes.map(t => {
+      const a = mapA.get(t) || null, b = mapB.get(t) || null;
+      if (!a) return { time: t, a: null, b, matchType: 'REPLAY_ONLY', divergedFields: [] };
+      if (!b) return { time: t, a, b: null, matchType: 'LIVE_ONLY',   divergedFields: [] };
+      const df = [];
+      if (a.regime         !== b.regime)         df.push('regime');
+      if (a.confirmedBias  !== b.confirmedBias)  df.push('confirmedBias');
+      if (a.winnerStrategy !== b.winnerStrategy) df.push('winnerStrategy');
+      if (Math.abs((a.winnerScore||0)-(b.winnerScore||0)) > SCORE_TOL) df.push('winnerScore');
+      if (a.action         !== b.action)         df.push('action');
+      if (a.positionState  !== b.positionState)  df.push('positionState');
+      if (a.exitReason     !== b.exitReason)     df.push('exitReason');
+      return { time: t, a, b, matchType: df.length === 0 ? 'MATCHED' : 'SIGNAL_MISMATCH', divergedFields: df };
+    });
+    const matched    = rows.filter(r => r.matchType === 'MATCHED').length;
+    const mismatch   = rows.filter(r => r.matchType === 'SIGNAL_MISMATCH').length;
+    const liveOnly   = rows.filter(r => r.matchType === 'LIVE_ONLY').length;
+    const replayOnly = rows.filter(r => r.matchType === 'REPLAY_ONLY').length;
+    const total = rows.length;
+    return { rows, stats: { total, matched, mismatch, liveOnly, replayOnly, matchPct: total > 0 ? (matched/total*100).toFixed(1) : null } };
+  })();
+
+  // ── 4. Trade comparison ──────────────────────────────────────────────────
+  // Strategy: greedy nearest entryTime match within TRADE_TOL_MS. Each trade consumed once.
   const tradeComparison = (() => {
-    if (!tradesA.length && !tradesB.length) return [];
-    const TOLERANCE_MS = 5 * 60 * 1000;
+    if (!tradesA.length && !tradesB.length) return { rows: [], stats: null };
     const usedB = new Set();
     const rows = [];
     for (const ta of tradesA) {
       const taMs = new Date(ta.entryTime).getTime();
-      const idx = tradesB.findIndex((tb, i) => !usedB.has(i) && Math.abs(new Date(tb.entryTime).getTime() - taMs) <= TOLERANCE_MS);
-      if (idx >= 0) { usedB.add(idx); rows.push({ type: 'both',  a: ta, b: tradesB[idx] }); }
-      else           rows.push({ type: 'aOnly', a: ta, b: null });
+      let bestIdx = -1, bestDiff = Infinity;
+      tradesB.forEach((tb, i) => {
+        if (usedB.has(i)) return;
+        const diff = Math.abs(new Date(tb.entryTime).getTime() - taMs);
+        if (diff <= TRADE_TOL_MS && diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+      });
+      if (bestIdx >= 0) { usedB.add(bestIdx); rows.push({ matchType: 'BOTH', a: ta, b: tradesB[bestIdx] }); }
+      else rows.push({ matchType: 'LIVE_ONLY', a: ta, b: null });
     }
-    tradesB.forEach((tb, i) => { if (!usedB.has(i)) rows.push({ type: 'bOnly', a: null, b: tb }); });
-    rows.sort((x, y) => (x.a?.entryTime || x.b?.entryTime || '').localeCompare(y.a?.entryTime || y.b?.entryTime || ''));
-    return rows;
+    tradesB.forEach((tb, i) => { if (!usedB.has(i)) rows.push({ matchType: 'REPLAY_ONLY', a: null, b: tb }); });
+    rows.sort((x,y) => ((x.a?.entryTime||x.b?.entryTime||'') > (y.a?.entryTime||y.b?.entryTime||'')) ? 1 : -1);
+    const both       = rows.filter(r => r.matchType === 'BOTH').length;
+    const liveOnly   = rows.filter(r => r.matchType === 'LIVE_ONLY').length;
+    const replayOnly = rows.filter(r => r.matchType === 'REPLAY_ONLY').length;
+    const tot = tradesA.length + tradesB.length;
+    return { rows, stats: { total: rows.length, both, liveOnly, replayOnly, matchPct: tot > 0 ? (both*2/tot*100).toFixed(1) : null } };
   })();
 
+  // ── 5. Config diff ───────────────────────────────────────────────────────
   const configDiff = (() => {
     if (!cfgA || !cfgB) return [];
-    function flat(obj, prefix = '') {
+    function flat(obj, prefix) {
       return Object.entries(obj || {}).flatMap(([k, v]) => {
         const key = prefix ? `${prefix}.${k}` : k;
         return (v && typeof v === 'object' && !Array.isArray(v)) ? flat(v, key) : [{ key, val: v }];
       });
     }
-    const mA = Object.fromEntries(flat(cfgA).map(e => [e.key, e.val]));
-    const mB = Object.fromEntries(flat(cfgB).map(e => [e.key, e.val]));
+    const mA = Object.fromEntries(flat(cfgA, '').map(e => [e.key, e.val]));
+    const mB = Object.fromEntries(flat(cfgB, '').map(e => [e.key, e.val]));
     return [...new Set([...Object.keys(mA), ...Object.keys(mB)])]
       .filter(k => String(mA[k] ?? '') !== String(mB[k] ?? ''))
       .map(k => ({ key: k, valA: mA[k], valB: mB[k] }))
-      .sort((x, y) => x.key.localeCompare(y.key));
+      .sort((x,y) => x.key.localeCompare(y.key));
+  })();
+
+  // ── 6. Divergence trace ──────────────────────────────────────────────────
+  // Walks the comparison chain (TICK → CANDLE → SIGNAL → TRADE) and reports
+  // the first point of divergence at each stage that was detected.
+  const divergenceTrace = (() => {
+    const stages = [];
+    const firstTickDiv = tickComparison.rows.find(r => r.matchType !== 'MATCHED');
+    if (firstTickDiv) stages.push({
+      stage: 'TICK', seqNo: 1,
+      time: new Date(firstTickDiv.a?.timeMs || firstTickDiv.b?.timeMs || 0).toISOString(),
+      matchType: firstTickDiv.matchType, token: String(firstTickDiv.token),
+      explanation: firstTickDiv.matchType === 'LIVE_ONLY'   ? 'Live received a tick that replay did not have' :
+                   firstTickDiv.matchType === 'REPLAY_ONLY' ? 'Replay had a tick not seen in live stream' :
+                   `LTP diverged by ${Number(firstTickDiv.priceDiff||0).toFixed(2)}`,
+    });
+    const firstCandleDiv = candleComparison.rows.find(r => r.matchType !== 'EXACT');
+    if (firstCandleDiv) stages.push({
+      stage: 'CANDLE', seqNo: 2, time: firstCandleDiv.time,
+      matchType: firstCandleDiv.matchType, token: 'NIFTY',
+      explanation: firstCandleDiv.matchType === 'LIVE_ONLY'   ? 'Candle exists only in live feed' :
+                   firstCandleDiv.matchType === 'REPLAY_ONLY' ? 'Candle exists only in replay feed' :
+                   `OHLC fields differ: ${firstCandleDiv.divergedFields.join(', ')}`,
+    });
+    const firstSignalDiv = signalComparison.rows.find(r => r.matchType !== 'MATCHED');
+    if (firstSignalDiv) stages.push({
+      stage: 'SIGNAL', seqNo: 3, time: firstSignalDiv.time,
+      matchType: firstSignalDiv.matchType, token: 'NIFTY',
+      explanation: firstSignalDiv.matchType === 'LIVE_ONLY'   ? 'Signal exists only in live' :
+                   firstSignalDiv.matchType === 'REPLAY_ONLY' ? 'Signal exists only in replay' :
+                   `Decision fields differ: ${firstSignalDiv.divergedFields.join(', ')}`,
+    });
+    const firstTradeDiv = tradeComparison.rows.find(r => r.matchType !== 'BOTH');
+    if (firstTradeDiv) stages.push({
+      stage: 'TRADE', seqNo: 4,
+      time: firstTradeDiv.a?.entryTime || firstTradeDiv.b?.entryTime || '—',
+      matchType: firstTradeDiv.matchType,
+      token: firstTradeDiv.a?.tradingSymbol || firstTradeDiv.b?.tradingSymbol || '—',
+      explanation: firstTradeDiv.matchType === 'LIVE_ONLY' ? 'Trade taken in live but not in replay' : 'Trade taken in replay but not in live',
+    });
+    stages.sort((x,y) => x.seqNo - y.seqNo);
+    return { stages, firstStage: stages[0] || null };
   })();
 
   const hasResults = resultA && resultB;
+  const labelA = resultA?.label || resultA?.sessionDate || 'A';
+  const labelB = resultB?.label || resultB?.sessionDate || 'B';
 
-  function downloadCSV() {
-    if (!hasResults) return;
-    const q   = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    const row = (...cols) => cols.map(q).join(',');
-    const n2  = v => v != null ? Number(v).toFixed(2) : '';
-    const blank = '';
-    const lines = [];
-    const labelA = resultA.label || resultA.sessionDate;
-    const labelB = resultB.label || resultB.sessionDate;
+  // ── CSV generation ────────────────────────────────────────────────────────
+  const q2  = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const row2 = (...cols) => cols.map(q2).join(',');
+  const n2c  = v => v != null ? Number(v).toFixed(2) : '';
 
-    // ── Session Summary ──────────────────────────────────────────────────────
-    lines.push(row('=== Session Summary ==='));
-    lines.push(row('Metric', `A — ${labelA}`, `B — ${labelB}`, 'Diff (B-A)'));
-    lines.push(row('Date',         resultA.sessionDate,  resultB.sessionDate,  ''));
-    lines.push(row('Type',         resultA.type,         resultB.type,         ''));
-    lines.push(row('Trades',       sumA?.trades??'',     sumB?.trades??'',     sumA?.trades!=null&&sumB?.trades!=null ? sumB.trades-sumA.trades : ''));
-    lines.push(row('Realized P&L', n2(sumA?.realizedPnl),  n2(sumB?.realizedPnl),  sumA?.realizedPnl!=null&&sumB?.realizedPnl!=null ? n2(sumB.realizedPnl-sumA.realizedPnl) : ''));
-    lines.push(row('Win Rate',     sumA?.winRate!=null?`${(sumA.winRate*100).toFixed(1)}%`:'', sumB?.winRate!=null?`${(sumB.winRate*100).toFixed(1)}%`:'', sumA?.winRate!=null&&sumB?.winRate!=null?`${((sumB.winRate-sumA.winRate)*100).toFixed(1)}%`:''));
-    lines.push(row('Final Capital',n2(sumA?.finalCapital), n2(sumB?.finalCapital), sumA?.finalCapital!=null&&sumB?.finalCapital!=null ? n2(sumB.finalCapital-sumA.finalCapital) : ''));
-    lines.push(blank);
-
-    // ── Config Differences ───────────────────────────────────────────────────
-    lines.push(row('=== Config Differences ==='));
-    if (configDiff.length === 0) {
-      lines.push(row('Configs are identical'));
-    } else {
-      lines.push(row('Field', `A — ${labelA}`, `B — ${labelB}`));
-      configDiff.forEach(({ key, valA, valB }) => lines.push(row(key, String(valA??''), String(valB??''))));
-    }
-    lines.push(blank);
-
-    // ── Trade Comparison ─────────────────────────────────────────────────────
-    if (tradeComparison.length > 0) {
-      lines.push(row('=== Trade Comparison ==='));
-      lines.push(row('Match', 'Entry Time', 'Type', 'Symbol', `A P&L`, `A Entry`, `A Exit`, `A Exit Reason`, `B P&L`, `B Entry`, `B Exit`, `B Exit Reason`, 'Diff (B-A)'));
-      tradeComparison.forEach(r => {
-        const diff = r.type==='both'&&r.a?.pnl!=null&&r.b?.pnl!=null ? n2(r.b.pnl-r.a.pnl) : '';
-        const t = r.a || r.b;
-        lines.push(row(
-          r.type==='both'?'Both':r.type==='aOnly'?'A only':'B only',
-          (t?.entryTime||'').slice(0,19),
-          t?.optionType||'',
-          t?.tradingSymbol||'',
-          r.a?.pnl!=null?n2(r.a.pnl):'',
-          r.a?.entryPrice!=null?n2(r.a.entryPrice):'',
-          r.a?.exitPrice!=null?n2(r.a.exitPrice):'',
-          r.a?.exitReason||'',
-          r.b?.pnl!=null?n2(r.b.pnl):'',
-          r.b?.entryPrice!=null?n2(r.b.entryPrice):'',
-          r.b?.exitPrice!=null?n2(r.b.exitPrice):'',
-          r.b?.exitReason||'',
-          diff,
-        ));
-      });
-      lines.push(blank);
-    }
-
-    // ── Candle Feed ──────────────────────────────────────────────────────────
-    if (interleavedFeed.length > 0) {
-      lines.push(row('=== Candle Feed ==='));
-      lines.push(row('Time', 'Src', 'Diverged', 'Regime', 'Conf Bias', 'Winner', 'Score', 'Pen Score', 'State', 'Action', 'Exit Reason', 'uPnL', 'rPnL', 'Capital', 'Option', 'Opt Close'));
-      interleavedFeed.forEach(({ time, a, b, diverged }) => {
-        const div = diverged ? 'YES' : '';
-        const addRow = (evt, src) => {
-          if (!evt) return;
-          lines.push(row(
-            (time||'').slice(0,19), src, div,
-            evt.regime||'', evt.confirmedBias||'', evt.winnerStrategy||'',
-            evt.winnerScore!=null?n2(evt.winnerScore):'', evt.penalizedScore!=null?n2(evt.penalizedScore):'',
-            evt.positionState||'', evt.action||'', evt.exitReason||'',
-            evt.unrealizedPnl!=null?n2(evt.unrealizedPnl):'',
-            evt.realizedPnl!=null?n2(evt.realizedPnl):'',
-            evt.capital!=null?n2(evt.capital):'',
-            evt.selectedTradingSymbol||'', evt.optionClose!=null?n2(evt.optionClose):'',
-          ));
-        };
-        addRow(a, `A — ${labelA}`);
-        addRow(b, `B — ${labelB}`);
-      });
-      lines.push(blank);
-    }
-
-    const csv  = lines.join('\n');
+  function triggerDownload(filename, csv) {
     const blob = new Blob([csv], { type: 'text/csv' });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
-    a.href     = url;
-    a.download = `compare_${(resultA.label||resultA.sessionDate).replace(/[^a-z0-9]/gi,'_')}_vs_${(resultB.label||resultB.sessionDate).replace(/[^a-z0-9]/gi,'_')}.csv`;
-    a.click();
+    a.href = url; a.download = filename; a.click();
     URL.revokeObjectURL(url);
   }
 
+  function slug() {
+    return `${(resultA?.label||resultA?.sessionDate||'A').replace(/[^a-z0-9]/gi,'_')}_vs_${(resultB?.label||resultB?.sessionDate||'B').replace(/[^a-z0-9]/gi,'_')}`;
+  }
+
+  function csvSummary() {
+    const lines = [
+      row2('Metric', `A — ${labelA}`, `B — ${labelB}`, 'Diff (B-A)'),
+      row2('Date',          resultA.sessionDate,  resultB.sessionDate,  ''),
+      row2('Type',          resultA.type,         resultB.type,         ''),
+      row2('Trades',        sumA?.trades??'',     sumB?.trades??'',     sumA?.trades!=null&&sumB?.trades!=null?sumB.trades-sumA.trades:''),
+      row2('Realized P&L',  n2c(sumA?.realizedPnl), n2c(sumB?.realizedPnl), sumA?.realizedPnl!=null&&sumB?.realizedPnl!=null?n2c(sumB.realizedPnl-sumA.realizedPnl):''),
+      row2('Win Rate',      sumA?.winRate!=null?`${(sumA.winRate*100).toFixed(1)}%`:'', sumB?.winRate!=null?`${(sumB.winRate*100).toFixed(1)}%`:'', sumA?.winRate!=null&&sumB?.winRate!=null?`${((sumB.winRate-sumA.winRate)*100).toFixed(1)}%`:''),
+      row2('Final Capital', n2c(sumA?.finalCapital), n2c(sumB?.finalCapital), sumA?.finalCapital!=null&&sumB?.finalCapital!=null?n2c(sumB.finalCapital-sumA.finalCapital):''),
+      '',
+      row2('Tick Match %',   tickComparison.matchPct!=null?`${tickComparison.matchPct}%`:'N/A — no ticks captured','',''),
+      row2('Candle Match %', candleComparison.stats?.matchPct!=null?`${candleComparison.stats.matchPct}%`:'','',''),
+      row2('Signal Match %', signalComparison.stats?.matchPct!=null?`${signalComparison.stats.matchPct}%`:'','',''),
+      row2('Trade Match %',  tradeComparison.stats?.matchPct!=null?`${tradeComparison.stats.matchPct}%`:'','',''),
+      '',
+      row2('First Divergence Stage',       divergenceTrace.firstStage?.stage??'NONE','',''),
+      row2('First Divergence Time',        divergenceTrace.firstStage?.time??'—','',''),
+      row2('First Divergence Instrument',  divergenceTrace.firstStage?.token??'—','',''),
+      row2('First Divergence Explanation', divergenceTrace.firstStage?.explanation??'—','',''),
+    ];
+    return lines.join('\n');
+  }
+
+  function csvTicks() {
+    if (!tickComparison.rows.length) return row2('No tick data — enable tick capture before starting session');
+    const lines = [row2('Match Type','Token','A Time (ms)','A LTP','A Volume','B Time (ms)','B LTP','B Volume','Time Diff ms','Price Diff')];
+    for (const r of tickComparison.rows)
+      lines.push(row2(r.matchType, r.token, r.a?.timeMs??'', r.a?.ltp??'', r.a?.volume??'', r.b?.timeMs??'', r.b?.ltp??'', r.b?.volume??'', r.timeDiffMs??'', r.priceDiff!=null?n2c(r.priceDiff):''));
+    return lines.join('\n');
+  }
+
+  function csvCandles() {
+    if (!candleComparison.rows.length) return row2('No candle data');
+    const lines = [row2('Match Type','Diverged Fields','Time','A Open','A High','A Low','A Close','A Volume','B Open','B High','B Low','B Close','B Volume','Delta Close')];
+    for (const r of candleComparison.rows)
+      lines.push(row2(r.matchType, r.divergedFields.join('|'), (r.time||'').slice(0,19),
+        r.a?.niftyOpen??'', r.a?.niftyHigh??'', r.a?.niftyLow??'', r.a?.niftyClose??'', r.a?.niftyVolume??'',
+        r.b?.niftyOpen??'', r.b?.niftyHigh??'', r.b?.niftyLow??'', r.b?.niftyClose??'', r.b?.niftyVolume??'',
+        r.a&&r.b?n2c((r.b.niftyClose||0)-(r.a.niftyClose||0)):''));
+    return lines.join('\n');
+  }
+
+  function csvSignals() {
+    if (!signalComparison.rows.length) return row2('No signal data');
+    const lines = [row2('Match Type','Diverged Fields','Time','A Regime','A Bias','A Winner','A Score','A Action','A State','B Regime','B Bias','B Winner','B Score','B Action','B State','Delta Score')];
+    for (const r of signalComparison.rows)
+      lines.push(row2(r.matchType, r.divergedFields.join('|'), (r.time||'').slice(0,19),
+        r.a?.regime??'', r.a?.confirmedBias??'', r.a?.winnerStrategy??'', r.a?.winnerScore!=null?n2c(r.a.winnerScore):'', r.a?.action??'', r.a?.positionState??'',
+        r.b?.regime??'', r.b?.confirmedBias??'', r.b?.winnerStrategy??'', r.b?.winnerScore!=null?n2c(r.b.winnerScore):'', r.b?.action??'', r.b?.positionState??'',
+        r.a&&r.b?n2c((r.b.winnerScore||0)-(r.a.winnerScore||0)):''));
+    return lines.join('\n');
+  }
+
+  function csvTrades() {
+    if (!tradeComparison.rows.length) return row2('No trade data');
+    const lines = [row2('Match Type','A Entry','A Exit','A Type','A Symbol','A EntPx','A ExtPx','A PnL','A ExitReason','A Bars','B Entry','B Exit','B Type','B Symbol','B EntPx','B ExtPx','B PnL','B ExitReason','B Bars','Delta PnL')];
+    for (const r of tradeComparison.rows) {
+      const diff = r.matchType==='BOTH'&&r.a?.pnl!=null&&r.b?.pnl!=null ? n2c(r.b.pnl-r.a.pnl) : '';
+      lines.push(row2(r.matchType,
+        (r.a?.entryTime||'').slice(0,19),(r.a?.exitTime||'').slice(0,19),
+        r.a?.optionType??'',r.a?.tradingSymbol??'',r.a?.entryPrice!=null?n2c(r.a.entryPrice):'',r.a?.exitPrice!=null?n2c(r.a.exitPrice):'',r.a?.pnl!=null?n2c(r.a.pnl):'',r.a?.exitReason??'',r.a?.barsInTrade??'',
+        (r.b?.entryTime||'').slice(0,19),(r.b?.exitTime||'').slice(0,19),
+        r.b?.optionType??'',r.b?.tradingSymbol??'',r.b?.entryPrice!=null?n2c(r.b.entryPrice):'',r.b?.exitPrice!=null?n2c(r.b.exitPrice):'',r.b?.pnl!=null?n2c(r.b.pnl):'',r.b?.exitReason??'',r.b?.barsInTrade??'',
+        diff));
+    }
+    return lines.join('\n');
+  }
+
+  function csvDivergence() {
+    if (!divergenceTrace.stages.length) return row2('No divergence detected — sessions appear identical');
+    const lines = [row2('Stage','Sequence','First Divergence Time','Instrument','Match Type','Explanation')];
+    for (const s of divergenceTrace.stages)
+      lines.push(row2(s.stage, s.seqNo, s.time, s.token, s.matchType, s.explanation));
+    return lines.join('\n');
+  }
+
+  function csvConfig() {
+    if (!configDiff.length) return row2('Configs are identical');
+    const lines = [row2('Field', `A — ${labelA}`, `B — ${labelB}`)];
+    configDiff.forEach(({ key, valA, valB }) => lines.push(row2(key, String(valA??''), String(valB??''))));
+    return lines.join('\n');
+  }
+
+  function downloadSection(key) {
+    const map = {
+      summary:    ['session_summary',    csvSummary()],
+      ticks:      ['tick_comparison',    csvTicks()],
+      candles:    ['candle_comparison',  csvCandles()],
+      signals:    ['signal_comparison',  csvSignals()],
+      trades:     ['trade_comparison',   csvTrades()],
+      divergence: ['divergence_summary', csvDivergence()],
+      config:     ['config_diff',        csvConfig()],
+    };
+    const [name, csv] = map[key] || [];
+    if (name) triggerDownload(`${name}_${slug()}.csv`, csv);
+  }
+
+  function downloadAll() {
+    ['summary','ticks','candles','signals','trades','divergence','config']
+      .forEach((k, i) => setTimeout(() => downloadSection(k), i * 250));
+  }
+
+  // ── Badge helper ──────────────────────────────────────────────────────────
+  function mtColor(type) {
+    return { MATCHED:'#22c55e', EXACT:'#22c55e', BOTH:'#22c55e', PRICE_MISMATCH:'#f59e0b', OHLC_MISMATCH:'#f59e0b', SIGNAL_MISMATCH:'#f59e0b', LIVE_ONLY:'#6366f1', REPLAY_ONLY:'#10b981' }[type] || 'var(--text-muted)';
+  }
+  function Badge({ type, label }) {
+    return <span style={{ fontWeight:700, fontSize:10, color: mtColor(type) }}>{label ?? type}</span>;
+  }
+
+  const COMPARE_TABS = [['summary','Summary'],['divergence','Divergence'],['ticks','Ticks'],['candles','Candles'],['signals','Signals'],['trades','Trades'],['config','Config']];
+
   return (
     <div>
+      {/* Session selector ─────────────────────────────────────────────────── */}
       <div className="card bt-opts-card" style={{ marginBottom: 16 }}>
         <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:12, flexWrap:'wrap' }}>
           <span className="bt-section-title" style={{ marginBottom:0 }}>Saved Sessions</span>
@@ -13612,8 +13823,7 @@ function SessionCompare() {
             </table>
           </div>
         )}
-
-        <div style={{ marginTop:14, display:'flex', gap:8, alignItems:'center' }}>
+        <div style={{ marginTop:14, display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' }}>
           <button type="button" className="btn-primary" onClick={handleCompare}
             disabled={!selA || !selB || comparing || selA === selB}>
             {comparing ? 'Loading…' : 'Compare A vs B'}
@@ -13626,46 +13836,314 @@ function SessionCompare() {
 
       {hasResults && (
         <>
-          <div style={{ display:'flex', justifyContent:'flex-end', marginBottom:8 }}>
-            <button type="button" className="btn-secondary btn-xs" onClick={downloadCSV}>⬇ Download CSV</button>
+          {/* Results toolbar ─────────────────────────────────────────────── */}
+          <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:12, flexWrap:'wrap' }}>
+            <div className="bt-live-right-tabs" style={{ flex:1, flexWrap:'wrap' }}>
+              {COMPARE_TABS.map(([k,l]) => (
+                <button key={k} className={`bt-live-tab-btn ${compareTab===k?'active':''}`} onClick={() => setCompareTab(k)}>{l}</button>
+              ))}
+            </div>
+            <button type="button" className="btn-secondary btn-xs" onClick={() => downloadSection(compareTab)} title="Download current tab as CSV">⬇ CSV</button>
+            <button type="button" className="btn-secondary btn-xs" onClick={downloadAll} title="Download all 7 CSVs">⬇ All CSVs</button>
           </div>
 
-          {/* Summary */}
-          <div className="card bt-opts-card" style={{ marginBottom:16 }}>
-            <span className="bt-section-title">Summary</span>
-            <table className="bt-table" style={{ fontSize:12 }}>
-              <thead><tr><th>Metric</th><th style={{ color:'#6366f1' }}>A — {resultA.label||resultA.sessionDate}</th><th style={{ color:'#10b981' }}>B — {resultB.label||resultB.sessionDate}</th><th>Diff (B−A)</th></tr></thead>
-              <tbody>
-                {[
-                  ['Date',          resultA.sessionDate, resultB.sessionDate, null],
-                  ['Type',          resultA.type,        resultB.type,        null],
-                  ['Trades',        sumA?.trades,        sumB?.trades,        sumA?.trades!=null&&sumB?.trades!=null ? sumB.trades-sumA.trades : null],
-                  ['Realized P&L',  sumA?.realizedPnl,   sumB?.realizedPnl,   sumA?.realizedPnl!=null&&sumB?.realizedPnl!=null ? sumB.realizedPnl-sumA.realizedPnl : null],
-                  ['Win Rate',
-                    sumA?.winRate!=null?`${(sumA.winRate*100).toFixed(1)}%`:null,
-                    sumB?.winRate!=null?`${(sumB.winRate*100).toFixed(1)}%`:null,
-                    sumA?.winRate!=null&&sumB?.winRate!=null?`${((sumB.winRate-sumA.winRate)*100).toFixed(1)}%`:null],
-                  ['Final Capital', sumA?.finalCapital,  sumB?.finalCapital,  sumA?.finalCapital!=null&&sumB?.finalCapital!=null ? sumB.finalCapital-sumA.finalCapital : null],
-                ].map(([lbl,vA,vB,diff]) => (
-                  <tr key={lbl}>
-                    <td style={{ fontWeight:700 }}>{lbl}</td>
-                    <td style={typeof vA==='number'?pnlStyle(vA):{}}>{typeof vA==='number'?fmt2(vA):(vA??'—')}</td>
-                    <td style={typeof vB==='number'?pnlStyle(vB):{}}>{typeof vB==='number'?fmt2(vB):(vB??'—')}</td>
-                    <td style={typeof diff==='number'?pnlStyle(diff):{}}>{diff!=null?(typeof diff==='number'?(diff>0?'+':'')+fmt2(diff):diff):'—'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          {/* ── Summary ──────────────────────────────────────────────────── */}
+          {compareTab === 'summary' && (
+            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
+              <span className="bt-section-title">Session Summary</span>
+              <table className="bt-table" style={{ fontSize:12 }}>
+                <thead><tr><th>Metric</th><th style={{ color:'#6366f1' }}>A — {labelA}</th><th style={{ color:'#10b981' }}>B — {labelB}</th><th>Diff (B−A)</th></tr></thead>
+                <tbody>
+                  {[['Date', resultA.sessionDate, resultB.sessionDate, null],
+                    ['Type', resultA.type,        resultB.type,        null],
+                    ['Trades', sumA?.trades, sumB?.trades, sumA?.trades!=null&&sumB?.trades!=null?sumB.trades-sumA.trades:null],
+                    ['Realized P&L', sumA?.realizedPnl, sumB?.realizedPnl, sumA?.realizedPnl!=null&&sumB?.realizedPnl!=null?sumB.realizedPnl-sumA.realizedPnl:null],
+                    ['Win Rate', sumA?.winRate!=null?`${(sumA.winRate*100).toFixed(1)}%`:null, sumB?.winRate!=null?`${(sumB.winRate*100).toFixed(1)}%`:null, sumA?.winRate!=null&&sumB?.winRate!=null?`${((sumB.winRate-sumA.winRate)*100).toFixed(1)}%`:null],
+                    ['Final Capital', sumA?.finalCapital, sumB?.finalCapital, sumA?.finalCapital!=null&&sumB?.finalCapital!=null?sumB.finalCapital-sumA.finalCapital:null],
+                  ].map(([lbl,vA,vB,diff]) => (
+                    <tr key={lbl}>
+                      <td style={{ fontWeight:700 }}>{lbl}</td>
+                      <td style={typeof vA==='number'?pnlStyle(vA):{}}>{typeof vA==='number'?fmt2(vA):(vA??'—')}</td>
+                      <td style={typeof vB==='number'?pnlStyle(vB):{}}>{typeof vB==='number'?fmt2(vB):(vB??'—')}</td>
+                      <td style={typeof diff==='number'?pnlStyle(diff):{}}>{diff!=null?(typeof diff==='number'?(diff>0?'+':'')+fmt2(diff):diff):'—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
 
-          {/* Config diff */}
-          <div className="card bt-opts-card" style={{ marginBottom:16 }}>
-            <span className="bt-section-title">Config Differences {configDiff.length>0?`(${configDiff.length})`:''}</span>
-            {configDiff.length===0
-              ? <p style={{ fontSize:12, color:'#22c55e', margin:0 }}>Configs are identical.</p>
-              : <div style={{ overflowX:'auto' }}>
+              <div style={{ marginTop:16 }}>
+                <span className="bt-section-title" style={{ fontSize:12 }}>Match Rates by Stage</span>
+                <table className="bt-table" style={{ fontSize:11, marginTop:6 }}>
+                  <thead><tr><th>Stage</th><th>A Count</th><th>B Count</th><th>Matched</th><th>Mismatch</th><th>A-only</th><th>B-only</th><th>Match %</th></tr></thead>
+                  <tbody>
+                    {[
+                      ['Ticks',   ticksA.length||0,  ticksB.length||0,  tickComparison.rows.filter(r=>r.matchType==='MATCHED').length,  tickComparison.rows.filter(r=>r.matchType==='PRICE_MISMATCH').length, tickComparison.rows.filter(r=>r.matchType==='LIVE_ONLY').length,  tickComparison.rows.filter(r=>r.matchType==='REPLAY_ONLY').length,  tickComparison.matchPct],
+                      ['Candles', feedA.length,       feedB.length,       candleComparison.stats?.exact??0,  candleComparison.stats?.mismatch??0,  candleComparison.stats?.liveOnly??0,  candleComparison.stats?.replayOnly??0,  candleComparison.stats?.matchPct],
+                      ['Signals', feedA.length,       feedB.length,       signalComparison.stats?.matched??0, signalComparison.stats?.mismatch??0,  signalComparison.stats?.liveOnly??0,  signalComparison.stats?.replayOnly??0, signalComparison.stats?.matchPct],
+                      ['Trades',  tradesA.length,     tradesB.length,     tradeComparison.stats?.both??0,    null,                                  tradeComparison.stats?.liveOnly??0,   tradeComparison.stats?.replayOnly??0,  tradeComparison.stats?.matchPct],
+                    ].map(([lbl,ac,bc,matched,mism,ao,bo,pct]) => (
+                      <tr key={lbl}>
+                        <td style={{ fontWeight:700 }}>{lbl}</td>
+                        <td>{ac}</td><td>{bc}</td><td>{matched}</td>
+                        <td style={{ color: mism>0?'#f59e0b':undefined }}>{mism??'—'}</td>
+                        <td style={{ color: ao>0?'#6366f1':undefined }}>{ao}</td>
+                        <td style={{ color: bo>0?'#10b981':undefined }}>{bo}</td>
+                        <td style={{ fontWeight:700, color: pct==null?'var(--text-muted)':parseFloat(pct)>=99?'#22c55e':parseFloat(pct)>=90?'#f59e0b':'#ef4444' }}>
+                          {pct!=null?`${pct}%`:<span style={{ color:'var(--text-muted)',fontSize:10 }}>N/A</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* ── Divergence ───────────────────────────────────────────────── */}
+          {compareTab === 'divergence' && (
+            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
+              <span className="bt-section-title">Divergence Trace — chain: Tick → Candle → Signal → Trade</span>
+              {divergenceTrace.stages.length === 0
+                ? <p style={{ fontSize:12, color:'#22c55e', margin:0 }}>No divergence detected across all stages. Sessions appear identical.</p>
+                : <>
+                  {divergenceTrace.firstStage && (
+                    <div style={{ padding:'10px 14px', background:'rgba(245,158,11,0.1)', borderLeft:'3px solid #f59e0b', borderRadius:4, marginBottom:14, fontSize:12 }}>
+                      <b>First divergence: {divergenceTrace.firstStage.stage}</b> at{' '}
+                      <b>{(divergenceTrace.firstStage.time||'').slice(0,19)}</b> on{' '}
+                      <b>{divergenceTrace.firstStage.token}</b> — {divergenceTrace.firstStage.explanation}
+                    </div>
+                  )}
+                  <table className="bt-table" style={{ fontSize:12 }}>
+                    <thead><tr><th>#</th><th>Stage</th><th>First Divergence Time</th><th>Instrument</th><th>Type</th><th>Explanation</th></tr></thead>
+                    <tbody>
+                      {divergenceTrace.stages.map(s => (
+                        <tr key={s.stage}>
+                          <td>{s.seqNo}</td>
+                          <td style={{ fontWeight:700 }}>{s.stage}</td>
+                          <td style={{ fontFamily:'monospace', fontSize:11 }}>{(s.time||'').slice(0,19)}</td>
+                          <td>{s.token}</td>
+                          <td><Badge type={s.matchType} /></td>
+                          <td style={{ fontSize:11 }}>{s.explanation}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </>
+              }
+            </div>
+          )}
+
+          {/* ── Ticks ────────────────────────────────────────────────────── */}
+          {compareTab === 'ticks' && (
+            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
+              <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:10 }}>
+                <span className="bt-section-title" style={{ marginBottom:0 }}>Tick Comparison</span>
+                <span style={{ fontSize:11, color:'var(--text-muted)' }}>Matching: per-instrument, nearest timestamp ±{TICK_TOL_MS/1000}s tolerance</span>
+              </div>
+              {tickComparison.rows.length === 0
+                ? <p style={{ fontSize:12, color:'var(--text-muted)', margin:0 }}>No tick data stored. Ticks are captured automatically from the next session onwards (up to 10 000 per session).</p>
+                : <>
+                  <div style={{ overflowX:'auto', marginBottom:12 }}>
+                    <table className="bt-table" style={{ fontSize:11 }}>
+                      <thead><tr><th>Token</th><th>A Ticks</th><th>B Ticks</th><th>Matched</th><th>Price Mismatch</th><th>A-only</th><th>B-only</th><th>Match %</th></tr></thead>
+                      <tbody>
+                        {Object.values(tickComparison.stats).map(s => (
+                          <tr key={s.token}>
+                            <td style={{ fontFamily:'monospace' }}>{s.token}</td>
+                            <td>{s.aCount}</td><td>{s.bCount}</td><td>{s.matched}</td>
+                            <td style={{ color:s.priceMismatch>0?'#f59e0b':undefined }}>{s.priceMismatch}</td>
+                            <td style={{ color:s.aOnly>0?'#6366f1':undefined }}>{s.aOnly}</td>
+                            <td style={{ color:s.bOnly>0?'#10b981':undefined }}>{s.bOnly}</td>
+                            <td style={{ fontWeight:700 }}>{Math.max(s.aCount,s.bCount)>0?(s.matched/Math.max(s.aCount,s.bCount)*100).toFixed(1)+'%':'—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div style={{ overflowX:'auto', maxHeight:380, overflowY:'auto' }}>
+                    <table className="bt-table" style={{ fontSize:10 }}>
+                      <thead><tr><th>Match</th><th>Token</th><th>A Time</th><th>A LTP</th><th>B Time</th><th>B LTP</th><th>Δt ms</th><th>ΔLTP</th></tr></thead>
+                      <tbody>
+                        {tickComparison.rows.slice(0, 1000).map((r, i) => (
+                          <tr key={i} style={{ background:r.matchType==='PRICE_MISMATCH'?'rgba(245,158,11,0.08)':r.matchType!=='MATCHED'?'rgba(99,102,241,0.06)':undefined }}>
+                            <td><Badge type={r.matchType} label={r.matchType==='MATCHED'?'✓':r.matchType==='PRICE_MISMATCH'?'PRICE':r.matchType==='LIVE_ONLY'?'A-only':'B-only'} /></td>
+                            <td style={{ fontFamily:'monospace', fontSize:9 }}>{r.token}</td>
+                            <td style={{ fontFamily:'monospace', fontSize:9 }}>{r.a?new Date(r.a.timeMs).toISOString().slice(11,23):'—'}</td>
+                            <td>{r.a?.ltp!=null?n2c(r.a.ltp):'—'}</td>
+                            <td style={{ fontFamily:'monospace', fontSize:9 }}>{r.b?new Date(r.b.timeMs).toISOString().slice(11,23):'—'}</td>
+                            <td>{r.b?.ltp!=null?n2c(r.b.ltp):'—'}</td>
+                            <td style={{ color:Math.abs(r.timeDiffMs||0)>500?'#f59e0b':undefined }}>{r.timeDiffMs??'—'}</td>
+                            <td style={{ color:Math.abs(r.priceDiff||0)>OHLC_TOL?'#f59e0b':undefined }}>{r.priceDiff!=null?n2c(r.priceDiff):'—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {tickComparison.rows.length > 1000 && (
+                    <p style={{ fontSize:11, color:'var(--text-muted)', margin:'6px 0 0' }}>Showing first 1 000 of {tickComparison.rows.length} rows — download CSV for full data.</p>
+                  )}
+                </>
+              }
+            </div>
+          )}
+
+          {/* ── Candles ──────────────────────────────────────────────────── */}
+          {compareTab === 'candles' && (
+            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
+              <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:10 }}>
+                <span className="bt-section-title" style={{ marginBottom:0 }}>Candle Comparison — NIFTY OHLCV</span>
+                {candleComparison.stats && (
+                  <span style={{ fontSize:11, color:'var(--text-muted)' }}>
+                    {candleComparison.stats.total} candles · {candleComparison.stats.exact} exact · {candleComparison.stats.mismatch} OHLC mismatch · {candleComparison.stats.liveOnly} live-only · {candleComparison.stats.replayOnly} replay-only
+                  </span>
+                )}
+              </div>
+              <div style={{ overflowX:'auto', maxHeight:480, overflowY:'auto' }}>
+                <table className="bt-table" style={{ fontSize:10 }}>
+                  <thead>
+                    <tr><th>Match</th><th>Diverged</th><th>Time</th>
+                      <th style={{ color:'#6366f1' }}>AO</th><th style={{ color:'#6366f1' }}>AH</th><th style={{ color:'#6366f1' }}>AL</th><th style={{ color:'#6366f1' }}>AC</th><th style={{ color:'#6366f1' }}>AV</th>
+                      <th style={{ color:'#10b981' }}>BO</th><th style={{ color:'#10b981' }}>BH</th><th style={{ color:'#10b981' }}>BL</th><th style={{ color:'#10b981' }}>BC</th><th style={{ color:'#10b981' }}>BV</th>
+                      <th>ΔClose</th></tr>
+                  </thead>
+                  <tbody>
+                    {candleComparison.rows.map((r, i) => (
+                      <tr key={i} style={{ background:r.matchType==='OHLC_MISMATCH'?'rgba(245,158,11,0.1)':r.matchType!=='EXACT'?'rgba(99,102,241,0.06)':undefined }}>
+                        <td><Badge type={r.matchType} label={r.matchType==='EXACT'?'✓':r.matchType==='OHLC_MISMATCH'?'OHLC':r.matchType==='LIVE_ONLY'?'A-only':'B-only'} /></td>
+                        <td style={{ color:'#f59e0b', fontSize:9 }}>{r.divergedFields.join(',')}</td>
+                        <td style={{ fontFamily:'monospace', fontSize:9 }}>{(r.time||'').slice(11,16)}</td>
+                        <td>{r.a?.niftyOpen!=null?n2c(r.a.niftyOpen):'—'}</td>
+                        <td>{r.a?.niftyHigh!=null?n2c(r.a.niftyHigh):'—'}</td>
+                        <td>{r.a?.niftyLow!=null?n2c(r.a.niftyLow):'—'}</td>
+                        <td>{r.a?.niftyClose!=null?n2c(r.a.niftyClose):'—'}</td>
+                        <td style={{ fontSize:9 }}>{r.a?.niftyVolume??'—'}</td>
+                        <td>{r.b?.niftyOpen!=null?n2c(r.b.niftyOpen):'—'}</td>
+                        <td>{r.b?.niftyHigh!=null?n2c(r.b.niftyHigh):'—'}</td>
+                        <td>{r.b?.niftyLow!=null?n2c(r.b.niftyLow):'—'}</td>
+                        <td>{r.b?.niftyClose!=null?n2c(r.b.niftyClose):'—'}</td>
+                        <td style={{ fontSize:9 }}>{r.b?.niftyVolume??'—'}</td>
+                        <td style={{ color:r.a&&r.b&&Math.abs((r.b.niftyClose||0)-(r.a.niftyClose||0))>OHLC_TOL?'#f59e0b':undefined }}>
+                          {r.a&&r.b?n2c((r.b.niftyClose||0)-(r.a.niftyClose||0)):'—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* ── Signals ──────────────────────────────────────────────────── */}
+          {compareTab === 'signals' && (
+            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
+              <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:10 }}>
+                <span className="bt-section-title" style={{ marginBottom:0 }}>Signal Comparison — regime · bias · winner · action</span>
+                {signalComparison.stats && (
+                  <span style={{ fontSize:11, color:'var(--text-muted)' }}>
+                    {signalComparison.stats.total} evals · {signalComparison.stats.matched} matched · {signalComparison.stats.mismatch} mismatched
+                  </span>
+                )}
+              </div>
+              <div style={{ overflowX:'auto', maxHeight:480, overflowY:'auto' }}>
+                <table className="bt-table" style={{ fontSize:10 }}>
+                  <thead>
+                    <tr><th>Match</th><th>Diverged</th><th>Time</th>
+                      <th style={{ color:'#6366f1' }}>A Regime</th><th style={{ color:'#6366f1' }}>A Bias</th><th style={{ color:'#6366f1' }}>A Winner</th><th style={{ color:'#6366f1' }}>A Score</th><th style={{ color:'#6366f1' }}>A Action</th><th style={{ color:'#6366f1' }}>A State</th>
+                      <th style={{ color:'#10b981' }}>B Regime</th><th style={{ color:'#10b981' }}>B Bias</th><th style={{ color:'#10b981' }}>B Winner</th><th style={{ color:'#10b981' }}>B Score</th><th style={{ color:'#10b981' }}>B Action</th><th style={{ color:'#10b981' }}>B State</th>
+                      <th>ΔScore</th></tr>
+                  </thead>
+                  <tbody>
+                    {signalComparison.rows.map((r, i) => (
+                      <tr key={i} style={{ background:r.matchType==='SIGNAL_MISMATCH'?'rgba(245,158,11,0.1)':r.matchType!=='MATCHED'?'rgba(99,102,241,0.06)':undefined }}>
+                        <td><Badge type={r.matchType} label={r.matchType==='MATCHED'?'✓':r.matchType==='SIGNAL_MISMATCH'?'⚡':'—'} /></td>
+                        <td style={{ color:'#f59e0b', fontSize:9 }}>{r.divergedFields.join(',')}</td>
+                        <td style={{ fontFamily:'monospace', fontSize:9 }}>{(r.time||'').slice(11,16)}</td>
+                        <td>{r.a?.regime||'—'}</td>
+                        <td style={{ color:r.a?.confirmedBias==='BULLISH'?'#22c55e':r.a?.confirmedBias==='BEARISH'?'#ef4444':undefined }}>{r.a?.confirmedBias||'—'}</td>
+                        <td>{r.a?.winnerStrategy||'—'}</td>
+                        <td>{r.a?.winnerScore!=null?Number(r.a.winnerScore).toFixed(1):'—'}</td>
+                        <td style={{ color:r.a?.action==='ENTERED'?'#22c55e':r.a?.action?.includes('EXIT')||r.a?.action?.includes('CLOSE')?'#f97316':undefined }}>{r.a?.action||'—'}</td>
+                        <td>{r.a?.positionState||'—'}</td>
+                        <td>{r.b?.regime||'—'}</td>
+                        <td style={{ color:r.b?.confirmedBias==='BULLISH'?'#22c55e':r.b?.confirmedBias==='BEARISH'?'#ef4444':undefined }}>{r.b?.confirmedBias||'—'}</td>
+                        <td>{r.b?.winnerStrategy||'—'}</td>
+                        <td>{r.b?.winnerScore!=null?Number(r.b.winnerScore).toFixed(1):'—'}</td>
+                        <td style={{ color:r.b?.action==='ENTERED'?'#22c55e':r.b?.action?.includes('EXIT')||r.b?.action?.includes('CLOSE')?'#f97316':undefined }}>{r.b?.action||'—'}</td>
+                        <td>{r.b?.positionState||'—'}</td>
+                        <td style={{ color:r.a&&r.b&&Math.abs((r.b.winnerScore||0)-(r.a.winnerScore||0))>SCORE_TOL?'#f59e0b':undefined }}>
+                          {r.a&&r.b?n2c((r.b.winnerScore||0)-(r.a.winnerScore||0)):'—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* ── Trades ───────────────────────────────────────────────────── */}
+          {compareTab === 'trades' && (
+            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
+              <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:10 }}>
+                <span className="bt-section-title" style={{ marginBottom:0 }}>Trade Comparison</span>
+                {tradeComparison.stats && (
+                  <span style={{ fontSize:11, color:'var(--text-muted)' }}>
+                    {tradeComparison.stats.both} both · {tradeComparison.stats.liveOnly} live-only · {tradeComparison.stats.replayOnly} replay-only
+                  </span>
+                )}
+              </div>
+              {tradeComparison.rows.length === 0
+                ? <p style={{ fontSize:12, color:'var(--text-muted)', margin:0 }}>No trades in either session.</p>
+                : <div style={{ overflowX:'auto' }}>
                   <table className="bt-table" style={{ fontSize:11 }}>
-                    <thead><tr><th>Field</th><th style={{ color:'#6366f1' }}>A</th><th style={{ color:'#10b981' }}>B</th></tr></thead>
+                    <thead>
+                      <tr><th>Match</th>
+                        <th style={{ color:'#6366f1' }}>A Entry</th><th style={{ color:'#6366f1' }}>A Type</th><th style={{ color:'#6366f1' }}>A Symbol</th><th style={{ color:'#6366f1' }}>A EntPx</th><th style={{ color:'#6366f1' }}>A ExtPx</th><th style={{ color:'#6366f1' }}>A P&L</th><th style={{ color:'#6366f1' }}>A Exit</th><th style={{ color:'#6366f1' }}>A Bars</th>
+                        <th style={{ color:'#10b981' }}>B Entry</th><th style={{ color:'#10b981' }}>B Type</th><th style={{ color:'#10b981' }}>B Symbol</th><th style={{ color:'#10b981' }}>B EntPx</th><th style={{ color:'#10b981' }}>B ExtPx</th><th style={{ color:'#10b981' }}>B P&L</th><th style={{ color:'#10b981' }}>B Exit</th><th style={{ color:'#10b981' }}>B Bars</th>
+                        <th>ΔP&L</th></tr>
+                    </thead>
+                    <tbody>
+                      {tradeComparison.rows.map((r, i) => {
+                        const pnlDiff = r.matchType==='BOTH'&&r.a?.pnl!=null&&r.b?.pnl!=null?r.b.pnl-r.a.pnl:null;
+                        return (
+                          <tr key={i} style={{ background:r.matchType==='LIVE_ONLY'?'rgba(99,102,241,0.07)':r.matchType==='REPLAY_ONLY'?'rgba(16,185,129,0.07)':undefined }}>
+                            <td><Badge type={r.matchType} label={r.matchType==='BOTH'?'✓ BOTH':r.matchType==='LIVE_ONLY'?'A ONLY':'B ONLY'} /></td>
+                            <td style={{ fontFamily:'monospace', fontSize:10 }}>{(r.a?.entryTime||'').slice(11,16)||'—'}</td>
+                            <td>{r.a?.optionType||'—'}</td>
+                            <td style={{ fontSize:10 }}>{r.a?.tradingSymbol||'—'}</td>
+                            <td>{r.a?.entryPrice!=null?n2c(r.a.entryPrice):'—'}</td>
+                            <td>{r.a?.exitPrice!=null?n2c(r.a.exitPrice):'—'}</td>
+                            <td style={r.a?.pnl!=null?pnlStyle(r.a.pnl):{}}>{r.a?.pnl!=null?fmt2(r.a.pnl):'—'}</td>
+                            <td style={{ fontSize:10 }}>{r.a?.exitReason||'—'}</td>
+                            <td>{r.a?.barsInTrade??'—'}</td>
+                            <td style={{ fontFamily:'monospace', fontSize:10 }}>{(r.b?.entryTime||'').slice(11,16)||'—'}</td>
+                            <td>{r.b?.optionType||'—'}</td>
+                            <td style={{ fontSize:10 }}>{r.b?.tradingSymbol||'—'}</td>
+                            <td>{r.b?.entryPrice!=null?n2c(r.b.entryPrice):'—'}</td>
+                            <td>{r.b?.exitPrice!=null?n2c(r.b.exitPrice):'—'}</td>
+                            <td style={r.b?.pnl!=null?pnlStyle(r.b.pnl):{}}>{r.b?.pnl!=null?fmt2(r.b.pnl):'—'}</td>
+                            <td style={{ fontSize:10 }}>{r.b?.exitReason||'—'}</td>
+                            <td>{r.b?.barsInTrade??'—'}</td>
+                            <td style={pnlDiff!=null?pnlStyle(pnlDiff):{}}>{pnlDiff!=null?(pnlDiff>0?'+':'')+fmt2(pnlDiff):'—'}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              }
+            </div>
+          )}
+
+          {/* ── Config ───────────────────────────────────────────────────── */}
+          {compareTab === 'config' && (
+            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
+              <span className="bt-section-title">Config Differences {configDiff.length>0?`(${configDiff.length})`:''}</span>
+              {configDiff.length === 0
+                ? <p style={{ fontSize:12, color:'#22c55e', margin:0 }}>Configs are identical.</p>
+                : <div style={{ overflowX:'auto' }}>
+                  <table className="bt-table" style={{ fontSize:11 }}>
+                    <thead><tr><th>Field</th><th style={{ color:'#6366f1' }}>A — {labelA}</th><th style={{ color:'#10b981' }}>B — {labelB}</th></tr></thead>
                     <tbody>
                       {configDiff.map(({ key, valA, valB }) => (
                         <tr key={key} style={{ background:'rgba(245,158,11,0.08)' }}>
@@ -13677,70 +14155,7 @@ function SessionCompare() {
                     </tbody>
                   </table>
                 </div>
-            }
-          </div>
-
-          {/* Candle feed */}
-          {interleavedFeed.length > 0 && (
-            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
-              <span className="bt-section-title">Candle Feed — {interleavedFeed.filter(r=>r.diverged).length} diverged / {interleavedFeed.length} buckets</span>
-              <div style={{ overflowX:'auto', maxHeight:480, overflowY:'auto' }}>
-                <table className="bt-table" style={{ fontSize:10 }}>
-                  <thead><tr><th>Time</th><th>Src</th><th>Regime</th><th>ConfBias</th><th>Winner</th><th>Score</th><th>State</th><th>Action</th><th>rPnL</th></tr></thead>
-                  <tbody>
-                    {interleavedFeed.map(({ time, a, b, diverged }) => {
-                      const bg = diverged ? 'rgba(245,158,11,0.12)' : undefined;
-                      const mkRow = (evt, src, showTime) => !evt ? null : (
-                        <tr key={`${time}-${src}`} style={{ background:bg }}>
-                          <td style={{ fontSize:10 }}>{showTime?(time||'').slice(11,16):''}</td>
-                          <td><span style={{ color:src==='A'?'#6366f1':'#10b981', fontWeight:700 }}>{src}</span></td>
-                          <td>{evt.regime||'—'}</td>
-                          <td style={{ color:evt.confirmedBias==='BULLISH'?'#22c55e':evt.confirmedBias==='BEARISH'?'#ef4444':undefined }}>{evt.confirmedBias||'—'}</td>
-                          <td>{evt.winnerStrategy||'—'}</td>
-                          <td>{evt.winnerScore!=null?Number(evt.winnerScore).toFixed(1):'—'}</td>
-                          <td>{evt.positionState||'—'}</td>
-                          <td style={{ color:evt.action==='ENTERED'?'#22c55e':evt.action?.includes('EXIT')||evt.action?.includes('CLOSE')?'#f97316':undefined }}>{evt.action||'—'}</td>
-                          <td style={evt.realizedPnl!=null?pnlStyle(evt.realizedPnl):{}}>{evt.realizedPnl!=null?fmt2(evt.realizedPnl):'—'}</td>
-                        </tr>
-                      );
-                      return <>{mkRow(a,'A',true)}{mkRow(b,'B',!a)}</>;
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-
-          {/* Trade comparison */}
-          {tradeComparison.length > 0 && (
-            <div className="card bt-opts-card" style={{ marginBottom:16 }}>
-              <span className="bt-section-title">
-                Trades — {tradeComparison.filter(r=>r.type==='both').length} matched · {tradeComparison.filter(r=>r.type==='aOnly').length} A-only · {tradeComparison.filter(r=>r.type==='bOnly').length} B-only
-              </span>
-              <div style={{ overflowX:'auto' }}>
-                <table className="bt-table" style={{ fontSize:11 }}>
-                  <thead><tr><th>Match</th><th>Entry</th><th>Type</th><th>Symbol</th><th style={{ color:'#6366f1' }}>A P&L</th><th style={{ color:'#6366f1' }}>A Exit</th><th style={{ color:'#10b981' }}>B P&L</th><th style={{ color:'#10b981' }}>B Exit</th><th>Diff</th></tr></thead>
-                  <tbody>
-                    {tradeComparison.map((row, i) => {
-                      const t = row.a || row.b;
-                      const diff = row.type==='both'&&row.a?.pnl!=null&&row.b?.pnl!=null ? row.b.pnl-row.a.pnl : null;
-                      return (
-                        <tr key={i} style={{ background:row.type==='aOnly'?'rgba(99,102,241,0.08)':row.type==='bOnly'?'rgba(16,185,129,0.08)':undefined }}>
-                          <td style={{ fontWeight:700, color:row.type==='both'?undefined:row.type==='aOnly'?'#6366f1':'#10b981' }}>{row.type==='both'?'Both':row.type==='aOnly'?'A only':'B only'}</td>
-                          <td style={{ fontSize:10 }}>{(t?.entryTime||'').slice(11,16)}</td>
-                          <td style={{ color:t?.optionType==='CE'?'#22c55e':'#ef4444', fontWeight:700 }}>{t?.optionType}</td>
-                          <td style={{ fontSize:10 }}>{t?.tradingSymbol||'—'}</td>
-                          <td style={row.a?.pnl!=null?pnlStyle(row.a.pnl):{color:'var(--text-muted)'}}>{row.a?.pnl!=null?fmt2(row.a.pnl):'—'}</td>
-                          <td style={{ fontSize:10 }}>{row.a?.exitReason||'—'}</td>
-                          <td style={row.b?.pnl!=null?pnlStyle(row.b.pnl):{color:'var(--text-muted)'}}>{row.b?.pnl!=null?fmt2(row.b.pnl):'—'}</td>
-                          <td style={{ fontSize:10 }}>{row.b?.exitReason||'—'}</td>
-                          <td style={diff!=null?pnlStyle(diff):{}}>{diff!=null?(diff>0?'+':'')+fmt2(diff):'—'}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
+              }
             </div>
           )}
         </>
@@ -13748,3 +14163,4 @@ function SessionCompare() {
     </div>
   );
 }
+

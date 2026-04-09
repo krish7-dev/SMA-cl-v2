@@ -46,6 +46,10 @@ public class SessionResultRecord {
     @Column(name = "feed_json", columnDefinition = "TEXT")
     private String feedJson;
 
+    /** JSON array of raw tick events ({token, ltp, timeMs}) captured during the session. */
+    @Column(name = "ticks_json", columnDefinition = "TEXT")
+    private String ticksJson;
+
     /** Pre-computed summary stats: trades, realizedPnl, winRate, finalCapital. */
     @Column(name = "summary_json", columnDefinition = "TEXT")
     private String summaryJson;
