@@ -36,6 +36,10 @@ export async function fetchHealth(servicePrefix) {
   return request(`${servicePrefix}/actuator/health`);
 }
 
+export async function fetchInfo(servicePrefix) {
+  return request(`${servicePrefix}/actuator/info`);
+}
+
 export async function fetchAllHealthStatuses() {
   const services = [
     { name: 'Broker Engine',    prefix: BROKER,    port: 9003, swaggerPath: '/swagger-ui/index.html' },
@@ -46,12 +50,18 @@ export async function fetchAllHealthStatuses() {
 
   return Promise.all(
     services.map(async (svc) => {
-      try {
-        const data = await fetchHealth(svc.prefix);
-        return { ...svc, status: data?.status === 'UP' ? 'UP' : 'DEGRADED', detail: data };
-      } catch (e) {
-        return { ...svc, status: 'DOWN', error: e.message };
-      }
+      const [healthResult, infoResult] = await Promise.allSettled([
+        fetchHealth(svc.prefix),
+        fetchInfo(svc.prefix),
+      ]);
+      const health = healthResult.status === 'fulfilled' ? healthResult.value : null;
+      const info   = infoResult.status   === 'fulfilled' ? infoResult.value   : null;
+      const commitId  = info?.git?.commit?.id?.abbrev || null;
+      const buildTime = info?.build?.time       || null;
+      const status = health
+        ? (health.status === 'UP' ? 'UP' : 'DEGRADED')
+        : 'DOWN';
+      return { ...svc, status, detail: health, commitId, buildTime, error: healthResult.reason?.message };
     })
   );
 }

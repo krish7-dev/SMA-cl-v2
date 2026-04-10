@@ -28,7 +28,9 @@
       "Bash(cmd /c \"set | grep -i db\")",
       "Bash(cmd /c \"set DB_URL & set DB_USERNAME & set DB_PASSWORD & set ENCRYPTION_SECRET_KEY\")",
       "Read(//g/SMA-Data-Engine/src/main/java/com/sma/dataengine/model/request/**)",
-      "Bash(chmod +x g:/SMA-claude-v2/check-errors.sh)"
+      "Bash(chmod +x g:/SMA-claude-v2/check-errors.sh)",
+      "Bash(ls g:/SMA-claude-v2/SMA-Broker-Engine/target/*.jar)",
+      "Bash(ls g:/SMA-claude-v2/SMA-Data-Engine/target/*.jar)"
     ]
   }
 }

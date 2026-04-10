@@ -60,8 +60,11 @@ export default function Sidebar() {
         {health.map(svc => {
           const abbr = HEALTH_ABBR[svc.name]?.abbr || svc.name[0];
           const cls = svc.status === 'UP' ? 'shb-up' : svc.status === 'DOWN' ? 'shb-down' : svc.status === 'DEGRADED' ? 'shb-warn' : 'shb-unknown';
+          const tooltip = svc.commitId
+            ? `${svc.name}: ${svc.status || 'checking…'}\ncommit: ${svc.commitId}`
+            : `${svc.name}: ${svc.status || 'checking…'}`;
           return (
-            <div key={svc.name} className={`shb-item ${cls}`} title={`${svc.name}: ${svc.status || 'checking…'}`}>
+            <div key={svc.name} className={`shb-item ${cls}`} title={tooltip}>
               <span className={`shb-dot ${cls}`} />
               <span className="shb-label">{abbr}</span>
             </div>
@@ -75,6 +78,22 @@ export default function Sidebar() {
         ))}
         <span className={`env-badge ${ENV_CLASS}`}>{ENV_LABEL}</span>
       </div>
+      {/* Build timestamps */}
+      {health.some(s => s.buildTime) && (
+        <div className="sidebar-build-info">
+          {health.map(svc => {
+            const abbr = HEALTH_ABBR[svc.name]?.abbr || svc.name[0];
+            const ts = svc.buildTime
+              ? new Date(svc.buildTime).toLocaleString('en-IN', { dateStyle: 'short', timeStyle: 'short' })
+              : '—';
+            return (
+              <span key={svc.name} className="build-commit" title={`${svc.name} built at ${svc.buildTime || 'unknown'}`}>
+                {abbr}:{ts}
+              </span>
+            );
+          })}
+        </div>
+      )}
 
       {/* Session status pill */}
       <div className="sidebar-session">
