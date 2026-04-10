@@ -11866,12 +11866,13 @@ function OptionsReplayTest() {
 
 function TickReplayTest() {
   const ls = (key, def) => { try { const s = localStorage.getItem(key); if (!s) return def; const v = JSON.parse(s); return (Array.isArray(def) && !Array.isArray(v)) ? def : v; } catch { return def; } };
+  const { session } = useSession();
 
   const [sessions,        setSessions]        = useState([]);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsError,   setSessionsError]   = useState('');
   const [sessionId,       setSessionId]       = useState(() => ls('sma_tick_session_id', ''));
-  const [userId,          setUserId]          = useState(() => ls('sma_tick_user_id',    ''));
+  const userId = session.userId;
   const [brokerName,      setBrokerName]      = useState(() => ls('sma_tick_broker',     'kite'));
   const [warmupDays,      setWarmupDays]      = useState(() => ls('sma_tick_warmup_days','5'));
   const [niftyToken,    setNiftyToken]    = useState(() => ls('sma_tick_nifty_token',    ''));
@@ -11915,7 +11916,7 @@ function TickReplayTest() {
   function updateCompressionEntry(key, val) { setCompressionEntry(p=> ({ ...p, [key]: val })); }
 
   useEffect(() => { try { localStorage.setItem('sma_tick_session_id',        JSON.stringify(sessionId));          } catch {} }, [sessionId]);
-  useEffect(() => { try { localStorage.setItem('sma_tick_user_id',           JSON.stringify(userId));             } catch {} }, [userId]);
+
   useEffect(() => { try { localStorage.setItem('sma_tick_broker',            JSON.stringify(brokerName));         } catch {} }, [brokerName]);
   useEffect(() => { try { localStorage.setItem('sma_tick_warmup_days',       JSON.stringify(warmupDays));         } catch {} }, [warmupDays]);
   useEffect(() => { try { localStorage.setItem('sma_tick_nifty_token',       JSON.stringify(niftyToken));         } catch {} }, [niftyToken]);
@@ -12834,8 +12835,8 @@ function TickReplayTest() {
             setOptsRisk(DEFAULT_OPTS_RISK); setRangeQuality(DEFAULT_RANGE_QUALITY); setTradeQuality(DEFAULT_TRADE_QUALITY);
             setTrendEntry(DEFAULT_TREND_ENTRY); setCompressionEntry(DEFAULT_COMPRESSION_ENTRY);
             setHoldConfig(DEFAULT_HOLD); setExitConfig(DEFAULT_EXIT_CONFIG); setPenaltyConfig(DEFAULT_PENALTY_CONFIG);
-            setInterval('MINUTE_5'); setFromDate(''); setToDate(''); setSpeed('0'); setTradingHoursEnabled(true); setCloseoutMins('15'); setWarmupDays('5'); setUserId(''); setBrokerName('kite'); setQuantity('0'); setCapital('100000');
-            ['sma_tick_session_id','sma_tick_user_id','sma_tick_broker','sma_tick_warmup_days','sma_tick_nifty_token','sma_tick_nifty_symbol','sma_tick_nifty_exchange','sma_tick_ce_pool','sma_tick_pe_pool','sma_tick_interval','sma_tick_from','sma_tick_to','sma_tick_speed','sma_tick_trading_hours_on','sma_tick_closeout_mins','sma_tick_qty','sma_tick_capital','sma_tick_strategies','sma_tick_decision','sma_tick_selection','sma_tick_switch','sma_tick_regime_cfg','sma_tick_chop_rules','sma_tick_trading_rules','sma_tick_regime_rules','sma_tick_regime_strat_rules','sma_tick_risk','sma_tick_range_quality','sma_tick_trade_quality','sma_tick_trend_entry','sma_tick_compression_entry','sma_tick_hold_config','sma_tick_exit_config','sma_tick_penalty_config'].forEach(k => localStorage.removeItem(k));
+            setInterval('MINUTE_5'); setFromDate(''); setToDate(''); setSpeed('0'); setTradingHoursEnabled(true); setCloseoutMins('15'); setWarmupDays('5'); setBrokerName('kite'); setQuantity('0'); setCapital('100000');
+            ['sma_tick_session_id','sma_tick_broker','sma_tick_warmup_days','sma_tick_nifty_token','sma_tick_nifty_symbol','sma_tick_nifty_exchange','sma_tick_ce_pool','sma_tick_pe_pool','sma_tick_interval','sma_tick_from','sma_tick_to','sma_tick_speed','sma_tick_trading_hours_on','sma_tick_closeout_mins','sma_tick_qty','sma_tick_capital','sma_tick_strategies','sma_tick_decision','sma_tick_selection','sma_tick_switch','sma_tick_regime_cfg','sma_tick_chop_rules','sma_tick_trading_rules','sma_tick_regime_rules','sma_tick_regime_strat_rules','sma_tick_risk','sma_tick_range_quality','sma_tick_trade_quality','sma_tick_trend_entry','sma_tick_compression_entry','sma_tick_hold_config','sma_tick_exit_config','sma_tick_penalty_config'].forEach(k => localStorage.removeItem(k));
           }}>Reset</button>
           {status==='completed' && <span className="badge badge-success">Completed</span>}
           {status==='error'     && <span className="badge badge-danger">Error</span>}
@@ -12955,7 +12956,7 @@ function TickReplayTest() {
             <div className="form-group"><label>Interval</label><select value={interval} onChange={e => setInterval(e.target.value)} disabled={isRunning}>{OPT_INTERVALS.map(([v,l]) => <option key={v} value={v}>{l}</option>)}</select></div>
             <div className="form-group"><label title="0 = max speed, 1 = real-time, 2 = 2× faster than real time">Speed Multiplier</label><input type="number" min="0" step="0.1" value={speed} onChange={e => setSpeed(e.target.value)} disabled={isRunning} /></div>
             <div className="form-group"><label title="Days of NIFTY candles to load before the session — primes indicators and regime (0 = cold start)">Warmup Days</label><input type="number" min="0" max="30" value={warmupDays} onChange={e => setWarmupDays(e.target.value)} disabled={isRunning} /></div>
-            <div className="form-group"><label title="User ID for warmup candle fetch (auto-resolved if blank)">User ID (warmup)</label><input type="text" value={userId} onChange={e => setUserId(e.target.value)} disabled={isRunning} placeholder="e.g. user1" /></div>
+
             <div className="form-group"><label title="Broker name for warmup candle fetch">Broker (warmup)</label><select value={brokerName} onChange={e => setBrokerName(e.target.value)} disabled={isRunning}><option value="kite">Kite</option><option value="">Auto</option></select></div>
             <div className="form-group" style={{ gridColumn: '1 / -1' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
