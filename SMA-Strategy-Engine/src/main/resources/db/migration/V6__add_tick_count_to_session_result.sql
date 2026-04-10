@@ -1,0 +1,1 @@
+-- no-op: tick_count is derived from ticks_json via Hibernate @Formula

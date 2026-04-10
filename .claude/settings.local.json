@@ -10,7 +10,24 @@
       "Bash(xargs ls:*)",
       "Bash(xargs grep:*)",
       "Read(//g//**)",
-      "Bash(python _replace_session_compare.py)"
+      "Bash(python _replace_session_compare.py)",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.206.197 \"tail -100 ~/logs/strategy.log\")",
+      "Bash(ssh -i G:/AWS/sma-key.pem -o StrictHostKeyChecking=no -o ConnectTimeout=15 ubuntu@16.16.119.222 'for svc in broker data execution strategy; do echo \"=== $svc ===\"; grep -i '\\\\''error\\\\|exception\\\\|WARN'\\\\'' ~/logs/$svc.log 2>/dev/null | tail -20; done')",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"curl -s http://169.254.169.254/latest/meta-data/instance-type\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"curl -s http://169.254.169.254/latest/meta-data/instance-type 2>&1; echo '---'; free -h; echo '---'; df -h /\")",
+      "Bash(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')",
+      "Bash(ssh -i G:/AWS/sma-key.pem -o StrictHostKeyChecking=no ubuntu@16.16.119.222 'TOKEN=__CMDSUB_OUTPUT__ && curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/instance-type')",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null; nproc; grep MemTotal /proc/meminfo\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"grep -E 'step|jump|leap|adjust' /var/log/syslog 2>/dev/null | grep '2026-04-10' | head -30; echo '---chrony---'; grep -E 'step|jump|offset' /var/log/chrony/tracking.log 2>/dev/null | tail -20; echo '---timedatectl---'; timedatectl show\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"journalctl -u chrony --since '2026-04-10 07:00:00' --until '2026-04-10 07:35:00' 2>/dev/null | head -40; echo '---'; journalctl -u systemd-timesyncd --since '2026-04-10 07:00:00' --until '2026-04-10 07:35:00' 2>/dev/null | head -40\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"journalctl -b -1 --since '2026-04-10 07:20:00' --until '2026-04-10 07:32:00' 2>/dev/null | grep -E 'OOM|oom|kill|reboot|shutdown|panic|error|fail|kernel' | head -40\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"journalctl -b -1 --since '2026-04-10 07:28:00' --until '2026-04-10 07:32:00' 2>/dev/null | grep -E 'killed|Killed|oom_kill|victim|selected' | head -20\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"ps aux | grep java | grep -v grep\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"cat ~/restart.sh | grep 'java -jar'\")",
+      "Bash(cmd /c \"echo %DB_URL%\")",
+      "Bash(cmd /c \"set | grep -i db\")",
+      "Bash(cmd /c \"set DB_URL & set DB_USERNAME & set DB_PASSWORD & set ENCRYPTION_SECRET_KEY\")",
+      "Read(//g/SMA-Data-Engine/src/main/java/com/sma/dataengine/model/request/**)"
     ]
   }
 }
