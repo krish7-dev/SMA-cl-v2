@@ -36,28 +36,28 @@ export async function fetchHealth(servicePrefix) {
   return request(`${servicePrefix}/actuator/health`);
 }
 
-export async function fetchInfo(servicePrefix) {
-  return request(`${servicePrefix}/actuator/info`);
+export async function fetchInfo(servicePrefix, versionPath) {
+  return request(`${servicePrefix}${versionPath}`);
 }
 
 export async function fetchAllHealthStatuses() {
   const services = [
-    { name: 'Broker Engine',    prefix: BROKER,    port: 9003, swaggerPath: '/swagger-ui/index.html' },
-    { name: 'Execution Engine', prefix: EXECUTION,  port: 9004, swaggerPath: '/swagger-ui/index.html' },
-    { name: 'Data Engine',      prefix: DATA,       port: 9005, swaggerPath: '/swagger-ui/index.html' },
-    { name: 'Strategy Engine',  prefix: STRATEGY,   port: 9006, swaggerPath: '/swagger-ui/index.html' },
+    { name: 'Broker Engine',    prefix: BROKER,    versionPath: '/api/v1/broker/version' },
+    { name: 'Execution Engine', prefix: EXECUTION,  versionPath: '/api/v1/execution/version' },
+    { name: 'Data Engine',      prefix: DATA,       versionPath: '/api/v1/data/version' },
+    { name: 'Strategy Engine',  prefix: STRATEGY,   versionPath: '/api/v1/strategy/version' },
   ];
 
   return Promise.all(
     services.map(async (svc) => {
       const [healthResult, infoResult] = await Promise.allSettled([
         fetchHealth(svc.prefix),
-        fetchInfo(svc.prefix),
+        fetchInfo(svc.prefix, svc.versionPath),
       ]);
       const health = healthResult.status === 'fulfilled' ? healthResult.value : null;
       const info   = infoResult.status   === 'fulfilled' ? infoResult.value   : null;
-      const commitId  = info?.git?.commit?.id?.abbrev || null;
-      const buildTime = info?.build?.time       || null;
+      const commitId  = null;
+      const buildTime = info?.buildTime || null;
       const status = health
         ? (health.status === 'UP' ? 'UP' : 'DEGRADED')
         : 'DOWN';

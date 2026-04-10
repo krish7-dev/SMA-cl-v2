@@ -40,12 +40,15 @@ management:
   endpoint:
     health:
       show-details: when-authorized
+    info:
+      enabled: true
   info:
     build:
       enabled: true
     git:
+      enabled: false
+    java:
       enabled: true
-      mode: simple
 
 # CORS — comma-separated list of allowed frontend origins.
 cors:
