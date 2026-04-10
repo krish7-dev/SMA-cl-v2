@@ -5,6 +5,7 @@ import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
+import org.hibernate.annotations.Formula;
 
 import java.time.Instant;
 import java.time.LocalDate;
@@ -53,6 +54,9 @@ public class SessionResultRecord {
     /** Pre-computed summary stats: trades, realizedPnl, winRate, finalCapital. */
     @Column(name = "summary_json", columnDefinition = "TEXT")
     private String summaryJson;
+
+    @Formula("jsonb_array_length(ticks_json::jsonb)")
+    private Integer tickCount;
 
     @Column(name = "saved_at", nullable = false)
     private Instant savedAt;

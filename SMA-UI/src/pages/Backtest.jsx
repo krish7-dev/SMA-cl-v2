@@ -10,6 +10,7 @@ import {
   listTickSessions, startTickReplayEval, streamTickReplayEval, stopTickReplayEval,
   startOptionsLiveEval, streamOptionsLiveEval, stopOptionsLiveEval, getActiveOptionsLiveSession,
   saveSessionResult, listSessionResults, getSessionResult, deleteSessionResult,
+  querySessionTicks,
 } from '../services/api';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { useSession } from '../context/SessionContext';
@@ -1260,7 +1261,9 @@ function OptionsLiveTest() {
   const lastRunPcRef  = useRef(null);
   const lastPayloadRef = useRef(null);
   // Accumulates raw tick events for post-session comparison. Capped at 10 000 to limit payload size.
-  const ticksRef = useRef([]);
+  const ticksRef        = useRef([]);
+  const sessionStartRef = useRef(null);
+  const lastTickTimeRef = useRef(null); // ms timestamp of last received tick, uncapped
 
   // ── Save to Compare state
   const [showSavePanel, setShowSavePanel] = useState(false);
@@ -1568,6 +1571,8 @@ function OptionsLiveTest() {
     };
     lastPayloadRef.current = payload;
     ticksRef.current = [];
+    sessionStartRef.current = new Date().toISOString();
+    lastTickTimeRef.current = null;
 
     try {
       // Step 1: start session
@@ -1611,7 +1616,7 @@ function OptionsLiveTest() {
             else if (evtName === 'candle') setFeed(prev => [...prev.slice(-499), parsed]);
             else if (evtName === 'tick') {
               setLiveTicks(prev => ({ ...prev, [parsed.token]: parsed }));
-              if (ticksRef.current.length < 10000) ticksRef.current.push(parsed);
+              if (parsed.timeMs) lastTickTimeRef.current = parsed.timeMs;
             }
           } catch {}
         }
@@ -1690,12 +1695,15 @@ function OptionsLiveTest() {
         config:      lastPayloadRef.current,
         closedTrades: trades,
         feed,
-        ticks: ticksRef.current,
         summary: {
-          trades:       trades.length,
-          realizedPnl:  lastEvt?.realizedPnl  ?? 0,
-          winRate:      trades.length > 0 ? wins / trades.length : 0,
-          finalCapital: (lastEvt?.capital ?? parseFloat(capital)) || 100000,
+          trades:              trades.length,
+          realizedPnl:         lastEvt?.realizedPnl  ?? 0,
+          winRate:             trades.length > 0 ? wins / trades.length : 0,
+          finalCapital:        (lastEvt?.capital ?? parseFloat(capital)) || 100000,
+          sessionStart:        sessionStartRef.current || undefined,
+          sessionEnd:          new Date().toISOString(),
+          lastTickTime:        lastTickTimeRef.current || undefined,
+          dataEngineSessionId: sessionIdRef.current || undefined,
         },
       });
       setSaveStatus('saved');
@@ -12464,12 +12472,16 @@ function TickReplayTest() {
         config:      lastPayloadRef.current,
         closedTrades: trades,
         feed,
-        ticks: ticksRef.current,
         summary: {
           trades:       trades.length,
           realizedPnl:  (lastEvt?.realizedPnl ?? summary?.realizedPnl ?? 0),
           winRate:      trades.length > 0 ? wins / trades.length : 0,
-          finalCapital: (lastEvt?.capital ?? summary?.finalCapital ?? parseFloat(capital) ?? 0) || 100000,
+          finalCapital:      (lastEvt?.capital ?? summary?.finalCapital ?? parseFloat(capital) ?? 0) || 100000,
+          fromDate:          fromDate || undefined,
+          toDate:            toDate   || undefined,
+          replayFirstTick:     selectedSession?.firstTick  || undefined,
+          replayLastTick:      selectedSession?.lastTick   || undefined,
+          dataEngineSessionId: selectedSession?.sessionId  || undefined,
         },
       });
       setSaveStatus('saved');
@@ -12569,7 +12581,6 @@ function TickReplayTest() {
             if      (evtName === 'init')    setInitInfo(parsed);
             else if (evtName === 'tick') {
               setLiveTicks(prev => ({ ...prev, [parsed.token]: parsed }));
-              if (ticksRef.current.length < 10000) ticksRef.current.push(parsed);
             }
             else if (evtName === 'candle')  setFeed(prev => [...prev.slice(-499), parsed]);
             else if (evtName === 'summary') setSummary(parsed);
@@ -13391,6 +13402,9 @@ function SessionCompare() {
   const [comparing,    setComparing]    = useState(false);
   const [compareErr,   setCompareErr]   = useState('');
   const [deleting,     setDeleting]     = useState(null);
+  const [ticksA,       setTicksA]       = useState([]);
+  const [ticksB,       setTicksB]       = useState([]);
+  const [ticksLoading, setTicksLoading] = useState(false);
   const [compareTab,   setCompareTab]   = useState('summary');
 
   // ── Session management ────────────────────────────────────────────────────
@@ -13406,10 +13420,30 @@ function SessionCompare() {
   async function handleCompare() {
     if (!selA || !selB) return;
     setComparing(true); setCompareErr(''); setResultA(null); setResultB(null);
+    setTicksA([]); setTicksB([]);
     try {
       const [rA, rB] = await Promise.all([getSessionResult(selA), getSessionResult(selB)]);
-      setResultA(rA?.data ?? null);
-      setResultB(rB?.data ?? null);
+      const dA = rA?.data ?? null;
+      const dB = rB?.data ?? null;
+      setResultA(dA);
+      setResultB(dB);
+
+      // Fetch ticks from Data Engine using stored dataEngineSessionId
+      const smA = (() => { try { return dA?.summaryJson ? JSON.parse(dA.summaryJson) : null; } catch { return null; } })();
+      const smB = (() => { try { return dB?.summaryJson ? JSON.parse(dB.summaryJson) : null; } catch { return null; } })();
+      const sidA = smA?.dataEngineSessionId;
+      const sidB = smB?.dataEngineSessionId;
+      if (sidA || sidB) {
+        setTicksLoading(true);
+        const [tA, tB] = await Promise.all([
+          sidA ? querySessionTicks(sidA, null).then(r => r?.data ?? []).catch(() => []) : Promise.resolve([]),
+          sidB ? querySessionTicks(sidB, null).then(r => r?.data ?? []).catch(() => []) : Promise.resolve([]),
+        ]);
+        // Normalise to { token, ltp, timeMs } format the comparison logic expects
+        setTicksA(tA.map(t => ({ token: String(t.instrumentToken), ltp: t.ltp, timeMs: t.tickTimeMs })));
+        setTicksB(tB.map(t => ({ token: String(t.instrumentToken), ltp: t.ltp, timeMs: t.tickTimeMs })));
+        setTicksLoading(false);
+      }
     } catch (e) { setCompareErr(e.message); }
     finally { setComparing(false); }
   }
@@ -13430,13 +13464,13 @@ function SessionCompare() {
   // ── Parse stored JSON blobs ───────────────────────────────────────────────
   function parseFeed(r)    { try { return r?.feedJson         ? JSON.parse(r.feedJson)         : []; } catch { return []; } }
   function parseTrades(r)  { try { return r?.closedTradesJson ? JSON.parse(r.closedTradesJson) : []; } catch { return []; } }
-  function parseTicks(r)   { try { return r?.ticksJson        ? JSON.parse(r.ticksJson)        : []; } catch { return []; } }
+  function parseTicks(r)   { return []; } // ticks now fetched from Data Engine — see handleCompare
   function parseSummary(r) { try { return r?.summaryJson      ? JSON.parse(r.summaryJson)      : null; } catch { return null; } }
   function parseConfig(r)  { try { return r?.configJson       ? JSON.parse(r.configJson)       : null; } catch { return null; } }
 
   const feedA   = parseFeed(resultA),   feedB   = parseFeed(resultB);
   const tradesA = parseTrades(resultA), tradesB = parseTrades(resultB);
-  const ticksA  = parseTicks(resultA),  ticksB  = parseTicks(resultB);
+  // ticksA / ticksB are now state, fetched in handleCompare from Data Engine
   const sumA    = parseSummary(resultA),sumB    = parseSummary(resultB);
   const cfgA    = parseConfig(resultA), cfgB    = parseConfig(resultB);
 
@@ -13798,27 +13832,94 @@ function SessionCompare() {
         {sessions.length > 0 && (
           <div style={{ overflowX:'auto' }}>
             <table className="bt-table" style={{ fontSize:11 }}>
-              <thead><tr><th>Date</th><th>Type</th><th>Label</th><th>User</th><th>Trades</th><th>P&L</th><th>Win%</th><th>Capital</th><th>A</th><th>B</th><th></th></tr></thead>
+              <thead><tr><th>Saved</th><th>Time Range</th><th>Type</th><th>Label</th><th>User</th><th>Ticks</th><th>Trades</th><th>P&L</th><th>Win%</th><th>Capital</th><th>A</th><th>B</th><th></th></tr></thead>
               <tbody>
-                {sessions.map(s => {
-                  const sm = (() => { try { return s.summaryJson ? JSON.parse(s.summaryJson) : null; } catch { return null; } })();
-                  const isA = selA === s.sessionId, isB = selB === s.sessionId;
-                  return (
-                    <tr key={s.sessionId} style={{ background: isA?'rgba(99,102,241,0.1)':isB?'rgba(16,185,129,0.1)':undefined }}>
-                      <td>{s.sessionDate}</td>
-                      <td><span style={{ color:s.type==='LIVE'?'#22c55e':'#6366f1', fontWeight:700 }}>{s.type==='LIVE'?'LIVE':'TICK'}</span></td>
-                      <td style={{ maxWidth:140, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{s.label||'—'}</td>
-                      <td>{s.userId||'—'}</td>
-                      <td>{sm?.trades??'—'}</td>
-                      <td style={sm?.realizedPnl!=null?pnlStyle(sm.realizedPnl):{}}>{sm?.realizedPnl!=null?fmt2(sm.realizedPnl):'—'}</td>
-                      <td>{sm?.winRate!=null?`${(sm.winRate*100).toFixed(1)}%`:'—'}</td>
-                      <td>{sm?.finalCapital!=null?fmt2(sm.finalCapital):'—'}</td>
-                      <td><button type="button" className={`btn-xs ${isA?'btn-primary':'btn-secondary'}`} onClick={() => setSelA(isA?null:s.sessionId)}>{isA?'A ✓':'A'}</button></td>
-                      <td><button type="button" className={`btn-xs ${isB?'btn-primary':'btn-secondary'}`} style={isB?{background:'#10b981',borderColor:'#10b981'}:{}} onClick={() => setSelB(isB?null:s.sessionId)}>{isB?'B ✓':'B'}</button></td>
-                      <td><button type="button" className="btn-xs btn-danger" disabled={deleting===s.sessionId} onClick={() => handleDelete(s.sessionId)}>✕</button></td>
-                    </tr>
-                  );
-                })}
+                {(() => {
+                  // ── Pair matching ──────────────────────────────────────────
+                  // Kite tick timestamps have no tz info but are IST (UTC+5:30)
+                  const toUtcMs = iso => {
+                    if (!iso) return null;
+                    if (iso.endsWith('Z') || /[+-]\d\d:\d\d$/.test(iso)) return new Date(iso).getTime();
+                    return new Date(iso + '+05:30').getTime();
+                  };
+                  const PAIR_THRESHOLD = 5 * 60 * 1000; // 5 min (tight when using lastTickTime)
+                  const PAIR_COLORS = ['#f59e0b','#06b6d4','#a78bfa','#f472b6','#34d399','#fb923c'];
+                  const pairMap   = new Map(); // sessionId → { partnerId, colorIdx }
+                  const liveSess  = sessions.filter(s => s.type === 'LIVE');
+                  const tickSess  = sessions.filter(s => s.type === 'TICK_REPLAY');
+                  const paired    = new Set();
+                  let   colorIdx  = 0;
+                  for (const live of liveSess) {
+                    const lsm = (() => { try { return live.summaryJson ? JSON.parse(live.summaryJson) : null; } catch { return null; } })();
+                    // Prefer lastTickTime (ms, independent of save delay) over savedAt
+                    const liveEndMs = lsm?.lastTickTime
+                      ? lsm.lastTickTime
+                      : new Date(live.savedAt).getTime();
+                    let best = null, bestDiff = Infinity;
+                    for (const tick of tickSess) {
+                      if (tick.userId !== live.userId || tick.sessionDate !== live.sessionDate) continue;
+                      if (paired.has(tick.sessionId)) continue;
+                      const tsm = (() => { try { return tick.summaryJson ? JSON.parse(tick.summaryJson) : null; } catch { return null; } })();
+                      const replayEndMs = toUtcMs(tsm?.replayLastTick);
+                      if (!replayEndMs) continue;
+                      const diff = Math.abs(liveEndMs - replayEndMs);
+                      if (diff < PAIR_THRESHOLD && diff < bestDiff) { bestDiff = diff; best = tick; }
+                    }
+                    if (best) {
+                      const ci = colorIdx++ % PAIR_COLORS.length;
+                      pairMap.set(live.sessionId, { partnerId: best.sessionId, colorIdx: ci });
+                      pairMap.set(best.sessionId, { partnerId: live.sessionId, colorIdx: ci });
+                      paired.add(best.sessionId);
+                    }
+                  }
+                  // ──────────────────────────────────────────────────────────
+                  const rows = [];
+                  let lastDate = null;
+                  sessions.forEach(s => {
+                    if (s.sessionDate !== lastDate) {
+                      lastDate = s.sessionDate;
+                      rows.push(
+                        <tr key={`hdr-${s.sessionDate}`}>
+                          <td colSpan={13} style={{ background:'var(--bg-secondary,#1e1e2e)', color:'var(--text-muted)', fontWeight:700, fontSize:10, letterSpacing:'0.05em', padding:'4px 8px', borderTop:'1px solid var(--border-color,#333)' }}>
+                            {s.sessionDate}
+                          </td>
+                        </tr>
+                      );
+                    }
+                    const sm   = (() => { try { return s.summaryJson ? JSON.parse(s.summaryJson) : null; } catch { return null; } })();
+                    const pair = pairMap.get(s.sessionId);
+                    const isA  = selA === s.sessionId, isB = selB === s.sessionId;
+                    rows.push(
+                      <tr key={s.sessionId} style={{ background: isA?'rgba(99,102,241,0.1)':isB?'rgba(16,185,129,0.1)':undefined }}>
+                        <td style={{ whiteSpace:'nowrap', color:'var(--text-muted)' }}>
+                          {s.savedAt ? new Date(s.savedAt).toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' }) : '—'}
+                        </td>
+                        <td style={{ whiteSpace:'nowrap', color:'var(--text-muted)' }}>
+                          {s.type === 'TICK_REPLAY' && sm?.replayFirstTick && sm?.replayLastTick
+                            ? `${sm.replayFirstTick.slice(11,16)} → ${sm.replayLastTick.slice(11,16)}`
+                            : s.type === 'LIVE' && sm?.sessionStart && sm?.sessionEnd
+                            ? `${sm.sessionStart.slice(11,16)} → ${sm.sessionEnd.slice(11,16)}`
+                            : '—'}
+                        </td>
+                        <td style={{ whiteSpace:'nowrap' }}>
+                          {pair && <span title={`Paired with ${pair.partnerId}`} style={{ display:'inline-block', width:8, height:8, borderRadius:'50%', background:PAIR_COLORS[pair.colorIdx], marginRight:5, verticalAlign:'middle' }} />}
+                          <span style={{ color:s.type==='LIVE'?'#22c55e':'#6366f1', fontWeight:700 }}>{s.type==='LIVE'?'LIVE':'TICK'}</span>
+                        </td>
+                        <td style={{ maxWidth:140, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{s.label||'—'}</td>
+                        <td>{s.userId||'—'}</td>
+                        <td>{s.tickCount!=null?s.tickCount.toLocaleString():'—'}</td>
+                        <td>{sm?.trades??'—'}</td>
+                        <td style={sm?.realizedPnl!=null?pnlStyle(sm.realizedPnl):{}}>{sm?.realizedPnl!=null?fmt2(sm.realizedPnl):'—'}</td>
+                        <td>{sm?.winRate!=null?`${(sm.winRate*100).toFixed(1)}%`:'—'}</td>
+                        <td>{sm?.finalCapital!=null?fmt2(sm.finalCapital):'—'}</td>
+                        <td><button type="button" className={`btn-xs ${isA?'btn-primary':'btn-secondary'}`} onClick={() => setSelA(isA?null:s.sessionId)}>{isA?'A ✓':'A'}</button></td>
+                        <td><button type="button" className={`btn-xs ${isB?'btn-primary':'btn-secondary'}`} style={isB?{background:'#10b981',borderColor:'#10b981'}:{}} onClick={() => setSelB(isB?null:s.sessionId)}>{isB?'B ✓':'B'}</button></td>
+                        <td><button type="button" className="btn-xs btn-danger" disabled={deleting===s.sessionId} onClick={() => handleDelete(s.sessionId)}>✕</button></td>
+                      </tr>
+                    );
+                  });
+                  return rows;
+                })()}
               </tbody>
             </table>
           </div>
@@ -13940,8 +14041,10 @@ function SessionCompare() {
                 <span className="bt-section-title" style={{ marginBottom:0 }}>Tick Comparison</span>
                 <span style={{ fontSize:11, color:'var(--text-muted)' }}>Matching: per-instrument, nearest timestamp ±{TICK_TOL_MS/1000}s tolerance</span>
               </div>
-              {tickComparison.rows.length === 0
-                ? <p style={{ fontSize:12, color:'var(--text-muted)', margin:0 }}>No tick data stored. Ticks are captured automatically from the next session onwards (up to 10 000 per session).</p>
+              {ticksLoading
+                ? <p style={{ fontSize:12, color:'var(--text-muted)', margin:0 }}>Loading ticks from Data Engine…</p>
+                : tickComparison.rows.length === 0
+                ? <p style={{ fontSize:12, color:'var(--text-muted)', margin:0 }}>No tick data available. Sessions must have a dataEngineSessionId saved to enable tick comparison.</p>
                 : <>
                   <div style={{ overflowX:'auto', marginBottom:12 }}>
                     <table className="bt-table" style={{ fontSize:11 }}>
@@ -13987,7 +14090,7 @@ function SessionCompare() {
             </div>
           )}
 
-          {/* ── Candles ──────────────────────────────────────────────────── */}
+          {/* ── Candles ───────────────────────────────────────────────────── */}
           {compareTab === 'candles' && (
             <div className="card bt-opts-card" style={{ marginBottom:16 }}>
               <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:10 }}>

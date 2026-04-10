@@ -345,6 +345,17 @@ export async function listTickSessions() {
 }
 
 /**
+ * Fetches raw ticks for a session + token list from the Data Engine.
+ * Returns ApiResponse<List<TickEntryDto>> — each entry: { instrumentToken, ltp, volume, tickTimeMs }
+ */
+export async function querySessionTicks(sessionId, tokens) {
+  return request(`${DATA}/api/v1/data/ticks/query`, {
+    method: 'POST',
+    body: { sessionId, tokens },
+  });
+}
+
+/**
  * Starts a tick replay background session.
  * Returns { data: { sessionId: "..." } }
  */
