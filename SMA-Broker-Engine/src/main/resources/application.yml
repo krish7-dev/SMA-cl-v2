@@ -41,6 +41,12 @@ management:
   endpoint:
     health:
       show-details: when-authorized
+  info:
+    build:
+      enabled: true
+    git:
+      enabled: true
+      mode: simple
 
 broker:
   encryption:

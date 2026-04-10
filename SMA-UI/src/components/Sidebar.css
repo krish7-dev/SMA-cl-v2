@@ -234,6 +234,21 @@
   color: #f59e0b;
 }
 
+.sidebar-build-info {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  padding: 4px 12px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.build-commit {
+  font-family: monospace;
+  font-size: 9px;
+  color: var(--text-muted);
+  letter-spacing: 0.3px;
+}
+
 .sidebar-footer {
   margin-top: auto;
   padding: 12px 20px;
