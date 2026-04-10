@@ -11,7 +11,7 @@ import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
  * Dev default: localhost:3000,localhost:5173
  * Production: set CORS_ALLOWED_ORIGINS=https://yourapp.vercel.app
  */
-@Configuration
+@Configuration(proxyBeanMethods = false)
 public class WebConfig implements WebMvcConfigurer {
 
     @Value("${cors.allowed-origins:http://localhost:3000,http://localhost:5173}")

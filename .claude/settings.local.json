@@ -30,7 +30,13 @@
       "Read(//g/SMA-Data-Engine/src/main/java/com/sma/dataengine/model/request/**)",
       "Bash(chmod +x g:/SMA-claude-v2/check-errors.sh)",
       "Bash(ls g:/SMA-claude-v2/SMA-Broker-Engine/target/*.jar)",
-      "Bash(ls g:/SMA-claude-v2/SMA-Data-Engine/target/*.jar)"
+      "Bash(ls g:/SMA-claude-v2/SMA-Data-Engine/target/*.jar)",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"cat /etc/nginx/sites-enabled/default 2>/dev/null || cat /etc/nginx/nginx.conf 2>/dev/null || ls /etc/nginx/sites-enabled/\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"ls /etc/nginx/ && cat /etc/nginx/nginx.conf\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"which nginx || which caddy || which apache2 || ls ~/app/ || ls ~/\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"cat ~/start.sh\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"ls -la ~ && ls ~/broker/ && cat /etc/caddy/Caddyfile 2>/dev/null || sudo cat /etc/caddy/Caddyfile 2>/dev/null\")",
+      "Bash(jar tf:*)"
     ]
   }
 }
