@@ -11,6 +11,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.stream.Collectors;
 
@@ -50,6 +51,11 @@ public class GlobalExceptionHandler {
                                               HttpServletRequest request) {
         log.error("Data Engine error: {}", ex.getMessage());
         return respond(HttpStatus.BAD_GATEWAY, ex.getMessage(), request);
+    }
+
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<?> handleNoResource(NoResourceFoundException ex, HttpServletRequest request) {
+        return respond(HttpStatus.NOT_FOUND, "Not found: " + ex.getResourcePath(), request);
     }
 
     @ExceptionHandler(Exception.class)
