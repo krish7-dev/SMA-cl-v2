@@ -459,6 +459,27 @@ export async function stopOptionsLiveEval(sessionId) {
 }
 
 /**
+ * Fetches the full server-side candle-event feed for a live session.
+ * Returns ApiResponse<List<String>> — each string is a JSON-serialised OptionsReplayCandleEvent.
+ */
+export async function getOptionsLiveFeed(sessionId) {
+  return request(
+    `${STRATEGY_API}/api/v1/strategy/options-live/${encodeURIComponent(sessionId)}/feed`,
+  );
+}
+
+/**
+ * Fetches the full server-side candle-event feed for a tick replay session.
+ * Feed is cached server-side for ~60 min after the session completes.
+ * Returns ApiResponse<List<String>> — each string is a JSON-serialised OptionsReplayCandleEvent.
+ */
+export async function getTickReplayFeed(sessionId) {
+  return request(
+    `${STRATEGY_API}/api/v1/strategy/tick-replay/${encodeURIComponent(sessionId)}/feed`,
+  );
+}
+
+/**
  * Returns the active sessionId for a given userId, or null if none running.
  */
 export async function getActiveOptionsLiveSession(userId) {

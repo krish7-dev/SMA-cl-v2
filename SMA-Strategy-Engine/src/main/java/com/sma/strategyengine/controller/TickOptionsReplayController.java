@@ -85,6 +85,23 @@ public class TickOptionsReplayController {
     }
 
     /**
+     * Returns the full candle-event feed for a session (active or recently completed).
+     * Sessions auto-remove on completion, so feeds are cached server-side for ~60 minutes.
+     * Used by the UI save-to-compare flow for a reliable, complete candle history.
+     *
+     * <pre>GET /api/v1/strategy/tick-replay/{sessionId}/feed</pre>
+     */
+    @GetMapping("/{sessionId}/feed")
+    public ResponseEntity<ApiResponse<List<String>>> feed(@PathVariable String sessionId) {
+        List<String> feed = tickOptionsReplayService.getFeed(sessionId);
+        if (feed == null) {
+            return ResponseEntity.status(404)
+                    .body(ApiResponse.error("Session not found or expired: " + sessionId));
+        }
+        return ResponseEntity.ok(ApiResponse.ok(feed));
+    }
+
+    /**
      * Stops a replay session early. The session also stops automatically when all ticks are exhausted.
      */
     @DeleteMapping("/{sessionId}")

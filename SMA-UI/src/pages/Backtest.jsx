@@ -9,6 +9,7 @@ import {
   startOptionsReplayEval,
   listTickSessions, startTickReplayEval, streamTickReplayEval, stopTickReplayEval,
   startOptionsLiveEval, streamOptionsLiveEval, stopOptionsLiveEval, getActiveOptionsLiveSession,
+  getOptionsLiveFeed, getTickReplayFeed,
   saveSessionResult, listSessionResults, getSessionResult, deleteSessionResult,
   querySessionTicks,
 } from '../services/api';
@@ -1685,6 +1686,17 @@ function OptionsLiveTest() {
       const trades  = lastEvt?.closedTrades || [];
       const wins    = trades.filter(t => t.pnl > 0).length;
       const sid     = sessionIdRef.current || sessionId || Date.now().toString();
+
+      // Fetch server-side feed (complete history, unaffected by SSE reconnects or client truncation).
+      // Fall back to client-side feed state if the server session is already gone.
+      let feedToSave = feed;
+      try {
+        const feedRes = await getOptionsLiveFeed(sid);
+        if (feedRes?.data?.length > 0) {
+          feedToSave = feedRes.data.map(s => JSON.parse(s));
+        }
+      } catch (_) { /* session may have ended — fall back to client feed */ }
+
       await saveSessionResult({
         sessionId:   sid,
         type:        'LIVE',
@@ -1694,7 +1706,7 @@ function OptionsLiveTest() {
         label:       saveLabel || new Date().toISOString().slice(0, 10),
         config:      lastPayloadRef.current,
         closedTrades: trades,
-        feed,
+        feed:        feedToSave,
         summary: {
           trades:              trades.length,
           realizedPnl:         lastEvt?.realizedPnl  ?? 0,
@@ -12463,8 +12475,20 @@ function TickReplayTest() {
       const trades     = lastEvt?.closedTrades || summary?.closedTrades || [];
       const wins       = trades.filter(t => t.pnl > 0).length;
       const replayDate = fromDate || new Date().toISOString().slice(0, 10);
+      const replaySid  = replaySessionRef.current || replaySessionId || Date.now().toString();
+
+      // Fetch server-side feed — the session may have already completed and auto-removed,
+      // but the feed is cached server-side for ~60 min after completion.
+      let feedToSave = feed;
+      try {
+        const feedRes = await getTickReplayFeed(replaySid);
+        if (feedRes?.data?.length > 0) {
+          feedToSave = feedRes.data.map(s => JSON.parse(s));
+        }
+      } catch (_) { /* expired or never ran — fall back to client feed */ }
+
       await saveSessionResult({
-        sessionId:   (replaySessionRef.current || replaySessionId || Date.now().toString()),
+        sessionId:   replaySid,
         type:        'TICK_REPLAY',
         userId:      userId || undefined,
         brokerName:  brokerName || 'kite',
@@ -12472,7 +12496,7 @@ function TickReplayTest() {
         label:       saveLabel || replayDate,
         config:      lastPayloadRef.current,
         closedTrades: trades,
-        feed,
+        feed:        feedToSave,
         summary: {
           trades:       trades.length,
           realizedPnl:  (lastEvt?.realizedPnl ?? summary?.realizedPnl ?? 0),

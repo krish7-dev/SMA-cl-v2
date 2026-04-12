@@ -78,7 +78,11 @@ public class OptionsLiveService {
             "DAY",       86_400_000L
     );
 
-    private final ConcurrentHashMap<String, LiveOptionsSession> sessions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, LiveOptionsSession> sessions       = new ConcurrentHashMap<>();
+
+    // Feed cache for stopped sessions — expires after ~60 min
+    private final ConcurrentHashMap<String, List<String>> completedFeeds     = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Instant>      completedFeedTimes = new ConcurrentHashMap<>();
 
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "opts-live-" + System.nanoTime());
@@ -181,6 +185,16 @@ public class OptionsLiveService {
     }
 
     /**
+     * Returns the full candle-event JSON list for a session (active or recently stopped).
+     * Used by save-to-compare to fetch server-side feed instead of relying on client SSE state.
+     */
+    public List<String> getFeed(String sessionId) {
+        LiveOptionsSession active = sessions.get(sessionId);
+        if (active != null) return active.getFeedList();
+        return completedFeeds.get(sessionId); // null if expired or never ran
+    }
+
+    /**
      * Sends an SSE comment (":ping") to all connected emitters every 15 seconds.
      * Keeps the Vercel proxy connection alive — without this, Vercel's reverse proxy
      * closes idle SSE streams after ~30 seconds of no data.
@@ -195,7 +209,18 @@ public class OptionsLiveService {
 
     private void stopSession(String sessionId) {
         LiveOptionsSession session = sessions.remove(sessionId);
-        if (session != null) session.stop();
+        if (session != null) {
+            completedFeeds.put(sessionId, session.getFeedList());
+            completedFeedTimes.put(sessionId, Instant.now());
+            session.stop();
+        }
+    }
+
+    @Scheduled(fixedDelay = 1_800_000) // every 30 min — evict feeds older than 60 min
+    public void cleanupCompletedFeeds() {
+        Instant cutoff = Instant.now().minusSeconds(3600);
+        completedFeedTimes.entrySet().removeIf(e -> e.getValue().isBefore(cutoff));
+        completedFeeds.keySet().retainAll(completedFeedTimes.keySet());
     }
 
     private void persistSnapshot(String sessionId, OptionsLiveRequest req) {
@@ -281,6 +306,9 @@ public class OptionsLiveService {
         private final Deque<String[]> eventBuffer = new ArrayDeque<>(BUFFER_SIZE);
         private final Object bufferLock = new Object();
 
+        // Full candle event history for reliable save-to-compare (unbounded, not a ring buffer).
+        private final List<String> feedList = new ArrayList<>();
+
         // Instrument sets
         final long        niftyToken;
         final Set<Long>   optionTokens = new HashSet<>();
@@ -359,6 +387,9 @@ public class OptionsLiveService {
             broadcast("error", message);
         }
 
+        /** Returns the full candle event history (for save-to-compare). */
+        List<String> getFeedList() { return Collections.unmodifiableList(feedList); }
+
         /** Sends a named event to all connected emitters; silently removes dead ones. */
         private void broadcast(String eventName, String data) {
             // Buffer the event for late-joining UIs (candle, init, warning events)
@@ -367,6 +398,10 @@ public class OptionsLiveService {
                     if (eventBuffer.size() >= BUFFER_SIZE) eventBuffer.pollFirst();
                     eventBuffer.addLast(new String[]{ eventName, data });
                 }
+            }
+            // Persist full candle history server-side for reliable save-to-compare
+            if ("candle".equals(eventName)) {
+                feedList.add(data);
             }
             if (emitters.isEmpty()) return;
             List<SseEmitter> dead = null;
