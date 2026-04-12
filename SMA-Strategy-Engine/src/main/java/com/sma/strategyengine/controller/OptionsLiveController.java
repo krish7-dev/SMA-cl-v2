@@ -101,6 +101,23 @@ public class OptionsLiveController {
     }
 
     /**
+     * Returns the full candle-event feed for a session (server-side history, not a ring buffer).
+     * Used by the UI save-to-compare flow to get a complete, reliable feed regardless of
+     * SSE reconnects or client-side state truncation.
+     *
+     * <pre>GET /api/v1/strategy/options-live/{sessionId}/feed</pre>
+     */
+    @GetMapping("/{sessionId}/feed")
+    public ResponseEntity<ApiResponse<List<String>>> feed(@PathVariable String sessionId) {
+        List<String> feed = optionsLiveService.getFeed(sessionId);
+        if (feed == null) {
+            return ResponseEntity.status(404)
+                    .body(ApiResponse.error("Session not found: " + sessionId));
+        }
+        return ResponseEntity.ok(ApiResponse.ok(feed));
+    }
+
+    /**
      * Stops a live session entirely. The session will not restart automatically.
      */
     @DeleteMapping("/{sessionId}")

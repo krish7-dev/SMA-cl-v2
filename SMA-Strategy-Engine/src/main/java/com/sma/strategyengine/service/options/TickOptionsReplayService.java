@@ -60,7 +60,11 @@ public class TickOptionsReplayService {
     private final DataEngineClient dataEngineClient;
     private final ObjectMapper     objectMapper;
 
-    private final ConcurrentHashMap<String, TickReplaySession> sessions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, TickReplaySession> sessions       = new ConcurrentHashMap<>();
+
+    // Feed cache for completed/stopped sessions — expires after ~60 min
+    private final ConcurrentHashMap<String, List<String>> completedFeeds     = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Instant>      completedFeedTimes = new ConcurrentHashMap<>();
 
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "tick-replay-" + System.nanoTime());
@@ -87,6 +91,9 @@ public class TickOptionsReplayService {
                 session.broadcastError(e.getMessage());
             } finally {
                 sessions.remove(sessionId);
+                // Cache feed so save-to-compare can fetch it after session completes
+                completedFeeds.put(sessionId, session.getFeedList());
+                completedFeedTimes.put(sessionId, Instant.now());
                 session.completeEmitters();
             }
         });
@@ -123,9 +130,29 @@ public class TickOptionsReplayService {
     public void stop(String sessionId) {
         TickReplaySession session = sessions.remove(sessionId);
         if (session != null) {
+            completedFeeds.put(sessionId, session.getFeedList());
+            completedFeedTimes.put(sessionId, Instant.now());
             session.stop();
             log.info("Tick replay session {} stopped by request", sessionId);
         }
+    }
+
+    /**
+     * Returns the full candle-event feed for a session (active or recently completed).
+     * Used by save-to-compare — sessions auto-remove after completion, so completed feeds
+     * are cached here for ~60 minutes.
+     */
+    public List<String> getFeed(String sessionId) {
+        TickReplaySession active = sessions.get(sessionId);
+        if (active != null) return active.getFeedList();
+        return completedFeeds.get(sessionId); // null if expired or never ran
+    }
+
+    @Scheduled(fixedDelay = 1_800_000) // every 30 min — evict feeds older than 60 min
+    public void cleanupCompletedFeeds() {
+        Instant cutoff = Instant.now().minusSeconds(3600);
+        completedFeedTimes.entrySet().removeIf(e -> e.getValue().isBefore(cutoff));
+        completedFeeds.keySet().retainAll(completedFeedTimes.keySet());
     }
 
     /** Returns a snapshot of all active (still-running) replay sessions. */
@@ -161,6 +188,9 @@ public class TickOptionsReplayService {
         private final Deque<String[]>                  eventBuffer = new ArrayDeque<>(BUFFER_SIZE);
         private final Object                           bufferLock  = new Object();
 
+        // Full candle event history for reliable save-to-compare (unbounded, not a ring buffer).
+        private final List<String> feedList = new ArrayList<>();
+
         volatile boolean stopped = false;
 
         // ── emitter management ────────────────────────────────────────────────
@@ -193,12 +223,19 @@ public class TickOptionsReplayService {
 
         void broadcastError(String message) { broadcast("error", "\"" + message + "\""); }
 
+        /** Returns the full candle event history (for save-to-compare). */
+        List<String> getFeedList() { return Collections.unmodifiableList(feedList); }
+
         private void broadcast(String eventName, String data) {
             if ("candle".equals(eventName) || "init".equals(eventName) || "summary".equals(eventName) || "warning".equals(eventName)) {
                 synchronized (bufferLock) {
                     if (eventBuffer.size() >= BUFFER_SIZE) eventBuffer.pollFirst();
                     eventBuffer.addLast(new String[]{ eventName, data });
                 }
+            }
+            // Persist full candle history server-side for reliable save-to-compare
+            if ("candle".equals(eventName)) {
+                feedList.add(data);
             }
             if (emitters.isEmpty()) return;
             List<SseEmitter> dead = null;
