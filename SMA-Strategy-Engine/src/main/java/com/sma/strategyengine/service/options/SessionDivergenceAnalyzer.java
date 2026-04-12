@@ -14,12 +14,15 @@ import java.time.ZoneId;
 import java.util.*;
 
 /**
- * Compares two saved session feeds (live vs replay) to pinpoint the first
+ * Compares two saved session feeds (A vs B) to pinpoint the first
  * divergence — candle OHLCV, regime, signal, or execution layer.
  *
  * <p>Uses {@code niftyTime} as the join key. Both feeds must have been saved
  * after Fix-1 (niftyTime = bucket-start, not actual tick time) for the key
  * to match reliably.
+ *
+ * <p>A and B are neutral labels — neither is assumed to be LIVE or REPLAY.
+ * The caller passes sessionA/sessionB in whichever order they chose in the UI.
  */
 @Slf4j
 @Service
@@ -47,39 +50,41 @@ public class SessionDivergenceAnalyzer {
         /** CANDLE | REGIME | SIGNAL | EXECUTION */
         private String stage;
         private String field;
-        private Object liveValue;
-        private Object replayValue;
+        private Object aValue;
+        private Object bValue;
     }
 
     @Data @Builder
     public static class TradeMatch {
-        private String  liveEntryTime;
-        private String  replayEntryTime;
+        private String  aEntryTime;
+        private String  bEntryTime;
         /** CE or PE */
         private String  side;
-        private boolean entryPriceMismatch;   // |live − replay| > PRICE_TOL
+        private boolean entryPriceMismatch;   // |a − b| > PRICE_TOL
         private boolean exitPriceMismatch;
         private boolean exitReasonMismatch;
-        private double  pnlDiff;              // replay.pnl − live.pnl
-        /** MATCHED | LIVE_ONLY | REPLAY_ONLY */
+        private double  pnlDiff;              // b.pnl − a.pnl
+        /** MATCHED | A_ONLY | B_ONLY */
         private String  status;
     }
 
     @Data @Builder
     public static class DivergenceReport {
-        private String sessionA;              // typically LIVE
-        private String sessionB;              // typically TICK_REPLAY
+        private String sessionA;
+        private String sessionB;
         private int    matchedCandles;
-        private int    liveOnlyCount;
-        private int    replayOnlyCount;
+        private int    aOnlyCount;
+        private int    bOnlyCount;
         private int    divergentCandleCount;
-        /** niftyTime of first candle that differs in any stage. */
+        /** niftyTime of first candle that differs in any stage (partial-start buckets excluded). */
         private String firstDivergenceTime;
         /** Stage of first difference: CANDLE | REGIME | SIGNAL | EXECUTION */
         private String firstDivergenceStage;
         private List<FieldDiff>  divergences;
-        private List<String>     liveOnlyTimes;
-        private List<String>     replayOnlyTimes;
+        private List<String>     aOnlyTimes;
+        private List<String>     bOnlyTimes;
+        /** Times that are only in one session AND are that session's first candle (startup alignment gap). */
+        private List<String>     partialStartBuckets;
         private List<TradeMatch> tradeComparison;
     }
 
@@ -103,25 +108,53 @@ public class SessionDivergenceAnalyzer {
         allTimes.addAll(mapA.keySet());
         allTimes.addAll(mapB.keySet());
 
-        List<String>    liveOnly    = new ArrayList<>();
-        List<String>    replayOnly  = new ArrayList<>();
+        // Detect partial start buckets: first candle of A or B that the other session doesn't have.
+        // This happens when a session attaches to the tick stream mid-bucket and therefore misses
+        // the partial first candle that the other session did accumulate.
+        String firstKeyA = mapA.isEmpty() ? null : mapA.keySet().iterator().next();
+        String firstKeyB = mapB.isEmpty() ? null : mapB.keySet().iterator().next();
+        List<String> partialStartBuckets = new ArrayList<>();
+        if (firstKeyA != null && !mapB.containsKey(firstKeyA)) {
+            partialStartBuckets.add(firstKeyA);
+        }
+        if (firstKeyB != null && !mapA.containsKey(firstKeyB)
+                && !firstKeyB.equals(firstKeyA)) {
+            partialStartBuckets.add(firstKeyB);
+        }
+        Set<String> partialSet = new HashSet<>(partialStartBuckets);
+
+        List<String>    aOnly       = new ArrayList<>();
+        List<String>    bOnly       = new ArrayList<>();
         List<FieldDiff> divergences = new ArrayList<>();
         Set<String>     divergentTimes = new LinkedHashSet<>();
 
         for (String t : allTimes) {
             boolean inA = mapA.containsKey(t);
             boolean inB = mapB.containsKey(t);
-            if (!inA) { replayOnly.add(t); continue; }
-            if (!inB) { liveOnly.add(t);   continue; }
+            if (!inA) { bOnly.add(t); continue; }
+            if (!inB) { aOnly.add(t); continue; }
             compareCandle(t, mapA.get(t), mapB.get(t), divergences, divergentTimes);
         }
 
-        // First divergence across all stages
+        // First divergence across all stages — skip partial-start buckets
         String firstTime  = null;
         String firstStage = null;
-        if (!divergences.isEmpty()) {
-            firstTime  = divergences.get(0).getNiftyTime();
-            firstStage = divergences.get(0).getStage();
+        for (FieldDiff d : divergences) {
+            if (!partialSet.contains(d.getNiftyTime())) {
+                firstTime  = d.getNiftyTime();
+                firstStage = d.getStage();
+                break;
+            }
+        }
+        // Also consider aOnly/bOnly times as first divergence if they precede field diffs
+        String firstOnlyTime = null;
+        for (String t : allTimes) {
+            if (partialSet.contains(t)) continue;
+            if (!mapA.containsKey(t) || !mapB.containsKey(t)) { firstOnlyTime = t; break; }
+        }
+        if (firstOnlyTime != null && (firstTime == null || firstOnlyTime.compareTo(firstTime) < 0)) {
+            firstTime  = firstOnlyTime;
+            firstStage = mapA.containsKey(firstOnlyTime) ? "A_ONLY" : "B_ONLY";
         }
 
         int matched = (int) allTimes.stream()
@@ -132,24 +165,25 @@ public class SessionDivergenceAnalyzer {
                 parseArray(recA.getClosedTradesJson()),
                 parseArray(recB.getClosedTradesJson()));
 
-        log.info("Divergence analysis {}/{}: matched={} liveOnly={} replayOnly={} "
-                + "divergentBuckets={} firstAt={} firstStage={}",
+        log.info("Divergence analysis {}/{}: matched={} aOnly={} bOnly={} "
+                + "divergentBuckets={} partialStart={} firstAt={} firstStage={}",
                 sessionA, sessionB, matched,
-                liveOnly.size(), replayOnly.size(), divergentTimes.size(),
-                firstTime, firstStage);
+                aOnly.size(), bOnly.size(), divergentTimes.size(),
+                partialStartBuckets, firstTime, firstStage);
 
         return DivergenceReport.builder()
                 .sessionA(sessionA)
                 .sessionB(sessionB)
                 .matchedCandles(matched)
-                .liveOnlyCount(liveOnly.size())
-                .replayOnlyCount(replayOnly.size())
+                .aOnlyCount(aOnly.size())
+                .bOnlyCount(bOnly.size())
                 .divergentCandleCount(divergentTimes.size())
                 .firstDivergenceTime(firstTime)
                 .firstDivergenceStage(firstStage)
                 .divergences(divergences)
-                .liveOnlyTimes(liveOnly)
-                .replayOnlyTimes(replayOnly)
+                .aOnlyTimes(aOnly)
+                .bOnlyTimes(bOnly)
+                .partialStartBuckets(partialStartBuckets)
                 .tradeComparison(trades)
                 .build();
     }
@@ -224,9 +258,9 @@ public class SessionDivergenceAnalyzer {
 
             if (bestIdx < 0) {
                 result.add(TradeMatch.builder()
-                        .liveEntryTime(str(ta.get("entryTime")))
+                        .aEntryTime(str(ta.get("entryTime")))
                         .side(str(ta.get("optionType")))
-                        .status("LIVE_ONLY")
+                        .status("A_ONLY")
                         .build());
             } else {
                 usedB[bestIdx] = true;
@@ -235,8 +269,8 @@ public class SessionDivergenceAnalyzer {
                 double xpA = num(ta.get("exitPrice")),  xpB = num(tb.get("exitPrice"));
                 double pnlA = num(ta.get("pnl")),       pnlB = num(tb.get("pnl"));
                 result.add(TradeMatch.builder()
-                        .liveEntryTime(str(ta.get("entryTime")))
-                        .replayEntryTime(str(tb.get("entryTime")))
+                        .aEntryTime(str(ta.get("entryTime")))
+                        .bEntryTime(str(tb.get("entryTime")))
                         .side(str(ta.get("optionType")))
                         .entryPriceMismatch(Math.abs(epA - epB) > PRICE_TOL)
                         .exitPriceMismatch(Math.abs(xpA - xpB) > PRICE_TOL)
@@ -247,14 +281,14 @@ public class SessionDivergenceAnalyzer {
             }
         }
 
-        // replay-only trades
+        // B-only trades
         for (int i = 0; i < tradesB.size(); i++) {
             if (!usedB[i]) {
                 Map<String, Object> tb = tradesB.get(i);
                 result.add(TradeMatch.builder()
-                        .replayEntryTime(str(tb.get("entryTime")))
+                        .bEntryTime(str(tb.get("entryTime")))
                         .side(str(tb.get("optionType")))
-                        .status("REPLAY_ONLY")
+                        .status("B_ONLY")
                         .build());
             }
         }
@@ -287,7 +321,7 @@ public class SessionDivergenceAnalyzer {
     private FieldDiff diff(String t, String stage, String field, Object a, Object b) {
         return FieldDiff.builder()
                 .niftyTime(t).stage(stage).field(field)
-                .liveValue(a).replayValue(b)
+                .aValue(a).bValue(b)
                 .build();
     }
 
