@@ -1,7 +1,6 @@
 package com.sma.dataengine.model.request;
 
 import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.NotNull;
 import lombok.Data;
 
 import java.time.LocalDateTime;
@@ -17,7 +16,7 @@ public class TickQueryRequest {
     @NotBlank
     private String sessionId;
 
-    @NotNull
+    /** Optional — if null or empty, all tokens for the session are returned. */
     private List<Long> tokens;
 
     /** Optional — filter ticks at or after this time within the session. */

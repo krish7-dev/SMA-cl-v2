@@ -27,6 +27,17 @@ public interface TickRecordRepository extends JpaRepository<TickRecord, Long> {
             @Param("tokens")    List<Long> tokens);
 
     /**
+     * Fetches all ticks for a session (no token filter), ordered by tick_time.
+     * Used when the caller wants all instruments for a session (e.g. compare tab).
+     */
+    @Query(value = """
+            SELECT * FROM tick_data
+            WHERE session_id = :sessionId
+            ORDER BY tick_time ASC
+            """, nativeQuery = true)
+    List<TickRecord> findBySessionIdOrdered(@Param("sessionId") String sessionId);
+
+    /**
      * Aggregates session metadata — one row per session_id.
      * Columns: session_id (0), first_tick (1), last_tick (2), tick_count (3), tokens (4).
      * The tokens column is a PostgreSQL array (Object[]).
