@@ -357,11 +357,28 @@ export async function listTickSessions() {
 /**
  * Fetches raw ticks for a session + token list from the Data Engine.
  * Returns ApiResponse<List<TickEntryDto>> — each entry: { instrumentToken, ltp, volume, tickTimeMs }
+ *
+ * REPLAY ENGINE PATH — do not use for compare UI. No row cap.
  */
 export async function querySessionTicks(sessionId, tokens) {
   return request(`${DATA}/api/v1/data/ticks/query`, {
     method: 'POST',
     body: { sessionId, tokens },
+  });
+}
+
+/**
+ * Capped tick query for the compare / debug UI.
+ * Returns ApiResponse<TickPageResponse>:
+ *   { ticks: TickEntryDto[], truncated: boolean, returnedCount: number, totalCount: number }
+ *
+ * Date filtering is applied in the DB query (not post-fetch).
+ * Server-side cap: 50,000 rows. If truncated, show a warning to the user.
+ */
+export async function querySessionTicksForCompare(sessionId, tokens, fromDate, toDate) {
+  return request(`${DATA}/api/v1/data/ticks/query/compare`, {
+    method: 'POST',
+    body: { sessionId, tokens, fromDate, toDate },
   });
 }
 
@@ -459,6 +476,27 @@ export async function stopOptionsLiveEval(sessionId) {
 }
 
 /**
+ * Fetches the full server-side candle-event feed for a live session.
+ * Returns ApiResponse<List<String>> — each string is a JSON-serialised OptionsReplayCandleEvent.
+ */
+export async function getOptionsLiveFeed(sessionId) {
+  return request(
+    `${STRATEGY_API}/api/v1/strategy/options-live/${encodeURIComponent(sessionId)}/feed`,
+  );
+}
+
+/**
+ * Fetches the full server-side candle-event feed for a tick replay session.
+ * Feed is cached server-side for ~60 min after the session completes.
+ * Returns ApiResponse<List<String>> — each string is a JSON-serialised OptionsReplayCandleEvent.
+ */
+export async function getTickReplayFeed(sessionId) {
+  return request(
+    `${STRATEGY_API}/api/v1/strategy/tick-replay/${encodeURIComponent(sessionId)}/feed`,
+  );
+}
+
+/**
  * Returns the active sessionId for a given userId, or null if none running.
  */
 export async function getActiveOptionsLiveSession(userId) {
@@ -491,4 +529,20 @@ export async function getSessionResult(sessionId) {
 
 export async function deleteSessionResult(sessionId) {
   return request(`${STRATEGY_API}/api/v1/strategy/session-results/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+}
+
+/**
+ * Runs a server-side field-by-field comparison of two saved sessions.
+ * Returns ApiResponse<DivergenceReport>:
+ *   { sessionA, sessionB, matchedCandles, liveOnlyCount, replayOnlyCount,
+ *     divergentCandleCount, firstDivergenceTime, firstDivergenceStage,
+ *     divergences: [{niftyTime, stage, field, liveValue, replayValue}],
+ *     liveOnlyTimes, replayOnlyTimes,
+ *     tradeComparison: [{liveEntryTime, replayEntryTime, side, entryPriceMismatch,
+ *                        exitPriceMismatch, exitReasonMismatch, pnlDiff, status}] }
+ */
+export async function getSessionDivergence(sessionA, sessionB) {
+  return request(
+    `${STRATEGY_API}/api/v1/strategy/session-results/divergence?sessionA=${encodeURIComponent(sessionA)}&sessionB=${encodeURIComponent(sessionB)}`
+  );
 }

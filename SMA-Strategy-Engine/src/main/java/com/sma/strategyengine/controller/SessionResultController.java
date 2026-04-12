@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sma.strategyengine.entity.SessionResultRecord;
 import com.sma.strategyengine.model.response.ApiResponse;
 import com.sma.strategyengine.repository.SessionResultRepository;
+import com.sma.strategyengine.service.options.SessionDivergenceAnalyzer;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -31,8 +32,9 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class SessionResultController {
 
-    private final SessionResultRepository repository;
-    private final ObjectMapper            objectMapper;
+    private final SessionResultRepository   repository;
+    private final ObjectMapper              objectMapper;
+    private final SessionDivergenceAnalyzer divergenceAnalyzer;
 
     // ── Request DTO ───────────────────────────────────────────────────────────
 
@@ -132,5 +134,31 @@ public class SessionResultController {
         repository.deleteBySessionId(sessionId);
         log.info("Session result deleted: sessionId={}", sessionId);
         return ResponseEntity.ok(ApiResponse.ok(null));
+    }
+
+    /**
+     * Compares two saved sessions field-by-field and returns the first divergence.
+     *
+     * <pre>
+     * GET /api/v1/strategy/session-results/divergence?sessionA={liveId}&sessionB={replayId}
+     * </pre>
+     */
+    @GetMapping("/divergence")
+    public ResponseEntity<ApiResponse<SessionDivergenceAnalyzer.DivergenceReport>> divergence(
+            @RequestParam String sessionA,
+            @RequestParam String sessionB) {
+
+        try {
+            SessionDivergenceAnalyzer.DivergenceReport report =
+                    divergenceAnalyzer.analyze(sessionA, sessionB);
+            return ResponseEntity.ok(ApiResponse.ok(report));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest()
+                    .body(ApiResponse.error(e.getMessage()));
+        } catch (Exception e) {
+            log.error("Divergence analysis failed {}/{}: {}", sessionA, sessionB, e.getMessage());
+            return ResponseEntity.internalServerError()
+                    .body(ApiResponse.error("Analysis failed: " + e.getMessage()));
+        }
     }
 }

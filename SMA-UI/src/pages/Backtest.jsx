@@ -9,8 +9,9 @@ import {
   startOptionsReplayEval,
   listTickSessions, startTickReplayEval, streamTickReplayEval, stopTickReplayEval,
   startOptionsLiveEval, streamOptionsLiveEval, stopOptionsLiveEval, getActiveOptionsLiveSession,
+  getOptionsLiveFeed, getTickReplayFeed,
   saveSessionResult, listSessionResults, getSessionResult, deleteSessionResult,
-  querySessionTicks,
+  querySessionTicksForCompare,
 } from '../services/api';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { useSession } from '../context/SessionContext';
@@ -1258,6 +1259,8 @@ function OptionsLiveTest() {
   const abortRef      = useRef(null);
   const readerRef     = useRef(null);
   const sessionIdRef  = useRef(null);
+  // Preserved across stop/complete — cleared only after a successful save. Used by save pipeline.
+  const lastSaveSessionIdRef = useRef(null);
   const lastRunPcRef  = useRef(null);
   const lastPayloadRef = useRef(null);
   // Accumulates raw tick events for post-session comparison. Capped at 10 000 to limit payload size.
@@ -1277,6 +1280,7 @@ function OptionsLiveTest() {
     getActiveOptionsLiveSession(session.userId).then(sid => {
       if (sid) {
         sessionIdRef.current = sid;
+        lastSaveSessionIdRef.current = sid;  // preserved past stop for save pipeline
         setSessionId(sid);
         // Auto-attach SSE so the feed starts populating immediately
         const ctrl = new AbortController();
@@ -1580,6 +1584,7 @@ function OptionsLiveTest() {
       const sid = startRes?.data?.sessionId;
       if (!sid) throw new Error('No sessionId returned');
       sessionIdRef.current = sid;
+      lastSaveSessionIdRef.current = sid;  // preserved past stop for save pipeline
       setSessionId(sid);
 
       // Step 2: attach SSE listener (session already running in backend)
@@ -1681,35 +1686,72 @@ function OptionsLiveTest() {
   async function handleSaveToCompare() {
     setSaveStatus('saving'); setSaveError('');
     try {
-      const lastEvt = feed[feed.length - 1];
-      const trades  = lastEvt?.closedTrades || [];
+      // Use the preserved session ID — never null out lastSaveSessionIdRef on stop.
+      const sid = lastSaveSessionIdRef.current;
+      if (!sid) {
+        console.warn('[LIVE save] blocked: no session ID available');
+        throw new Error('No completed live session to save. Please run a session first.');
+      }
+      console.log('[LIVE save] session ID:', sid);
+
+      // Fetch the auto-saved draft record from DB (written by server on session stop).
+      // This is the authoritative source — avoids empty client-side SSE state.
+      let record;
+      try {
+        const res = await getSessionResult(sid);
+        record = res?.data;
+      } catch (e) {
+        console.warn('[LIVE save] DB fetch failed:', e.message);
+      }
+
+      const serverFeed   = record?.feedJson   ? JSON.parse(record.feedJson)   : null;
+      const serverTrades = record?.closedTradesJson ? JSON.parse(record.closedTradesJson) : null;
+      console.log('[LIVE save] server feed count:', serverFeed?.length ?? 0,
+                  '| server trades:', serverTrades?.length ?? 0,
+                  '| dataEngineSessionId:', sid);
+
+      if (!serverFeed || serverFeed.length === 0) {
+        throw new Error(
+          'Reliable server-side session feed not found. ' +
+          'Session may not have emitted any candles yet, or the server was restarted before the session ran. ' +
+          'Cannot save for compare.'
+        );
+      }
+
+      const serverSummary = record?.summaryJson ? JSON.parse(record.summaryJson) : {};
+      const lastEvt = serverFeed[serverFeed.length - 1];
+      const trades  = serverTrades ?? lastEvt?.closedTrades ?? [];
       const wins    = trades.filter(t => t.pnl > 0).length;
-      const sid     = sessionIdRef.current || sessionId || Date.now().toString();
+
       await saveSessionResult({
-        sessionId:   sid,
-        type:        'LIVE',
-        userId:      session.userId,
-        brokerName:  session.brokerName,
-        sessionDate: new Date().toISOString().slice(0, 10),
-        label:       saveLabel || new Date().toISOString().slice(0, 10),
-        config:      lastPayloadRef.current,
+        sessionId:    sid,
+        type:         'LIVE',
+        userId:       session.userId,
+        brokerName:   session.brokerName,
+        sessionDate:  new Date().toISOString().slice(0, 10),
+        label:        saveLabel || new Date().toISOString().slice(0, 10),
+        config:       lastPayloadRef.current,
         closedTrades: trades,
-        feed,
+        feed:         serverFeed,
         summary: {
           trades:              trades.length,
-          realizedPnl:         lastEvt?.realizedPnl  ?? 0,
+          realizedPnl:         serverSummary.realizedPnl  ?? lastEvt?.realizedPnl  ?? 0,
           winRate:             trades.length > 0 ? wins / trades.length : 0,
-          finalCapital:        (lastEvt?.capital ?? parseFloat(capital)) || 100000,
-          sessionStart:        sessionStartRef.current || undefined,
-          sessionEnd:          new Date().toISOString(),
-          lastTickTime:        lastTickTimeRef.current || undefined,
-          dataEngineSessionId: sessionIdRef.current || undefined,
+          finalCapital:        serverSummary.finalCapital ?? lastEvt?.capital ?? parseFloat(capital) ?? 100000,
+          sessionStart:        sessionStartRef.current    || serverSummary.sessionStart  || undefined,
+          sessionEnd:          serverSummary.sessionEnd   || new Date().toISOString(),
+          lastTickTime:        lastTickTimeRef.current    || undefined,
+          dataEngineSessionId: sid,  // LIVE session ID = Data Engine tick session ID
         },
       });
+      console.log('[LIVE save] saved successfully: sessionId=', sid,
+                  'candles=', serverFeed.length, 'trades=', trades.length);
+      lastSaveSessionIdRef.current = null;  // clear only after successful save
       setSaveStatus('saved');
       setShowSavePanel(false);
       setSaveLabel('');
     } catch (e) {
+      console.error('[LIVE save] failed:', e.message);
       setSaveStatus('error');
       setSaveError(e.message);
     }
@@ -12060,10 +12102,12 @@ function TickReplayTest() {
   const [feedExpanded,    setFeedExpanded]    = useState(false);
   const [liveTicks,       setLiveTicks]       = useState({});
   const [replaySessionId, setReplaySessionId] = useState(null);
-  const abortRef         = useRef(null);
-  const readerRef        = useRef(null);
-  const replaySessionRef = useRef(null);
-  const lastPayloadRef   = useRef(null);
+  const abortRef              = useRef(null);
+  const readerRef             = useRef(null);
+  const replaySessionRef      = useRef(null);
+  // Preserved across completion — cleared only after a successful save. Used by save pipeline.
+  const lastSaveReplaySessionIdRef = useRef(null);
+  const lastPayloadRef        = useRef(null);
   // Accumulates raw tick events for post-session comparison. Capped at 10 000 to limit payload size.
   const ticksRef         = useRef([]);
 
@@ -12459,36 +12503,74 @@ function TickReplayTest() {
   async function handleSaveToCompare() {
     setSaveStatus('saving'); setSaveError('');
     try {
-      const lastEvt    = feed[feed.length - 1];
-      const trades     = lastEvt?.closedTrades || summary?.closedTrades || [];
-      const wins       = trades.filter(t => t.pnl > 0).length;
+      // Use the preserved replay session ID — never null out lastSaveReplaySessionIdRef on completion.
+      const replaySid = lastSaveReplaySessionIdRef.current;
+      if (!replaySid) {
+        console.warn('[REPLAY save] blocked: no session ID available');
+        throw new Error('No completed replay session to save. Please run a tick replay first.');
+      }
+      console.log('[REPLAY save] session ID:', replaySid);
+
+      // Fetch the auto-saved draft record from DB (written by server on session completion).
+      // This is the authoritative source — survives server restarts and client state resets.
+      let record;
+      try {
+        const res = await getSessionResult(replaySid);
+        record = res?.data;
+      } catch (e) {
+        console.warn('[REPLAY save] DB fetch failed:', e.message);
+      }
+
+      const serverFeed   = record?.feedJson        ? JSON.parse(record.feedJson)        : null;
+      const serverTrades = record?.closedTradesJson ? JSON.parse(record.closedTradesJson) : null;
+      const serverSummary = record?.summaryJson     ? JSON.parse(record.summaryJson)     : {};
+      console.log('[REPLAY save] server feed count:', serverFeed?.length ?? 0,
+                  '| server trades:', serverTrades?.length ?? 0,
+                  '| dataEngineSessionId:', serverSummary.dataEngineSessionId ?? selectedSession?.sessionId);
+
+      if (!serverFeed || serverFeed.length === 0) {
+        throw new Error(
+          'Reliable server-side session feed not found. ' +
+          'The server may have been restarted before the session ran. ' +
+          'Cannot save for compare.'
+        );
+      }
+
       const replayDate = fromDate || new Date().toISOString().slice(0, 10);
+      const lastEvt    = serverFeed[serverFeed.length - 1];
+      const trades     = serverTrades ?? lastEvt?.closedTrades ?? [];
+      const wins       = trades.filter(t => t.pnl > 0).length;
+
       await saveSessionResult({
-        sessionId:   (replaySessionRef.current || replaySessionId || Date.now().toString()),
-        type:        'TICK_REPLAY',
-        userId:      userId || undefined,
-        brokerName:  brokerName || 'kite',
-        sessionDate: replayDate,
-        label:       saveLabel || replayDate,
-        config:      lastPayloadRef.current,
+        sessionId:    replaySid,
+        type:         'TICK_REPLAY',
+        userId:       userId || undefined,
+        brokerName:   brokerName || 'kite',
+        sessionDate:  replayDate,
+        label:        saveLabel || replayDate,
+        config:       lastPayloadRef.current,
         closedTrades: trades,
-        feed,
+        feed:         serverFeed,
         summary: {
-          trades:       trades.length,
-          realizedPnl:  (lastEvt?.realizedPnl ?? summary?.realizedPnl ?? 0),
-          winRate:      trades.length > 0 ? wins / trades.length : 0,
-          finalCapital:      (lastEvt?.capital ?? summary?.finalCapital ?? parseFloat(capital) ?? 0) || 100000,
-          fromDate:          fromDate || undefined,
-          toDate:            toDate   || undefined,
-          replayFirstTick:     selectedSession?.firstTick  || undefined,
-          replayLastTick:      selectedSession?.lastTick   || undefined,
-          dataEngineSessionId: selectedSession?.sessionId  || undefined,
+          trades:              trades.length,
+          realizedPnl:         serverSummary.realizedPnl  ?? lastEvt?.realizedPnl  ?? 0,
+          winRate:             trades.length > 0 ? wins / trades.length : 0,
+          finalCapital:        serverSummary.finalCapital ?? lastEvt?.capital ?? parseFloat(capital) ?? 100000,
+          fromDate:            fromDate                   || serverSummary.fromDate   || undefined,
+          toDate:              toDate                     || serverSummary.toDate     || undefined,
+          replayFirstTick:     selectedSession?.firstTick || undefined,
+          replayLastTick:      selectedSession?.lastTick  || undefined,
+          dataEngineSessionId: selectedSession?.sessionId || serverSummary.dataEngineSessionId || undefined,
         },
       });
+      console.log('[REPLAY save] saved successfully: sessionId=', replaySid,
+                  'candles=', serverFeed.length, 'trades=', trades.length);
+      lastSaveReplaySessionIdRef.current = null;  // clear only after successful save
       setSaveStatus('saved');
       setShowSavePanel(false);
       setSaveLabel('');
     } catch (e) {
+      console.error('[REPLAY save] failed:', e.message);
       setSaveStatus('error');
       setSaveError(e.message);
     }
@@ -12553,6 +12635,7 @@ function TickReplayTest() {
       const sid = res?.data?.sessionId;
       if (!sid) throw new Error('No sessionId returned from server');
       replaySessionRef.current = sid;
+      lastSaveReplaySessionIdRef.current = sid;  // preserved past completion for save pipeline
       setReplaySessionId(sid);
 
       // Step 2: attach SSE stream
@@ -13403,10 +13486,12 @@ function SessionCompare() {
   const [comparing,    setComparing]    = useState(false);
   const [compareErr,   setCompareErr]   = useState('');
   const [deleting,     setDeleting]     = useState(null);
-  const [ticksA,       setTicksA]       = useState([]);
-  const [ticksB,       setTicksB]       = useState([]);
-  const [ticksLoading, setTicksLoading] = useState(false);
-  const [compareTab,   setCompareTab]   = useState('summary');
+  const [ticksA,           setTicksA]           = useState([]);
+  const [ticksB,           setTicksB]           = useState([]);
+  const [ticksLoading,     setTicksLoading]     = useState(false);
+  const [compareTab,       setCompareTab]       = useState('summary');
+  const [skipPartialBucket, setSkipPartialBucket] = useState(true);
+  const [ticksMeta,        setTicksMeta]        = useState({ truncatedA: false, truncatedB: false, totalA: 0, totalB: 0 });
 
   // ── Session management ────────────────────────────────────────────────────
   function loadSessions(userId, type) {
@@ -13434,16 +13519,30 @@ function SessionCompare() {
       const smB = (() => { try { return dB?.summaryJson ? JSON.parse(dB.summaryJson) : null; } catch { return null; } })();
       const sidA = smA?.dataEngineSessionId;
       const sidB = smB?.dataEngineSessionId;
+      console.log('[compare] A sessionId:', selA, '| dataEngineSessionId:', sidA, '| summaryKeys:', smA ? Object.keys(smA) : null);
+      console.log('[compare] B sessionId:', selB, '| dataEngineSessionId:', sidB, '| summaryKeys:', smB ? Object.keys(smB) : null);
       if (sidA || sidB) {
         setTicksLoading(true);
-        const [tA, tB] = await Promise.all([
-          sidA ? querySessionTicks(sidA, null).then(r => r?.data ?? []).catch(() => []) : Promise.resolve([]),
-          sidB ? querySessionTicks(sidB, null).then(r => r?.data ?? []).catch(() => []) : Promise.resolve([]),
-        ]);
+        setTicksMeta({ truncatedA: false, truncatedB: false, totalA: 0, totalB: 0 });
+        const fetchTicks = (sid) => sid
+          ? querySessionTicksForCompare(sid, null, null, null)
+              .then(r => {
+                const page = r?.data ?? { ticks: [], truncated: false, returnedCount: 0, totalCount: 0 };
+                console.log(`[compare] ${sid}: returned=${page.returnedCount} total=${page.totalCount} truncated=${page.truncated}`);
+                return page;
+              })
+              .catch(e => { console.warn(`[compare] ticks fetch failed for ${sid}:`, e.message); return { ticks: [], truncated: false, returnedCount: 0, totalCount: 0 }; })
+          : Promise.resolve({ ticks: [], truncated: false, returnedCount: 0, totalCount: 0 });
+
+        const [pageA, pageB] = await Promise.all([fetchTicks(sidA), fetchTicks(sidB)]);
+        console.log('[compare] ticksA count:', pageA.ticks.length, '| ticksB count:', pageB.ticks.length);
         // Normalise to { token, ltp, timeMs } format the comparison logic expects
-        setTicksA(tA.map(t => ({ token: String(t.instrumentToken), ltp: t.ltp, timeMs: t.tickTimeMs })));
-        setTicksB(tB.map(t => ({ token: String(t.instrumentToken), ltp: t.ltp, timeMs: t.tickTimeMs })));
+        setTicksA(pageA.ticks.map(t => ({ token: String(t.instrumentToken), ltp: t.ltp, timeMs: t.tickTimeMs })));
+        setTicksB(pageB.ticks.map(t => ({ token: String(t.instrumentToken), ltp: t.ltp, timeMs: t.tickTimeMs })));
+        setTicksMeta({ truncatedA: pageA.truncated, truncatedB: pageB.truncated, totalA: pageA.totalCount, totalB: pageB.totalCount });
         setTicksLoading(false);
+      } else {
+        console.warn('[compare] no dataEngineSessionId in either session — tick comparison skipped');
       }
     } catch (e) { setCompareErr(e.message); }
     finally { setComparing(false); }
@@ -13477,7 +13576,7 @@ function SessionCompare() {
 
   // ── Comparison tolerances — tune to adjust matching sensitivity ───────────
   const TICK_TOL_MS    = 2000;          // ±2 s  : network/replay jitter
-  const TRADE_TOL_MS   = 5 * 60 * 1000;// ±5 min: same-instrument nearest entry
+  const TRADE_TOL_MS   = 60 * 1000;    // ±1 min: tight — replay/live entries should be near-identical
   const OHLC_TOL       = 0.05;         // 5 paise: price rounding noise
   const SCORE_TOL      = 0.5;          // 0.5 pt: floating-point noise in scores
 
@@ -13513,19 +13612,19 @@ function SessionCompare() {
             token, a: ta, b: tb, timeDiffMs: tb.timeMs - ta.timeMs, priceDiff });
           totalMatched++;
         } else {
-          tokenRows.push({ matchType: 'LIVE_ONLY', token, a: ta, b: null, timeDiffMs: null, priceDiff: null });
+          tokenRows.push({ matchType: 'A_ONLY', token, a: ta, b: null, timeDiffMs: null, priceDiff: null });
         }
       }
       for (let bi = 0; bi < bs.length; bi++) {
-        if (!usedB.has(bi)) tokenRows.push({ matchType: 'REPLAY_ONLY', token, a: null, b: bs[bi], timeDiffMs: null, priceDiff: null });
+        if (!usedB.has(bi)) tokenRows.push({ matchType: 'B_ONLY', token, a: null, b: bs[bi], timeDiffMs: null, priceDiff: null });
       }
       stats[token] = {
         token,
         aCount: as.length, bCount: bs.length,
         matched:      tokenRows.filter(r => r.matchType === 'MATCHED').length,
         priceMismatch:tokenRows.filter(r => r.matchType === 'PRICE_MISMATCH').length,
-        aOnly:        tokenRows.filter(r => r.matchType === 'LIVE_ONLY').length,
-        bOnly:        tokenRows.filter(r => r.matchType === 'REPLAY_ONLY').length,
+        aOnly:        tokenRows.filter(r => r.matchType === 'A_ONLY').length,
+        bOnly:        tokenRows.filter(r => r.matchType === 'B_ONLY').length,
       };
       rows.push(...tokenRows);
     }
@@ -13537,15 +13636,23 @@ function SessionCompare() {
 
   // ── 2. Candle comparison ─────────────────────────────────────────────────
   // Strategy: exact lookup by niftyTime ISO string. OHLC compared with OHLC_TOL.
+  // Partial start buckets: first candle of A or B that the other session doesn't have
+  // (caused by LIVE attaching mid-bucket). Marked PARTIAL_START_BUCKET for optional exclusion.
   const candleComparison = (() => {
-    if (!feedA.length && !feedB.length) return { rows: [], stats: null };
+    if (!feedA.length && !feedB.length) return { rows: [], stats: null, partialBuckets: new Set() };
     const mapA = new Map(feedA.map(e => [e.niftyTime, e]));
     const mapB = new Map(feedB.map(e => [e.niftyTime, e]));
     const allTimes = [...new Set([...feedA.map(e => e.niftyTime), ...feedB.map(e => e.niftyTime)])].sort();
+    // Detect partial start buckets: first candle in A not in B, or vice versa
+    const partialBuckets = new Set();
+    const firstA = feedA.length ? feedA[0].niftyTime : null;
+    const firstB = feedB.length ? feedB[0].niftyTime : null;
+    if (firstA && !mapB.has(firstA)) partialBuckets.add(firstA);
+    if (firstB && !mapA.has(firstB) && firstB !== firstA) partialBuckets.add(firstB);
     const rows = allTimes.map(t => {
       const a = mapA.get(t) || null, b = mapB.get(t) || null;
-      if (!a) return { time: t, a: null, b, matchType: 'REPLAY_ONLY', divergedFields: [] };
-      if (!b) return { time: t, a, b: null, matchType: 'LIVE_ONLY',   divergedFields: [] };
+      if (!a) return { time: t, a: null, b, matchType: partialBuckets.has(t) ? 'PARTIAL_START_BUCKET' : 'B_ONLY', divergedFields: [] };
+      if (!b) return { time: t, a, b: null, matchType: partialBuckets.has(t) ? 'PARTIAL_START_BUCKET' : 'A_ONLY', divergedFields: [] };
       const df = [];
       if (Math.abs((a.niftyOpen  ||0)-(b.niftyOpen  ||0)) > OHLC_TOL) df.push('open');
       if (Math.abs((a.niftyHigh  ||0)-(b.niftyHigh  ||0)) > OHLC_TOL) df.push('high');
@@ -13554,12 +13661,16 @@ function SessionCompare() {
       if ((a.niftyVolume||0) !== (b.niftyVolume||0))                   df.push('volume');
       return { time: t, a, b, matchType: df.length === 0 ? 'EXACT' : 'OHLC_MISMATCH', divergedFields: df };
     });
-    const exact      = rows.filter(r => r.matchType === 'EXACT').length;
-    const mismatch   = rows.filter(r => r.matchType === 'OHLC_MISMATCH').length;
-    const liveOnly   = rows.filter(r => r.matchType === 'LIVE_ONLY').length;
-    const replayOnly = rows.filter(r => r.matchType === 'REPLAY_ONLY').length;
-    const total = rows.length;
-    return { rows, stats: { total, exact, mismatch, liveOnly, replayOnly, matchPct: total > 0 ? (exact/total*100).toFixed(1) : null } };
+    // Stats computed over rows that are not excluded by skipPartialBucket filter
+    const scored = skipPartialBucket ? rows.filter(r => r.matchType !== 'PARTIAL_START_BUCKET') : rows;
+    const exact      = scored.filter(r => r.matchType === 'EXACT').length;
+    const mismatch   = scored.filter(r => r.matchType === 'OHLC_MISMATCH').length;
+    const aOnly      = scored.filter(r => r.matchType === 'A_ONLY').length;
+    const bOnly      = scored.filter(r => r.matchType === 'B_ONLY').length;
+    const partial    = rows.filter(r => r.matchType === 'PARTIAL_START_BUCKET').length;
+    const total = scored.length;
+    // aCount/bCount = unique niftyTime buckets per feed (not raw feed entry count)
+    return { rows, scored, partialBuckets, stats: { total, exact, mismatch, aOnly, bOnly, partial, aCount: mapA.size, bCount: mapB.size, matchPct: total > 0 ? (exact/total*100).toFixed(1) : null } };
   })();
 
   // ── 3. Signal comparison ─────────────────────────────────────────────────
@@ -13569,10 +13680,11 @@ function SessionCompare() {
     const mapA = new Map(feedA.map(e => [e.niftyTime, e]));
     const mapB = new Map(feedB.map(e => [e.niftyTime, e]));
     const allTimes = [...new Set([...feedA.map(e => e.niftyTime), ...feedB.map(e => e.niftyTime)])].sort();
+    const { partialBuckets } = candleComparison;
     const rows = allTimes.map(t => {
       const a = mapA.get(t) || null, b = mapB.get(t) || null;
-      if (!a) return { time: t, a: null, b, matchType: 'REPLAY_ONLY', divergedFields: [] };
-      if (!b) return { time: t, a, b: null, matchType: 'LIVE_ONLY',   divergedFields: [] };
+      if (!a) return { time: t, a: null, b, matchType: partialBuckets.has(t) ? 'PARTIAL_START_BUCKET' : 'B_ONLY', divergedFields: [] };
+      if (!b) return { time: t, a, b: null, matchType: partialBuckets.has(t) ? 'PARTIAL_START_BUCKET' : 'A_ONLY', divergedFields: [] };
       const df = [];
       if (a.regime         !== b.regime)         df.push('regime');
       if (a.confirmedBias  !== b.confirmedBias)  df.push('confirmedBias');
@@ -13583,16 +13695,18 @@ function SessionCompare() {
       if (a.exitReason     !== b.exitReason)     df.push('exitReason');
       return { time: t, a, b, matchType: df.length === 0 ? 'MATCHED' : 'SIGNAL_MISMATCH', divergedFields: df };
     });
-    const matched    = rows.filter(r => r.matchType === 'MATCHED').length;
-    const mismatch   = rows.filter(r => r.matchType === 'SIGNAL_MISMATCH').length;
-    const liveOnly   = rows.filter(r => r.matchType === 'LIVE_ONLY').length;
-    const replayOnly = rows.filter(r => r.matchType === 'REPLAY_ONLY').length;
-    const total = rows.length;
-    return { rows, stats: { total, matched, mismatch, liveOnly, replayOnly, matchPct: total > 0 ? (matched/total*100).toFixed(1) : null } };
+    const scored  = skipPartialBucket ? rows.filter(r => r.matchType !== 'PARTIAL_START_BUCKET') : rows;
+    const matched    = scored.filter(r => r.matchType === 'MATCHED').length;
+    const mismatch   = scored.filter(r => r.matchType === 'SIGNAL_MISMATCH').length;
+    const aOnly      = scored.filter(r => r.matchType === 'A_ONLY').length;
+    const bOnly      = scored.filter(r => r.matchType === 'B_ONLY').length;
+    const total = scored.length;
+    return { rows, scored, stats: { total, matched, mismatch, aOnly, bOnly, aCount: mapA.size, bCount: mapB.size, matchPct: total > 0 ? (matched/total*100).toFixed(1) : null } };
   })();
 
   // ── 4. Trade comparison ──────────────────────────────────────────────────
   // Strategy: greedy nearest entryTime match within TRADE_TOL_MS. Each trade consumed once.
+  // Flags entryPriceMismatch / exitPriceMismatch / exitReasonMismatch on BOTH rows.
   const tradeComparison = (() => {
     if (!tradesA.length && !tradesB.length) return { rows: [], stats: null };
     const usedB = new Set();
@@ -13605,16 +13719,29 @@ function SessionCompare() {
         const diff = Math.abs(new Date(tb.entryTime).getTime() - taMs);
         if (diff <= TRADE_TOL_MS && diff < bestDiff) { bestDiff = diff; bestIdx = i; }
       });
-      if (bestIdx >= 0) { usedB.add(bestIdx); rows.push({ matchType: 'BOTH', a: ta, b: tradesB[bestIdx] }); }
-      else rows.push({ matchType: 'LIVE_ONLY', a: ta, b: null });
+      if (bestIdx >= 0) {
+        usedB.add(bestIdx);
+        const tb = tradesB[bestIdx];
+        const entryPriceMismatch = Math.abs((ta.entryPrice||0) - (tb.entryPrice||0)) > 0.5;
+        const exitPriceMismatch  = ta.exitPrice != null && tb.exitPrice != null
+                                    && Math.abs(ta.exitPrice - tb.exitPrice) > 0.5;
+        const exitReasonMismatch = ta.exitReason !== tb.exitReason;
+        const pnlDiff            = (tb.pnl||0) - (ta.pnl||0);
+        rows.push({ matchType: 'BOTH', a: ta, b: tb,
+                    entryPriceMismatch, exitPriceMismatch, exitReasonMismatch, pnlDiff });
+      } else {
+        rows.push({ matchType: 'A_ONLY', a: ta, b: null });
+      }
     }
-    tradesB.forEach((tb, i) => { if (!usedB.has(i)) rows.push({ matchType: 'REPLAY_ONLY', a: null, b: tb }); });
+    tradesB.forEach((tb, i) => { if (!usedB.has(i)) rows.push({ matchType: 'B_ONLY', a: null, b: tb }); });
     rows.sort((x,y) => ((x.a?.entryTime||x.b?.entryTime||'') > (y.a?.entryTime||y.b?.entryTime||'')) ? 1 : -1);
-    const both       = rows.filter(r => r.matchType === 'BOTH').length;
-    const liveOnly   = rows.filter(r => r.matchType === 'LIVE_ONLY').length;
-    const replayOnly = rows.filter(r => r.matchType === 'REPLAY_ONLY').length;
+    const both         = rows.filter(r => r.matchType === 'BOTH').length;
+    const aOnly        = rows.filter(r => r.matchType === 'A_ONLY').length;
+    const bOnly        = rows.filter(r => r.matchType === 'B_ONLY').length;
+    const priceMismatch = rows.filter(r => r.matchType === 'BOTH' && (r.entryPriceMismatch || r.exitPriceMismatch)).length;
     const tot = tradesA.length + tradesB.length;
-    return { rows, stats: { total: rows.length, both, liveOnly, replayOnly, matchPct: tot > 0 ? (both*2/tot*100).toFixed(1) : null } };
+    return { rows, stats: { total: rows.length, both, aOnly, bOnly, priceMismatch,
+                            matchPct: tot > 0 ? (both*2/tot*100).toFixed(1) : null } };
   })();
 
   // ── 5. Config diff ───────────────────────────────────────────────────────
@@ -13637,6 +13764,7 @@ function SessionCompare() {
   // ── 6. Divergence trace ──────────────────────────────────────────────────
   // Walks the comparison chain (TICK → CANDLE → SIGNAL → TRADE) and reports
   // the first point of divergence at each stage that was detected.
+  // Partial-start buckets are excluded when skipPartialBucket is on.
   const divergenceTrace = (() => {
     const stages = [];
     const firstTickDiv = tickComparison.rows.find(r => r.matchType !== 'MATCHED');
@@ -13644,24 +13772,33 @@ function SessionCompare() {
       stage: 'TICK', seqNo: 1,
       time: new Date(firstTickDiv.a?.timeMs || firstTickDiv.b?.timeMs || 0).toISOString(),
       matchType: firstTickDiv.matchType, token: String(firstTickDiv.token),
-      explanation: firstTickDiv.matchType === 'LIVE_ONLY'   ? 'Live received a tick that replay did not have' :
-                   firstTickDiv.matchType === 'REPLAY_ONLY' ? 'Replay had a tick not seen in live stream' :
+      explanation: firstTickDiv.matchType === 'A_ONLY'        ? 'Session A received a tick that session B did not have' :
+                   firstTickDiv.matchType === 'B_ONLY'        ? 'Session B had a tick not seen in session A' :
                    `LTP diverged by ${Number(firstTickDiv.priceDiff||0).toFixed(2)}`,
     });
-    const firstCandleDiv = candleComparison.rows.find(r => r.matchType !== 'EXACT');
+    // Candle: skip partial-start buckets in trace when toggle is on
+    const candleRows = skipPartialBucket
+      ? candleComparison.rows.filter(r => r.matchType !== 'PARTIAL_START_BUCKET')
+      : candleComparison.rows;
+    const firstCandleDiv = candleRows.find(r => r.matchType !== 'EXACT');
     if (firstCandleDiv) stages.push({
       stage: 'CANDLE', seqNo: 2, time: firstCandleDiv.time,
       matchType: firstCandleDiv.matchType, token: 'NIFTY',
-      explanation: firstCandleDiv.matchType === 'LIVE_ONLY'   ? 'Candle exists only in live feed' :
-                   firstCandleDiv.matchType === 'REPLAY_ONLY' ? 'Candle exists only in replay feed' :
+      explanation: firstCandleDiv.matchType === 'A_ONLY'             ? 'Candle exists only in session A feed' :
+                   firstCandleDiv.matchType === 'B_ONLY'             ? 'Candle exists only in session B feed' :
+                   firstCandleDiv.matchType === 'PARTIAL_START_BUCKET' ? 'Startup alignment gap — one session missed the partial first bucket' :
                    `OHLC fields differ: ${firstCandleDiv.divergedFields.join(', ')}`,
     });
-    const firstSignalDiv = signalComparison.rows.find(r => r.matchType !== 'MATCHED');
+    const signalRows = skipPartialBucket
+      ? signalComparison.rows.filter(r => r.matchType !== 'PARTIAL_START_BUCKET')
+      : signalComparison.rows;
+    const firstSignalDiv = signalRows.find(r => r.matchType !== 'MATCHED');
     if (firstSignalDiv) stages.push({
       stage: 'SIGNAL', seqNo: 3, time: firstSignalDiv.time,
       matchType: firstSignalDiv.matchType, token: 'NIFTY',
-      explanation: firstSignalDiv.matchType === 'LIVE_ONLY'   ? 'Signal exists only in live' :
-                   firstSignalDiv.matchType === 'REPLAY_ONLY' ? 'Signal exists only in replay' :
+      explanation: firstSignalDiv.matchType === 'A_ONLY'             ? 'Signal exists only in session A' :
+                   firstSignalDiv.matchType === 'B_ONLY'             ? 'Signal exists only in session B' :
+                   firstSignalDiv.matchType === 'PARTIAL_START_BUCKET' ? 'Startup alignment gap in signal layer' :
                    `Decision fields differ: ${firstSignalDiv.divergedFields.join(', ')}`,
     });
     const firstTradeDiv = tradeComparison.rows.find(r => r.matchType !== 'BOTH');
@@ -13670,7 +13807,8 @@ function SessionCompare() {
       time: firstTradeDiv.a?.entryTime || firstTradeDiv.b?.entryTime || '—',
       matchType: firstTradeDiv.matchType,
       token: firstTradeDiv.a?.tradingSymbol || firstTradeDiv.b?.tradingSymbol || '—',
-      explanation: firstTradeDiv.matchType === 'LIVE_ONLY' ? 'Trade taken in live but not in replay' : 'Trade taken in replay but not in live',
+      explanation: firstTradeDiv.matchType === 'A_ONLY' ? 'Trade taken in session A but not in session B'
+                                                        : 'Trade taken in session B but not in session A',
     });
     stages.sort((x,y) => x.seqNo - y.seqNo);
     return { stages, firstStage: stages[0] || null };
@@ -13752,15 +13890,18 @@ function SessionCompare() {
 
   function csvTrades() {
     if (!tradeComparison.rows.length) return row2('No trade data');
-    const lines = [row2('Match Type','A Entry','A Exit','A Type','A Symbol','A EntPx','A ExtPx','A PnL','A ExitReason','A Bars','B Entry','B Exit','B Type','B Symbol','B EntPx','B ExtPx','B PnL','B ExitReason','B Bars','Delta PnL')];
+    const lines = [row2('Match Type','A Entry','A Exit','A Type','A Symbol','A EntPx','A ExtPx','A PnL','A ExitReason','A Bars','B Entry','B Exit','B Type','B Symbol','B EntPx','B ExtPx','B PnL','B ExitReason','B Bars','Delta PnL','EntPx?','ExtPx?','ExitRsn?')];
     for (const r of tradeComparison.rows) {
-      const diff = r.matchType==='BOTH'&&r.a?.pnl!=null&&r.b?.pnl!=null ? n2c(r.b.pnl-r.a.pnl) : '';
+      const diff = r.matchType==='BOTH' ? n2c(r.pnlDiff??0) : '';
       lines.push(row2(r.matchType,
         (r.a?.entryTime||'').slice(0,19),(r.a?.exitTime||'').slice(0,19),
         r.a?.optionType??'',r.a?.tradingSymbol??'',r.a?.entryPrice!=null?n2c(r.a.entryPrice):'',r.a?.exitPrice!=null?n2c(r.a.exitPrice):'',r.a?.pnl!=null?n2c(r.a.pnl):'',r.a?.exitReason??'',r.a?.barsInTrade??'',
         (r.b?.entryTime||'').slice(0,19),(r.b?.exitTime||'').slice(0,19),
         r.b?.optionType??'',r.b?.tradingSymbol??'',r.b?.entryPrice!=null?n2c(r.b.entryPrice):'',r.b?.exitPrice!=null?n2c(r.b.exitPrice):'',r.b?.pnl!=null?n2c(r.b.pnl):'',r.b?.exitReason??'',r.b?.barsInTrade??'',
-        diff));
+        diff,
+        r.matchType==='BOTH'?(r.entryPriceMismatch?'MISMATCH':'ok'):'',
+        r.matchType==='BOTH'?(r.exitPriceMismatch?'MISMATCH':'ok'):'',
+        r.matchType==='BOTH'?(r.exitReasonMismatch?'MISMATCH':'ok'):''));
     }
     return lines.join('\n');
   }
@@ -13801,7 +13942,12 @@ function SessionCompare() {
 
   // ── Badge helper ──────────────────────────────────────────────────────────
   function mtColor(type) {
-    return { MATCHED:'#22c55e', EXACT:'#22c55e', BOTH:'#22c55e', PRICE_MISMATCH:'#f59e0b', OHLC_MISMATCH:'#f59e0b', SIGNAL_MISMATCH:'#f59e0b', LIVE_ONLY:'#6366f1', REPLAY_ONLY:'#10b981' }[type] || 'var(--text-muted)';
+    return {
+      MATCHED:'#22c55e', EXACT:'#22c55e', BOTH:'#22c55e',
+      PRICE_MISMATCH:'#f59e0b', OHLC_MISMATCH:'#f59e0b', SIGNAL_MISMATCH:'#f59e0b',
+      A_ONLY:'#6366f1', B_ONLY:'#10b981',
+      PARTIAL_START_BUCKET:'#94a3b8',
+    }[type] || 'var(--text-muted)';
   }
   function Badge({ type, label }) {
     return <span style={{ fontWeight:700, fontSize:10, color: mtColor(type) }}>{label ?? type}</span>;
@@ -13893,21 +14039,21 @@ function SessionCompare() {
                     rows.push(
                       <tr key={s.sessionId} style={{ background: isA?'rgba(99,102,241,0.1)':isB?'rgba(16,185,129,0.1)':undefined }}>
                         <td style={{ whiteSpace:'nowrap', color:'var(--text-muted)' }}>
-                          {s.savedAt ? new Date(s.savedAt).toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' }) : '—'}
+                          {s.savedAt ? new Date(s.savedAt).toLocaleTimeString('en-IN', { hour:'2-digit', minute:'2-digit', timeZone:'Asia/Kolkata', hour12:false }) : '—'}
                         </td>
                         <td style={{ whiteSpace:'nowrap', color:'var(--text-muted)' }}>
                           {s.type === 'TICK_REPLAY' && sm?.replayFirstTick && sm?.replayLastTick
                             ? `${sm.replayFirstTick.slice(11,16)} → ${sm.replayLastTick.slice(11,16)}`
                             : s.type === 'LIVE' && sm?.sessionStart && sm?.sessionEnd
-                            ? `${sm.sessionStart.slice(11,16)} → ${sm.sessionEnd.slice(11,16)}`
+                            ? `${new Date(sm.sessionStart).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata',hour12:false})} → ${new Date(sm.sessionEnd).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata',hour12:false})}`
                             : '—'}
                         </td>
                         <td style={{ whiteSpace:'nowrap' }}>
                           {pair && <span title={`Paired with ${pair.partnerId}`} style={{ display:'inline-block', width:8, height:8, borderRadius:'50%', background:PAIR_COLORS[pair.colorIdx], marginRight:5, verticalAlign:'middle' }} />}
                           <span style={{ color:s.type==='LIVE'?'#22c55e':'#6366f1', fontWeight:700 }}>{s.type==='LIVE'?'LIVE':'TICK'}</span>
                         </td>
-                        <td style={{ maxWidth:140, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{s.label||'—'}</td>
-                        <td>{s.userId||'—'}</td>
+                        <td style={{ maxWidth:220, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{s.label||'—'}</td>
+                        <td style={{ maxWidth:80, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', color:'var(--text-muted)', fontSize:10 }} title={s.userId||''}>{s.userId ? s.userId.split('@')[0] : '—'}</td>
                         <td>{s.tickCount!=null?s.tickCount.toLocaleString():'—'}</td>
                         <td>{sm?.trades??'—'}</td>
                         <td style={sm?.realizedPnl!=null?pnlStyle(sm.realizedPnl):{}}>{sm?.realizedPnl!=null?fmt2(sm.realizedPnl):'—'}</td>
@@ -13930,6 +14076,11 @@ function SessionCompare() {
             disabled={!selA || !selB || comparing || selA === selB}>
             {comparing ? 'Loading…' : 'Compare A vs B'}
           </button>
+          <label style={{ display:'flex', alignItems:'center', gap:5, fontSize:11, cursor:'pointer', userSelect:'none' }}
+            title="Exclude partial first candle from divergence counts — occurs when one session attached to the tick stream mid-bucket">
+            <input type="checkbox" checked={skipPartialBucket} onChange={e => setSkipPartialBucket(e.target.checked)} />
+            Skip startup bucket
+          </label>
           {selA && <span style={{ fontSize:11 }}>A: <b style={{ color:'#6366f1' }}>{sessions.find(s=>s.sessionId===selA)?.label||selA}</b></span>}
           {selB && <span style={{ fontSize:11 }}>B: <b style={{ color:'#10b981' }}>{sessions.find(s=>s.sessionId===selB)?.label||selB}</b></span>}
           {compareErr && <span style={{ fontSize:11, color:'#ef4444' }}>{compareErr}</span>}
@@ -13956,20 +14107,23 @@ function SessionCompare() {
               <table className="bt-table" style={{ fontSize:12 }}>
                 <thead><tr><th>Metric</th><th style={{ color:'#6366f1' }}>A — {labelA}</th><th style={{ color:'#10b981' }}>B — {labelB}</th><th>Diff (B−A)</th></tr></thead>
                 <tbody>
-                  {[['Date', resultA.sessionDate, resultB.sessionDate, null],
-                    ['Type', resultA.type,        resultB.type,        null],
-                    ['Trades', sumA?.trades, sumB?.trades, sumA?.trades!=null&&sumB?.trades!=null?sumB.trades-sumA.trades:null],
-                    ['Realized P&L', sumA?.realizedPnl, sumB?.realizedPnl, sumA?.realizedPnl!=null&&sumB?.realizedPnl!=null?sumB.realizedPnl-sumA.realizedPnl:null],
-                    ['Win Rate', sumA?.winRate!=null?`${(sumA.winRate*100).toFixed(1)}%`:null, sumB?.winRate!=null?`${(sumB.winRate*100).toFixed(1)}%`:null, sumA?.winRate!=null&&sumB?.winRate!=null?`${((sumB.winRate-sumA.winRate)*100).toFixed(1)}%`:null],
-                    ['Final Capital', sumA?.finalCapital, sumB?.finalCapital, sumA?.finalCapital!=null&&sumB?.finalCapital!=null?sumB.finalCapital-sumA.finalCapital:null],
-                  ].map(([lbl,vA,vB,diff]) => (
+                  {[['Date', resultA.sessionDate, resultB.sessionDate, null, 'str'],
+                    ['Type', resultA.type,        resultB.type,        null, 'str'],
+                    ['Trades', sumA?.trades, sumB?.trades, sumA?.trades!=null&&sumB?.trades!=null?sumB.trades-sumA.trades:null, 'int'],
+                    ['Realized P&L', sumA?.realizedPnl, sumB?.realizedPnl, sumA?.realizedPnl!=null&&sumB?.realizedPnl!=null?sumB.realizedPnl-sumA.realizedPnl:null, 'pnl'],
+                    ['Win Rate', sumA?.winRate!=null?`${(sumA.winRate*100).toFixed(1)}%`:null, sumB?.winRate!=null?`${(sumB.winRate*100).toFixed(1)}%`:null, sumA?.winRate!=null&&sumB?.winRate!=null?`${((sumB.winRate-sumA.winRate)*100).toFixed(1)}%`:null, 'str'],
+                    ['Final Capital', sumA?.finalCapital, sumB?.finalCapital, sumA?.finalCapital!=null&&sumB?.finalCapital!=null?sumB.finalCapital-sumA.finalCapital:null, 'pnl'],
+                  ].map(([lbl,vA,vB,diff,fmt]) => {
+                    const fmtVal = (v) => fmt==='int' ? String(v) : fmt2(v);
+                    const fmtDiff = (d) => fmt==='int' ? (d>0?'+':'')+d : (d>0?'+':'')+fmt2(d);
+                    return (
                     <tr key={lbl}>
                       <td style={{ fontWeight:700 }}>{lbl}</td>
-                      <td style={typeof vA==='number'?pnlStyle(vA):{}}>{typeof vA==='number'?fmt2(vA):(vA??'—')}</td>
-                      <td style={typeof vB==='number'?pnlStyle(vB):{}}>{typeof vB==='number'?fmt2(vB):(vB??'—')}</td>
-                      <td style={typeof diff==='number'?pnlStyle(diff):{}}>{diff!=null?(typeof diff==='number'?(diff>0?'+':'')+fmt2(diff):diff):'—'}</td>
+                      <td style={fmt==='pnl'&&typeof vA==='number'?pnlStyle(vA):{}}>{typeof vA==='number'?fmtVal(vA):(vA??'—')}</td>
+                      <td style={fmt==='pnl'&&typeof vB==='number'?pnlStyle(vB):{}}>{typeof vB==='number'?fmtVal(vB):(vB??'—')}</td>
+                      <td style={fmt==='pnl'&&typeof diff==='number'?pnlStyle(diff):{}}>{diff!=null?(typeof diff==='number'?fmtDiff(diff):diff):'—'}</td>
                     </tr>
-                  ))}
+                  )})}
                 </tbody>
               </table>
 
@@ -13979,10 +14133,10 @@ function SessionCompare() {
                   <thead><tr><th>Stage</th><th>A Count</th><th>B Count</th><th>Matched</th><th>Mismatch</th><th>A-only</th><th>B-only</th><th>Match %</th></tr></thead>
                   <tbody>
                     {[
-                      ['Ticks',   ticksA.length||0,  ticksB.length||0,  tickComparison.rows.filter(r=>r.matchType==='MATCHED').length,  tickComparison.rows.filter(r=>r.matchType==='PRICE_MISMATCH').length, tickComparison.rows.filter(r=>r.matchType==='LIVE_ONLY').length,  tickComparison.rows.filter(r=>r.matchType==='REPLAY_ONLY').length,  tickComparison.matchPct],
-                      ['Candles', feedA.length,       feedB.length,       candleComparison.stats?.exact??0,  candleComparison.stats?.mismatch??0,  candleComparison.stats?.liveOnly??0,  candleComparison.stats?.replayOnly??0,  candleComparison.stats?.matchPct],
-                      ['Signals', feedA.length,       feedB.length,       signalComparison.stats?.matched??0, signalComparison.stats?.mismatch??0,  signalComparison.stats?.liveOnly??0,  signalComparison.stats?.replayOnly??0, signalComparison.stats?.matchPct],
-                      ['Trades',  tradesA.length,     tradesB.length,     tradeComparison.stats?.both??0,    null,                                  tradeComparison.stats?.liveOnly??0,   tradeComparison.stats?.replayOnly??0,  tradeComparison.stats?.matchPct],
+                      ['Ticks',   ticksA.length||0,                    ticksB.length||0,                    tickComparison.rows.filter(r=>r.matchType==='MATCHED').length,  tickComparison.rows.filter(r=>r.matchType==='PRICE_MISMATCH').length, tickComparison.rows.filter(r=>r.matchType==='A_ONLY').length,  tickComparison.rows.filter(r=>r.matchType==='B_ONLY').length,  tickComparison.matchPct],
+                      ['Candles', candleComparison.stats?.aCount??feedA.length, candleComparison.stats?.bCount??feedB.length, candleComparison.stats?.exact??0,  candleComparison.stats?.mismatch??0,  candleComparison.stats?.aOnly??0,  candleComparison.stats?.bOnly??0,  candleComparison.stats?.matchPct],
+                      ['Signals', signalComparison.stats?.aCount??feedA.length, signalComparison.stats?.bCount??feedB.length, signalComparison.stats?.matched??0, signalComparison.stats?.mismatch??0,  signalComparison.stats?.aOnly??0,  signalComparison.stats?.bOnly??0, signalComparison.stats?.matchPct],
+                      ['Trades',  tradesA.length,                      tradesB.length,                      tradeComparison.stats?.both??0,    tradeComparison.stats?.priceMismatch??0,  tradeComparison.stats?.aOnly??0,   tradeComparison.stats?.bOnly??0,  tradeComparison.stats?.matchPct],
                     ].map(([lbl,ac,bc,matched,mism,ao,bo,pct]) => (
                       <tr key={lbl}>
                         <td style={{ fontWeight:700 }}>{lbl}</td>
@@ -14042,6 +14196,14 @@ function SessionCompare() {
                 <span className="bt-section-title" style={{ marginBottom:0 }}>Tick Comparison</span>
                 <span style={{ fontSize:11, color:'var(--text-muted)' }}>Matching: per-instrument, nearest timestamp ±{TICK_TOL_MS/1000}s tolerance</span>
               </div>
+              {(ticksMeta.truncatedA || ticksMeta.truncatedB) && (
+                <div style={{ padding:'8px 12px', background:'rgba(245,158,11,0.12)', border:'1px solid rgba(245,158,11,0.4)', borderRadius:4, marginBottom:10, fontSize:11 }}>
+                  Tick data was truncated to 50,000 rows per session.
+                  {ticksMeta.truncatedA && <span> A: {(ticksMeta.totalA).toLocaleString()} total.</span>}
+                  {ticksMeta.truncatedB && <span> B: {(ticksMeta.totalB).toLocaleString()} total.</span>}
+                  {' '}Comparison stats reflect only returned rows. Narrow the time range for a full comparison.
+                </div>
+              )}
               {ticksLoading
                 ? <p style={{ fontSize:12, color:'var(--text-muted)', margin:0 }}>Loading ticks from Data Engine…</p>
                 : tickComparison.rows.length === 0
@@ -14070,7 +14232,7 @@ function SessionCompare() {
                       <tbody>
                         {tickComparison.rows.slice(0, 1000).map((r, i) => (
                           <tr key={i} style={{ background:r.matchType==='PRICE_MISMATCH'?'rgba(245,158,11,0.08)':r.matchType!=='MATCHED'?'rgba(99,102,241,0.06)':undefined }}>
-                            <td><Badge type={r.matchType} label={r.matchType==='MATCHED'?'✓':r.matchType==='PRICE_MISMATCH'?'PRICE':r.matchType==='LIVE_ONLY'?'A-only':'B-only'} /></td>
+                            <td><Badge type={r.matchType} label={r.matchType==='MATCHED'?'✓':r.matchType==='PRICE_MISMATCH'?'PRICE':r.matchType==='A_ONLY'?'A-only':'B-only'} /></td>
                             <td style={{ fontFamily:'monospace', fontSize:9 }}>{r.token}</td>
                             <td style={{ fontFamily:'monospace', fontSize:9 }}>{r.a?new Date(r.a.timeMs).toISOString().slice(11,23):'—'}</td>
                             <td>{r.a?.ltp!=null?n2c(r.a.ltp):'—'}</td>
@@ -14098,7 +14260,7 @@ function SessionCompare() {
                 <span className="bt-section-title" style={{ marginBottom:0 }}>Candle Comparison — NIFTY OHLCV</span>
                 {candleComparison.stats && (
                   <span style={{ fontSize:11, color:'var(--text-muted)' }}>
-                    {candleComparison.stats.total} candles · {candleComparison.stats.exact} exact · {candleComparison.stats.mismatch} OHLC mismatch · {candleComparison.stats.liveOnly} live-only · {candleComparison.stats.replayOnly} replay-only
+                    {candleComparison.stats.total} candles · {candleComparison.stats.exact} exact · {candleComparison.stats.mismatch} OHLC mismatch · {candleComparison.stats.aOnly} A-only · {candleComparison.stats.bOnly} B-only{candleComparison.stats.partial > 0 ? ` · ${candleComparison.stats.partial} startup gap${skipPartialBucket ? ' (excluded)' : ''}` : ''}
                   </span>
                 )}
               </div>
@@ -14113,7 +14275,7 @@ function SessionCompare() {
                   <tbody>
                     {candleComparison.rows.map((r, i) => (
                       <tr key={i} style={{ background:r.matchType==='OHLC_MISMATCH'?'rgba(245,158,11,0.1)':r.matchType!=='EXACT'?'rgba(99,102,241,0.06)':undefined }}>
-                        <td><Badge type={r.matchType} label={r.matchType==='EXACT'?'✓':r.matchType==='OHLC_MISMATCH'?'OHLC':r.matchType==='LIVE_ONLY'?'A-only':'B-only'} /></td>
+                        <td><Badge type={r.matchType} label={r.matchType==='EXACT'?'✓':r.matchType==='OHLC_MISMATCH'?'OHLC':r.matchType==='PARTIAL_START_BUCKET'?'STARTUP':r.matchType==='A_ONLY'?'A-only':'B-only'} /></td>
                         <td style={{ color:'#f59e0b', fontSize:9 }}>{r.divergedFields.join(',')}</td>
                         <td style={{ fontFamily:'monospace', fontSize:9 }}>{(r.time||'').slice(11,16)}</td>
                         <td>{r.a?.niftyOpen!=null?n2c(r.a.niftyOpen):'—'}</td>
@@ -14192,7 +14354,10 @@ function SessionCompare() {
                 <span className="bt-section-title" style={{ marginBottom:0 }}>Trade Comparison</span>
                 {tradeComparison.stats && (
                   <span style={{ fontSize:11, color:'var(--text-muted)' }}>
-                    {tradeComparison.stats.both} both · {tradeComparison.stats.liveOnly} live-only · {tradeComparison.stats.replayOnly} replay-only
+                    {tradeComparison.stats.both} both · {tradeComparison.stats.aOnly} A-only · {tradeComparison.stats.bOnly} B-only
+                    {tradeComparison.stats.priceMismatch > 0 && (
+                      <span style={{ color:'#f59e0b', marginLeft:6 }}>· {tradeComparison.stats.priceMismatch} price mismatch</span>
+                    )}
                   </span>
                 )}
               </div>
@@ -14204,31 +14369,35 @@ function SessionCompare() {
                       <tr><th>Match</th>
                         <th style={{ color:'#6366f1' }}>A Entry</th><th style={{ color:'#6366f1' }}>A Type</th><th style={{ color:'#6366f1' }}>A Symbol</th><th style={{ color:'#6366f1' }}>A EntPx</th><th style={{ color:'#6366f1' }}>A ExtPx</th><th style={{ color:'#6366f1' }}>A P&L</th><th style={{ color:'#6366f1' }}>A Exit</th><th style={{ color:'#6366f1' }}>A Bars</th>
                         <th style={{ color:'#10b981' }}>B Entry</th><th style={{ color:'#10b981' }}>B Type</th><th style={{ color:'#10b981' }}>B Symbol</th><th style={{ color:'#10b981' }}>B EntPx</th><th style={{ color:'#10b981' }}>B ExtPx</th><th style={{ color:'#10b981' }}>B P&L</th><th style={{ color:'#10b981' }}>B Exit</th><th style={{ color:'#10b981' }}>B Bars</th>
-                        <th>ΔP&L</th></tr>
+                        <th>ΔP&L</th><th title="Entry price mismatch |A−B|>0.5">EntPx?</th><th title="Exit price mismatch |A−B|>0.5">ExtPx?</th><th title="Exit reason mismatch">ExitRsn?</th></tr>
                     </thead>
                     <tbody>
                       {tradeComparison.rows.map((r, i) => {
-                        const pnlDiff = r.matchType==='BOTH'&&r.a?.pnl!=null&&r.b?.pnl!=null?r.b.pnl-r.a.pnl:null;
+                        const pnlDiff = r.matchType==='BOTH' ? (r.pnlDiff??null) : null;
+                        const MISMATCH_BG = 'rgba(245,158,11,0.18)';
                         return (
-                          <tr key={i} style={{ background:r.matchType==='LIVE_ONLY'?'rgba(99,102,241,0.07)':r.matchType==='REPLAY_ONLY'?'rgba(16,185,129,0.07)':undefined }}>
-                            <td><Badge type={r.matchType} label={r.matchType==='BOTH'?'✓ BOTH':r.matchType==='LIVE_ONLY'?'A ONLY':'B ONLY'} /></td>
+                          <tr key={i} style={{ background:r.matchType==='A_ONLY'?'rgba(99,102,241,0.07)':r.matchType==='B_ONLY'?'rgba(16,185,129,0.07)':undefined }}>
+                            <td><Badge type={r.matchType} label={r.matchType==='BOTH'?'✓ BOTH':r.matchType==='A_ONLY'?'A ONLY':'B ONLY'} /></td>
                             <td style={{ fontFamily:'monospace', fontSize:10 }}>{(r.a?.entryTime||'').slice(11,16)||'—'}</td>
                             <td>{r.a?.optionType||'—'}</td>
                             <td style={{ fontSize:10 }}>{r.a?.tradingSymbol||'—'}</td>
-                            <td>{r.a?.entryPrice!=null?n2c(r.a.entryPrice):'—'}</td>
-                            <td>{r.a?.exitPrice!=null?n2c(r.a.exitPrice):'—'}</td>
+                            <td style={r.entryPriceMismatch?{background:MISMATCH_BG}:{}}>{r.a?.entryPrice!=null?n2c(r.a.entryPrice):'—'}</td>
+                            <td style={r.exitPriceMismatch?{background:MISMATCH_BG}:{}}>{r.a?.exitPrice!=null?n2c(r.a.exitPrice):'—'}</td>
                             <td style={r.a?.pnl!=null?pnlStyle(r.a.pnl):{}}>{r.a?.pnl!=null?fmt2(r.a.pnl):'—'}</td>
-                            <td style={{ fontSize:10 }}>{r.a?.exitReason||'—'}</td>
+                            <td style={{ fontSize:10, ...(r.exitReasonMismatch?{background:MISMATCH_BG}:{}) }}>{r.a?.exitReason||'—'}</td>
                             <td>{r.a?.barsInTrade??'—'}</td>
                             <td style={{ fontFamily:'monospace', fontSize:10 }}>{(r.b?.entryTime||'').slice(11,16)||'—'}</td>
                             <td>{r.b?.optionType||'—'}</td>
                             <td style={{ fontSize:10 }}>{r.b?.tradingSymbol||'—'}</td>
-                            <td>{r.b?.entryPrice!=null?n2c(r.b.entryPrice):'—'}</td>
-                            <td>{r.b?.exitPrice!=null?n2c(r.b.exitPrice):'—'}</td>
+                            <td style={r.entryPriceMismatch?{background:MISMATCH_BG}:{}}>{r.b?.entryPrice!=null?n2c(r.b.entryPrice):'—'}</td>
+                            <td style={r.exitPriceMismatch?{background:MISMATCH_BG}:{}}>{r.b?.exitPrice!=null?n2c(r.b.exitPrice):'—'}</td>
                             <td style={r.b?.pnl!=null?pnlStyle(r.b.pnl):{}}>{r.b?.pnl!=null?fmt2(r.b.pnl):'—'}</td>
-                            <td style={{ fontSize:10 }}>{r.b?.exitReason||'—'}</td>
+                            <td style={{ fontSize:10, ...(r.exitReasonMismatch?{background:MISMATCH_BG}:{}) }}>{r.b?.exitReason||'—'}</td>
                             <td>{r.b?.barsInTrade??'—'}</td>
                             <td style={pnlDiff!=null?pnlStyle(pnlDiff):{}}>{pnlDiff!=null?(pnlDiff>0?'+':'')+fmt2(pnlDiff):'—'}</td>
+                            <td style={{ textAlign:'center' }}>{r.matchType==='BOTH'?(r.entryPriceMismatch?<span style={{ color:'#f59e0b' }}>✗</span>:'✓'):'—'}</td>
+                            <td style={{ textAlign:'center' }}>{r.matchType==='BOTH'?(r.exitPriceMismatch?<span style={{ color:'#f59e0b' }}>✗</span>:'✓'):'—'}</td>
+                            <td style={{ textAlign:'center' }}>{r.matchType==='BOTH'?(r.exitReasonMismatch?<span style={{ color:'#f59e0b' }}>✗</span>:'✓'):'—'}</td>
                           </tr>
                         );
                       })}

@@ -3,11 +3,14 @@ package com.sma.dataengine.service;
 import com.sma.dataengine.model.TickRecord;
 import com.sma.dataengine.model.request.TickQueryRequest;
 import com.sma.dataengine.model.response.TickEntryDto;
+import com.sma.dataengine.model.response.TickPageResponse;
 import com.sma.dataengine.model.response.TickSessionInfo;
 import com.sma.dataengine.repository.CandleRepository;
 import com.sma.dataengine.repository.TickRecordRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -73,12 +76,15 @@ public class TickQueryService {
      */
     @Transactional(readOnly = true)
     public List<TickEntryDto> queryTicks(TickQueryRequest req) {
-        if (req.getTokens() == null || req.getTokens().isEmpty()) {
-            return List.of();
-        }
+        List<Long> tokens = req.getTokens();
 
-        List<TickRecord> records = repo.findBySessionIdAndTokensOrdered(
-                req.getSessionId(), req.getTokens());
+        // If no tokens specified, return all ticks for the session (used by compare tab).
+        List<TickRecord> records;
+        if (tokens == null || tokens.isEmpty()) {
+            records = repo.findBySessionIdOrdered(req.getSessionId());
+        } else {
+            records = repo.findBySessionIdAndTokensOrdered(req.getSessionId(), tokens);
+        }
 
         return records.stream()
                 .filter(r -> {
@@ -94,6 +100,61 @@ public class TickQueryService {
                         .build())
                 .collect(Collectors.toList());
     }
+
+    // ─── Capped tick query (compare / UI path) ────────────────────────────────
+
+    /**
+     * Fetches ticks for the compare/debug UI, capped at {@value #COMPARE_ROW_CAP} rows.
+     *
+     * <p>This is intentionally separate from {@link #queryTicks} so that the row cap
+     * never affects the replay engine, which calls {@link #queryTicks} directly and
+     * must receive complete data.
+     *
+     * <p>Date filtering (fromDate/toDate) is pushed into the SQL WHERE clause —
+     * no post-fetch filtering in Java. Open-ended bounds use LocalDateTime.MIN/MAX
+     * rather than nulls, keeping the SQL simple and JDBC-null-safe.
+     */
+    @Transactional(readOnly = true)
+    public TickPageResponse queryTicksCapped(TickQueryRequest req) {
+        List<Long> tokens = req.getTokens();
+        // LocalDateTime.MIN/MAX are outside PostgreSQL's valid timestamp range — use
+        // wide but safe sentinels that cover all realistic trading data instead.
+        LocalDateTime from = req.getFromDate() != null ? req.getFromDate() : LocalDateTime.of(2000, 1, 1, 0, 0, 0);
+        LocalDateTime to   = req.getToDate()   != null ? req.getToDate()   : LocalDateTime.of(2100, 12, 31, 23, 59, 59);
+
+        PageRequest pr = PageRequest.of(0, COMPARE_ROW_CAP);
+        Page<TickRecord> page;
+        if (tokens == null || tokens.isEmpty()) {
+            page = repo.findForCompare(req.getSessionId(), from, to, pr);
+        } else {
+            page = repo.findByTokensForCompare(req.getSessionId(), tokens, from, to, pr);
+        }
+
+        List<TickEntryDto> ticks = page.getContent().stream()
+                .map(r -> TickEntryDto.builder()
+                        .instrumentToken(r.getInstrumentToken())
+                        .ltp(r.getLtp().doubleValue())
+                        .volume(r.getVolume() != null ? r.getVolume() : 0L)
+                        .tickTimeMs(r.getTickTime().atZone(IST).toInstant().toEpochMilli())
+                        .build())
+                .collect(Collectors.toList());
+
+        boolean truncated = !page.isLast() || page.getTotalPages() > 1;
+        log.info("queryTicksCapped session={} tokens={} from={} to={} returned={} total={} truncated={}",
+                req.getSessionId(), tokens == null ? "all" : tokens.size(),
+                req.getFromDate(), req.getToDate(),
+                ticks.size(), page.getTotalElements(), truncated);
+
+        return TickPageResponse.builder()
+                .ticks(ticks)
+                .truncated(truncated)
+                .returnedCount(ticks.size())
+                .totalCount(page.getTotalElements())
+                .build();
+    }
+
+    /** Maximum rows returned by the capped compare/UI query. Replay engine is not subject to this cap. */
+    private static final int COMPARE_ROW_CAP = 50_000;
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
 

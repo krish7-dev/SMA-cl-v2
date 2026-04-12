@@ -1,14 +1,17 @@
 package com.sma.strategyengine.service.options;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sma.strategyengine.client.DataEngineClient;
 import com.sma.strategyengine.client.DataEngineClient.CandleDto;
 import com.sma.strategyengine.entity.LiveSnapshotRecord;
+import com.sma.strategyengine.entity.SessionResultRecord;
 import com.sma.strategyengine.model.request.BacktestRequest;
 import com.sma.strategyengine.model.request.OptionsLiveRequest;
 import com.sma.strategyengine.model.request.OptionsReplayRequest;
 import com.sma.strategyengine.model.response.OptionsReplayCandleEvent;
 import com.sma.strategyengine.repository.LiveSnapshotRepository;
+import com.sma.strategyengine.repository.SessionResultRepository;
 import com.sma.strategyengine.service.MarketRegimeDetector;
 import com.sma.strategyengine.strategy.StrategyRegistry;
 import lombok.Getter;
@@ -55,10 +58,11 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class OptionsLiveService {
 
-    private final StrategyRegistry      strategyRegistry;
-    private final DataEngineClient      dataEngineClient;
-    private final ObjectMapper          objectMapper;
+    private final StrategyRegistry       strategyRegistry;
+    private final DataEngineClient       dataEngineClient;
+    private final ObjectMapper           objectMapper;
     private final LiveSnapshotRepository snapshotRepository;
+    private final SessionResultRepository sessionResultRepository;
 
     @Value("${strategy.data-engine.base-url:http://localhost:9005}")
     private String dataEngineBaseUrl;
@@ -78,7 +82,11 @@ public class OptionsLiveService {
             "DAY",       86_400_000L
     );
 
-    private final ConcurrentHashMap<String, LiveOptionsSession> sessions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, LiveOptionsSession> sessions       = new ConcurrentHashMap<>();
+
+    // Feed cache for stopped sessions — expires after ~60 min
+    private final ConcurrentHashMap<String, List<String>> completedFeeds     = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Instant>      completedFeedTimes = new ConcurrentHashMap<>();
 
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "opts-live-" + System.nanoTime());
@@ -181,6 +189,16 @@ public class OptionsLiveService {
     }
 
     /**
+     * Returns the full candle-event JSON list for a session (active or recently stopped).
+     * Used by save-to-compare to fetch server-side feed instead of relying on client SSE state.
+     */
+    public List<String> getFeed(String sessionId) {
+        LiveOptionsSession active = sessions.get(sessionId);
+        if (active != null) return active.getFeedList();
+        return completedFeeds.get(sessionId); // null if expired or never ran
+    }
+
+    /**
      * Sends an SSE comment (":ping") to all connected emitters every 15 seconds.
      * Keeps the Vercel proxy connection alive — without this, Vercel's reverse proxy
      * closes idle SSE streams after ~30 seconds of no data.
@@ -195,7 +213,19 @@ public class OptionsLiveService {
 
     private void stopSession(String sessionId) {
         LiveOptionsSession session = sessions.remove(sessionId);
-        if (session != null) session.stop();
+        if (session != null) {
+            session.autoSave();   // persist feed+trades to DB before the session is GC'd
+            completedFeeds.put(sessionId, session.getFeedList());
+            completedFeedTimes.put(sessionId, Instant.now());
+            session.stop();
+        }
+    }
+
+    @Scheduled(fixedDelay = 1_800_000) // every 30 min — evict feeds older than 60 min
+    public void cleanupCompletedFeeds() {
+        Instant cutoff = Instant.now().minusSeconds(3600);
+        completedFeedTimes.entrySet().removeIf(e -> e.getValue().isBefore(cutoff));
+        completedFeeds.keySet().retainAll(completedFeedTimes.keySet());
     }
 
     private void persistSnapshot(String sessionId, OptionsLiveRequest req) {
@@ -281,6 +311,9 @@ public class OptionsLiveService {
         private final Deque<String[]> eventBuffer = new ArrayDeque<>(BUFFER_SIZE);
         private final Object bufferLock = new Object();
 
+        // Full candle event history for reliable save-to-compare (unbounded, not a ring buffer).
+        private final List<String> feedList = new ArrayList<>();
+
         // Instrument sets
         final long        niftyToken;
         final Set<Long>   optionTokens = new HashSet<>();
@@ -359,6 +392,65 @@ public class OptionsLiveService {
             broadcast("error", message);
         }
 
+        /** Returns the full candle event history (for save-to-compare). */
+        List<String> getFeedList() { return Collections.unmodifiableList(feedList); }
+
+        /**
+         * Auto-saves this session's feed, trades, config, and summary to the session_result table.
+         * Called on stop so the data survives beyond the in-memory session.
+         * Uses an empty label ("") so the user-initiated save can overwrite it with a proper label.
+         */
+        void autoSave() {
+            if (feedList.isEmpty()) {
+                log.info("LIVE auto-save skipped (no candles emitted): sessionId={}", sessionId);
+                return;
+            }
+            try {
+                String feedJson = "[" + String.join(",", feedList) + "]";
+
+                // Extract closedTrades and stats from the last candle event
+                String closedTradesJson = null;
+                Map<String, Object> summaryMap = new LinkedHashMap<>();
+                try {
+                    Map<String, Object> lastEvt = objectMapper.readValue(
+                            feedList.get(feedList.size() - 1),
+                            new TypeReference<Map<String, Object>>() {});
+                    Object trades = lastEvt.get("closedTrades");
+                    if (trades != null) closedTradesJson = objectMapper.writeValueAsString(trades);
+                    int tradeCount = trades instanceof List ? ((List<?>) trades).size() : 0;
+                    summaryMap.put("trades",              tradeCount);
+                    summaryMap.put("finalCapital",        lastEvt.getOrDefault("capital", 100000));
+                    summaryMap.put("realizedPnl",         lastEvt.getOrDefault("realizedPnl", 0));
+                    summaryMap.put("winRate",             lastEvt.getOrDefault("winRate", 0));
+                } catch (Exception e) {
+                    log.warn("LIVE auto-save: failed to parse last candle event: {}", e.getMessage());
+                }
+                // sessionId for LIVE is also the Data Engine tick session identifier
+                summaryMap.put("dataEngineSessionId", sessionId);
+                summaryMap.put("sessionEnd",          Instant.now().toString());
+
+                SessionResultRecord record = SessionResultRecord.builder()
+                        .sessionId(sessionId)
+                        .type("LIVE")
+                        .userId(userId)
+                        .brokerName(req.getBrokerName())
+                        .sessionDate(LocalDate.now())
+                        .label("")
+                        .configJson(objectMapper.writeValueAsString(req))
+                        .closedTradesJson(closedTradesJson)
+                        .feedJson(feedJson)
+                        .summaryJson(objectMapper.writeValueAsString(summaryMap))
+                        .savedAt(Instant.now())
+                        .build();
+                sessionResultRepository.save(record);
+                log.info("LIVE auto-saved: sessionId={} candles={} trades={}",
+                        sessionId, feedList.size(),
+                        closedTradesJson != null ? "present" : "none");
+            } catch (Exception e) {
+                log.error("LIVE auto-save failed: sessionId={} error={}", sessionId, e.getMessage());
+            }
+        }
+
         /** Sends a named event to all connected emitters; silently removes dead ones. */
         private void broadcast(String eventName, String data) {
             // Buffer the event for late-joining UIs (candle, init, warning events)
@@ -367,6 +459,10 @@ public class OptionsLiveService {
                     if (eventBuffer.size() >= BUFFER_SIZE) eventBuffer.pollFirst();
                     eventBuffer.addLast(new String[]{ eventName, data });
                 }
+            }
+            // Persist full candle history server-side for reliable save-to-compare
+            if ("candle".equals(eventName)) {
+                feedList.add(data);
             }
             if (emitters.isEmpty()) return;
             List<SseEmitter> dead = null;
@@ -889,6 +985,11 @@ public class OptionsLiveService {
                         openTime, action, marketPhase, tradable);
 
                 broadcast("candle", objectMapper.writeValueAsString(event));
+
+                // ── divergence debug (enable via logging.level.com.sma=DEBUG) ──
+                if (log.isDebugEnabled()) {
+                    logCandleDebug(bucketMs, event);
+                }
             } catch (Exception e) {
                 log.debug("Options live session {}: tick candle emit failed: {}", sessionId, e.getMessage());
             }
@@ -1152,6 +1253,43 @@ public class OptionsLiveService {
                     .confidence(c.getConfidence())
                     .penalty(c.getPenalty())
                     .build()).collect(Collectors.toList());
+        }
+
+        // ── divergence debug helper ───────────────────────────────────────────
+
+        /** Logs one line per NIFTY event plus one line per option token snapshot.
+         *  Mirror of the same helper in {@link TickOptionsReplayService}.
+         *  tickEpochMs is unavailable in emitTickCandleEvent — always 0 for LIVE mode. */
+        private void logCandleDebug(long bucketMs, OptionsReplayCandleEvent e) {
+            log.debug("[LIVE][{}] tick=0 bucket={} niftyTime={} regime={} bias={} winner={} score={} "
+                    + "entryAllowed={} blockReason={} execWait={} state={} action={} "
+                    + "token={} symbol={} entryPx={} capital={}",
+                    sessionId, bucketMs,
+                    e.getNiftyTime(), e.getRegime(), e.getConfirmedBias(),
+                    e.getWinnerStrategy(), String.format("%.2f", e.getWinnerScore()),
+                    e.isEntryAllowed(),
+                    e.getBlockReason()    != null ? e.getBlockReason()    : "-",
+                    e.getExecWaitReason() != null ? e.getExecWaitReason() : "-",
+                    e.getPositionState(), e.getAction(),
+                    e.getSelectedToken()        != null ? e.getSelectedToken()        : "-",
+                    e.getSelectedTradingSymbol() != null ? e.getSelectedTradingSymbol() : "-",
+                    String.format("%.2f", e.getEntryPrice()),
+                    String.format("%.2f", e.getCapital()));
+            LocalDateTime bucketLdt = bucketToLocalDateTime(bucketMs);
+            for (Long token : optionTokens) {
+                NavigableMap<LocalDateTime, CandleDto> map = liveOptionCandles.get(token);
+                FormingCandle fc = forming.get(token);
+                boolean hasSameBucket = fc != null && fc.startMs == bucketMs;
+                CandleDto snap = map != null ? map.get(bucketLdt) : null;
+                log.debug("[LIVE][{}]   opt-snap token={} bucketMs={} hasSameBucketForming={} "
+                        + "snapPresent={} O={} H={} L={} C={}",
+                        sessionId, token, bucketMs, hasSameBucket,
+                        snap != null,
+                        snap != null ? snap.open()  : "-",
+                        snap != null ? snap.high()  : "-",
+                        snap != null ? snap.low()   : "-",
+                        snap != null ? snap.close() : "-");
+            }
         }
     }
 

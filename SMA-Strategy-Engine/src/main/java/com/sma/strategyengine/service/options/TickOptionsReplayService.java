@@ -1,12 +1,15 @@
 package com.sma.strategyengine.service.options;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sma.strategyengine.client.DataEngineClient;
 import com.sma.strategyengine.client.DataEngineClient.CandleDto;
+import com.sma.strategyengine.entity.SessionResultRecord;
 import com.sma.strategyengine.model.request.BacktestRequest;
 import com.sma.strategyengine.model.request.OptionsReplayRequest;
 import com.sma.strategyengine.model.request.TickOptionsReplayRequest;
 import com.sma.strategyengine.model.response.OptionsReplayCandleEvent;
+import com.sma.strategyengine.repository.SessionResultRepository;
 import com.sma.strategyengine.service.MarketRegimeDetector;
 import com.sma.strategyengine.strategy.StrategyRegistry;
 import lombok.RequiredArgsConstructor;
@@ -17,6 +20,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.ZoneId;
@@ -56,11 +60,16 @@ public class TickOptionsReplayService {
 
     private static final int BUFFER_SIZE = 200;
 
-    private final StrategyRegistry strategyRegistry;
-    private final DataEngineClient dataEngineClient;
-    private final ObjectMapper     objectMapper;
+    private final StrategyRegistry       strategyRegistry;
+    private final DataEngineClient       dataEngineClient;
+    private final ObjectMapper           objectMapper;
+    private final SessionResultRepository sessionResultRepository;
 
-    private final ConcurrentHashMap<String, TickReplaySession> sessions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, TickReplaySession> sessions       = new ConcurrentHashMap<>();
+
+    // Feed cache for completed/stopped sessions — expires after ~60 min
+    private final ConcurrentHashMap<String, List<String>> completedFeeds     = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Instant>      completedFeedTimes = new ConcurrentHashMap<>();
 
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "tick-replay-" + System.nanoTime());
@@ -87,6 +96,9 @@ public class TickOptionsReplayService {
                 session.broadcastError(e.getMessage());
             } finally {
                 sessions.remove(sessionId);
+                session.autoSave();   // persist feed+trades to DB before the session is GC'd
+                completedFeeds.put(sessionId, session.getFeedList());
+                completedFeedTimes.put(sessionId, Instant.now());
                 session.completeEmitters();
             }
         });
@@ -123,9 +135,30 @@ public class TickOptionsReplayService {
     public void stop(String sessionId) {
         TickReplaySession session = sessions.remove(sessionId);
         if (session != null) {
+            session.autoSave();   // persist feed+trades to DB on explicit stop too
+            completedFeeds.put(sessionId, session.getFeedList());
+            completedFeedTimes.put(sessionId, Instant.now());
             session.stop();
             log.info("Tick replay session {} stopped by request", sessionId);
         }
+    }
+
+    /**
+     * Returns the full candle-event feed for a session (active or recently completed).
+     * Used by save-to-compare — sessions auto-remove after completion, so completed feeds
+     * are cached here for ~60 minutes.
+     */
+    public List<String> getFeed(String sessionId) {
+        TickReplaySession active = sessions.get(sessionId);
+        if (active != null) return active.getFeedList();
+        return completedFeeds.get(sessionId); // null if expired or never ran
+    }
+
+    @Scheduled(fixedDelay = 1_800_000) // every 30 min — evict feeds older than 60 min
+    public void cleanupCompletedFeeds() {
+        Instant cutoff = Instant.now().minusSeconds(3600);
+        completedFeedTimes.entrySet().removeIf(e -> e.getValue().isBefore(cutoff));
+        completedFeeds.keySet().retainAll(completedFeedTimes.keySet());
     }
 
     /** Returns a snapshot of all active (still-running) replay sessions. */
@@ -161,6 +194,9 @@ public class TickOptionsReplayService {
         private final Deque<String[]>                  eventBuffer = new ArrayDeque<>(BUFFER_SIZE);
         private final Object                           bufferLock  = new Object();
 
+        // Full candle event history for reliable save-to-compare (unbounded, not a ring buffer).
+        private final List<String> feedList = new ArrayList<>();
+
         volatile boolean stopped = false;
 
         // ── emitter management ────────────────────────────────────────────────
@@ -193,12 +229,76 @@ public class TickOptionsReplayService {
 
         void broadcastError(String message) { broadcast("error", "\"" + message + "\""); }
 
+        /** Returns the full candle event history (for save-to-compare). */
+        List<String> getFeedList() { return Collections.unmodifiableList(feedList); }
+
+        /**
+         * Auto-saves this session's feed, trades, config, and summary to the session_result table.
+         * Called on completion/stop so the data survives beyond the in-memory session (and server restarts).
+         * Uses an empty label ("") so the user-initiated save can overwrite it with a proper label.
+         */
+        void autoSave() {
+            if (feedList.isEmpty()) {
+                log.info("TICK_REPLAY auto-save skipped (no candles emitted): sessionId={}", sessionId);
+                return;
+            }
+            try {
+                String feedJson = "[" + String.join(",", feedList) + "]";
+
+                // Extract closedTrades and stats from the last candle event
+                String closedTradesJson = null;
+                Map<String, Object> summaryMap = new LinkedHashMap<>();
+                try {
+                    Map<String, Object> lastEvt = objectMapper.readValue(
+                            feedList.get(feedList.size() - 1),
+                            new TypeReference<Map<String, Object>>() {});
+                    Object trades = lastEvt.get("closedTrades");
+                    if (trades != null) closedTradesJson = objectMapper.writeValueAsString(trades);
+                    int tradeCount = trades instanceof List ? ((List<?>) trades).size() : 0;
+                    summaryMap.put("trades",              tradeCount);
+                    summaryMap.put("finalCapital",        lastEvt.getOrDefault("capital", 100000));
+                    summaryMap.put("realizedPnl",         lastEvt.getOrDefault("realizedPnl", 0));
+                    summaryMap.put("winRate",             lastEvt.getOrDefault("winRate", 0));
+                } catch (Exception e) {
+                    log.warn("TICK_REPLAY auto-save: failed to parse last candle event: {}", e.getMessage());
+                }
+                // Data Engine tick session ID is the source session for this replay
+                summaryMap.put("dataEngineSessionId", req.getSessionId());
+                summaryMap.put("fromDate",            req.getFromDate());
+                summaryMap.put("toDate",              req.getToDate());
+
+                SessionResultRecord record = SessionResultRecord.builder()
+                        .sessionId(sessionId)
+                        .type("TICK_REPLAY")
+                        .userId(req.getUserId())
+                        .brokerName(req.getBrokerName() != null ? req.getBrokerName() : "kite")
+                        .sessionDate(LocalDate.now())
+                        .label("")
+                        .configJson(objectMapper.writeValueAsString(req))
+                        .closedTradesJson(closedTradesJson)
+                        .feedJson(feedJson)
+                        .summaryJson(objectMapper.writeValueAsString(summaryMap))
+                        .savedAt(Instant.now())
+                        .build();
+                sessionResultRepository.save(record);
+                log.info("TICK_REPLAY auto-saved: sessionId={} candles={} trades={}",
+                        sessionId, feedList.size(),
+                        closedTradesJson != null ? "present" : "none");
+            } catch (Exception e) {
+                log.error("TICK_REPLAY auto-save failed: sessionId={} error={}", sessionId, e.getMessage());
+            }
+        }
+
         private void broadcast(String eventName, String data) {
             if ("candle".equals(eventName) || "init".equals(eventName) || "summary".equals(eventName) || "warning".equals(eventName)) {
                 synchronized (bufferLock) {
                     if (eventBuffer.size() >= BUFFER_SIZE) eventBuffer.pollFirst();
                     eventBuffer.addLast(new String[]{ eventName, data });
                 }
+            }
+            // Persist full candle history server-side for reliable save-to-compare
+            if ("candle".equals(eventName)) {
+                feedList.add(data);
             }
             if (emitters.isEmpty()) return;
             List<SseEmitter> dead = null;
@@ -424,7 +524,7 @@ public class TickOptionsReplayService {
                         emittedCount = emitCandleEvent(
                                 fc, bucketMs, epochMs, decisionEngine, selectorService,
                                 execEngine, currentRegime, emittedCount, cePool, pePool,
-                                phase, tradable);
+                                phase, tradable, forming, liveOptionCandles, optionTokens);
                     }
 
                 } else if (optionTokens.contains(token)) {
@@ -519,10 +619,12 @@ public class TickOptionsReplayService {
                                     String regime, int emittedCount,
                                     List<OptionsReplayRequest.OptionCandidate> cePool,
                                     List<OptionsReplayRequest.OptionCandidate> pePool,
-                                    String marketPhase, boolean tradable) {
+                                    String marketPhase, boolean tradable,
+                                    Map<Long, OptionsLiveService.FormingCandle> forming,
+                                    Map<Long, NavigableMap<LocalDateTime, CandleDto>> liveOptionCandles,
+                                    Set<Long> optionTokens) {
             try {
                 LocalDateTime openTime = toLDT(bucketMs);
-                LocalDateTime tickTime = toLDT(tickEpochMs);
                 CandleDto snapshot = fc.toCandle(openTime);
 
                 // Always evaluate for warmup/scoring regardless of phase
@@ -555,14 +657,77 @@ public class TickOptionsReplayService {
 
                 OptionsReplayCandleEvent event = buildEvent(
                         emittedCount, snapshot, decision, execEngine, selectorService,
-                        openTime, tickTime, action, optCandle, marketPhase, tradable);
+                        openTime, action, optCandle, marketPhase, tradable);
 
                 broadcast("candle", objectMapper.writeValueAsString(event));
+
+                // ── divergence debug (log.debug — enable via logging.level.com.sma=DEBUG) ─
+                if (log.isDebugEnabled()) {
+                    logCandleDebug("REPLAY", sessionId, tickEpochMs, bucketMs, event, forming,
+                            liveOptionCandles, optionTokens);
+                }
 
             } catch (Exception e) {
                 log.debug("Tick replay session {}: candle event failed: {}", sessionId, e.getMessage());
             }
             return emittedCount;
+        }
+
+        // ── divergence debug helper ───────────────────────────────────────────
+
+        /**
+         * Logs every NIFTY evaluation point so live and replay logs can be diffed line-by-line.
+         * Enabled only at DEBUG level — no performance cost in production.
+         *
+         * <p>Also logs option snapshot state for each CE/PE token at this bucket so you can
+         * see exactly what price data the selector had (or didn't have) at decision time.
+         */
+        private static void logCandleDebug(String mode, String sessionId,
+                long tickEpochMs, long bucketMs,
+                OptionsReplayCandleEvent e,
+                Map<Long, OptionsLiveService.FormingCandle> forming,
+                Map<Long, NavigableMap<LocalDateTime, CandleDto>> liveOptionCandles,
+                Set<Long> optionTokens) {
+
+            log.debug("[{}][{}] tick={} bucket={} niftyTime={} regime={} bias={} winner={} score={} " +
+                            "entryAllowed={} blockReason={} execWait={} state={} action={} " +
+                            "token={} symbol={} entryPx={} capital={}",
+                    mode, sessionId,
+                    tickEpochMs, bucketMs,
+                    e.getNiftyTime(),
+                    e.getRegime(),
+                    e.getConfirmedBias(),
+                    e.getWinnerStrategy(),
+                    String.format("%.2f", e.getWinnerScore()),
+                    e.isEntryAllowed(),
+                    e.getBlockReason()    != null ? e.getBlockReason()    : "-",
+                    e.getExecWaitReason() != null ? e.getExecWaitReason() : "-",
+                    e.getPositionState(),
+                    e.getAction(),
+                    e.getSelectedToken()          != null ? e.getSelectedToken()         : "-",
+                    e.getSelectedTradingSymbol()   != null ? e.getSelectedTradingSymbol()  : "-",
+                    String.format("%.2f", e.getEntryPrice()),
+                    String.format("%.2f", e.getCapital()));
+
+            // Log option snapshot state for every CE/PE token
+            java.time.LocalDateTime bucketLdt = toLDT(bucketMs);
+            for (Long token : optionTokens) {
+                NavigableMap<java.time.LocalDateTime, CandleDto> map =
+                        liveOptionCandles != null ? liveOptionCandles.get(token) : null;
+                OptionsLiveService.FormingCandle forming_ = forming != null ? forming.get(token) : null;
+                boolean hasSameBucket = forming_ != null && forming_.startMs == bucketMs;
+                CandleDto snap = map != null ? map.get(bucketLdt) : null;
+                log.debug("[{}][{}]   opt-snap token={} bucketMs={} hasSameBucketForming={} " +
+                                "snapPresent={} O={} H={} L={} C={}",
+                        mode, sessionId,
+                        token, bucketMs,
+                        hasSameBucket,
+                        snap != null,
+                        snap != null ? snap.open()  : "-",
+                        snap != null ? snap.high()  : "-",
+                        snap != null ? snap.low()   : "-",
+                        snap != null ? snap.close() : "-");
+            }
         }
 
         private int warmupOptionCandles(OptionsReplayRequest.OptionCandidate c,
@@ -597,8 +762,20 @@ public class TickOptionsReplayService {
             return "TRADING";
         }
 
-        // ── option candle snapshot (forward-fill) ─────────────────────────────
+        // ── option candle snapshot (same-bucket only — matches live behaviour exactly) ──
 
+        /**
+         * Snapshots the current forming state of each option token into
+         * {@code liveOptionCandles} for {@code bucketMs}.
+         *
+         * <p><b>Intentionally no forward-fill.</b>
+         * Live ({@link OptionsLiveService#snapshotOptionCandles}) only writes a snapshot
+         * when the option's {@code FormingCandle.startMs == closedBucketMs}; it never
+         * synthesises data from prior candles.  Replay must mirror this exactly so that
+         * {@link com.sma.strategyengine.service.options.OptionSelectorService#getCandle}
+         * returns the same result (or absence of result) in both modes.
+         * Divergence in snapshot content is the primary source of entry-price mismatch.
+         */
         private static void snapshotOptionCandles(
                 long bucketMs, LocalDateTime bucketTime,
                 Map<Long, OptionsLiveService.FormingCandle> forming,
@@ -609,28 +786,16 @@ public class TickOptionsReplayService {
                 if (map == null) continue;
                 OptionsLiveService.FormingCandle opt = forming.get(token);
                 if (opt != null && opt.startMs == bucketMs) {
+                    // Option is in the same bucket — snapshot forming state (partial candle)
                     CandleDto snap = new CandleDto(
                             bucketTime,
                             BigDecimal.valueOf(opt.open), BigDecimal.valueOf(opt.high),
                             BigDecimal.valueOf(opt.low),  BigDecimal.valueOf(opt.close),
                             opt.volume);
                     map.put(snap.openTime(), snap);
-                } else if (!map.containsKey(bucketTime)) {
-                    CandleDto fwd = null;
-                    if (opt != null) {
-                        fwd = new CandleDto(bucketTime,
-                                BigDecimal.valueOf(opt.open), BigDecimal.valueOf(opt.high),
-                                BigDecimal.valueOf(opt.low),  BigDecimal.valueOf(opt.close),
-                                opt.volume);
-                    } else {
-                        Map.Entry<LocalDateTime, CandleDto> prior = map.floorEntry(bucketTime);
-                        if (prior != null) {
-                            CandleDto p = prior.getValue();
-                            fwd = new CandleDto(bucketTime, p.open(), p.high(), p.low(), p.close(), p.volume());
-                        }
-                    }
-                    if (fwd != null) map.put(bucketTime, fwd);
                 }
+                // No forward-fill: if the option has no tick in this bucket yet,
+                // leave the map entry absent — same as live.
             }
         }
 
@@ -711,15 +876,14 @@ public class TickOptionsReplayService {
                                                     OptionExecutionEngine exec,
                                                     OptionSelectorService selector,
                                                     LocalDateTime candleTime,
-                                                    LocalDateTime tickTime,
                                                     String action,
                                                     CandleDto optCandle,
                                                     String marketPhase,
                                                     boolean tradable) {
             return OptionsReplayCandleEvent.builder()
                     .emitted(emitted).total(0)
-                    .niftyTime(tickTime != null ? tickTime.toString()
-                            : (nifty.openTime() != null ? nifty.openTime().toString() : null))
+                    // niftyTime = bucket start, identical to live — required for compare-tab key matching
+                    .niftyTime(nifty.openTime() != null ? nifty.openTime().toString() : null)
                     .niftyOpen(nifty.open().doubleValue())
                     .niftyHigh(nifty.high().doubleValue())
                     .niftyLow(nifty.low().doubleValue())
