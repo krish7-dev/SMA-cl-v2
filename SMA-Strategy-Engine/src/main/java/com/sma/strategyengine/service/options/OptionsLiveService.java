@@ -1,14 +1,17 @@
 package com.sma.strategyengine.service.options;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sma.strategyengine.client.DataEngineClient;
 import com.sma.strategyengine.client.DataEngineClient.CandleDto;
 import com.sma.strategyengine.entity.LiveSnapshotRecord;
+import com.sma.strategyengine.entity.SessionResultRecord;
 import com.sma.strategyengine.model.request.BacktestRequest;
 import com.sma.strategyengine.model.request.OptionsLiveRequest;
 import com.sma.strategyengine.model.request.OptionsReplayRequest;
 import com.sma.strategyengine.model.response.OptionsReplayCandleEvent;
 import com.sma.strategyengine.repository.LiveSnapshotRepository;
+import com.sma.strategyengine.repository.SessionResultRepository;
 import com.sma.strategyengine.service.MarketRegimeDetector;
 import com.sma.strategyengine.strategy.StrategyRegistry;
 import lombok.Getter;
@@ -55,10 +58,11 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class OptionsLiveService {
 
-    private final StrategyRegistry      strategyRegistry;
-    private final DataEngineClient      dataEngineClient;
-    private final ObjectMapper          objectMapper;
+    private final StrategyRegistry       strategyRegistry;
+    private final DataEngineClient       dataEngineClient;
+    private final ObjectMapper           objectMapper;
     private final LiveSnapshotRepository snapshotRepository;
+    private final SessionResultRepository sessionResultRepository;
 
     @Value("${strategy.data-engine.base-url:http://localhost:9005}")
     private String dataEngineBaseUrl;
@@ -210,6 +214,7 @@ public class OptionsLiveService {
     private void stopSession(String sessionId) {
         LiveOptionsSession session = sessions.remove(sessionId);
         if (session != null) {
+            session.autoSave();   // persist feed+trades to DB before the session is GC'd
             completedFeeds.put(sessionId, session.getFeedList());
             completedFeedTimes.put(sessionId, Instant.now());
             session.stop();
@@ -389,6 +394,62 @@ public class OptionsLiveService {
 
         /** Returns the full candle event history (for save-to-compare). */
         List<String> getFeedList() { return Collections.unmodifiableList(feedList); }
+
+        /**
+         * Auto-saves this session's feed, trades, config, and summary to the session_result table.
+         * Called on stop so the data survives beyond the in-memory session.
+         * Uses an empty label ("") so the user-initiated save can overwrite it with a proper label.
+         */
+        void autoSave() {
+            if (feedList.isEmpty()) {
+                log.info("LIVE auto-save skipped (no candles emitted): sessionId={}", sessionId);
+                return;
+            }
+            try {
+                String feedJson = "[" + String.join(",", feedList) + "]";
+
+                // Extract closedTrades and stats from the last candle event
+                String closedTradesJson = null;
+                Map<String, Object> summaryMap = new LinkedHashMap<>();
+                try {
+                    Map<String, Object> lastEvt = objectMapper.readValue(
+                            feedList.get(feedList.size() - 1),
+                            new TypeReference<Map<String, Object>>() {});
+                    Object trades = lastEvt.get("closedTrades");
+                    if (trades != null) closedTradesJson = objectMapper.writeValueAsString(trades);
+                    int tradeCount = trades instanceof List ? ((List<?>) trades).size() : 0;
+                    summaryMap.put("trades",              tradeCount);
+                    summaryMap.put("finalCapital",        lastEvt.getOrDefault("capital", 100000));
+                    summaryMap.put("realizedPnl",         lastEvt.getOrDefault("realizedPnl", 0));
+                    summaryMap.put("winRate",             lastEvt.getOrDefault("winRate", 0));
+                } catch (Exception e) {
+                    log.warn("LIVE auto-save: failed to parse last candle event: {}", e.getMessage());
+                }
+                // sessionId for LIVE is also the Data Engine tick session identifier
+                summaryMap.put("dataEngineSessionId", sessionId);
+                summaryMap.put("sessionEnd",          Instant.now().toString());
+
+                SessionResultRecord record = SessionResultRecord.builder()
+                        .sessionId(sessionId)
+                        .type("LIVE")
+                        .userId(userId)
+                        .brokerName(req.getBrokerName())
+                        .sessionDate(LocalDate.now())
+                        .label("")
+                        .configJson(objectMapper.writeValueAsString(req))
+                        .closedTradesJson(closedTradesJson)
+                        .feedJson(feedJson)
+                        .summaryJson(objectMapper.writeValueAsString(summaryMap))
+                        .savedAt(Instant.now())
+                        .build();
+                sessionResultRepository.save(record);
+                log.info("LIVE auto-saved: sessionId={} candles={} trades={}",
+                        sessionId, feedList.size(),
+                        closedTradesJson != null ? "present" : "none");
+            } catch (Exception e) {
+                log.error("LIVE auto-save failed: sessionId={} error={}", sessionId, e.getMessage());
+            }
+        }
 
         /** Sends a named event to all connected emitters; silently removes dead ones. */
         private void broadcast(String eventName, String data) {

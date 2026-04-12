@@ -1259,6 +1259,8 @@ function OptionsLiveTest() {
   const abortRef      = useRef(null);
   const readerRef     = useRef(null);
   const sessionIdRef  = useRef(null);
+  // Preserved across stop/complete — cleared only after a successful save. Used by save pipeline.
+  const lastSaveSessionIdRef = useRef(null);
   const lastRunPcRef  = useRef(null);
   const lastPayloadRef = useRef(null);
   // Accumulates raw tick events for post-session comparison. Capped at 10 000 to limit payload size.
@@ -1278,6 +1280,7 @@ function OptionsLiveTest() {
     getActiveOptionsLiveSession(session.userId).then(sid => {
       if (sid) {
         sessionIdRef.current = sid;
+        lastSaveSessionIdRef.current = sid;  // preserved past stop for save pipeline
         setSessionId(sid);
         // Auto-attach SSE so the feed starts populating immediately
         const ctrl = new AbortController();
@@ -1581,6 +1584,7 @@ function OptionsLiveTest() {
       const sid = startRes?.data?.sessionId;
       if (!sid) throw new Error('No sessionId returned');
       sessionIdRef.current = sid;
+      lastSaveSessionIdRef.current = sid;  // preserved past stop for save pipeline
       setSessionId(sid);
 
       // Step 2: attach SSE listener (session already running in backend)
@@ -1682,46 +1686,72 @@ function OptionsLiveTest() {
   async function handleSaveToCompare() {
     setSaveStatus('saving'); setSaveError('');
     try {
-      const lastEvt = feed[feed.length - 1];
-      const trades  = lastEvt?.closedTrades || [];
-      const wins    = trades.filter(t => t.pnl > 0).length;
-      const sid     = sessionIdRef.current || sessionId || Date.now().toString();
+      // Use the preserved session ID — never null out lastSaveSessionIdRef on stop.
+      const sid = lastSaveSessionIdRef.current;
+      if (!sid) {
+        console.warn('[LIVE save] blocked: no session ID available');
+        throw new Error('No completed live session to save. Please run a session first.');
+      }
+      console.log('[LIVE save] session ID:', sid);
 
-      // Fetch server-side feed (complete history, unaffected by SSE reconnects or client truncation).
-      // Fall back to client-side feed state if the server session is already gone.
-      let feedToSave = feed;
+      // Fetch the auto-saved draft record from DB (written by server on session stop).
+      // This is the authoritative source — avoids empty client-side SSE state.
+      let record;
       try {
-        const feedRes = await getOptionsLiveFeed(sid);
-        if (feedRes?.data?.length > 0) {
-          feedToSave = feedRes.data.map(s => JSON.parse(s));
-        }
-      } catch (_) { /* session may have ended — fall back to client feed */ }
+        const res = await getSessionResult(sid);
+        record = res?.data;
+      } catch (e) {
+        console.warn('[LIVE save] DB fetch failed:', e.message);
+      }
+
+      const serverFeed   = record?.feedJson   ? JSON.parse(record.feedJson)   : null;
+      const serverTrades = record?.closedTradesJson ? JSON.parse(record.closedTradesJson) : null;
+      console.log('[LIVE save] server feed count:', serverFeed?.length ?? 0,
+                  '| server trades:', serverTrades?.length ?? 0,
+                  '| dataEngineSessionId:', sid);
+
+      if (!serverFeed || serverFeed.length === 0) {
+        throw new Error(
+          'Reliable server-side session feed not found. ' +
+          'Session may not have emitted any candles yet, or the server was restarted before the session ran. ' +
+          'Cannot save for compare.'
+        );
+      }
+
+      const serverSummary = record?.summaryJson ? JSON.parse(record.summaryJson) : {};
+      const lastEvt = serverFeed[serverFeed.length - 1];
+      const trades  = serverTrades ?? lastEvt?.closedTrades ?? [];
+      const wins    = trades.filter(t => t.pnl > 0).length;
 
       await saveSessionResult({
-        sessionId:   sid,
-        type:        'LIVE',
-        userId:      session.userId,
-        brokerName:  session.brokerName,
-        sessionDate: new Date().toISOString().slice(0, 10),
-        label:       saveLabel || new Date().toISOString().slice(0, 10),
-        config:      lastPayloadRef.current,
+        sessionId:    sid,
+        type:         'LIVE',
+        userId:       session.userId,
+        brokerName:   session.brokerName,
+        sessionDate:  new Date().toISOString().slice(0, 10),
+        label:        saveLabel || new Date().toISOString().slice(0, 10),
+        config:       lastPayloadRef.current,
         closedTrades: trades,
-        feed:        feedToSave,
+        feed:         serverFeed,
         summary: {
           trades:              trades.length,
-          realizedPnl:         lastEvt?.realizedPnl  ?? 0,
+          realizedPnl:         serverSummary.realizedPnl  ?? lastEvt?.realizedPnl  ?? 0,
           winRate:             trades.length > 0 ? wins / trades.length : 0,
-          finalCapital:        (lastEvt?.capital ?? parseFloat(capital)) || 100000,
-          sessionStart:        sessionStartRef.current || undefined,
-          sessionEnd:          new Date().toISOString(),
-          lastTickTime:        lastTickTimeRef.current || undefined,
-          dataEngineSessionId: sessionIdRef.current || undefined,
+          finalCapital:        serverSummary.finalCapital ?? lastEvt?.capital ?? parseFloat(capital) ?? 100000,
+          sessionStart:        sessionStartRef.current    || serverSummary.sessionStart  || undefined,
+          sessionEnd:          serverSummary.sessionEnd   || new Date().toISOString(),
+          lastTickTime:        lastTickTimeRef.current    || undefined,
+          dataEngineSessionId: sid,  // LIVE session ID = Data Engine tick session ID
         },
       });
+      console.log('[LIVE save] saved successfully: sessionId=', sid,
+                  'candles=', serverFeed.length, 'trades=', trades.length);
+      lastSaveSessionIdRef.current = null;  // clear only after successful save
       setSaveStatus('saved');
       setShowSavePanel(false);
       setSaveLabel('');
     } catch (e) {
+      console.error('[LIVE save] failed:', e.message);
       setSaveStatus('error');
       setSaveError(e.message);
     }
@@ -12072,10 +12102,12 @@ function TickReplayTest() {
   const [feedExpanded,    setFeedExpanded]    = useState(false);
   const [liveTicks,       setLiveTicks]       = useState({});
   const [replaySessionId, setReplaySessionId] = useState(null);
-  const abortRef         = useRef(null);
-  const readerRef        = useRef(null);
-  const replaySessionRef = useRef(null);
-  const lastPayloadRef   = useRef(null);
+  const abortRef              = useRef(null);
+  const readerRef             = useRef(null);
+  const replaySessionRef      = useRef(null);
+  // Preserved across completion — cleared only after a successful save. Used by save pipeline.
+  const lastSaveReplaySessionIdRef = useRef(null);
+  const lastPayloadRef        = useRef(null);
   // Accumulates raw tick events for post-session comparison. Capped at 10 000 to limit payload size.
   const ticksRef         = useRef([]);
 
@@ -12471,48 +12503,74 @@ function TickReplayTest() {
   async function handleSaveToCompare() {
     setSaveStatus('saving'); setSaveError('');
     try {
-      const lastEvt    = feed[feed.length - 1];
-      const trades     = lastEvt?.closedTrades || summary?.closedTrades || [];
-      const wins       = trades.filter(t => t.pnl > 0).length;
-      const replayDate = fromDate || new Date().toISOString().slice(0, 10);
-      const replaySid  = replaySessionRef.current || replaySessionId || Date.now().toString();
+      // Use the preserved replay session ID — never null out lastSaveReplaySessionIdRef on completion.
+      const replaySid = lastSaveReplaySessionIdRef.current;
+      if (!replaySid) {
+        console.warn('[REPLAY save] blocked: no session ID available');
+        throw new Error('No completed replay session to save. Please run a tick replay first.');
+      }
+      console.log('[REPLAY save] session ID:', replaySid);
 
-      // Fetch server-side feed — the session may have already completed and auto-removed,
-      // but the feed is cached server-side for ~60 min after completion.
-      let feedToSave = feed;
+      // Fetch the auto-saved draft record from DB (written by server on session completion).
+      // This is the authoritative source — survives server restarts and client state resets.
+      let record;
       try {
-        const feedRes = await getTickReplayFeed(replaySid);
-        if (feedRes?.data?.length > 0) {
-          feedToSave = feedRes.data.map(s => JSON.parse(s));
-        }
-      } catch (_) { /* expired or never ran — fall back to client feed */ }
+        const res = await getSessionResult(replaySid);
+        record = res?.data;
+      } catch (e) {
+        console.warn('[REPLAY save] DB fetch failed:', e.message);
+      }
+
+      const serverFeed   = record?.feedJson        ? JSON.parse(record.feedJson)        : null;
+      const serverTrades = record?.closedTradesJson ? JSON.parse(record.closedTradesJson) : null;
+      const serverSummary = record?.summaryJson     ? JSON.parse(record.summaryJson)     : {};
+      console.log('[REPLAY save] server feed count:', serverFeed?.length ?? 0,
+                  '| server trades:', serverTrades?.length ?? 0,
+                  '| dataEngineSessionId:', serverSummary.dataEngineSessionId ?? selectedSession?.sessionId);
+
+      if (!serverFeed || serverFeed.length === 0) {
+        throw new Error(
+          'Reliable server-side session feed not found. ' +
+          'The server may have been restarted before the session ran. ' +
+          'Cannot save for compare.'
+        );
+      }
+
+      const replayDate = fromDate || new Date().toISOString().slice(0, 10);
+      const lastEvt    = serverFeed[serverFeed.length - 1];
+      const trades     = serverTrades ?? lastEvt?.closedTrades ?? [];
+      const wins       = trades.filter(t => t.pnl > 0).length;
 
       await saveSessionResult({
-        sessionId:   replaySid,
-        type:        'TICK_REPLAY',
-        userId:      userId || undefined,
-        brokerName:  brokerName || 'kite',
-        sessionDate: replayDate,
-        label:       saveLabel || replayDate,
-        config:      lastPayloadRef.current,
+        sessionId:    replaySid,
+        type:         'TICK_REPLAY',
+        userId:       userId || undefined,
+        brokerName:   brokerName || 'kite',
+        sessionDate:  replayDate,
+        label:        saveLabel || replayDate,
+        config:       lastPayloadRef.current,
         closedTrades: trades,
-        feed:        feedToSave,
+        feed:         serverFeed,
         summary: {
-          trades:       trades.length,
-          realizedPnl:  (lastEvt?.realizedPnl ?? summary?.realizedPnl ?? 0),
-          winRate:      trades.length > 0 ? wins / trades.length : 0,
-          finalCapital:      (lastEvt?.capital ?? summary?.finalCapital ?? parseFloat(capital) ?? 0) || 100000,
-          fromDate:          fromDate || undefined,
-          toDate:            toDate   || undefined,
-          replayFirstTick:     selectedSession?.firstTick  || undefined,
-          replayLastTick:      selectedSession?.lastTick   || undefined,
-          dataEngineSessionId: selectedSession?.sessionId  || undefined,
+          trades:              trades.length,
+          realizedPnl:         serverSummary.realizedPnl  ?? lastEvt?.realizedPnl  ?? 0,
+          winRate:             trades.length > 0 ? wins / trades.length : 0,
+          finalCapital:        serverSummary.finalCapital ?? lastEvt?.capital ?? parseFloat(capital) ?? 100000,
+          fromDate:            fromDate                   || serverSummary.fromDate   || undefined,
+          toDate:              toDate                     || serverSummary.toDate     || undefined,
+          replayFirstTick:     selectedSession?.firstTick || undefined,
+          replayLastTick:      selectedSession?.lastTick  || undefined,
+          dataEngineSessionId: selectedSession?.sessionId || serverSummary.dataEngineSessionId || undefined,
         },
       });
+      console.log('[REPLAY save] saved successfully: sessionId=', replaySid,
+                  'candles=', serverFeed.length, 'trades=', trades.length);
+      lastSaveReplaySessionIdRef.current = null;  // clear only after successful save
       setSaveStatus('saved');
       setShowSavePanel(false);
       setSaveLabel('');
     } catch (e) {
+      console.error('[REPLAY save] failed:', e.message);
       setSaveStatus('error');
       setSaveError(e.message);
     }
@@ -12577,6 +12635,7 @@ function TickReplayTest() {
       const sid = res?.data?.sessionId;
       if (!sid) throw new Error('No sessionId returned from server');
       replaySessionRef.current = sid;
+      lastSaveReplaySessionIdRef.current = sid;  // preserved past completion for save pipeline
       setReplaySessionId(sid);
 
       // Step 2: attach SSE stream
@@ -13458,16 +13517,21 @@ function SessionCompare() {
       const smB = (() => { try { return dB?.summaryJson ? JSON.parse(dB.summaryJson) : null; } catch { return null; } })();
       const sidA = smA?.dataEngineSessionId;
       const sidB = smB?.dataEngineSessionId;
+      console.log('[compare] A sessionId:', selA, '| dataEngineSessionId:', sidA, '| summaryKeys:', smA ? Object.keys(smA) : null);
+      console.log('[compare] B sessionId:', selB, '| dataEngineSessionId:', sidB, '| summaryKeys:', smB ? Object.keys(smB) : null);
       if (sidA || sidB) {
         setTicksLoading(true);
         const [tA, tB] = await Promise.all([
-          sidA ? querySessionTicks(sidA, null).then(r => r?.data ?? []).catch(() => []) : Promise.resolve([]),
-          sidB ? querySessionTicks(sidB, null).then(r => r?.data ?? []).catch(() => []) : Promise.resolve([]),
+          sidA ? querySessionTicks(sidA, null).then(r => r?.data ?? []).catch(e => { console.warn('[compare] ticksA fetch failed:', e.message); return []; }) : Promise.resolve([]),
+          sidB ? querySessionTicks(sidB, null).then(r => r?.data ?? []).catch(e => { console.warn('[compare] ticksB fetch failed:', e.message); return []; }) : Promise.resolve([]),
         ]);
+        console.log('[compare] ticksA count:', tA.length, '| ticksB count:', tB.length);
         // Normalise to { token, ltp, timeMs } format the comparison logic expects
         setTicksA(tA.map(t => ({ token: String(t.instrumentToken), ltp: t.ltp, timeMs: t.tickTimeMs })));
         setTicksB(tB.map(t => ({ token: String(t.instrumentToken), ltp: t.ltp, timeMs: t.tickTimeMs })));
         setTicksLoading(false);
+      } else {
+        console.warn('[compare] no dataEngineSessionId in either session — tick comparison skipped');
       }
     } catch (e) { setCompareErr(e.message); }
     finally { setComparing(false); }

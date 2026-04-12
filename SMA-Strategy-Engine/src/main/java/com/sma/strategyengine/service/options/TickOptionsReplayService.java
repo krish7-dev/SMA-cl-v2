@@ -1,12 +1,15 @@
 package com.sma.strategyengine.service.options;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sma.strategyengine.client.DataEngineClient;
 import com.sma.strategyengine.client.DataEngineClient.CandleDto;
+import com.sma.strategyengine.entity.SessionResultRecord;
 import com.sma.strategyengine.model.request.BacktestRequest;
 import com.sma.strategyengine.model.request.OptionsReplayRequest;
 import com.sma.strategyengine.model.request.TickOptionsReplayRequest;
 import com.sma.strategyengine.model.response.OptionsReplayCandleEvent;
+import com.sma.strategyengine.repository.SessionResultRepository;
 import com.sma.strategyengine.service.MarketRegimeDetector;
 import com.sma.strategyengine.strategy.StrategyRegistry;
 import lombok.RequiredArgsConstructor;
@@ -17,6 +20,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.ZoneId;
@@ -56,9 +60,10 @@ public class TickOptionsReplayService {
 
     private static final int BUFFER_SIZE = 200;
 
-    private final StrategyRegistry strategyRegistry;
-    private final DataEngineClient dataEngineClient;
-    private final ObjectMapper     objectMapper;
+    private final StrategyRegistry       strategyRegistry;
+    private final DataEngineClient       dataEngineClient;
+    private final ObjectMapper           objectMapper;
+    private final SessionResultRepository sessionResultRepository;
 
     private final ConcurrentHashMap<String, TickReplaySession> sessions       = new ConcurrentHashMap<>();
 
@@ -91,7 +96,7 @@ public class TickOptionsReplayService {
                 session.broadcastError(e.getMessage());
             } finally {
                 sessions.remove(sessionId);
-                // Cache feed so save-to-compare can fetch it after session completes
+                session.autoSave();   // persist feed+trades to DB before the session is GC'd
                 completedFeeds.put(sessionId, session.getFeedList());
                 completedFeedTimes.put(sessionId, Instant.now());
                 session.completeEmitters();
@@ -130,6 +135,7 @@ public class TickOptionsReplayService {
     public void stop(String sessionId) {
         TickReplaySession session = sessions.remove(sessionId);
         if (session != null) {
+            session.autoSave();   // persist feed+trades to DB on explicit stop too
             completedFeeds.put(sessionId, session.getFeedList());
             completedFeedTimes.put(sessionId, Instant.now());
             session.stop();
@@ -225,6 +231,63 @@ public class TickOptionsReplayService {
 
         /** Returns the full candle event history (for save-to-compare). */
         List<String> getFeedList() { return Collections.unmodifiableList(feedList); }
+
+        /**
+         * Auto-saves this session's feed, trades, config, and summary to the session_result table.
+         * Called on completion/stop so the data survives beyond the in-memory session (and server restarts).
+         * Uses an empty label ("") so the user-initiated save can overwrite it with a proper label.
+         */
+        void autoSave() {
+            if (feedList.isEmpty()) {
+                log.info("TICK_REPLAY auto-save skipped (no candles emitted): sessionId={}", sessionId);
+                return;
+            }
+            try {
+                String feedJson = "[" + String.join(",", feedList) + "]";
+
+                // Extract closedTrades and stats from the last candle event
+                String closedTradesJson = null;
+                Map<String, Object> summaryMap = new LinkedHashMap<>();
+                try {
+                    Map<String, Object> lastEvt = objectMapper.readValue(
+                            feedList.get(feedList.size() - 1),
+                            new TypeReference<Map<String, Object>>() {});
+                    Object trades = lastEvt.get("closedTrades");
+                    if (trades != null) closedTradesJson = objectMapper.writeValueAsString(trades);
+                    int tradeCount = trades instanceof List ? ((List<?>) trades).size() : 0;
+                    summaryMap.put("trades",              tradeCount);
+                    summaryMap.put("finalCapital",        lastEvt.getOrDefault("capital", 100000));
+                    summaryMap.put("realizedPnl",         lastEvt.getOrDefault("realizedPnl", 0));
+                    summaryMap.put("winRate",             lastEvt.getOrDefault("winRate", 0));
+                } catch (Exception e) {
+                    log.warn("TICK_REPLAY auto-save: failed to parse last candle event: {}", e.getMessage());
+                }
+                // Data Engine tick session ID is the source session for this replay
+                summaryMap.put("dataEngineSessionId", req.getSessionId());
+                summaryMap.put("fromDate",            req.getFromDate());
+                summaryMap.put("toDate",              req.getToDate());
+
+                SessionResultRecord record = SessionResultRecord.builder()
+                        .sessionId(sessionId)
+                        .type("TICK_REPLAY")
+                        .userId(req.getUserId())
+                        .brokerName(req.getBrokerName() != null ? req.getBrokerName() : "kite")
+                        .sessionDate(LocalDate.now())
+                        .label("")
+                        .configJson(objectMapper.writeValueAsString(req))
+                        .closedTradesJson(closedTradesJson)
+                        .feedJson(feedJson)
+                        .summaryJson(objectMapper.writeValueAsString(summaryMap))
+                        .savedAt(Instant.now())
+                        .build();
+                sessionResultRepository.save(record);
+                log.info("TICK_REPLAY auto-saved: sessionId={} candles={} trades={}",
+                        sessionId, feedList.size(),
+                        closedTradesJson != null ? "present" : "none");
+            } catch (Exception e) {
+                log.error("TICK_REPLAY auto-save failed: sessionId={} error={}", sessionId, e.getMessage());
+            }
+        }
 
         private void broadcast(String eventName, String data) {
             if ("candle".equals(eventName) || "init".equals(eventName) || "summary".equals(eventName) || "warning".equals(eventName)) {
@@ -461,7 +524,7 @@ public class TickOptionsReplayService {
                         emittedCount = emitCandleEvent(
                                 fc, bucketMs, epochMs, decisionEngine, selectorService,
                                 execEngine, currentRegime, emittedCount, cePool, pePool,
-                                phase, tradable);
+                                phase, tradable, forming, liveOptionCandles, optionTokens);
                     }
 
                 } else if (optionTokens.contains(token)) {
@@ -556,7 +619,10 @@ public class TickOptionsReplayService {
                                     String regime, int emittedCount,
                                     List<OptionsReplayRequest.OptionCandidate> cePool,
                                     List<OptionsReplayRequest.OptionCandidate> pePool,
-                                    String marketPhase, boolean tradable) {
+                                    String marketPhase, boolean tradable,
+                                    Map<Long, OptionsLiveService.FormingCandle> forming,
+                                    Map<Long, NavigableMap<LocalDateTime, CandleDto>> liveOptionCandles,
+                                    Set<Long> optionTokens) {
             try {
                 LocalDateTime openTime = toLDT(bucketMs);
                 CandleDto snapshot = fc.toCandle(openTime);

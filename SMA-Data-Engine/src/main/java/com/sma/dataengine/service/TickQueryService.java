@@ -73,12 +73,15 @@ public class TickQueryService {
      */
     @Transactional(readOnly = true)
     public List<TickEntryDto> queryTicks(TickQueryRequest req) {
-        if (req.getTokens() == null || req.getTokens().isEmpty()) {
-            return List.of();
-        }
+        List<Long> tokens = req.getTokens();
 
-        List<TickRecord> records = repo.findBySessionIdAndTokensOrdered(
-                req.getSessionId(), req.getTokens());
+        // If no tokens specified, return all ticks for the session (used by compare tab).
+        List<TickRecord> records;
+        if (tokens == null || tokens.isEmpty()) {
+            records = repo.findBySessionIdOrdered(req.getSessionId());
+        } else {
+            records = repo.findBySessionIdAndTokensOrdered(req.getSessionId(), tokens);
+        }
 
         return records.stream()
                 .filter(r -> {
