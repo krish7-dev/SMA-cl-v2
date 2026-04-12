@@ -13477,7 +13477,7 @@ function SessionCompare() {
 
   // ── Comparison tolerances — tune to adjust matching sensitivity ───────────
   const TICK_TOL_MS    = 2000;          // ±2 s  : network/replay jitter
-  const TRADE_TOL_MS   = 5 * 60 * 1000;// ±5 min: same-instrument nearest entry
+  const TRADE_TOL_MS   = 60 * 1000;    // ±1 min: tight — replay/live entries should be near-identical
   const OHLC_TOL       = 0.05;         // 5 paise: price rounding noise
   const SCORE_TOL      = 0.5;          // 0.5 pt: floating-point noise in scores
 
@@ -13593,6 +13593,7 @@ function SessionCompare() {
 
   // ── 4. Trade comparison ──────────────────────────────────────────────────
   // Strategy: greedy nearest entryTime match within TRADE_TOL_MS. Each trade consumed once.
+  // Flags entryPriceMismatch / exitPriceMismatch / exitReasonMismatch on BOTH rows.
   const tradeComparison = (() => {
     if (!tradesA.length && !tradesB.length) return { rows: [], stats: null };
     const usedB = new Set();
@@ -13605,16 +13606,29 @@ function SessionCompare() {
         const diff = Math.abs(new Date(tb.entryTime).getTime() - taMs);
         if (diff <= TRADE_TOL_MS && diff < bestDiff) { bestDiff = diff; bestIdx = i; }
       });
-      if (bestIdx >= 0) { usedB.add(bestIdx); rows.push({ matchType: 'BOTH', a: ta, b: tradesB[bestIdx] }); }
-      else rows.push({ matchType: 'LIVE_ONLY', a: ta, b: null });
+      if (bestIdx >= 0) {
+        usedB.add(bestIdx);
+        const tb = tradesB[bestIdx];
+        const entryPriceMismatch = Math.abs((ta.entryPrice||0) - (tb.entryPrice||0)) > 0.5;
+        const exitPriceMismatch  = ta.exitPrice != null && tb.exitPrice != null
+                                    && Math.abs(ta.exitPrice - tb.exitPrice) > 0.5;
+        const exitReasonMismatch = ta.exitReason !== tb.exitReason;
+        const pnlDiff            = (tb.pnl||0) - (ta.pnl||0);
+        rows.push({ matchType: 'BOTH', a: ta, b: tb,
+                    entryPriceMismatch, exitPriceMismatch, exitReasonMismatch, pnlDiff });
+      } else {
+        rows.push({ matchType: 'LIVE_ONLY', a: ta, b: null });
+      }
     }
     tradesB.forEach((tb, i) => { if (!usedB.has(i)) rows.push({ matchType: 'REPLAY_ONLY', a: null, b: tb }); });
     rows.sort((x,y) => ((x.a?.entryTime||x.b?.entryTime||'') > (y.a?.entryTime||y.b?.entryTime||'')) ? 1 : -1);
-    const both       = rows.filter(r => r.matchType === 'BOTH').length;
-    const liveOnly   = rows.filter(r => r.matchType === 'LIVE_ONLY').length;
-    const replayOnly = rows.filter(r => r.matchType === 'REPLAY_ONLY').length;
+    const both         = rows.filter(r => r.matchType === 'BOTH').length;
+    const liveOnly     = rows.filter(r => r.matchType === 'LIVE_ONLY').length;
+    const replayOnly   = rows.filter(r => r.matchType === 'REPLAY_ONLY').length;
+    const priceMismatch = rows.filter(r => r.matchType === 'BOTH' && (r.entryPriceMismatch || r.exitPriceMismatch)).length;
     const tot = tradesA.length + tradesB.length;
-    return { rows, stats: { total: rows.length, both, liveOnly, replayOnly, matchPct: tot > 0 ? (both*2/tot*100).toFixed(1) : null } };
+    return { rows, stats: { total: rows.length, both, liveOnly, replayOnly, priceMismatch,
+                            matchPct: tot > 0 ? (both*2/tot*100).toFixed(1) : null } };
   })();
 
   // ── 5. Config diff ───────────────────────────────────────────────────────
@@ -13752,15 +13766,18 @@ function SessionCompare() {
 
   function csvTrades() {
     if (!tradeComparison.rows.length) return row2('No trade data');
-    const lines = [row2('Match Type','A Entry','A Exit','A Type','A Symbol','A EntPx','A ExtPx','A PnL','A ExitReason','A Bars','B Entry','B Exit','B Type','B Symbol','B EntPx','B ExtPx','B PnL','B ExitReason','B Bars','Delta PnL')];
+    const lines = [row2('Match Type','A Entry','A Exit','A Type','A Symbol','A EntPx','A ExtPx','A PnL','A ExitReason','A Bars','B Entry','B Exit','B Type','B Symbol','B EntPx','B ExtPx','B PnL','B ExitReason','B Bars','Delta PnL','EntPx?','ExtPx?','ExitRsn?')];
     for (const r of tradeComparison.rows) {
-      const diff = r.matchType==='BOTH'&&r.a?.pnl!=null&&r.b?.pnl!=null ? n2c(r.b.pnl-r.a.pnl) : '';
+      const diff = r.matchType==='BOTH' ? n2c(r.pnlDiff??0) : '';
       lines.push(row2(r.matchType,
         (r.a?.entryTime||'').slice(0,19),(r.a?.exitTime||'').slice(0,19),
         r.a?.optionType??'',r.a?.tradingSymbol??'',r.a?.entryPrice!=null?n2c(r.a.entryPrice):'',r.a?.exitPrice!=null?n2c(r.a.exitPrice):'',r.a?.pnl!=null?n2c(r.a.pnl):'',r.a?.exitReason??'',r.a?.barsInTrade??'',
         (r.b?.entryTime||'').slice(0,19),(r.b?.exitTime||'').slice(0,19),
         r.b?.optionType??'',r.b?.tradingSymbol??'',r.b?.entryPrice!=null?n2c(r.b.entryPrice):'',r.b?.exitPrice!=null?n2c(r.b.exitPrice):'',r.b?.pnl!=null?n2c(r.b.pnl):'',r.b?.exitReason??'',r.b?.barsInTrade??'',
-        diff));
+        diff,
+        r.matchType==='BOTH'?(r.entryPriceMismatch?'MISMATCH':'ok'):'',
+        r.matchType==='BOTH'?(r.exitPriceMismatch?'MISMATCH':'ok'):'',
+        r.matchType==='BOTH'?(r.exitReasonMismatch?'MISMATCH':'ok'):''));
     }
     return lines.join('\n');
   }
@@ -13893,21 +13910,21 @@ function SessionCompare() {
                     rows.push(
                       <tr key={s.sessionId} style={{ background: isA?'rgba(99,102,241,0.1)':isB?'rgba(16,185,129,0.1)':undefined }}>
                         <td style={{ whiteSpace:'nowrap', color:'var(--text-muted)' }}>
-                          {s.savedAt ? new Date(s.savedAt).toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' }) : '—'}
+                          {s.savedAt ? new Date(s.savedAt).toLocaleTimeString('en-IN', { hour:'2-digit', minute:'2-digit', timeZone:'Asia/Kolkata', hour12:false }) : '—'}
                         </td>
                         <td style={{ whiteSpace:'nowrap', color:'var(--text-muted)' }}>
                           {s.type === 'TICK_REPLAY' && sm?.replayFirstTick && sm?.replayLastTick
                             ? `${sm.replayFirstTick.slice(11,16)} → ${sm.replayLastTick.slice(11,16)}`
                             : s.type === 'LIVE' && sm?.sessionStart && sm?.sessionEnd
-                            ? `${sm.sessionStart.slice(11,16)} → ${sm.sessionEnd.slice(11,16)}`
+                            ? `${new Date(sm.sessionStart).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata',hour12:false})} → ${new Date(sm.sessionEnd).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata',hour12:false})}`
                             : '—'}
                         </td>
                         <td style={{ whiteSpace:'nowrap' }}>
                           {pair && <span title={`Paired with ${pair.partnerId}`} style={{ display:'inline-block', width:8, height:8, borderRadius:'50%', background:PAIR_COLORS[pair.colorIdx], marginRight:5, verticalAlign:'middle' }} />}
                           <span style={{ color:s.type==='LIVE'?'#22c55e':'#6366f1', fontWeight:700 }}>{s.type==='LIVE'?'LIVE':'TICK'}</span>
                         </td>
-                        <td style={{ maxWidth:140, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{s.label||'—'}</td>
-                        <td>{s.userId||'—'}</td>
+                        <td style={{ maxWidth:220, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{s.label||'—'}</td>
+                        <td style={{ maxWidth:80, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', color:'var(--text-muted)', fontSize:10 }} title={s.userId||''}>{s.userId ? s.userId.split('@')[0] : '—'}</td>
                         <td>{s.tickCount!=null?s.tickCount.toLocaleString():'—'}</td>
                         <td>{sm?.trades??'—'}</td>
                         <td style={sm?.realizedPnl!=null?pnlStyle(sm.realizedPnl):{}}>{sm?.realizedPnl!=null?fmt2(sm.realizedPnl):'—'}</td>
@@ -13982,7 +13999,7 @@ function SessionCompare() {
                       ['Ticks',   ticksA.length||0,  ticksB.length||0,  tickComparison.rows.filter(r=>r.matchType==='MATCHED').length,  tickComparison.rows.filter(r=>r.matchType==='PRICE_MISMATCH').length, tickComparison.rows.filter(r=>r.matchType==='LIVE_ONLY').length,  tickComparison.rows.filter(r=>r.matchType==='REPLAY_ONLY').length,  tickComparison.matchPct],
                       ['Candles', feedA.length,       feedB.length,       candleComparison.stats?.exact??0,  candleComparison.stats?.mismatch??0,  candleComparison.stats?.liveOnly??0,  candleComparison.stats?.replayOnly??0,  candleComparison.stats?.matchPct],
                       ['Signals', feedA.length,       feedB.length,       signalComparison.stats?.matched??0, signalComparison.stats?.mismatch??0,  signalComparison.stats?.liveOnly??0,  signalComparison.stats?.replayOnly??0, signalComparison.stats?.matchPct],
-                      ['Trades',  tradesA.length,     tradesB.length,     tradeComparison.stats?.both??0,    null,                                  tradeComparison.stats?.liveOnly??0,   tradeComparison.stats?.replayOnly??0,  tradeComparison.stats?.matchPct],
+                      ['Trades',  tradesA.length,     tradesB.length,     tradeComparison.stats?.both??0,    tradeComparison.stats?.priceMismatch??0,  tradeComparison.stats?.liveOnly??0,   tradeComparison.stats?.replayOnly??0,  tradeComparison.stats?.matchPct],
                     ].map(([lbl,ac,bc,matched,mism,ao,bo,pct]) => (
                       <tr key={lbl}>
                         <td style={{ fontWeight:700 }}>{lbl}</td>
@@ -14193,6 +14210,9 @@ function SessionCompare() {
                 {tradeComparison.stats && (
                   <span style={{ fontSize:11, color:'var(--text-muted)' }}>
                     {tradeComparison.stats.both} both · {tradeComparison.stats.liveOnly} live-only · {tradeComparison.stats.replayOnly} replay-only
+                    {tradeComparison.stats.priceMismatch > 0 && (
+                      <span style={{ color:'#f59e0b', marginLeft:6 }}>· {tradeComparison.stats.priceMismatch} price mismatch</span>
+                    )}
                   </span>
                 )}
               </div>
@@ -14204,31 +14224,35 @@ function SessionCompare() {
                       <tr><th>Match</th>
                         <th style={{ color:'#6366f1' }}>A Entry</th><th style={{ color:'#6366f1' }}>A Type</th><th style={{ color:'#6366f1' }}>A Symbol</th><th style={{ color:'#6366f1' }}>A EntPx</th><th style={{ color:'#6366f1' }}>A ExtPx</th><th style={{ color:'#6366f1' }}>A P&L</th><th style={{ color:'#6366f1' }}>A Exit</th><th style={{ color:'#6366f1' }}>A Bars</th>
                         <th style={{ color:'#10b981' }}>B Entry</th><th style={{ color:'#10b981' }}>B Type</th><th style={{ color:'#10b981' }}>B Symbol</th><th style={{ color:'#10b981' }}>B EntPx</th><th style={{ color:'#10b981' }}>B ExtPx</th><th style={{ color:'#10b981' }}>B P&L</th><th style={{ color:'#10b981' }}>B Exit</th><th style={{ color:'#10b981' }}>B Bars</th>
-                        <th>ΔP&L</th></tr>
+                        <th>ΔP&L</th><th title="Entry price mismatch |A−B|>0.5">EntPx?</th><th title="Exit price mismatch |A−B|>0.5">ExtPx?</th><th title="Exit reason mismatch">ExitRsn?</th></tr>
                     </thead>
                     <tbody>
                       {tradeComparison.rows.map((r, i) => {
-                        const pnlDiff = r.matchType==='BOTH'&&r.a?.pnl!=null&&r.b?.pnl!=null?r.b.pnl-r.a.pnl:null;
+                        const pnlDiff = r.matchType==='BOTH' ? (r.pnlDiff??null) : null;
+                        const MISMATCH_BG = 'rgba(245,158,11,0.18)';
                         return (
                           <tr key={i} style={{ background:r.matchType==='LIVE_ONLY'?'rgba(99,102,241,0.07)':r.matchType==='REPLAY_ONLY'?'rgba(16,185,129,0.07)':undefined }}>
                             <td><Badge type={r.matchType} label={r.matchType==='BOTH'?'✓ BOTH':r.matchType==='LIVE_ONLY'?'A ONLY':'B ONLY'} /></td>
                             <td style={{ fontFamily:'monospace', fontSize:10 }}>{(r.a?.entryTime||'').slice(11,16)||'—'}</td>
                             <td>{r.a?.optionType||'—'}</td>
                             <td style={{ fontSize:10 }}>{r.a?.tradingSymbol||'—'}</td>
-                            <td>{r.a?.entryPrice!=null?n2c(r.a.entryPrice):'—'}</td>
-                            <td>{r.a?.exitPrice!=null?n2c(r.a.exitPrice):'—'}</td>
+                            <td style={r.entryPriceMismatch?{background:MISMATCH_BG}:{}}>{r.a?.entryPrice!=null?n2c(r.a.entryPrice):'—'}</td>
+                            <td style={r.exitPriceMismatch?{background:MISMATCH_BG}:{}}>{r.a?.exitPrice!=null?n2c(r.a.exitPrice):'—'}</td>
                             <td style={r.a?.pnl!=null?pnlStyle(r.a.pnl):{}}>{r.a?.pnl!=null?fmt2(r.a.pnl):'—'}</td>
-                            <td style={{ fontSize:10 }}>{r.a?.exitReason||'—'}</td>
+                            <td style={{ fontSize:10, ...(r.exitReasonMismatch?{background:MISMATCH_BG}:{}) }}>{r.a?.exitReason||'—'}</td>
                             <td>{r.a?.barsInTrade??'—'}</td>
                             <td style={{ fontFamily:'monospace', fontSize:10 }}>{(r.b?.entryTime||'').slice(11,16)||'—'}</td>
                             <td>{r.b?.optionType||'—'}</td>
                             <td style={{ fontSize:10 }}>{r.b?.tradingSymbol||'—'}</td>
-                            <td>{r.b?.entryPrice!=null?n2c(r.b.entryPrice):'—'}</td>
-                            <td>{r.b?.exitPrice!=null?n2c(r.b.exitPrice):'—'}</td>
+                            <td style={r.entryPriceMismatch?{background:MISMATCH_BG}:{}}>{r.b?.entryPrice!=null?n2c(r.b.entryPrice):'—'}</td>
+                            <td style={r.exitPriceMismatch?{background:MISMATCH_BG}:{}}>{r.b?.exitPrice!=null?n2c(r.b.exitPrice):'—'}</td>
                             <td style={r.b?.pnl!=null?pnlStyle(r.b.pnl):{}}>{r.b?.pnl!=null?fmt2(r.b.pnl):'—'}</td>
-                            <td style={{ fontSize:10 }}>{r.b?.exitReason||'—'}</td>
+                            <td style={{ fontSize:10, ...(r.exitReasonMismatch?{background:MISMATCH_BG}:{}) }}>{r.b?.exitReason||'—'}</td>
                             <td>{r.b?.barsInTrade??'—'}</td>
                             <td style={pnlDiff!=null?pnlStyle(pnlDiff):{}}>{pnlDiff!=null?(pnlDiff>0?'+':'')+fmt2(pnlDiff):'—'}</td>
+                            <td style={{ textAlign:'center' }}>{r.matchType==='BOTH'?(r.entryPriceMismatch?<span style={{ color:'#f59e0b' }}>✗</span>:'✓'):'—'}</td>
+                            <td style={{ textAlign:'center' }}>{r.matchType==='BOTH'?(r.exitPriceMismatch?<span style={{ color:'#f59e0b' }}>✗</span>:'✓'):'—'}</td>
+                            <td style={{ textAlign:'center' }}>{r.matchType==='BOTH'?(r.exitReasonMismatch?<span style={{ color:'#f59e0b' }}>✗</span>:'✓'):'—'}</td>
                           </tr>
                         );
                       })}
