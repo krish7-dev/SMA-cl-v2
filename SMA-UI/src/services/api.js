@@ -492,3 +492,19 @@ export async function getSessionResult(sessionId) {
 export async function deleteSessionResult(sessionId) {
   return request(`${STRATEGY_API}/api/v1/strategy/session-results/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
 }
+
+/**
+ * Runs a server-side field-by-field comparison of two saved sessions.
+ * Returns ApiResponse<DivergenceReport>:
+ *   { sessionA, sessionB, matchedCandles, liveOnlyCount, replayOnlyCount,
+ *     divergentCandleCount, firstDivergenceTime, firstDivergenceStage,
+ *     divergences: [{niftyTime, stage, field, liveValue, replayValue}],
+ *     liveOnlyTimes, replayOnlyTimes,
+ *     tradeComparison: [{liveEntryTime, replayEntryTime, side, entryPriceMismatch,
+ *                        exitPriceMismatch, exitReasonMismatch, pnlDiff, status}] }
+ */
+export async function getSessionDivergence(sessionA, sessionB) {
+  return request(
+    `${STRATEGY_API}/api/v1/strategy/session-results/divergence?sessionA=${encodeURIComponent(sessionA)}&sessionB=${encodeURIComponent(sessionB)}`
+  );
+}

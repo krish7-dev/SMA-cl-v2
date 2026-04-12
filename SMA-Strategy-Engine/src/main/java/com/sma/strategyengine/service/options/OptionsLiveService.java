@@ -889,6 +889,11 @@ public class OptionsLiveService {
                         openTime, action, marketPhase, tradable);
 
                 broadcast("candle", objectMapper.writeValueAsString(event));
+
+                // ── divergence debug (enable via logging.level.com.sma=DEBUG) ──
+                if (log.isDebugEnabled()) {
+                    logCandleDebug(bucketMs, event);
+                }
             } catch (Exception e) {
                 log.debug("Options live session {}: tick candle emit failed: {}", sessionId, e.getMessage());
             }
@@ -1152,6 +1157,43 @@ public class OptionsLiveService {
                     .confidence(c.getConfidence())
                     .penalty(c.getPenalty())
                     .build()).collect(Collectors.toList());
+        }
+
+        // ── divergence debug helper ───────────────────────────────────────────
+
+        /** Logs one line per NIFTY event plus one line per option token snapshot.
+         *  Mirror of the same helper in {@link TickOptionsReplayService}.
+         *  tickEpochMs is unavailable in emitTickCandleEvent — always 0 for LIVE mode. */
+        private void logCandleDebug(long bucketMs, OptionsReplayCandleEvent e) {
+            log.debug("[LIVE][{}] tick=0 bucket={} niftyTime={} regime={} bias={} winner={} score={} "
+                    + "entryAllowed={} blockReason={} execWait={} state={} action={} "
+                    + "token={} symbol={} entryPx={} capital={}",
+                    sessionId, bucketMs,
+                    e.getNiftyTime(), e.getRegime(), e.getConfirmedBias(),
+                    e.getWinnerStrategy(), String.format("%.2f", e.getWinnerScore()),
+                    e.isEntryAllowed(),
+                    e.getBlockReason()    != null ? e.getBlockReason()    : "-",
+                    e.getExecWaitReason() != null ? e.getExecWaitReason() : "-",
+                    e.getPositionState(), e.getAction(),
+                    e.getSelectedToken()        != null ? e.getSelectedToken()        : "-",
+                    e.getSelectedTradingSymbol() != null ? e.getSelectedTradingSymbol() : "-",
+                    String.format("%.2f", e.getEntryPrice()),
+                    String.format("%.2f", e.getCapital()));
+            LocalDateTime bucketLdt = bucketToLocalDateTime(bucketMs);
+            for (Long token : optionTokens) {
+                NavigableMap<LocalDateTime, CandleDto> map = liveOptionCandles.get(token);
+                FormingCandle fc = forming.get(token);
+                boolean hasSameBucket = fc != null && fc.startMs == bucketMs;
+                CandleDto snap = map != null ? map.get(bucketLdt) : null;
+                log.debug("[LIVE][{}]   opt-snap token={} bucketMs={} hasSameBucketForming={} "
+                        + "snapPresent={} O={} H={} L={} C={}",
+                        sessionId, token, bucketMs, hasSameBucket,
+                        snap != null,
+                        snap != null ? snap.open()  : "-",
+                        snap != null ? snap.high()  : "-",
+                        snap != null ? snap.low()   : "-",
+                        snap != null ? snap.close() : "-");
+            }
         }
     }
 
