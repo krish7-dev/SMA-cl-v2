@@ -13486,10 +13486,11 @@ function SessionCompare() {
   const [comparing,    setComparing]    = useState(false);
   const [compareErr,   setCompareErr]   = useState('');
   const [deleting,     setDeleting]     = useState(null);
-  const [ticksA,       setTicksA]       = useState([]);
-  const [ticksB,       setTicksB]       = useState([]);
-  const [ticksLoading, setTicksLoading] = useState(false);
-  const [compareTab,   setCompareTab]   = useState('summary');
+  const [ticksA,           setTicksA]           = useState([]);
+  const [ticksB,           setTicksB]           = useState([]);
+  const [ticksLoading,     setTicksLoading]     = useState(false);
+  const [compareTab,       setCompareTab]       = useState('summary');
+  const [skipPartialBucket, setSkipPartialBucket] = useState(true);
 
   // ── Session management ────────────────────────────────────────────────────
   function loadSessions(userId, type) {
@@ -13601,19 +13602,19 @@ function SessionCompare() {
             token, a: ta, b: tb, timeDiffMs: tb.timeMs - ta.timeMs, priceDiff });
           totalMatched++;
         } else {
-          tokenRows.push({ matchType: 'LIVE_ONLY', token, a: ta, b: null, timeDiffMs: null, priceDiff: null });
+          tokenRows.push({ matchType: 'A_ONLY', token, a: ta, b: null, timeDiffMs: null, priceDiff: null });
         }
       }
       for (let bi = 0; bi < bs.length; bi++) {
-        if (!usedB.has(bi)) tokenRows.push({ matchType: 'REPLAY_ONLY', token, a: null, b: bs[bi], timeDiffMs: null, priceDiff: null });
+        if (!usedB.has(bi)) tokenRows.push({ matchType: 'B_ONLY', token, a: null, b: bs[bi], timeDiffMs: null, priceDiff: null });
       }
       stats[token] = {
         token,
         aCount: as.length, bCount: bs.length,
         matched:      tokenRows.filter(r => r.matchType === 'MATCHED').length,
         priceMismatch:tokenRows.filter(r => r.matchType === 'PRICE_MISMATCH').length,
-        aOnly:        tokenRows.filter(r => r.matchType === 'LIVE_ONLY').length,
-        bOnly:        tokenRows.filter(r => r.matchType === 'REPLAY_ONLY').length,
+        aOnly:        tokenRows.filter(r => r.matchType === 'A_ONLY').length,
+        bOnly:        tokenRows.filter(r => r.matchType === 'B_ONLY').length,
       };
       rows.push(...tokenRows);
     }
@@ -13625,15 +13626,23 @@ function SessionCompare() {
 
   // ── 2. Candle comparison ─────────────────────────────────────────────────
   // Strategy: exact lookup by niftyTime ISO string. OHLC compared with OHLC_TOL.
+  // Partial start buckets: first candle of A or B that the other session doesn't have
+  // (caused by LIVE attaching mid-bucket). Marked PARTIAL_START_BUCKET for optional exclusion.
   const candleComparison = (() => {
-    if (!feedA.length && !feedB.length) return { rows: [], stats: null };
+    if (!feedA.length && !feedB.length) return { rows: [], stats: null, partialBuckets: new Set() };
     const mapA = new Map(feedA.map(e => [e.niftyTime, e]));
     const mapB = new Map(feedB.map(e => [e.niftyTime, e]));
     const allTimes = [...new Set([...feedA.map(e => e.niftyTime), ...feedB.map(e => e.niftyTime)])].sort();
+    // Detect partial start buckets: first candle in A not in B, or vice versa
+    const partialBuckets = new Set();
+    const firstA = feedA.length ? feedA[0].niftyTime : null;
+    const firstB = feedB.length ? feedB[0].niftyTime : null;
+    if (firstA && !mapB.has(firstA)) partialBuckets.add(firstA);
+    if (firstB && !mapA.has(firstB) && firstB !== firstA) partialBuckets.add(firstB);
     const rows = allTimes.map(t => {
       const a = mapA.get(t) || null, b = mapB.get(t) || null;
-      if (!a) return { time: t, a: null, b, matchType: 'REPLAY_ONLY', divergedFields: [] };
-      if (!b) return { time: t, a, b: null, matchType: 'LIVE_ONLY',   divergedFields: [] };
+      if (!a) return { time: t, a: null, b, matchType: partialBuckets.has(t) ? 'PARTIAL_START_BUCKET' : 'B_ONLY', divergedFields: [] };
+      if (!b) return { time: t, a, b: null, matchType: partialBuckets.has(t) ? 'PARTIAL_START_BUCKET' : 'A_ONLY', divergedFields: [] };
       const df = [];
       if (Math.abs((a.niftyOpen  ||0)-(b.niftyOpen  ||0)) > OHLC_TOL) df.push('open');
       if (Math.abs((a.niftyHigh  ||0)-(b.niftyHigh  ||0)) > OHLC_TOL) df.push('high');
@@ -13642,12 +13651,16 @@ function SessionCompare() {
       if ((a.niftyVolume||0) !== (b.niftyVolume||0))                   df.push('volume');
       return { time: t, a, b, matchType: df.length === 0 ? 'EXACT' : 'OHLC_MISMATCH', divergedFields: df };
     });
-    const exact      = rows.filter(r => r.matchType === 'EXACT').length;
-    const mismatch   = rows.filter(r => r.matchType === 'OHLC_MISMATCH').length;
-    const liveOnly   = rows.filter(r => r.matchType === 'LIVE_ONLY').length;
-    const replayOnly = rows.filter(r => r.matchType === 'REPLAY_ONLY').length;
-    const total = rows.length;
-    return { rows, stats: { total, exact, mismatch, liveOnly, replayOnly, matchPct: total > 0 ? (exact/total*100).toFixed(1) : null } };
+    // Stats computed over rows that are not excluded by skipPartialBucket filter
+    const scored = skipPartialBucket ? rows.filter(r => r.matchType !== 'PARTIAL_START_BUCKET') : rows;
+    const exact      = scored.filter(r => r.matchType === 'EXACT').length;
+    const mismatch   = scored.filter(r => r.matchType === 'OHLC_MISMATCH').length;
+    const aOnly      = scored.filter(r => r.matchType === 'A_ONLY').length;
+    const bOnly      = scored.filter(r => r.matchType === 'B_ONLY').length;
+    const partial    = rows.filter(r => r.matchType === 'PARTIAL_START_BUCKET').length;
+    const total = scored.length;
+    // aCount/bCount = unique niftyTime buckets per feed (not raw feed entry count)
+    return { rows, scored, partialBuckets, stats: { total, exact, mismatch, aOnly, bOnly, partial, aCount: mapA.size, bCount: mapB.size, matchPct: total > 0 ? (exact/total*100).toFixed(1) : null } };
   })();
 
   // ── 3. Signal comparison ─────────────────────────────────────────────────
@@ -13657,10 +13670,11 @@ function SessionCompare() {
     const mapA = new Map(feedA.map(e => [e.niftyTime, e]));
     const mapB = new Map(feedB.map(e => [e.niftyTime, e]));
     const allTimes = [...new Set([...feedA.map(e => e.niftyTime), ...feedB.map(e => e.niftyTime)])].sort();
+    const { partialBuckets } = candleComparison;
     const rows = allTimes.map(t => {
       const a = mapA.get(t) || null, b = mapB.get(t) || null;
-      if (!a) return { time: t, a: null, b, matchType: 'REPLAY_ONLY', divergedFields: [] };
-      if (!b) return { time: t, a, b: null, matchType: 'LIVE_ONLY',   divergedFields: [] };
+      if (!a) return { time: t, a: null, b, matchType: partialBuckets.has(t) ? 'PARTIAL_START_BUCKET' : 'B_ONLY', divergedFields: [] };
+      if (!b) return { time: t, a, b: null, matchType: partialBuckets.has(t) ? 'PARTIAL_START_BUCKET' : 'A_ONLY', divergedFields: [] };
       const df = [];
       if (a.regime         !== b.regime)         df.push('regime');
       if (a.confirmedBias  !== b.confirmedBias)  df.push('confirmedBias');
@@ -13671,12 +13685,13 @@ function SessionCompare() {
       if (a.exitReason     !== b.exitReason)     df.push('exitReason');
       return { time: t, a, b, matchType: df.length === 0 ? 'MATCHED' : 'SIGNAL_MISMATCH', divergedFields: df };
     });
-    const matched    = rows.filter(r => r.matchType === 'MATCHED').length;
-    const mismatch   = rows.filter(r => r.matchType === 'SIGNAL_MISMATCH').length;
-    const liveOnly   = rows.filter(r => r.matchType === 'LIVE_ONLY').length;
-    const replayOnly = rows.filter(r => r.matchType === 'REPLAY_ONLY').length;
-    const total = rows.length;
-    return { rows, stats: { total, matched, mismatch, liveOnly, replayOnly, matchPct: total > 0 ? (matched/total*100).toFixed(1) : null } };
+    const scored  = skipPartialBucket ? rows.filter(r => r.matchType !== 'PARTIAL_START_BUCKET') : rows;
+    const matched    = scored.filter(r => r.matchType === 'MATCHED').length;
+    const mismatch   = scored.filter(r => r.matchType === 'SIGNAL_MISMATCH').length;
+    const aOnly      = scored.filter(r => r.matchType === 'A_ONLY').length;
+    const bOnly      = scored.filter(r => r.matchType === 'B_ONLY').length;
+    const total = scored.length;
+    return { rows, scored, stats: { total, matched, mismatch, aOnly, bOnly, aCount: mapA.size, bCount: mapB.size, matchPct: total > 0 ? (matched/total*100).toFixed(1) : null } };
   })();
 
   // ── 4. Trade comparison ──────────────────────────────────────────────────
@@ -13705,17 +13720,17 @@ function SessionCompare() {
         rows.push({ matchType: 'BOTH', a: ta, b: tb,
                     entryPriceMismatch, exitPriceMismatch, exitReasonMismatch, pnlDiff });
       } else {
-        rows.push({ matchType: 'LIVE_ONLY', a: ta, b: null });
+        rows.push({ matchType: 'A_ONLY', a: ta, b: null });
       }
     }
-    tradesB.forEach((tb, i) => { if (!usedB.has(i)) rows.push({ matchType: 'REPLAY_ONLY', a: null, b: tb }); });
+    tradesB.forEach((tb, i) => { if (!usedB.has(i)) rows.push({ matchType: 'B_ONLY', a: null, b: tb }); });
     rows.sort((x,y) => ((x.a?.entryTime||x.b?.entryTime||'') > (y.a?.entryTime||y.b?.entryTime||'')) ? 1 : -1);
     const both         = rows.filter(r => r.matchType === 'BOTH').length;
-    const liveOnly     = rows.filter(r => r.matchType === 'LIVE_ONLY').length;
-    const replayOnly   = rows.filter(r => r.matchType === 'REPLAY_ONLY').length;
+    const aOnly        = rows.filter(r => r.matchType === 'A_ONLY').length;
+    const bOnly        = rows.filter(r => r.matchType === 'B_ONLY').length;
     const priceMismatch = rows.filter(r => r.matchType === 'BOTH' && (r.entryPriceMismatch || r.exitPriceMismatch)).length;
     const tot = tradesA.length + tradesB.length;
-    return { rows, stats: { total: rows.length, both, liveOnly, replayOnly, priceMismatch,
+    return { rows, stats: { total: rows.length, both, aOnly, bOnly, priceMismatch,
                             matchPct: tot > 0 ? (both*2/tot*100).toFixed(1) : null } };
   })();
 
@@ -13739,6 +13754,7 @@ function SessionCompare() {
   // ── 6. Divergence trace ──────────────────────────────────────────────────
   // Walks the comparison chain (TICK → CANDLE → SIGNAL → TRADE) and reports
   // the first point of divergence at each stage that was detected.
+  // Partial-start buckets are excluded when skipPartialBucket is on.
   const divergenceTrace = (() => {
     const stages = [];
     const firstTickDiv = tickComparison.rows.find(r => r.matchType !== 'MATCHED');
@@ -13746,24 +13762,33 @@ function SessionCompare() {
       stage: 'TICK', seqNo: 1,
       time: new Date(firstTickDiv.a?.timeMs || firstTickDiv.b?.timeMs || 0).toISOString(),
       matchType: firstTickDiv.matchType, token: String(firstTickDiv.token),
-      explanation: firstTickDiv.matchType === 'LIVE_ONLY'   ? 'Live received a tick that replay did not have' :
-                   firstTickDiv.matchType === 'REPLAY_ONLY' ? 'Replay had a tick not seen in live stream' :
+      explanation: firstTickDiv.matchType === 'A_ONLY'        ? 'Session A received a tick that session B did not have' :
+                   firstTickDiv.matchType === 'B_ONLY'        ? 'Session B had a tick not seen in session A' :
                    `LTP diverged by ${Number(firstTickDiv.priceDiff||0).toFixed(2)}`,
     });
-    const firstCandleDiv = candleComparison.rows.find(r => r.matchType !== 'EXACT');
+    // Candle: skip partial-start buckets in trace when toggle is on
+    const candleRows = skipPartialBucket
+      ? candleComparison.rows.filter(r => r.matchType !== 'PARTIAL_START_BUCKET')
+      : candleComparison.rows;
+    const firstCandleDiv = candleRows.find(r => r.matchType !== 'EXACT');
     if (firstCandleDiv) stages.push({
       stage: 'CANDLE', seqNo: 2, time: firstCandleDiv.time,
       matchType: firstCandleDiv.matchType, token: 'NIFTY',
-      explanation: firstCandleDiv.matchType === 'LIVE_ONLY'   ? 'Candle exists only in live feed' :
-                   firstCandleDiv.matchType === 'REPLAY_ONLY' ? 'Candle exists only in replay feed' :
+      explanation: firstCandleDiv.matchType === 'A_ONLY'             ? 'Candle exists only in session A feed' :
+                   firstCandleDiv.matchType === 'B_ONLY'             ? 'Candle exists only in session B feed' :
+                   firstCandleDiv.matchType === 'PARTIAL_START_BUCKET' ? 'Startup alignment gap — one session missed the partial first bucket' :
                    `OHLC fields differ: ${firstCandleDiv.divergedFields.join(', ')}`,
     });
-    const firstSignalDiv = signalComparison.rows.find(r => r.matchType !== 'MATCHED');
+    const signalRows = skipPartialBucket
+      ? signalComparison.rows.filter(r => r.matchType !== 'PARTIAL_START_BUCKET')
+      : signalComparison.rows;
+    const firstSignalDiv = signalRows.find(r => r.matchType !== 'MATCHED');
     if (firstSignalDiv) stages.push({
       stage: 'SIGNAL', seqNo: 3, time: firstSignalDiv.time,
       matchType: firstSignalDiv.matchType, token: 'NIFTY',
-      explanation: firstSignalDiv.matchType === 'LIVE_ONLY'   ? 'Signal exists only in live' :
-                   firstSignalDiv.matchType === 'REPLAY_ONLY' ? 'Signal exists only in replay' :
+      explanation: firstSignalDiv.matchType === 'A_ONLY'             ? 'Signal exists only in session A' :
+                   firstSignalDiv.matchType === 'B_ONLY'             ? 'Signal exists only in session B' :
+                   firstSignalDiv.matchType === 'PARTIAL_START_BUCKET' ? 'Startup alignment gap in signal layer' :
                    `Decision fields differ: ${firstSignalDiv.divergedFields.join(', ')}`,
     });
     const firstTradeDiv = tradeComparison.rows.find(r => r.matchType !== 'BOTH');
@@ -13772,7 +13797,8 @@ function SessionCompare() {
       time: firstTradeDiv.a?.entryTime || firstTradeDiv.b?.entryTime || '—',
       matchType: firstTradeDiv.matchType,
       token: firstTradeDiv.a?.tradingSymbol || firstTradeDiv.b?.tradingSymbol || '—',
-      explanation: firstTradeDiv.matchType === 'LIVE_ONLY' ? 'Trade taken in live but not in replay' : 'Trade taken in replay but not in live',
+      explanation: firstTradeDiv.matchType === 'A_ONLY' ? 'Trade taken in session A but not in session B'
+                                                        : 'Trade taken in session B but not in session A',
     });
     stages.sort((x,y) => x.seqNo - y.seqNo);
     return { stages, firstStage: stages[0] || null };
@@ -13906,7 +13932,12 @@ function SessionCompare() {
 
   // ── Badge helper ──────────────────────────────────────────────────────────
   function mtColor(type) {
-    return { MATCHED:'#22c55e', EXACT:'#22c55e', BOTH:'#22c55e', PRICE_MISMATCH:'#f59e0b', OHLC_MISMATCH:'#f59e0b', SIGNAL_MISMATCH:'#f59e0b', LIVE_ONLY:'#6366f1', REPLAY_ONLY:'#10b981' }[type] || 'var(--text-muted)';
+    return {
+      MATCHED:'#22c55e', EXACT:'#22c55e', BOTH:'#22c55e',
+      PRICE_MISMATCH:'#f59e0b', OHLC_MISMATCH:'#f59e0b', SIGNAL_MISMATCH:'#f59e0b',
+      A_ONLY:'#6366f1', B_ONLY:'#10b981',
+      PARTIAL_START_BUCKET:'#94a3b8',
+    }[type] || 'var(--text-muted)';
   }
   function Badge({ type, label }) {
     return <span style={{ fontWeight:700, fontSize:10, color: mtColor(type) }}>{label ?? type}</span>;
@@ -14035,6 +14066,11 @@ function SessionCompare() {
             disabled={!selA || !selB || comparing || selA === selB}>
             {comparing ? 'Loading…' : 'Compare A vs B'}
           </button>
+          <label style={{ display:'flex', alignItems:'center', gap:5, fontSize:11, cursor:'pointer', userSelect:'none' }}
+            title="Exclude partial first candle from divergence counts — occurs when one session attached to the tick stream mid-bucket">
+            <input type="checkbox" checked={skipPartialBucket} onChange={e => setSkipPartialBucket(e.target.checked)} />
+            Skip startup bucket
+          </label>
           {selA && <span style={{ fontSize:11 }}>A: <b style={{ color:'#6366f1' }}>{sessions.find(s=>s.sessionId===selA)?.label||selA}</b></span>}
           {selB && <span style={{ fontSize:11 }}>B: <b style={{ color:'#10b981' }}>{sessions.find(s=>s.sessionId===selB)?.label||selB}</b></span>}
           {compareErr && <span style={{ fontSize:11, color:'#ef4444' }}>{compareErr}</span>}
@@ -14061,20 +14097,23 @@ function SessionCompare() {
               <table className="bt-table" style={{ fontSize:12 }}>
                 <thead><tr><th>Metric</th><th style={{ color:'#6366f1' }}>A — {labelA}</th><th style={{ color:'#10b981' }}>B — {labelB}</th><th>Diff (B−A)</th></tr></thead>
                 <tbody>
-                  {[['Date', resultA.sessionDate, resultB.sessionDate, null],
-                    ['Type', resultA.type,        resultB.type,        null],
-                    ['Trades', sumA?.trades, sumB?.trades, sumA?.trades!=null&&sumB?.trades!=null?sumB.trades-sumA.trades:null],
-                    ['Realized P&L', sumA?.realizedPnl, sumB?.realizedPnl, sumA?.realizedPnl!=null&&sumB?.realizedPnl!=null?sumB.realizedPnl-sumA.realizedPnl:null],
-                    ['Win Rate', sumA?.winRate!=null?`${(sumA.winRate*100).toFixed(1)}%`:null, sumB?.winRate!=null?`${(sumB.winRate*100).toFixed(1)}%`:null, sumA?.winRate!=null&&sumB?.winRate!=null?`${((sumB.winRate-sumA.winRate)*100).toFixed(1)}%`:null],
-                    ['Final Capital', sumA?.finalCapital, sumB?.finalCapital, sumA?.finalCapital!=null&&sumB?.finalCapital!=null?sumB.finalCapital-sumA.finalCapital:null],
-                  ].map(([lbl,vA,vB,diff]) => (
+                  {[['Date', resultA.sessionDate, resultB.sessionDate, null, 'str'],
+                    ['Type', resultA.type,        resultB.type,        null, 'str'],
+                    ['Trades', sumA?.trades, sumB?.trades, sumA?.trades!=null&&sumB?.trades!=null?sumB.trades-sumA.trades:null, 'int'],
+                    ['Realized P&L', sumA?.realizedPnl, sumB?.realizedPnl, sumA?.realizedPnl!=null&&sumB?.realizedPnl!=null?sumB.realizedPnl-sumA.realizedPnl:null, 'pnl'],
+                    ['Win Rate', sumA?.winRate!=null?`${(sumA.winRate*100).toFixed(1)}%`:null, sumB?.winRate!=null?`${(sumB.winRate*100).toFixed(1)}%`:null, sumA?.winRate!=null&&sumB?.winRate!=null?`${((sumB.winRate-sumA.winRate)*100).toFixed(1)}%`:null, 'str'],
+                    ['Final Capital', sumA?.finalCapital, sumB?.finalCapital, sumA?.finalCapital!=null&&sumB?.finalCapital!=null?sumB.finalCapital-sumA.finalCapital:null, 'pnl'],
+                  ].map(([lbl,vA,vB,diff,fmt]) => {
+                    const fmtVal = (v) => fmt==='int' ? String(v) : fmt2(v);
+                    const fmtDiff = (d) => fmt==='int' ? (d>0?'+':'')+d : (d>0?'+':'')+fmt2(d);
+                    return (
                     <tr key={lbl}>
                       <td style={{ fontWeight:700 }}>{lbl}</td>
-                      <td style={typeof vA==='number'?pnlStyle(vA):{}}>{typeof vA==='number'?fmt2(vA):(vA??'—')}</td>
-                      <td style={typeof vB==='number'?pnlStyle(vB):{}}>{typeof vB==='number'?fmt2(vB):(vB??'—')}</td>
-                      <td style={typeof diff==='number'?pnlStyle(diff):{}}>{diff!=null?(typeof diff==='number'?(diff>0?'+':'')+fmt2(diff):diff):'—'}</td>
+                      <td style={fmt==='pnl'&&typeof vA==='number'?pnlStyle(vA):{}}>{typeof vA==='number'?fmtVal(vA):(vA??'—')}</td>
+                      <td style={fmt==='pnl'&&typeof vB==='number'?pnlStyle(vB):{}}>{typeof vB==='number'?fmtVal(vB):(vB??'—')}</td>
+                      <td style={fmt==='pnl'&&typeof diff==='number'?pnlStyle(diff):{}}>{diff!=null?(typeof diff==='number'?fmtDiff(diff):diff):'—'}</td>
                     </tr>
-                  ))}
+                  )})}
                 </tbody>
               </table>
 
@@ -14084,10 +14123,10 @@ function SessionCompare() {
                   <thead><tr><th>Stage</th><th>A Count</th><th>B Count</th><th>Matched</th><th>Mismatch</th><th>A-only</th><th>B-only</th><th>Match %</th></tr></thead>
                   <tbody>
                     {[
-                      ['Ticks',   ticksA.length||0,  ticksB.length||0,  tickComparison.rows.filter(r=>r.matchType==='MATCHED').length,  tickComparison.rows.filter(r=>r.matchType==='PRICE_MISMATCH').length, tickComparison.rows.filter(r=>r.matchType==='LIVE_ONLY').length,  tickComparison.rows.filter(r=>r.matchType==='REPLAY_ONLY').length,  tickComparison.matchPct],
-                      ['Candles', feedA.length,       feedB.length,       candleComparison.stats?.exact??0,  candleComparison.stats?.mismatch??0,  candleComparison.stats?.liveOnly??0,  candleComparison.stats?.replayOnly??0,  candleComparison.stats?.matchPct],
-                      ['Signals', feedA.length,       feedB.length,       signalComparison.stats?.matched??0, signalComparison.stats?.mismatch??0,  signalComparison.stats?.liveOnly??0,  signalComparison.stats?.replayOnly??0, signalComparison.stats?.matchPct],
-                      ['Trades',  tradesA.length,     tradesB.length,     tradeComparison.stats?.both??0,    tradeComparison.stats?.priceMismatch??0,  tradeComparison.stats?.liveOnly??0,   tradeComparison.stats?.replayOnly??0,  tradeComparison.stats?.matchPct],
+                      ['Ticks',   ticksA.length||0,                    ticksB.length||0,                    tickComparison.rows.filter(r=>r.matchType==='MATCHED').length,  tickComparison.rows.filter(r=>r.matchType==='PRICE_MISMATCH').length, tickComparison.rows.filter(r=>r.matchType==='A_ONLY').length,  tickComparison.rows.filter(r=>r.matchType==='B_ONLY').length,  tickComparison.matchPct],
+                      ['Candles', candleComparison.stats?.aCount??feedA.length, candleComparison.stats?.bCount??feedB.length, candleComparison.stats?.exact??0,  candleComparison.stats?.mismatch??0,  candleComparison.stats?.aOnly??0,  candleComparison.stats?.bOnly??0,  candleComparison.stats?.matchPct],
+                      ['Signals', signalComparison.stats?.aCount??feedA.length, signalComparison.stats?.bCount??feedB.length, signalComparison.stats?.matched??0, signalComparison.stats?.mismatch??0,  signalComparison.stats?.aOnly??0,  signalComparison.stats?.bOnly??0, signalComparison.stats?.matchPct],
+                      ['Trades',  tradesA.length,                      tradesB.length,                      tradeComparison.stats?.both??0,    tradeComparison.stats?.priceMismatch??0,  tradeComparison.stats?.aOnly??0,   tradeComparison.stats?.bOnly??0,  tradeComparison.stats?.matchPct],
                     ].map(([lbl,ac,bc,matched,mism,ao,bo,pct]) => (
                       <tr key={lbl}>
                         <td style={{ fontWeight:700 }}>{lbl}</td>
@@ -14175,7 +14214,7 @@ function SessionCompare() {
                       <tbody>
                         {tickComparison.rows.slice(0, 1000).map((r, i) => (
                           <tr key={i} style={{ background:r.matchType==='PRICE_MISMATCH'?'rgba(245,158,11,0.08)':r.matchType!=='MATCHED'?'rgba(99,102,241,0.06)':undefined }}>
-                            <td><Badge type={r.matchType} label={r.matchType==='MATCHED'?'✓':r.matchType==='PRICE_MISMATCH'?'PRICE':r.matchType==='LIVE_ONLY'?'A-only':'B-only'} /></td>
+                            <td><Badge type={r.matchType} label={r.matchType==='MATCHED'?'✓':r.matchType==='PRICE_MISMATCH'?'PRICE':r.matchType==='A_ONLY'?'A-only':'B-only'} /></td>
                             <td style={{ fontFamily:'monospace', fontSize:9 }}>{r.token}</td>
                             <td style={{ fontFamily:'monospace', fontSize:9 }}>{r.a?new Date(r.a.timeMs).toISOString().slice(11,23):'—'}</td>
                             <td>{r.a?.ltp!=null?n2c(r.a.ltp):'—'}</td>
@@ -14203,7 +14242,7 @@ function SessionCompare() {
                 <span className="bt-section-title" style={{ marginBottom:0 }}>Candle Comparison — NIFTY OHLCV</span>
                 {candleComparison.stats && (
                   <span style={{ fontSize:11, color:'var(--text-muted)' }}>
-                    {candleComparison.stats.total} candles · {candleComparison.stats.exact} exact · {candleComparison.stats.mismatch} OHLC mismatch · {candleComparison.stats.liveOnly} live-only · {candleComparison.stats.replayOnly} replay-only
+                    {candleComparison.stats.total} candles · {candleComparison.stats.exact} exact · {candleComparison.stats.mismatch} OHLC mismatch · {candleComparison.stats.aOnly} A-only · {candleComparison.stats.bOnly} B-only{candleComparison.stats.partial > 0 ? ` · ${candleComparison.stats.partial} startup gap${skipPartialBucket ? ' (excluded)' : ''}` : ''}
                   </span>
                 )}
               </div>
@@ -14218,7 +14257,7 @@ function SessionCompare() {
                   <tbody>
                     {candleComparison.rows.map((r, i) => (
                       <tr key={i} style={{ background:r.matchType==='OHLC_MISMATCH'?'rgba(245,158,11,0.1)':r.matchType!=='EXACT'?'rgba(99,102,241,0.06)':undefined }}>
-                        <td><Badge type={r.matchType} label={r.matchType==='EXACT'?'✓':r.matchType==='OHLC_MISMATCH'?'OHLC':r.matchType==='LIVE_ONLY'?'A-only':'B-only'} /></td>
+                        <td><Badge type={r.matchType} label={r.matchType==='EXACT'?'✓':r.matchType==='OHLC_MISMATCH'?'OHLC':r.matchType==='PARTIAL_START_BUCKET'?'STARTUP':r.matchType==='A_ONLY'?'A-only':'B-only'} /></td>
                         <td style={{ color:'#f59e0b', fontSize:9 }}>{r.divergedFields.join(',')}</td>
                         <td style={{ fontFamily:'monospace', fontSize:9 }}>{(r.time||'').slice(11,16)}</td>
                         <td>{r.a?.niftyOpen!=null?n2c(r.a.niftyOpen):'—'}</td>
@@ -14297,7 +14336,7 @@ function SessionCompare() {
                 <span className="bt-section-title" style={{ marginBottom:0 }}>Trade Comparison</span>
                 {tradeComparison.stats && (
                   <span style={{ fontSize:11, color:'var(--text-muted)' }}>
-                    {tradeComparison.stats.both} both · {tradeComparison.stats.liveOnly} live-only · {tradeComparison.stats.replayOnly} replay-only
+                    {tradeComparison.stats.both} both · {tradeComparison.stats.aOnly} A-only · {tradeComparison.stats.bOnly} B-only
                     {tradeComparison.stats.priceMismatch > 0 && (
                       <span style={{ color:'#f59e0b', marginLeft:6 }}>· {tradeComparison.stats.priceMismatch} price mismatch</span>
                     )}
@@ -14319,8 +14358,8 @@ function SessionCompare() {
                         const pnlDiff = r.matchType==='BOTH' ? (r.pnlDiff??null) : null;
                         const MISMATCH_BG = 'rgba(245,158,11,0.18)';
                         return (
-                          <tr key={i} style={{ background:r.matchType==='LIVE_ONLY'?'rgba(99,102,241,0.07)':r.matchType==='REPLAY_ONLY'?'rgba(16,185,129,0.07)':undefined }}>
-                            <td><Badge type={r.matchType} label={r.matchType==='BOTH'?'✓ BOTH':r.matchType==='LIVE_ONLY'?'A ONLY':'B ONLY'} /></td>
+                          <tr key={i} style={{ background:r.matchType==='A_ONLY'?'rgba(99,102,241,0.07)':r.matchType==='B_ONLY'?'rgba(16,185,129,0.07)':undefined }}>
+                            <td><Badge type={r.matchType} label={r.matchType==='BOTH'?'✓ BOTH':r.matchType==='A_ONLY'?'A ONLY':'B ONLY'} /></td>
                             <td style={{ fontFamily:'monospace', fontSize:10 }}>{(r.a?.entryTime||'').slice(11,16)||'—'}</td>
                             <td>{r.a?.optionType||'—'}</td>
                             <td style={{ fontSize:10 }}>{r.a?.tradingSymbol||'—'}</td>
