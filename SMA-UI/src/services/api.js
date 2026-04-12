@@ -357,11 +357,28 @@ export async function listTickSessions() {
 /**
  * Fetches raw ticks for a session + token list from the Data Engine.
  * Returns ApiResponse<List<TickEntryDto>> — each entry: { instrumentToken, ltp, volume, tickTimeMs }
+ *
+ * REPLAY ENGINE PATH — do not use for compare UI. No row cap.
  */
 export async function querySessionTicks(sessionId, tokens) {
   return request(`${DATA}/api/v1/data/ticks/query`, {
     method: 'POST',
     body: { sessionId, tokens },
+  });
+}
+
+/**
+ * Capped tick query for the compare / debug UI.
+ * Returns ApiResponse<TickPageResponse>:
+ *   { ticks: TickEntryDto[], truncated: boolean, returnedCount: number, totalCount: number }
+ *
+ * Date filtering is applied in the DB query (not post-fetch).
+ * Server-side cap: 50,000 rows. If truncated, show a warning to the user.
+ */
+export async function querySessionTicksForCompare(sessionId, tokens, fromDate, toDate) {
+  return request(`${DATA}/api/v1/data/ticks/query/compare`, {
+    method: 'POST',
+    body: { sessionId, tokens, fromDate, toDate },
   });
 }
 

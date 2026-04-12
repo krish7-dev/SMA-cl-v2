@@ -11,7 +11,7 @@ import {
   startOptionsLiveEval, streamOptionsLiveEval, stopOptionsLiveEval, getActiveOptionsLiveSession,
   getOptionsLiveFeed, getTickReplayFeed,
   saveSessionResult, listSessionResults, getSessionResult, deleteSessionResult,
-  querySessionTicks,
+  querySessionTicksForCompare,
 } from '../services/api';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { useSession } from '../context/SessionContext';
@@ -13491,6 +13491,7 @@ function SessionCompare() {
   const [ticksLoading,     setTicksLoading]     = useState(false);
   const [compareTab,       setCompareTab]       = useState('summary');
   const [skipPartialBucket, setSkipPartialBucket] = useState(true);
+  const [ticksMeta,        setTicksMeta]        = useState({ truncatedA: false, truncatedB: false, totalA: 0, totalB: 0 });
 
   // ── Session management ────────────────────────────────────────────────────
   function loadSessions(userId, type) {
@@ -13522,14 +13523,23 @@ function SessionCompare() {
       console.log('[compare] B sessionId:', selB, '| dataEngineSessionId:', sidB, '| summaryKeys:', smB ? Object.keys(smB) : null);
       if (sidA || sidB) {
         setTicksLoading(true);
-        const [tA, tB] = await Promise.all([
-          sidA ? querySessionTicks(sidA, null).then(r => r?.data ?? []).catch(e => { console.warn('[compare] ticksA fetch failed:', e.message); return []; }) : Promise.resolve([]),
-          sidB ? querySessionTicks(sidB, null).then(r => r?.data ?? []).catch(e => { console.warn('[compare] ticksB fetch failed:', e.message); return []; }) : Promise.resolve([]),
-        ]);
-        console.log('[compare] ticksA count:', tA.length, '| ticksB count:', tB.length);
+        setTicksMeta({ truncatedA: false, truncatedB: false, totalA: 0, totalB: 0 });
+        const fetchTicks = (sid) => sid
+          ? querySessionTicksForCompare(sid, null, null, null)
+              .then(r => {
+                const page = r?.data ?? { ticks: [], truncated: false, returnedCount: 0, totalCount: 0 };
+                console.log(`[compare] ${sid}: returned=${page.returnedCount} total=${page.totalCount} truncated=${page.truncated}`);
+                return page;
+              })
+              .catch(e => { console.warn(`[compare] ticks fetch failed for ${sid}:`, e.message); return { ticks: [], truncated: false, returnedCount: 0, totalCount: 0 }; })
+          : Promise.resolve({ ticks: [], truncated: false, returnedCount: 0, totalCount: 0 });
+
+        const [pageA, pageB] = await Promise.all([fetchTicks(sidA), fetchTicks(sidB)]);
+        console.log('[compare] ticksA count:', pageA.ticks.length, '| ticksB count:', pageB.ticks.length);
         // Normalise to { token, ltp, timeMs } format the comparison logic expects
-        setTicksA(tA.map(t => ({ token: String(t.instrumentToken), ltp: t.ltp, timeMs: t.tickTimeMs })));
-        setTicksB(tB.map(t => ({ token: String(t.instrumentToken), ltp: t.ltp, timeMs: t.tickTimeMs })));
+        setTicksA(pageA.ticks.map(t => ({ token: String(t.instrumentToken), ltp: t.ltp, timeMs: t.tickTimeMs })));
+        setTicksB(pageB.ticks.map(t => ({ token: String(t.instrumentToken), ltp: t.ltp, timeMs: t.tickTimeMs })));
+        setTicksMeta({ truncatedA: pageA.truncated, truncatedB: pageB.truncated, totalA: pageA.totalCount, totalB: pageB.totalCount });
         setTicksLoading(false);
       } else {
         console.warn('[compare] no dataEngineSessionId in either session — tick comparison skipped');
@@ -14186,6 +14196,14 @@ function SessionCompare() {
                 <span className="bt-section-title" style={{ marginBottom:0 }}>Tick Comparison</span>
                 <span style={{ fontSize:11, color:'var(--text-muted)' }}>Matching: per-instrument, nearest timestamp ±{TICK_TOL_MS/1000}s tolerance</span>
               </div>
+              {(ticksMeta.truncatedA || ticksMeta.truncatedB) && (
+                <div style={{ padding:'8px 12px', background:'rgba(245,158,11,0.12)', border:'1px solid rgba(245,158,11,0.4)', borderRadius:4, marginBottom:10, fontSize:11 }}>
+                  Tick data was truncated to 50,000 rows per session.
+                  {ticksMeta.truncatedA && <span> A: {(ticksMeta.totalA).toLocaleString()} total.</span>}
+                  {ticksMeta.truncatedB && <span> B: {(ticksMeta.totalB).toLocaleString()} total.</span>}
+                  {' '}Comparison stats reflect only returned rows. Narrow the time range for a full comparison.
+                </div>
+              )}
               {ticksLoading
                 ? <p style={{ fontSize:12, color:'var(--text-muted)', margin:0 }}>Loading ticks from Data Engine…</p>
                 : tickComparison.rows.length === 0
