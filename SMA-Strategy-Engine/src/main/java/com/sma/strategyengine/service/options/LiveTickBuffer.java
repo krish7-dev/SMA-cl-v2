@@ -39,6 +39,8 @@ public class LiveTickBuffer {
 
     private final BlockingQueue<BufferedTick> queue = new LinkedBlockingQueue<>();
     private final ScheduledExecutorService   scheduler;
+    // Dedicated single-thread executor for HTTP send + retry — keeps the scheduler thread free.
+    private final ExecutorService            sendExecutor;
     private       ScheduledFuture<?>         flushTask;
     private volatile boolean                 stopped = false;
 
@@ -47,7 +49,12 @@ public class LiveTickBuffer {
         this.provider         = provider;
         this.dataEngineClient = dataEngineClient;
         this.scheduler        = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "live-tick-buffer-" + sessionId.substring(0, 8));
+            Thread t = new Thread(r, "live-tick-buf-sched-" + sessionId.substring(0, 8));
+            t.setDaemon(true);
+            return t;
+        });
+        this.sendExecutor     = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "live-tick-buf-send-" + sessionId.substring(0, 8));
             t.setDaemon(true);
             return t;
         });
@@ -67,16 +74,20 @@ public class LiveTickBuffer {
     public void stop() {
         stopped = true;
         if (flushTask != null) flushTask.cancel(false);
-        flushBatch();
+        flushBatch();          // drain remaining into sendExecutor
         scheduler.shutdownNow();
+        sendExecutor.shutdown();
+        try { sendExecutor.awaitTermination(30, TimeUnit.SECONDS); }
+        catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
     }
 
-    private synchronized void flushBatch() {
+    // Runs on the single scheduler thread — drains queue and hands off to sendExecutor immediately.
+    private void flushBatch() {
         if (queue.isEmpty()) return;
         List<BufferedTick> batch = new ArrayList<>(BATCH_SIZE);
         queue.drainTo(batch, BATCH_SIZE);
         if (batch.isEmpty()) return;
-        sendWithRetry(batch, 1);
+        sendExecutor.submit(() -> sendWithRetry(batch, 1));
     }
 
     private void sendWithRetry(List<BufferedTick> batch, int attempt) {
