@@ -36,7 +36,11 @@
       "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"which nginx || which caddy || which apache2 || ls ~/app/ || ls ~/\")",
       "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"cat ~/start.sh\")",
       "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"ls -la ~ && ls ~/broker/ && cat /etc/caddy/Caddyfile 2>/dev/null || sudo cat /etc/caddy/Caddyfile 2>/dev/null\")",
-      "Bash(jar tf:*)"
+      "Bash(jar tf:*)",
+      "Bash(find /g/SMA-claude-v2/SMA-UI/src -type f \\\\\\( -name \"*.jsx\" -o -name \"*.js\" \\\\\\) -exec grep -l \"feed\\\\|Feed\\\\|tick\\\\|Tick\" {} \\\\;)",
+      "Bash(git -C \"g:/SMA-claude-v2\" log --oneline main..HEAD)",
+      "Bash(git -C g:/SMA-claude-v2 diff main HEAD --stat)",
+      "Bash(grep -v \"^[+\\\\-][[:space:]]*\\\\*\\\\|^[+\\\\-][[:space:]]*//\")"
     ]
   }
 }
