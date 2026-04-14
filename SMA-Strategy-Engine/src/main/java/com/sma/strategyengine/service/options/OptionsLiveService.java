@@ -351,6 +351,10 @@ public class OptionsLiveService {
         volatile boolean   stopped    = false;
         volatile Future<?> tickFuture = null;
 
+        // Signals when readTickStream has established the SSE connection to the Data Engine.
+        // run() waits on this before subscribing tokens so no initial Kite snapshot ticks are missed.
+        private final java.util.concurrent.CountDownLatch tickStreamReady = new java.util.concurrent.CountDownLatch(1);
+
         // Live candle persistence buffer — null when recordCandles=false
         final LiveCandleBuffer candleBuffer;
 
@@ -595,14 +599,25 @@ public class OptionsLiveService {
                 log.warn("Options live session {}: init event serialisation failed: {}", sessionId, e.getMessage());
             }
 
-            // Phase 2: subscribe NIFTY + option tokens to Data Engine live stream
-            if (!stopped) {
-                subscribeTokens();
-            }
-
-            // Phase 3: consume tick SSE
+            // Phase 2: start tick SSE listener FIRST so the Strategy Engine is in tickClients
+            // before Kite sends the initial snapshot ticks on subscription.
             if (!stopped) {
                 tickFuture = executor.submit(this::readTickStream);
+                try {
+                    boolean connected = tickStreamReady.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                    if (!connected) {
+                        log.warn("Options live session {}: tick SSE did not connect within 5 s, subscribing anyway", sessionId);
+                    } else {
+                        log.info("Options live session {}: tick SSE connected, subscribing tokens", sessionId);
+                    }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            // Phase 3: subscribe NIFTY + option tokens — now that the SSE listener is ready
+            if (!stopped) {
+                subscribeTokens();
             }
         }
 
@@ -772,6 +787,9 @@ public class OptionsLiveService {
 
                     HttpResponse<InputStream> response = httpClient.send(
                             request, HttpResponse.BodyHandlers.ofInputStream());
+
+                    // Signal that the SSE connection is established (headers received = stream open).
+                    tickStreamReady.countDown();
 
                     try (BufferedReader reader = new BufferedReader(
                             new InputStreamReader(response.body()))) {

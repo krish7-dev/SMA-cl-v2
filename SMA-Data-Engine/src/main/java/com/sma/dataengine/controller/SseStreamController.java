@@ -79,7 +79,9 @@ public class SseStreamController {
      */
     @GetMapping(value = "/ticks", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter ticks(@RequestParam(required = false) String sessionId) {
-        SseEmitter emitter = new SseEmitter(600_000L);
+        // No timeout — Strategy Engine holds this connection for the full trading session.
+        // onCompletion/onError callbacks handle cleanup when the client disconnects.
+        SseEmitter emitter = new SseEmitter(0L);
         SseEntry entry = new SseEntry(emitter, sessionId);
         tickClients.add(entry);
         emitter.onCompletion(() -> tickClients.remove(entry));
