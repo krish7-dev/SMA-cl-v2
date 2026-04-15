@@ -13,6 +13,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import java.io.IOException;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -56,6 +57,17 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(NoResourceFoundException.class)
     public ResponseEntity<?> handleNoResource(NoResourceFoundException ex, HttpServletRequest request) {
         return respond(HttpStatus.NOT_FOUND, "Not found: " + ex.getResourcePath(), request);
+    }
+
+    @ExceptionHandler(IOException.class)
+    public ResponseEntity<?> handleIo(IOException ex, HttpServletRequest request) {
+        String msg = ex.getMessage();
+        if (msg != null && (msg.contains("Broken pipe") || msg.contains("Connection reset"))) {
+            log.debug("Client disconnected from SSE stream: {}", msg);
+            return ResponseEntity.status(HttpStatus.OK).build();
+        }
+        log.error("Unhandled IO exception: {}", msg, ex);
+        return respond(HttpStatus.INTERNAL_SERVER_ERROR, "Internal server error: " + msg, request);
     }
 
     @ExceptionHandler(Exception.class)

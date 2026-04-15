@@ -41,7 +41,11 @@
       "Bash(git -C \"g:/SMA-claude-v2\" log --oneline main..HEAD)",
       "Bash(git -C g:/SMA-claude-v2 diff main HEAD --stat)",
       "Bash(grep -v \"^[+\\\\-][[:space:]]*\\\\*\\\\|^[+\\\\-][[:space:]]*//\")",
-      "Bash(awk -F: '$2 > 1800 && $2 < 2400 {print}')"
+      "Bash(awk -F: '$2 > 1800 && $2 < 2400 {print}')",
+      "Bash(mvn -f SMA-Broker-Engine/pom.xml clean package -DskipTests -q)",
+      "Bash(mvn -f SMA-Execution-Engine/pom.xml clean package -DskipTests -q)",
+      "Bash(mvn -f SMA-Data-Engine/pom.xml clean package -DskipTests -q)",
+      "Bash(mvn -f SMA-Strategy-Engine/pom.xml clean package -DskipTests)"
     ]
   }
 }

@@ -1273,6 +1273,8 @@ function OptionsLiveTest() {
   const [saveLabel,     setSaveLabel]     = useState('');
   const [saveStatus,    setSaveStatus]    = useState('idle'); // idle|saving|saved|error
   const [saveError,     setSaveError]     = useState('');
+  const [canSave,       setCanSave]       = useState(false);
+  const [syncInfo,      setSyncInfo]      = useState(null);  // {flushedAt, totalCandles}
 
   // On mount: check if a session is already running for this user and auto-reconnect to it.
   useEffect(() => {
@@ -1282,6 +1284,7 @@ function OptionsLiveTest() {
         sessionIdRef.current = sid;
         lastSaveSessionIdRef.current = sid;  // preserved past stop for save pipeline
         setSessionId(sid);
+        setCanSave(true);
         // Auto-attach SSE so the feed starts populating immediately
         const ctrl = new AbortController();
         abortRef.current = ctrl;
@@ -1313,6 +1316,7 @@ function OptionsLiveTest() {
                   if (evtName === 'init')        setInitInfo(parsed);
                   else if (evtName === 'candle') setFeed(prev => [...prev.slice(-499), parsed]);
                   else if (evtName === 'tick')   setLiveTicks(prev => ({ ...prev, [parsed.token]: parsed }));
+                  else if (evtName === 'sync')   setSyncInfo(parsed);
                 } catch {}
               }
             }
@@ -1586,6 +1590,7 @@ function OptionsLiveTest() {
       sessionIdRef.current = sid;
       lastSaveSessionIdRef.current = sid;  // preserved past stop for save pipeline
       setSessionId(sid);
+      setCanSave(true); setSyncInfo(null);
 
       // Step 2: attach SSE listener (session already running in backend)
       const ctrl = new AbortController();
@@ -1673,6 +1678,7 @@ function OptionsLiveTest() {
             if (evtName === 'init')        setInitInfo(parsed);
             else if (evtName === 'candle') setFeed(prev => [...prev.slice(-499), parsed]);
             else if (evtName === 'tick')   setLiveTicks(prev => ({ ...prev, [parsed.token]: parsed }));
+            else if (evtName === 'sync')   setSyncInfo(parsed);
           } catch {}
         }
       }
@@ -1750,6 +1756,7 @@ function OptionsLiveTest() {
       setSaveStatus('saved');
       setShowSavePanel(false);
       setSaveLabel('');
+      setCanSave(false);
     } catch (e) {
       console.error('[LIVE save] failed:', e.message);
       setSaveStatus('error');
@@ -1917,11 +1924,16 @@ function OptionsLiveTest() {
                 </span>
               </>
             )}
-            {!isRunning && (
+            {canSave && (
               <button type="button" className="btn-secondary btn-xs"
                 onClick={() => { setShowSavePanel(s => !s); setSaveLabel('Live ' + new Date().toISOString().slice(0, 10)); setSaveStatus('idle'); setSaveError(''); }}>
                 {showSavePanel ? 'Cancel' : 'Save to Compare'}
               </button>
+            )}
+            {syncInfo && !showSavePanel && saveStatus !== 'saved' && (
+              <span style={{ fontSize: 11, color: '#22c55e' }} title="Data is being auto-saved to DB every ~15s">
+                ✓ Synced {syncInfo.totalCandles} candles · {new Date(syncInfo.flushedAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}
+              </span>
             )}
             {saveStatus === 'saved' && !showSavePanel && (
               <span style={{ fontSize: 11, color: '#22c55e' }}>Saved!</span>
@@ -1929,7 +1941,7 @@ function OptionsLiveTest() {
           </div>
         </div>
 
-        {showSavePanel && !isRunning && (
+        {showSavePanel && canSave && (
           <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12, padding: '10px 12px', background: 'var(--bg-secondary)', borderRadius: 6 }}>
             <div className="form-group" style={{ flex: '1 1 200px', marginBottom: 0 }}>
               <label style={{ fontSize: 11 }}>Label</label>
@@ -2279,6 +2291,7 @@ function OptionsLiveTest() {
           )}
           <button type="button" className="btn-secondary" onClick={() => {
             setFeed([]); setInitInfo(null); setWarnings([]); setError(''); setStatus('idle');
+            setCanSave(false); setSyncInfo(null);
             setNifty({ symbol: '', exchange: 'NSE', instrumentToken: '' });
             setCePool([EMPTY_OPTION_INST()]); setPePool([EMPTY_OPTION_INST()]);
             setStrategies(defaultStrategies());
