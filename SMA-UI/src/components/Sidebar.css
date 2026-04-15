@@ -249,6 +249,85 @@
   letter-spacing: 0.3px;
 }
 
+/* Market week strip */
+.sidebar-market-week {
+  padding: 8px 16px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.smw-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 7px;
+}
+
+.smw-title {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-muted);
+}
+
+.smw-status {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.smw-dots {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+}
+
+.smw-day {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+}
+
+.smw-dot-wrap {
+  position: relative;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.smw-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.smw-dot-today {
+  width: 10px;
+  height: 10px;
+  outline: 1.5px solid var(--text-muted);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+.smw-pulse-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid #22c55e;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.smw-letter {
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 0.3px;
+}
+
 .sidebar-footer {
   margin-top: auto;
   padding: 12px 20px;
