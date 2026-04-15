@@ -47,7 +47,7 @@ public interface SessionResultRepository extends JpaRepository<SessionResultReco
         VALUES
             (:sessionId, 'LIVE', :userId, :brokerName, CAST(:sessionDate AS DATE), '', :chunk, NOW())
         ON CONFLICT (session_id) DO UPDATE
-        SET feed_json = (COALESCE(session_result.feed_json, '[]')::jsonb || :chunk::jsonb)::text,
+        SET feed_json = (COALESCE(session_result.feed_json, '[]')::jsonb || CAST(:chunk AS jsonb))::text,
             saved_at  = NOW()
         """, nativeQuery = true)
     void appendFeedChunk(
@@ -68,6 +68,7 @@ public interface SessionResultRepository extends JpaRepository<SessionResultReco
         SET closed_trades_json = :closedTradesJson,
             summary_json       = :summaryJson,
             config_json        = :configJson,
+            label              = COALESCE(NULLIF(:label, ''), label),
             saved_at           = NOW()
         WHERE session_id = :sessionId
         """, nativeQuery = true)
@@ -75,5 +76,6 @@ public interface SessionResultRepository extends JpaRepository<SessionResultReco
             @Param("sessionId")        String sessionId,
             @Param("closedTradesJson") String closedTradesJson,
             @Param("summaryJson")      String summaryJson,
-            @Param("configJson")       String configJson);
+            @Param("configJson")       String configJson,
+            @Param("label")            String label);
 }
