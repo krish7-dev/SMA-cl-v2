@@ -212,10 +212,24 @@ public class OptionsLiveService {
         }
     }
 
+    /**
+     * At market close (3:30 PM IST, Mon-Fri) auto-saves all active sessions with a dated label.
+     * This ensures the full day's data is captured even if the user forgets to click Save.
+     * The session keeps running — only an explicit DELETE stops it.
+     */
+    @Scheduled(cron = "0 30 15 * * MON-FRI", zone = "Asia/Kolkata")
+    public void autoFinalSave() {
+        if (sessions.isEmpty()) return;
+        String label = "LIVE " + LocalDate.now(IST).toString();
+        log.info("Market close auto-save triggered: {} active session(s), label='{}'",
+                sessions.size(), label);
+        sessions.values().forEach(session -> session.autoSave(label));
+    }
+
     private void stopSession(String sessionId) {
         LiveOptionsSession session = sessions.remove(sessionId);
         if (session != null) {
-            session.autoSave();   // persist feed+trades to DB before the session is GC'd
+            session.autoSave("");  // persist feed+trades to DB before the session is GC'd
             completedFeeds.put(sessionId, session.getFeedList());
             completedFeedTimes.put(sessionId, Instant.now());
             session.stop();
@@ -404,14 +418,17 @@ public class OptionsLiveService {
 
         /**
          * Auto-saves this session's feed, trades, config, and summary to the session_result table.
-         * Called on stop so the data survives beyond the in-memory session.
-         * Uses an empty label ("") so the user-initiated save can overwrite it with a proper label.
+         * Called on stop (empty label) or at market close (label = "LIVE yyyy-MM-dd").
          *
          * Feed data is written via incremental flushFeed() calls (heartbeat + final flush here)
          * so the peak allocation is one small batch, not the full day's JSON at once.
+         *
+         * @param label  display label; empty string preserves whatever label is already in the row.
          */
-        void autoSave() {
-            if (feedList.isEmpty()) {
+        void autoSave(String label) {
+            int feedSize;
+            synchronized (feedList) { feedSize = feedList.size(); }
+            if (feedSize == 0) {
                 log.info("LIVE auto-save skipped (no candles emitted): sessionId={}", sessionId);
                 return;
             }
@@ -443,9 +460,10 @@ public class OptionsLiveService {
                         sessionId,
                         closedTradesJson,
                         objectMapper.writeValueAsString(summaryMap),
-                        objectMapper.writeValueAsString(req));
+                        objectMapper.writeValueAsString(req),
+                        label);
                 log.info("LIVE auto-saved: sessionId={} candles={} trades={}",
-                        sessionId, feedList.size(), closedTradesJson != null ? "present" : "none");
+                        sessionId, feedSize, closedTradesJson != null ? "present" : "none");
             } catch (Exception e) {
                 log.error("LIVE auto-save failed: sessionId={} error={}", sessionId, e.getMessage());
             }
@@ -472,6 +490,13 @@ public class OptionsLiveService {
                 lastFlushedSize = currentSize;
                 log.debug("LIVE feed flushed: sessionId={} +{} candles (total {})",
                         sessionId, batch.size(), currentSize);
+                // Notify connected UIs so they can show live sync status
+                try {
+                    String syncJson = objectMapper.writeValueAsString(Map.of(
+                            "flushedAt",    Instant.now().toString(),
+                            "totalCandles", lastFlushedSize));
+                    broadcast("sync", syncJson);
+                } catch (Exception ignored) {}
             } catch (Exception e) {
                 log.warn("LIVE feed flush failed: sessionId={} error={}", sessionId, e.getMessage());
             }
