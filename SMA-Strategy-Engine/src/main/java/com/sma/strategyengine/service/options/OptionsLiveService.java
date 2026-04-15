@@ -208,6 +208,7 @@ public class OptionsLiveService {
         if (sessions.isEmpty()) return;
         for (LiveOptionsSession session : sessions.values()) {
             session.sendHeartbeat();
+            session.flushFeed();   // incremental DB persist — keeps autoSave() batch tiny
         }
     }
 
@@ -313,6 +314,8 @@ public class OptionsLiveService {
 
         // Full candle event history for reliable save-to-compare (unbounded, not a ring buffer).
         private final List<String> feedList = new ArrayList<>();
+        // Tracks how many feedList entries have already been flushed to DB.
+        private volatile int lastFlushedSize = 0;
 
         // Instrument sets
         final long        niftyToken;
@@ -403,55 +406,74 @@ public class OptionsLiveService {
          * Auto-saves this session's feed, trades, config, and summary to the session_result table.
          * Called on stop so the data survives beyond the in-memory session.
          * Uses an empty label ("") so the user-initiated save can overwrite it with a proper label.
+         *
+         * Feed data is written via incremental flushFeed() calls (heartbeat + final flush here)
+         * so the peak allocation is one small batch, not the full day's JSON at once.
          */
         void autoSave() {
             if (feedList.isEmpty()) {
                 log.info("LIVE auto-save skipped (no candles emitted): sessionId={}", sessionId);
                 return;
             }
+            // Flush any candles not yet persisted — after this the DB row has the complete feed.
+            flushFeed();
+            // Update metadata fields (summary, trades, config) in the row that flushFeed() created.
             try {
-                String feedJson = "[" + String.join(",", feedList) + "]";
-
-                // Extract closedTrades and stats from the last candle event
                 String closedTradesJson = null;
                 Map<String, Object> summaryMap = new LinkedHashMap<>();
                 try {
+                    String lastEntry;
+                    synchronized (feedList) { lastEntry = feedList.get(feedList.size() - 1); }
                     Map<String, Object> lastEvt = objectMapper.readValue(
-                            feedList.get(feedList.size() - 1),
-                            new TypeReference<Map<String, Object>>() {});
+                            lastEntry, new TypeReference<Map<String, Object>>() {});
                     Object trades = lastEvt.get("closedTrades");
                     if (trades != null) closedTradesJson = objectMapper.writeValueAsString(trades);
                     int tradeCount = trades instanceof List ? ((List<?>) trades).size() : 0;
-                    summaryMap.put("trades",              tradeCount);
-                    summaryMap.put("finalCapital",        lastEvt.getOrDefault("capital", 100000));
-                    summaryMap.put("realizedPnl",         lastEvt.getOrDefault("realizedPnl", 0));
-                    summaryMap.put("winRate",             lastEvt.getOrDefault("winRate", 0));
+                    summaryMap.put("trades",       tradeCount);
+                    summaryMap.put("finalCapital", lastEvt.getOrDefault("capital", 100000));
+                    summaryMap.put("realizedPnl",  lastEvt.getOrDefault("realizedPnl", 0));
+                    summaryMap.put("winRate",      lastEvt.getOrDefault("winRate", 0));
                 } catch (Exception e) {
                     log.warn("LIVE auto-save: failed to parse last candle event: {}", e.getMessage());
                 }
-                // sessionId for LIVE is also the Data Engine tick session identifier
                 summaryMap.put("dataEngineSessionId", sessionId);
                 summaryMap.put("sessionEnd",          Instant.now().toString());
 
-                SessionResultRecord record = SessionResultRecord.builder()
-                        .sessionId(sessionId)
-                        .type("LIVE")
-                        .userId(userId)
-                        .brokerName(req.getBrokerName())
-                        .sessionDate(LocalDate.now())
-                        .label("")
-                        .configJson(objectMapper.writeValueAsString(req))
-                        .closedTradesJson(closedTradesJson)
-                        .feedJson(feedJson)
-                        .summaryJson(objectMapper.writeValueAsString(summaryMap))
-                        .savedAt(Instant.now())
-                        .build();
-                sessionResultRepository.save(record);
+                sessionResultRepository.updateMetadata(
+                        sessionId,
+                        closedTradesJson,
+                        objectMapper.writeValueAsString(summaryMap),
+                        objectMapper.writeValueAsString(req));
                 log.info("LIVE auto-saved: sessionId={} candles={} trades={}",
-                        sessionId, feedList.size(),
-                        closedTradesJson != null ? "present" : "none");
+                        sessionId, feedList.size(), closedTradesJson != null ? "present" : "none");
             } catch (Exception e) {
                 log.error("LIVE auto-save failed: sessionId={} error={}", sessionId, e.getMessage());
+            }
+        }
+
+        /**
+         * Flushes candle events added since the last flush to the DB via an incremental JSONB append.
+         * Called from the heartbeat scheduler (every 15 s) and from autoSave() on session stop.
+         * Each call only allocates a string for the new batch — never the full day's feed at once.
+         */
+        void flushFeed() {
+            int currentSize;
+            List<String> batch;
+            synchronized (feedList) {
+                currentSize = feedList.size();
+                if (currentSize <= lastFlushedSize) return;
+                batch = new ArrayList<>(feedList.subList(lastFlushedSize, currentSize));
+            }
+            String chunkJson = "[" + String.join(",", batch) + "]";
+            try {
+                sessionResultRepository.appendFeedChunk(
+                        sessionId, userId, req.getBrokerName(),
+                        LocalDate.now().toString(), chunkJson);
+                lastFlushedSize = currentSize;
+                log.debug("LIVE feed flushed: sessionId={} +{} candles (total {})",
+                        sessionId, batch.size(), currentSize);
+            } catch (Exception e) {
+                log.warn("LIVE feed flush failed: sessionId={} error={}", sessionId, e.getMessage());
             }
         }
 
@@ -466,7 +488,7 @@ public class OptionsLiveService {
             }
             // Persist full candle history server-side for reliable save-to-compare
             if ("candle".equals(eventName)) {
-                feedList.add(data);
+                synchronized (feedList) { feedList.add(data); }
             }
             if (emitters.isEmpty()) return;
             List<SseEmitter> dead = null;

@@ -15,6 +15,13 @@ declare -A JARS=(
   [strategy]="sma-strategy-engine-0.0.1-SNAPSHOT.jar"
 )
 
+declare -A JVMOPTS=(
+  [broker]=""
+  [execution]=""
+  [data]=""
+  [strategy]="-Xmx3g"
+)
+
 declare -A ENVS=(
   [broker]="broker.env"
   [execution]="execution.env"
@@ -45,7 +52,7 @@ restart_service() {
 
   echo "--- Starting $svc (port $port)..."
   set -a; source ~/env/$env; set +a
-  nohup java -jar ~/app/$svc/$jar > ~/logs/$svc.log 2>&1 &
+  nohup java ${JVMOPTS[$svc]} -jar ~/app/$svc/$jar > ~/logs/$svc.log 2>&1 &
 
   echo "--- Waiting for $svc to be healthy..."
   for i in $(seq 1 30); do
