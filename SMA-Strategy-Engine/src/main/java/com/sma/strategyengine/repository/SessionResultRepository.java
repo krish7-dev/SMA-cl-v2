@@ -47,7 +47,7 @@ public interface SessionResultRepository extends JpaRepository<SessionResultReco
         VALUES
             (:sessionId, 'LIVE', :userId, :brokerName, CAST(:sessionDate AS DATE), '', :chunk, NOW())
         ON CONFLICT (session_id) DO UPDATE
-        SET feed_json = (COALESCE(session_result.feed_json, '[]')::jsonb || CAST(:chunk AS jsonb))::text,
+        SET feed_json = CAST(CAST(COALESCE(session_result.feed_json, '[]') AS jsonb) || CAST(:chunk AS jsonb) AS text),
             saved_at  = NOW()
         """, nativeQuery = true)
     void appendFeedChunk(
