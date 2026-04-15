@@ -6,6 +6,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolationException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
+import java.io.IOException;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -56,6 +57,17 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(NoResourceFoundException.class)
     public ResponseEntity<?> handleNoResource(NoResourceFoundException ex, HttpServletRequest request) {
         return respond(HttpStatus.NOT_FOUND, "Not found: " + ex.getResourcePath(), request);
+    }
+
+    @ExceptionHandler(IOException.class)
+    public ResponseEntity<?> handleIo(IOException ex, HttpServletRequest request) {
+        String msg = ex.getMessage();
+        if (msg != null && (msg.contains("Broken pipe") || msg.contains("Connection reset"))) {
+            log.debug("Client disconnected from SSE stream: {}", msg);
+            return ResponseEntity.status(HttpStatus.OK).build();
+        }
+        log.error("Unhandled IO exception: {}", msg, ex);
+        return respond(HttpStatus.INTERNAL_SERVER_ERROR, "Internal server error: " + msg, request);
     }
 
     @ExceptionHandler(Exception.class)
