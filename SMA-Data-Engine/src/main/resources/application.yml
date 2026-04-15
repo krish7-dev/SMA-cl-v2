@@ -5,6 +5,10 @@ spring:
   application:
     name: sma-data-engine
 
+  devtools:
+    restart:
+      enabled: false
+
   datasource:
     url: ${DB_URL}
     username: ${DB_USERNAME}
