@@ -40,7 +40,8 @@
       "Bash(find /g/SMA-claude-v2/SMA-UI/src -type f \\\\\\( -name \"*.jsx\" -o -name \"*.js\" \\\\\\) -exec grep -l \"feed\\\\|Feed\\\\|tick\\\\|Tick\" {} \\\\;)",
       "Bash(git -C \"g:/SMA-claude-v2\" log --oneline main..HEAD)",
       "Bash(git -C g:/SMA-claude-v2 diff main HEAD --stat)",
-      "Bash(grep -v \"^[+\\\\-][[:space:]]*\\\\*\\\\|^[+\\\\-][[:space:]]*//\")"
+      "Bash(grep -v \"^[+\\\\-][[:space:]]*\\\\*\\\\|^[+\\\\-][[:space:]]*//\")",
+      "Bash(awk -F: '$2 > 1800 && $2 < 2400 {print}')"
     ]
   }
 }
