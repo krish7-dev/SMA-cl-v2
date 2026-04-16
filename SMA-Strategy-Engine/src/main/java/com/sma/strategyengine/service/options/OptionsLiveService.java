@@ -13,6 +13,7 @@ import com.sma.strategyengine.model.response.OptionsReplayCandleEvent;
 import com.sma.strategyengine.repository.LiveSnapshotRepository;
 import com.sma.strategyengine.repository.SessionResultRepository;
 import com.sma.strategyengine.service.MarketRegimeDetector;
+import com.sma.strategyengine.service.SessionPersistenceService;
 import com.sma.strategyengine.strategy.StrategyRegistry;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
@@ -58,11 +59,12 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class OptionsLiveService {
 
-    private final StrategyRegistry       strategyRegistry;
-    private final DataEngineClient       dataEngineClient;
-    private final ObjectMapper           objectMapper;
-    private final LiveSnapshotRepository snapshotRepository;
-    private final SessionResultRepository sessionResultRepository;
+    private final StrategyRegistry           strategyRegistry;
+    private final DataEngineClient           dataEngineClient;
+    private final ObjectMapper               objectMapper;
+    private final LiveSnapshotRepository     snapshotRepository;
+    private final SessionResultRepository    sessionResultRepository;
+    private final SessionPersistenceService  sessionPersistenceService;
 
     @Value("${strategy.data-engine.base-url:http://localhost:9005}")
     private String dataEngineBaseUrl;
@@ -456,7 +458,7 @@ public class OptionsLiveService {
                 summaryMap.put("dataEngineSessionId", sessionId);
                 summaryMap.put("sessionEnd",          Instant.now().toString());
 
-                sessionResultRepository.updateMetadata(
+                sessionPersistenceService.updateMetadata(
                         sessionId,
                         closedTradesJson,
                         objectMapper.writeValueAsString(summaryMap),
@@ -484,7 +486,7 @@ public class OptionsLiveService {
             }
             String chunkJson = "[" + String.join(",", batch) + "]";
             try {
-                sessionResultRepository.appendFeedChunk(
+                sessionPersistenceService.appendFeedChunk(
                         sessionId, userId, req.getBrokerName(),
                         LocalDate.now().toString(), chunkJson);
                 lastFlushedSize = currentSize;
