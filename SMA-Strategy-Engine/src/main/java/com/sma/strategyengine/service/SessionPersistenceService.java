@@ -1,5 +1,7 @@
 package com.sma.strategyengine.service;
 
+import com.sma.strategyengine.entity.SessionFeedChunkRecord;
+import com.sma.strategyengine.repository.SessionFeedChunkRepository;
 import com.sma.strategyengine.repository.SessionResultRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -7,21 +9,30 @@ import org.springframework.retry.annotation.Backoff;
 import org.springframework.retry.annotation.Retryable;
 import org.springframework.stereotype.Service;
 
+import java.time.Instant;
+
 /**
- * Wraps session_result DB writes with retry logic so transient DB connection issues
- * (e.g. Supabase pool exhaustion at market open) never lose data or crash the app.
+ * Wraps session_result / session_feed_chunk DB writes with retry logic so transient
+ * DB connection issues never lose data or crash the app.
  *
- * Retry policy: up to 5 attempts with exponential backoff starting at 2s, capped at 30s.
- * If all 5 attempts fail the exception propagates — flushFeed() catches it and the next
- * heartbeat will retry the full pending batch automatically.
+ * Feed chunks are written to the {@code session_feed_chunk} table (O(1) INSERT each time)
+ * rather than appending to a growing JSONB column in {@code session_result}.
+ * The old JSONB-append pattern caused 13-110 second queries by end-of-day as the document grew.
+ *
+ * Retry policy: up to 5 attempts, exponential backoff 2 s → 30 s.
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class SessionPersistenceService {
 
-    private final SessionResultRepository repository;
+    private final SessionResultRepository   sessionResultRepository;
+    private final SessionFeedChunkRepository chunkRepository;
 
+    /**
+     * Ensures the session_result header row exists, then inserts one chunk row.
+     * Each call is a simple O(1) INSERT — no JSONB concatenation.
+     */
     @Retryable(
             retryFor = Exception.class,
             maxAttempts = 5,
@@ -29,7 +40,15 @@ public class SessionPersistenceService {
     )
     public void appendFeedChunk(String sessionId, String userId, String brokerName,
                                 String sessionDate, String chunk) {
-        repository.appendFeedChunk(sessionId, userId, brokerName, sessionDate, chunk);
+        // Upsert the header row (no-op on conflict, updates saved_at)
+        sessionResultRepository.ensureSessionRow(sessionId, userId, brokerName, sessionDate);
+
+        // Insert the chunk — plain INSERT, always O(1) regardless of session size
+        chunkRepository.save(SessionFeedChunkRecord.builder()
+                .sessionId(sessionId)
+                .chunkJson(chunk)
+                .savedAt(Instant.now())
+                .build());
     }
 
     @Retryable(
@@ -39,6 +58,6 @@ public class SessionPersistenceService {
     )
     public void updateMetadata(String sessionId, String closedTradesJson,
                                String summaryJson, String configJson, String label) {
-        repository.updateMetadata(sessionId, closedTradesJson, summaryJson, configJson, label);
+        sessionResultRepository.updateMetadata(sessionId, closedTradesJson, summaryJson, configJson, label);
     }
 }

@@ -2,6 +2,8 @@ package com.sma.strategyengine.service.options;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sma.strategyengine.entity.SessionFeedChunkRecord;
+import com.sma.strategyengine.repository.SessionFeedChunkRepository;
 import com.sma.strategyengine.repository.SessionResultRepository;
 import lombok.Builder;
 import lombok.Data;
@@ -29,8 +31,9 @@ import java.util.*;
 @RequiredArgsConstructor
 public class SessionDivergenceAnalyzer {
 
-    private final SessionResultRepository repository;
-    private final ObjectMapper            objectMapper;
+    private final SessionResultRepository   repository;
+    private final SessionFeedChunkRepository chunkRepository;
+    private final ObjectMapper              objectMapper;
 
     // ── Tolerances ────────────────────────────────────────────────────────────
 
@@ -96,8 +99,8 @@ public class SessionDivergenceAnalyzer {
         var recB = repository.findById(sessionB).orElseThrow(() ->
                 new IllegalArgumentException("Session not found: " + sessionB));
 
-        List<Map<String, Object>> feedA = parseArray(recA.getFeedJson());
-        List<Map<String, Object>> feedB = parseArray(recB.getFeedJson());
+        List<Map<String, Object>> feedA = parseArray(resolvedFeedJson(sessionA, recA.getFeedJson()));
+        List<Map<String, Object>> feedB = parseArray(resolvedFeedJson(sessionB, recB.getFeedJson()));
 
         // Index by niftyTime — preserving original insertion order
         LinkedHashMap<String, Map<String, Object>> mapA = indexBy(feedA, "niftyTime");
@@ -296,6 +299,32 @@ public class SessionDivergenceAnalyzer {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Returns the feed JSON for a session: uses feed_json if present (manual saves / old sessions),
+     * otherwise assembles from session_feed_chunk rows (new chunk-based auto-save).
+     */
+    private String resolvedFeedJson(String sessionId, String feedJson) {
+        if (feedJson != null && !feedJson.isBlank()) return feedJson;
+        java.util.List<SessionFeedChunkRecord> chunks =
+                chunkRepository.findBySessionIdOrderByIdAsc(sessionId);
+        if (chunks.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder("[");
+        boolean firstItem = true;
+        for (SessionFeedChunkRecord chunk : chunks) {
+            String json = chunk.getChunkJson().trim();
+            if (json.startsWith("[") && json.endsWith("]")) {
+                json = json.substring(1, json.length() - 1).trim();
+            }
+            if (!json.isEmpty()) {
+                if (!firstItem) sb.append(",");
+                sb.append(json);
+                firstItem = false;
+            }
+        }
+        sb.append("]");
+        return sb.toString();
+    }
 
     private List<Map<String, Object>> parseArray(String json) {
         if (json == null || json.isBlank()) return List.of();

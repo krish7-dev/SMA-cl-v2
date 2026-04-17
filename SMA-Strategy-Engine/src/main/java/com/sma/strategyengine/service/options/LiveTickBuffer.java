@@ -22,7 +22,7 @@ public class LiveTickBuffer {
 
     private static final int  BATCH_SIZE        = 50;
     private static final long FLUSH_INTERVAL_MS = 10_000L;
-    private static final int  MAX_RETRIES       = 10;
+    private static final long MAX_BACKOFF_MS    = 30_000L;
 
     private final String           sessionId;
     private final String           provider;
@@ -87,36 +87,35 @@ public class LiveTickBuffer {
         List<BufferedTick> batch = new ArrayList<>(BATCH_SIZE);
         queue.drainTo(batch, BATCH_SIZE);
         if (batch.isEmpty()) return;
-        sendExecutor.submit(() -> sendWithRetry(batch, 1));
+        sendExecutor.submit(() -> sendWithRetry(batch));
     }
 
-    private void sendWithRetry(List<BufferedTick> batch, int attempt) {
-        try {
-            dataEngineClient.ingestLiveTicks(sessionId, provider, batch);
-            log.debug("LiveTickBuffer: flushed {} ticks (sessionId={})", batch.size(), sessionId);
-        } catch (Exception e) {
-            if (attempt < MAX_RETRIES) {
-                long delayMs = Math.min(1000L * (long) Math.pow(2, attempt - 1), 10_000L);
-                log.warn("LiveTickBuffer: ingest attempt {}/{} failed (sessionId={}), retrying in {}ms: {}",
-                        attempt, MAX_RETRIES, sessionId, delayMs, e.getMessage());
-                try { Thread.sleep(delayMs); } catch (InterruptedException ie) {
+    private void sendWithRetry(List<BufferedTick> batch) {
+        long backoff = 1_000L;
+        int  attempt = 0;
+        while (!stopped) {
+            try {
+                dataEngineClient.ingestLiveTicks(sessionId, provider, batch);
+                if (attempt > 0) {
+                    log.info("LiveTickBuffer: tick ingest recovered after {} retries (sessionId={})", attempt, sessionId);
+                }
+                log.debug("LiveTickBuffer: flushed {} ticks (sessionId={})", batch.size(), sessionId);
+                return;
+            } catch (Exception e) {
+                attempt++;
+                log.warn("LiveTickBuffer: ingest attempt {} failed (sessionId={}), retrying in {}ms: {}",
+                        attempt, sessionId, backoff, e.getMessage());
+                try { Thread.sleep(backoff); } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
-                    logFailure(batch);
+                    log.warn("LiveTickBuffer: retry interrupted, dropping {} ticks (sessionId={})",
+                            batch.size(), sessionId);
                     return;
                 }
-                sendWithRetry(batch, attempt + 1);
-            } else {
-                logFailure(batch);
+                backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
             }
         }
-    }
-
-    private void logFailure(List<BufferedTick> batch) {
-        log.error("LiveTickBuffer: PERMANENTLY FAILED to persist {} ticks after {} retries (sessionId={}). " +
-                  "First: token={} epochMs={}, Last: token={} epochMs={}",
-                batch.size(), MAX_RETRIES, sessionId,
-                batch.get(0).instrumentToken(), batch.get(0).epochMs(),
-                batch.get(batch.size() - 1).instrumentToken(), batch.get(batch.size() - 1).epochMs());
+        log.warn("LiveTickBuffer: session stopped during retry, dropping {} ticks (sessionId={})",
+                batch.size(), sessionId);
     }
 
     private static final ZoneId IST = ZoneId.of("Asia/Kolkata");
