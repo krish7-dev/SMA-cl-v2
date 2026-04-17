@@ -45,7 +45,9 @@
       "Bash(mvn -f SMA-Broker-Engine/pom.xml clean package -DskipTests -q)",
       "Bash(mvn -f SMA-Execution-Engine/pom.xml clean package -DskipTests -q)",
       "Bash(mvn -f SMA-Data-Engine/pom.xml clean package -DskipTests -q)",
-      "Bash(mvn -f SMA-Strategy-Engine/pom.xml clean package -DskipTests)"
+      "Bash(mvn -f SMA-Strategy-Engine/pom.xml clean package -DskipTests)",
+      "Bash(curl -s http://localhost:9003/actuator/metrics)",
+      "Bash(python -c \"import sys,json; data=json.load\\(sys.stdin\\); [print\\(n\\) for n in data['names'] if 'hikari' in n.lower\\(\\)]\")"
     ]
   }
 }
