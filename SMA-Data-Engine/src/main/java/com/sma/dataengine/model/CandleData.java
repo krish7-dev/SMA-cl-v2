@@ -2,6 +2,7 @@ package com.sma.dataengine.model;
 
 import lombok.Builder;
 import lombok.Data;
+import lombok.extern.jackson.Jacksonized;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
@@ -12,6 +13,7 @@ import java.time.LocalDateTime;
  */
 @Data
 @Builder
+@Jacksonized
 public class CandleData {
 
     private Long          instrumentToken;
