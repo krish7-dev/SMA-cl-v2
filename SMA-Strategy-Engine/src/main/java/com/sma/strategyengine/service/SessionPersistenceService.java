@@ -10,6 +10,7 @@ import org.springframework.retry.annotation.Retryable;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
+import java.util.List;
 
 /**
  * Wraps session_result / session_feed_chunk DB writes with retry logic so transient
@@ -59,5 +60,51 @@ public class SessionPersistenceService {
     public void updateMetadata(String sessionId, String closedTradesJson,
                                String summaryJson, String configJson, String label) {
         sessionResultRepository.updateMetadata(sessionId, closedTradesJson, summaryJson, configJson, label);
+    }
+
+    /**
+     * Idempotent feed chunk insert for the Redis-Stream drainer.
+     * Uses ON CONFLICT (session_id, stream_last_id) DO NOTHING so that
+     * re-drained batches (after crash before XACK) are silently skipped.
+     *
+     * @param streamLastId "firstMessageId:lastMessageId" batch dedup key
+     */
+    @Retryable(
+            retryFor = Exception.class,
+            maxAttempts = 5,
+            backoff = @Backoff(delay = 2000, multiplier = 2.0, maxDelay = 30000)
+    )
+    public void appendFeedChunkIdempotent(String sessionId, String userId, String brokerName,
+                                          String sessionDate, String chunkJson, String streamLastId) {
+        sessionResultRepository.ensureSessionRow(sessionId, userId, brokerName, sessionDate);
+        chunkRepository.insertIdempotent(sessionId, chunkJson, streamLastId);
+    }
+
+    /**
+     * Assembles the full feed JSON array from all chunk rows for a session.
+     * Returns {@code null} if no chunks exist.
+     * Called by OptionsLiveService.getFeed() after drainFully() to reconstruct
+     * the candle-event timeline from DB.
+     */
+    public String assembleFeedJson(String sessionId) {
+        List<SessionFeedChunkRecord> chunks =
+                chunkRepository.findBySessionIdOrderByIdAsc(sessionId);
+        if (chunks.isEmpty()) return null;
+
+        StringBuilder sb = new StringBuilder("[");
+        boolean first = true;
+        for (SessionFeedChunkRecord chunk : chunks) {
+            String json = chunk.getChunkJson().trim();
+            if (json.startsWith("[") && json.endsWith("]")) {
+                json = json.substring(1, json.length() - 1).trim();
+            }
+            if (!json.isEmpty()) {
+                if (!first) sb.append(",");
+                sb.append(json);
+                first = false;
+            }
+        }
+        sb.append("]");
+        return sb.toString();
     }
 }

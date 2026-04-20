@@ -29,7 +29,8 @@ public class LiveTickIngestService {
             if (e.getInstrumentToken() == null || e.getTickTime() == null) continue;
             em.createNativeQuery(
                 "INSERT INTO tick_data (instrument_token, symbol, exchange, ltp, volume, tick_time, session_id, provider) " +
-                "VALUES (?, ?, ?, ?, ?, CAST(? AS timestamp), ?, ?)")
+                "VALUES (?, ?, ?, ?, ?, CAST(? AS timestamp), ?, ?) " +
+                "ON CONFLICT (instrument_token, session_id, tick_time) DO NOTHING")
               .setParameter(1, e.getInstrumentToken())
               .setParameter(2, e.getSymbol())
               .setParameter(3, e.getExchange())

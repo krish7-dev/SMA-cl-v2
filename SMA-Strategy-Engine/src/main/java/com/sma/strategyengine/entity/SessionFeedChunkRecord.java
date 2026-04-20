@@ -35,4 +35,13 @@ public class SessionFeedChunkRecord {
 
     @Column(name = "saved_at", nullable = false)
     private Instant savedAt;
+
+    /**
+     * Dedup key written by the Redis-Stream drainer: "firstMessageId:lastMessageId".
+     * One DB row maps to exactly one drained batch. On re-drain after a crash before XACK,
+     * the same batch produces the same key → ON CONFLICT DO NOTHING prevents duplicates.
+     * NULL for rows written by the legacy flush path (pre-Redis).
+     */
+    @Column(name = "stream_last_id", length = 80)
+    private String streamLastId;
 }
