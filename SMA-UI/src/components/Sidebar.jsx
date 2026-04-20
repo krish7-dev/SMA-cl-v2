@@ -116,6 +116,7 @@ const HEALTH_ABBR = {
   'Execution Engine': { abbr: 'E' },
   'Data Engine':      { abbr: 'D' },
   'Strategy Engine':  { abbr: 'S' },
+  'Redis':            { abbr: 'R' },
 };
 
 const backendHost = import.meta.env.VITE_BACKEND_HOST || 'http://localhost';
@@ -158,7 +159,7 @@ export default function Sidebar() {
             </div>
           );
         })}
-        {health.length === 0 && ['B','E','D','S'].map(a => (
+        {health.length === 0 && ['B','E','D','S','R'].map(a => (
           <div key={a} className="shb-item shb-unknown">
             <span className="shb-dot shb-unknown" />
             <span className="shb-label">{a}</span>
