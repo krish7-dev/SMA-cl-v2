@@ -1,7 +1,6 @@
 package com.sma.strategyengine.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.sma.strategyengine.entity.SessionFeedChunkRecord;
 import com.sma.strategyengine.entity.SessionResultRecord;
 import com.sma.strategyengine.model.response.ApiResponse;
 import com.sma.strategyengine.repository.SessionFeedChunkRepository;
@@ -124,18 +123,34 @@ public class SessionResultController {
     @GetMapping("/{sessionId}")
     public ResponseEntity<ApiResponse<SessionResultRecord>> get(
             @PathVariable String sessionId) {
-
+        // feedJson intentionally excluded — feed lives in session_feed_chunk to avoid OOM.
+        // Use the /feed endpoint when the full candle feed is needed for display/comparison.
         return repository.findById(sessionId)
-                .map(r -> {
-                    // If feed_json is absent (new chunk-based auto-save), assemble from chunk table.
-                    // If feed_json is present (manual save or old auto-save), use it as-is.
-                    if ((r.getFeedJson() == null || r.getFeedJson().isBlank())
-                            && chunkRepository.existsBySessionId(sessionId)) {
-                        r.setFeedJson(assembleFromChunks(sessionId));
-                    }
-                    return ResponseEntity.ok(ApiResponse.ok(r));
-                })
+                .map(r -> { r.setFeedJson(null); return ResponseEntity.ok(ApiResponse.ok(r)); })
                 .orElse(ResponseEntity.notFound().build());
+    }
+
+    @Data
+    public static class FinalizeRequest {
+        private String label;
+        private Object summary;
+        private Object closedTrades;
+    }
+
+    @PatchMapping("/{sessionId}")
+    public ResponseEntity<ApiResponse<Map<String, String>>> finalize(
+            @PathVariable String sessionId,
+            @RequestBody FinalizeRequest req) {
+        try {
+            String summaryJson      = req.getSummary()      != null ? objectMapper.writeValueAsString(req.getSummary())      : null;
+            String closedTradesJson = req.getClosedTrades() != null ? objectMapper.writeValueAsString(req.getClosedTrades()) : null;
+            repository.finalizeSession(sessionId, req.getLabel() != null ? req.getLabel() : "", summaryJson, closedTradesJson);
+            log.info("Session finalized: sessionId={} label={}", sessionId, req.getLabel());
+            return ResponseEntity.ok(ApiResponse.ok(Map.of("sessionId", sessionId)));
+        } catch (Exception e) {
+            log.error("Failed to finalize session {}: {}", sessionId, e.getMessage());
+            return ResponseEntity.internalServerError().body(ApiResponse.error("Failed to finalize: " + e.getMessage()));
+        }
     }
 
     @DeleteMapping("/{sessionId}")
@@ -146,34 +161,6 @@ public class SessionResultController {
         repository.deleteBySessionId(sessionId);
         log.info("Session result deleted: sessionId={}", sessionId);
         return ResponseEntity.ok(ApiResponse.ok(null));
-    }
-
-    /**
-     * Concatenates all chunk JSON arrays for a session into one JSON array string.
-     * Each chunk is stored as a JSON array, e.g. [{...},{...}].
-     * The result is a single flat array of all candle events in insertion order.
-     */
-    private String assembleFromChunks(String sessionId) {
-        java.util.List<SessionFeedChunkRecord> chunks =
-                chunkRepository.findBySessionIdOrderByIdAsc(sessionId);
-        if (chunks.isEmpty()) return "[]";
-
-        StringBuilder sb = new StringBuilder("[");
-        boolean firstItem = true;
-        for (SessionFeedChunkRecord chunk : chunks) {
-            String json = chunk.getChunkJson().trim();
-            // Strip the outer [ ] from each chunk array and join the inner items
-            if (json.startsWith("[") && json.endsWith("]")) {
-                json = json.substring(1, json.length() - 1).trim();
-            }
-            if (!json.isEmpty()) {
-                if (!firstItem) sb.append(",");
-                sb.append(json);
-                firstItem = false;
-            }
-        }
-        sb.append("]");
-        return sb.toString();
     }
 
     /**
