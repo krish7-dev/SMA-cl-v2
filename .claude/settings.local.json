@@ -131,7 +131,28 @@
       "Read(//g/AWS/**)",
       "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o ConnectTimeout=10 ubuntu@16.16.206.197 \"free -m | grep Mem && ps aux | grep strategy | grep -v grep | awk '{print \\\\\"Strategy RAM:\\\\\", \\\\$6/1024, \\\\\"MB\\\\\"}' && echo '--- Last 50 log lines errors ---' && tail -n 50 ~/logs/strategy.log | grep -E '\\(ERROR|WARN|Exception|OOM|heap|OutOfMemory\\)' || echo 'No errors found'\")",
       "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o ConnectTimeout=10 ubuntu@16.16.119.222 \"bash ~/monitor.sh 2>/dev/null\")",
-      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"bash ~/monitor.sh\")"
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"bash ~/monitor.sh\")",
+      "Bash(scp -i \"G:/AWS/sma-key.pem\" \"g:/SMA-claude-v2/SMA-Strategy-Engine/target/sma-strategy-engine-0.0.1-SNAPSHOT.jar\" ubuntu@16.16.119.222:~/app/strategy/sma-strategy-engine-0.0.1-SNAPSHOT.jar)",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"bash ~/restart.sh strategy\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"tail -80 ~/logs/strategy.log\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"grep -n 'Started\\\\|ERROR\\\\|FATAL\\\\|Exception\\\\|OOM\\\\|OutOfMemory\\\\|Failed\\\\|failed' ~/logs/strategy.log | tail -40\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"strings ~/logs/strategy.log | grep -E 'Started|ERROR|FATAL|Exception|OutOfMemory|Failed to start|Application run failed' | tail -40\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"strings ~/logs/strategy.log | grep -A5 'APPLICATION FAILED\\\\|Application run failed\\\\|LoggingFailureAnalysis' | tail -60\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"strings ~/logs/strategy.log | tail -30\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"strings ~/logs/strategy.log | tail -20\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"curl -s http://localhost:9006/api/v1/strategy/session-results/6ce279ae-7074-499d-a33b-8c4cfe01f8bb\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"curl -s 'http://localhost:9006/api/v1/strategy/session-results?userId=krishnaanilkumar007@gmail.com&type=LIVE'\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(r['sessionId'], '|', r['label'], '|', r['savedAt']\\) for r in d['data']]\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"grep -i 'PATCH\\\\|finalize\\\\|session-result\\\\|6ce279ae\\\\|manual' ~/logs/strategy-engine.log 2>/dev/null | tail -30\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"ls ~/logs/ && journalctl -u strategy-engine --since '2026-04-23 15:00:00' --until '2026-04-23 16:00:00' 2>/dev/null | grep -i 'PATCH\\\\|finalize\\\\|session\\\\|6ce279ae' | tail -30\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"grep -i 'finalize\\\\|PATCH\\\\|6ce279ae\\\\|manual\\\\|session.*saved\\\\|session.*result' ~/logs/strategy.log | tail -40\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"tail -100 ~/logs/strategy.log\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"wc -l ~/logs/strategy.log && grep -n 'session\\\\|Session\\\\|save\\\\|Save\\\\|finalize\\\\|Finalize' ~/logs/strategy.log | tail -30\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"curl -s 'http://localhost:9006/api/v1/strategy/session-results?userId=krishna' | python3 -m json.tool 2>/dev/null || curl -s 'http://localhost:9006/api/v1/strategy/session-results?userId=krishna'\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"curl -s 'http://localhost:9006/api/v1/strategy/session-results' | python3 -m json.tool 2>/dev/null | head -80\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"curl -s -X PATCH 'http://localhost:9006/api/v1/strategy/session-results/6ce279ae-7074-499d-a33b-8c4cfe01f8bb' -H 'Content-Type: application/json' -d '{\\\\\"label\\\\\": \\\\\"Live 2026-04-23 manual\\\\\"}'\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"curl -s 'http://localhost:9006/api/v1/strategy/session-results/6ce279ae-7074-499d-a33b-8c4cfe01f8bb' | python3 -m json.tool | head -20\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"curl -s 'http://localhost:9006/api/v1/strategy/session-results' | python3 -m json.tool | grep -E 'sessionId|label|savedAt|sessionDate|type'\")"
     ]
   }
 }

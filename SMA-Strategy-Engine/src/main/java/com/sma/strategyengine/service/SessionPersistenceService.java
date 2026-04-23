@@ -10,7 +10,6 @@ import org.springframework.retry.annotation.Retryable;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
-import java.util.List;
 
 /**
  * Wraps session_result / session_feed_chunk DB writes with retry logic so transient
@@ -98,28 +97,12 @@ public class SessionPersistenceService {
     /**
      * Assembles the full feed JSON array from all chunk rows for a session.
      * Returns {@code null} if no chunks exist.
-     * Called by OptionsLiveService.getFeed() after drainFully() to reconstruct
-     * the candle-event timeline from DB.
+     * Delegates to a native PostgreSQL json_agg query so that no chunk entities
+     * are loaded into Java heap — prevents OOM on long sessions.
      */
     public String assembleFeedJson(String sessionId) {
-        List<SessionFeedChunkRecord> chunks =
-                chunkRepository.findBySessionIdOrderByIdAsc(sessionId);
-        if (chunks.isEmpty()) return null;
-
-        StringBuilder sb = new StringBuilder("[");
-        boolean first = true;
-        for (SessionFeedChunkRecord chunk : chunks) {
-            String json = chunk.getChunkJson().trim();
-            if (json.startsWith("[") && json.endsWith("]")) {
-                json = json.substring(1, json.length() - 1).trim();
-            }
-            if (!json.isEmpty()) {
-                if (!first) sb.append(",");
-                sb.append(json);
-                first = false;
-            }
-        }
-        sb.append("]");
-        return sb.toString();
+        if (!chunkRepository.existsBySessionId(sessionId)) return null;
+        String result = chunkRepository.assembleFeedJsonNative(sessionId);
+        return (result == null || result.equals("[]")) ? null : result;
     }
 }

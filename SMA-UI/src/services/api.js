@@ -541,6 +541,10 @@ export async function getSessionResult(sessionId) {
   return request(`${STRATEGY_API}/api/v1/strategy/session-results/${encodeURIComponent(sessionId)}`);
 }
 
+export async function finalizeSessionResult(sessionId, data) {
+  return request(`${STRATEGY_API}/api/v1/strategy/session-results/${encodeURIComponent(sessionId)}`, { method: 'PATCH', body: data });
+}
+
 export async function deleteSessionResult(sessionId) {
   return request(`${STRATEGY_API}/api/v1/strategy/session-results/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
 }

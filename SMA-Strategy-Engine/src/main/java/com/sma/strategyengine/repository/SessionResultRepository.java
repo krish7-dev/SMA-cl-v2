@@ -74,6 +74,27 @@ public interface SessionResultRepository extends JpaRepository<SessionResultReco
      * Updates the metadata fields of an existing session_result row.
      * Called by autoSave() after all feed chunks have been flushed.
      */
+    /**
+     * Finalizes a draft session: updates label, summary, and closed trades.
+     * Never touches feed_json — feed lives in session_feed_chunk.
+     * COALESCE keeps existing values when caller passes null.
+     */
+    @Modifying
+    @Transactional
+    @Query(value = """
+        UPDATE session_result
+        SET label              = COALESCE(NULLIF(:label, ''), label),
+            summary_json       = COALESCE(:summaryJson, summary_json),
+            closed_trades_json = COALESCE(:closedTradesJson, closed_trades_json),
+            saved_at           = NOW()
+        WHERE session_id = :sessionId
+        """, nativeQuery = true)
+    void finalizeSession(
+            @Param("sessionId")        String sessionId,
+            @Param("label")            String label,
+            @Param("summaryJson")      String summaryJson,
+            @Param("closedTradesJson") String closedTradesJson);
+
     @Modifying
     @Transactional
     @Query(value = """
