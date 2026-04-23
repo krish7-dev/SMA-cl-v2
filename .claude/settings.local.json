@@ -121,7 +121,17 @@
       "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"ps aux | grep java | awk '{print \\\\$1,\\\\$2,\\\\$4,\\\\$11}' && echo '---' && uptime\")",
       "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"curl -s --max-time 10 http://localhost:9006/actuator/health 2>&1 && echo '---' && curl -s --max-time 10 http://localhost:9003/actuator/health 2>&1\")",
       "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"tail -15 ~/logs/strategy.log\")",
-      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"grep -i 'connection\\\\|refused\\\\|timeout\\\\|FATAL\\\\|error' ~/logs/strategy.log | tail -20\")"
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"grep -i 'connection\\\\|refused\\\\|timeout\\\\|FATAL\\\\|error' ~/logs/strategy.log | tail -20\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"grep 'LiveCandleBuffer\\\\|CandleData\\\\|PERMANENTLY FAILED' ~/logs/strategy.log | tail -5\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"ps aux | grep java | awk '{print \\\\$2,\\\\$4,\\\\$11}' && echo '---' && tail -10 ~/logs/strategy.log\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.206.197 \"grep REDIS ~/strategy.env\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"grep REDIS ~/strategy.env\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" ubuntu@16.16.119.222 \"find ~/ -name '*.env' 2>/dev/null | head -10\")",
+      "Bash(scp -i \"G:/AWS/sma-key.pem\" \"g:/SMA-claude-v2/SMA-Strategy-Engine/target/sma-strategy-engine-0.0.1-SNAPSHOT.jar\" ubuntu@16.16.206.197:~/app/strategy/sma-strategy-engine-0.0.1-SNAPSHOT.jar)",
+      "Read(//g/AWS/**)",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o ConnectTimeout=10 ubuntu@16.16.206.197 \"free -m | grep Mem && ps aux | grep strategy | grep -v grep | awk '{print \\\\\"Strategy RAM:\\\\\", \\\\$6/1024, \\\\\"MB\\\\\"}' && echo '--- Last 50 log lines errors ---' && tail -n 50 ~/logs/strategy.log | grep -E '\\(ERROR|WARN|Exception|OOM|heap|OutOfMemory\\)' || echo 'No errors found'\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o ConnectTimeout=10 ubuntu@16.16.119.222 \"bash ~/monitor.sh 2>/dev/null\")",
+      "Bash(ssh -i \"G:/AWS/sma-key.pem\" -o StrictHostKeyChecking=no ubuntu@16.16.119.222 \"bash ~/monitor.sh\")"
     ]
   }
 }

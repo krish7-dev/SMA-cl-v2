@@ -19,7 +19,7 @@ declare -A JVMOPTS=(
   [broker]=""
   [execution]=""
   [data]=""
-  [strategy]="-Xmx3g"
+  [strategy]="-Xmx3g -XX:MaxHeapFreeRatio=30 -XX:MinHeapFreeRatio=10"
 )
 
 declare -A ENVS=(

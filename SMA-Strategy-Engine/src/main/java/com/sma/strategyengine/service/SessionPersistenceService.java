@@ -62,6 +62,21 @@ public class SessionPersistenceService {
         sessionResultRepository.updateMetadata(sessionId, closedTradesJson, summaryJson, configJson, label);
     }
 
+    @Retryable(
+            retryFor = Exception.class,
+            maxAttempts = 5,
+            backoff = @Backoff(delay = 2000, multiplier = 2.0, maxDelay = 30000)
+    )
+    public void appendFeedChunkTyped(String sessionId, String type, String userId, String brokerName,
+                                     String sessionDate, String chunk) {
+        sessionResultRepository.ensureSessionRowTyped(sessionId, type, userId, brokerName, sessionDate);
+        chunkRepository.save(SessionFeedChunkRecord.builder()
+                .sessionId(sessionId)
+                .chunkJson(chunk)
+                .savedAt(Instant.now())
+                .build());
+    }
+
     /**
      * Idempotent feed chunk insert for the Redis-Stream drainer.
      * Uses ON CONFLICT (session_id, stream_last_id) DO NOTHING so that
