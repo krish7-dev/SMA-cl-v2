@@ -1275,6 +1275,11 @@ function OptionsLiveTest() {
   const [saveError,     setSaveError]     = useState('');
   const [canSave,       setCanSave]       = useState(false);
   const [syncInfo,      setSyncInfo]      = useState(null);  // {flushedAt, totalCandles}
+  const skipConfirmRef     = useRef(false);
+  const [showStartConfirm, setShowStartConfirm] = useState(false);
+  const [startConfirmText, setStartConfirmText] = useState('');
+  const [showStopConfirm,  setShowStopConfirm]  = useState(false);
+  const [stopConfirmText,  setStopConfirmText]  = useState('');
 
   // On mount: check if a session is already running for this user and auto-reconnect to it.
   useEffect(() => {
@@ -1358,8 +1363,23 @@ function OptionsLiveTest() {
   }
 
   async function handleStart(e) {
-    e.preventDefault();
-    if (status === 'running') { handleStop(); return; }
+    if (e && e.preventDefault) e.preventDefault();
+    if (status === 'running') {
+      if (feed.length > 0 && !skipConfirmRef.current) {
+        setShowStopConfirm(true);
+        setStopConfirmText('');
+        return;
+      }
+      skipConfirmRef.current = false;
+      handleStop();
+      return;
+    }
+    if (lastSaveSessionIdRef.current && saveStatus !== 'saved' && canSave && !skipConfirmRef.current) {
+      setShowStartConfirm(true);
+      setStartConfirmText('');
+      return;
+    }
+    skipConfirmRef.current = false;
 
     if (!canRun) {
       setError('Select a NIFTY instrument and at least one CE or PE option before starting.');
@@ -1689,6 +1709,20 @@ function OptionsLiveTest() {
     }
   }
 
+  function handleConfirmedStart() {
+    setShowStartConfirm(false);
+    setStartConfirmText('');
+    skipConfirmRef.current = true;
+    handleStart(null);
+  }
+
+  function handleConfirmedStop() {
+    setShowStopConfirm(false);
+    setStopConfirmText('');
+    skipConfirmRef.current = true;
+    handleStart(null);
+  }
+
   async function handleSaveToCompare() {
     setSaveStatus('saving'); setSaveError('');
     try {
@@ -1710,8 +1744,20 @@ function OptionsLiveTest() {
         console.warn('[LIVE save] DB fetch failed:', e.message);
       }
 
-      const serverFeed   = record?.feedJson   ? JSON.parse(record.feedJson)   : null;
+      let serverFeed   = record?.feedJson   ? JSON.parse(record.feedJson)   : null;
       const serverTrades = record?.closedTradesJson ? JSON.parse(record.closedTradesJson) : null;
+
+      // feedJson absent from session_result — assemble from session_feed_chunk via /feed endpoint
+      if (!serverFeed || serverFeed.length === 0) {
+        try {
+          const feedRes = await getOptionsLiveFeed(sid);
+          serverFeed = feedRes?.data ?? null;
+          console.log('[LIVE save] /feed fallback: got', serverFeed?.length ?? 0, 'events');
+        } catch (fe) {
+          console.warn('[LIVE save] /feed fallback failed:', fe.message);
+        }
+      }
+
       console.log('[LIVE save] server feed count:', serverFeed?.length ?? 0,
                   '| server trades:', serverTrades?.length ?? 0,
                   '| dataEngineSessionId:', sid);
@@ -3212,6 +3258,84 @@ function OptionsLiveTest() {
         </div>
 
       </form>
+
+      {showStartConfirm && (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.55)',
+            display:'flex', alignItems:'center', justifyContent:'center', zIndex:1000 }}>
+          <div style={{ background:'#1e1e2e', border:'1px solid #f38ba8', borderRadius:10,
+              padding:'28px 32px', maxWidth:420, width:'90%', textAlign:'center' }}>
+            <div style={{ fontSize:22, marginBottom:12 }}>⚠️</div>
+            <div style={{ fontWeight:700, fontSize:16, marginBottom:8, color:'#f38ba8' }}>
+              Unsaved Session Data
+            </div>
+            <div style={{ color:'#cdd6f4', marginBottom:20, fontSize:14, lineHeight:1.5 }}>
+              The previous session has data pending save to compare.
+              Starting a new session will make it harder to recover.<br /><br />
+              Type <strong>yes</strong> to confirm and start anyway.
+            </div>
+            <input autoFocus value={startConfirmText}
+              onChange={e => setStartConfirmText(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && startConfirmText.toLowerCase() === 'yes') handleConfirmedStart();
+                if (e.key === 'Escape') { setShowStartConfirm(false); setStartConfirmText(''); }
+              }}
+              placeholder="Type yes to confirm"
+              style={{ width:'100%', padding:'8px 12px', borderRadius:6, marginBottom:16,
+                border:'1px solid #45475a', background:'#181825', color:'#cdd6f4',
+                fontSize:14, textAlign:'center', boxSizing:'border-box' }} />
+            <div style={{ display:'flex', gap:10, justifyContent:'center' }}>
+              <button className="btn-secondary"
+                onClick={() => { setShowStartConfirm(false); setStartConfirmText(''); }}>
+                Cancel
+              </button>
+              <button className="btn-primary"
+                disabled={startConfirmText.toLowerCase() !== 'yes'}
+                onClick={handleConfirmedStart}>
+                Start Anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showStopConfirm && (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.55)',
+            display:'flex', alignItems:'center', justifyContent:'center', zIndex:1000 }}>
+          <div style={{ background:'#1e1e2e', border:'1px solid #f38ba8', borderRadius:10,
+              padding:'28px 32px', maxWidth:420, width:'90%', textAlign:'center' }}>
+            <div style={{ fontSize:22, marginBottom:12 }}>⚠️</div>
+            <div style={{ fontWeight:700, fontSize:16, marginBottom:8, color:'#f38ba8' }}>
+              Stop Live Session?
+            </div>
+            <div style={{ color:'#cdd6f4', marginBottom:20, fontSize:14, lineHeight:1.5 }}>
+              The session has live data that hasn't been saved to compare yet.
+              Stopping will end the session — make sure to save before starting a new one.<br /><br />
+              Type <strong>yes</strong> to confirm and stop.
+            </div>
+            <input autoFocus value={stopConfirmText}
+              onChange={e => setStopConfirmText(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && stopConfirmText.toLowerCase() === 'yes') handleConfirmedStop();
+                if (e.key === 'Escape') { setShowStopConfirm(false); setStopConfirmText(''); }
+              }}
+              placeholder="Type yes to confirm"
+              style={{ width:'100%', padding:'8px 12px', borderRadius:6, marginBottom:16,
+                border:'1px solid #45475a', background:'#181825', color:'#cdd6f4',
+                fontSize:14, textAlign:'center', boxSizing:'border-box' }} />
+            <div style={{ display:'flex', gap:10, justifyContent:'center' }}>
+              <button className="btn-secondary"
+                onClick={() => { setShowStopConfirm(false); setStopConfirmText(''); }}>
+                Cancel
+              </button>
+              <button className="btn-primary"
+                disabled={stopConfirmText.toLowerCase() !== 'yes'}
+                onClick={handleConfirmedStop}>
+                Stop Session
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -12534,9 +12658,21 @@ function TickReplayTest() {
         console.warn('[REPLAY save] DB fetch failed:', e.message);
       }
 
-      const serverFeed   = record?.feedJson        ? JSON.parse(record.feedJson)        : null;
-      const serverTrades = record?.closedTradesJson ? JSON.parse(record.closedTradesJson) : null;
-      const serverSummary = record?.summaryJson     ? JSON.parse(record.summaryJson)     : {};
+      let serverFeed      = record?.feedJson        ? JSON.parse(record.feedJson)        : null;
+      const serverTrades  = record?.closedTradesJson ? JSON.parse(record.closedTradesJson) : null;
+      const serverSummary = record?.summaryJson      ? JSON.parse(record.summaryJson)      : {};
+
+      // feedJson absent — try in-memory /feed endpoint (works when server not restarted)
+      if (!serverFeed || serverFeed.length === 0) {
+        try {
+          const feedRes = await getTickReplayFeed(replaySid);
+          serverFeed = feedRes?.data ?? null;
+          console.log('[REPLAY save] /feed fallback: got', serverFeed?.length ?? 0, 'events');
+        } catch (fe) {
+          console.warn('[REPLAY save] /feed fallback failed:', fe.message);
+        }
+      }
+
       console.log('[REPLAY save] server feed count:', serverFeed?.length ?? 0,
                   '| server trades:', serverTrades?.length ?? 0,
                   '| dataEngineSessionId:', serverSummary.dataEngineSessionId ?? selectedSession?.sessionId);

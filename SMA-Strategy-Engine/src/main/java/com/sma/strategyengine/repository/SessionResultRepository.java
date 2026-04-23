@@ -53,6 +53,23 @@ public interface SessionResultRepository extends JpaRepository<SessionResultReco
             @Param("brokerName")  String brokerName,
             @Param("sessionDate") String sessionDate);
 
+    @Modifying
+    @Transactional
+    @Query(value = """
+        INSERT INTO session_result
+            (session_id, type, user_id, broker_name, session_date, label, saved_at)
+        VALUES
+            (:sessionId, :type, :userId, :brokerName, CAST(:sessionDate AS DATE), '', NOW())
+        ON CONFLICT (session_id) DO UPDATE
+        SET saved_at = NOW()
+        """, nativeQuery = true)
+    void ensureSessionRowTyped(
+            @Param("sessionId")   String sessionId,
+            @Param("type")        String type,
+            @Param("userId")      String userId,
+            @Param("brokerName")  String brokerName,
+            @Param("sessionDate") String sessionDate);
+
     /**
      * Updates the metadata fields of an existing session_result row.
      * Called by autoSave() after all feed chunks have been flushed.
