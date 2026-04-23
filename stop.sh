@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
-# stop.sh — Stop one or more SMA services on EC2
+# stop.sh — Stop one or more SMA services (local or EC2)
 # Usage:
 #   ./stop.sh              — stop all 4 services
 #   ./stop.sh data         — stop only data engine
 #   ./stop.sh data strategy — stop data then strategy
 
-declare -A JARS=(
-  [broker]="sma-broker-engine-0.0.1-SNAPSHOT.jar"
-  [execution]="sma-execution-engine-0.0.1-SNAPSHOT.jar"
-  [data]="sma-data-engine-0.0.1-SNAPSHOT.jar"
-  [strategy]="sma-strategy-engine-0.0.1-SNAPSHOT.jar"
-)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOGS_DIR="$SCRIPT_DIR/logs"
 
 if [ $# -eq 0 ]; then
   SERVICES=("broker" "execution" "data" "strategy")
@@ -19,18 +15,21 @@ else
 fi
 
 for svc in "${SERVICES[@]}"; do
-  if [ -z "${JARS[$svc]}" ]; then
-    echo "Unknown service: $svc (valid: broker, execution, data, strategy)"
-    exit 1
-  fi
+  case "$svc" in
+    broker|execution|data|strategy) ;;
+    *) echo "Unknown service: $svc (valid: broker, execution, data, strategy)"; exit 1 ;;
+  esac
 
-  jar="${JARS[$svc]}"
-  pid=$(pgrep -f "$jar" || true)
-
-  if [ -z "$pid" ]; then
-    echo "[$svc] not running"
+  pid_file="$LOGS_DIR/$svc.pid"
+  if [ -f "$pid_file" ]; then
+    pid=$(cat "$pid_file")
+    if kill "$pid" 2>/dev/null; then
+      echo "[$svc] stopped (pid $pid)"
+    else
+      echo "[$svc] not running (stale pid $pid)"
+    fi
+    rm -f "$pid_file"
   else
-    kill "$pid"
-    echo "[$svc] stopped (pid $pid)"
+    echo "[$svc] not running (no pid file)"
   fi
 done

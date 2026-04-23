@@ -1,4 +1,4 @@
-package com.sma.strategyengine.config;
+package com.sma.dataengine.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
@@ -18,10 +18,9 @@ public class AppConfig {
     }
 
     /**
-     * Multi-threaded scheduler so the 15 s heartbeat/flushFeed tasks can never block
-     * the market-close autoFinalSave cron (or any other scheduled task).
-     * Spring's default is a single-threaded scheduler — one blocked DB call prevents
-     * all other scheduled tasks from firing until it completes or times out.
+     * Multi-threaded scheduler so the Redis drain @Scheduled tasks never block
+     * each other or any other periodic work (replay housekeeping, health checks).
+     * Spring's default is a single-threaded scheduler.
      */
     @Bean
     public ThreadPoolTaskScheduler taskScheduler() {

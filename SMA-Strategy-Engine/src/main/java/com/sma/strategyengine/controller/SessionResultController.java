@@ -1,8 +1,10 @@
 package com.sma.strategyengine.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sma.strategyengine.entity.SessionFeedChunkRecord;
 import com.sma.strategyengine.entity.SessionResultRecord;
 import com.sma.strategyengine.model.response.ApiResponse;
+import com.sma.strategyengine.repository.SessionFeedChunkRepository;
 import com.sma.strategyengine.repository.SessionResultRepository;
 import com.sma.strategyengine.service.options.SessionDivergenceAnalyzer;
 import lombok.Data;
@@ -33,6 +35,7 @@ import java.util.Map;
 public class SessionResultController {
 
     private final SessionResultRepository   repository;
+    private final SessionFeedChunkRepository chunkRepository;
     private final ObjectMapper              objectMapper;
     private final SessionDivergenceAnalyzer divergenceAnalyzer;
 
@@ -123,7 +126,15 @@ public class SessionResultController {
             @PathVariable String sessionId) {
 
         return repository.findById(sessionId)
-                .map(r -> ResponseEntity.ok(ApiResponse.ok(r)))
+                .map(r -> {
+                    // If feed_json is absent (new chunk-based auto-save), assemble from chunk table.
+                    // If feed_json is present (manual save or old auto-save), use it as-is.
+                    if ((r.getFeedJson() == null || r.getFeedJson().isBlank())
+                            && chunkRepository.existsBySessionId(sessionId)) {
+                        r.setFeedJson(assembleFromChunks(sessionId));
+                    }
+                    return ResponseEntity.ok(ApiResponse.ok(r));
+                })
                 .orElse(ResponseEntity.notFound().build());
     }
 
@@ -131,9 +142,38 @@ public class SessionResultController {
     public ResponseEntity<ApiResponse<Void>> delete(
             @PathVariable String sessionId) {
 
+        chunkRepository.deleteBySessionId(sessionId);
         repository.deleteBySessionId(sessionId);
         log.info("Session result deleted: sessionId={}", sessionId);
         return ResponseEntity.ok(ApiResponse.ok(null));
+    }
+
+    /**
+     * Concatenates all chunk JSON arrays for a session into one JSON array string.
+     * Each chunk is stored as a JSON array, e.g. [{...},{...}].
+     * The result is a single flat array of all candle events in insertion order.
+     */
+    private String assembleFromChunks(String sessionId) {
+        java.util.List<SessionFeedChunkRecord> chunks =
+                chunkRepository.findBySessionIdOrderByIdAsc(sessionId);
+        if (chunks.isEmpty()) return "[]";
+
+        StringBuilder sb = new StringBuilder("[");
+        boolean firstItem = true;
+        for (SessionFeedChunkRecord chunk : chunks) {
+            String json = chunk.getChunkJson().trim();
+            // Strip the outer [ ] from each chunk array and join the inner items
+            if (json.startsWith("[") && json.endsWith("]")) {
+                json = json.substring(1, json.length() - 1).trim();
+            }
+            if (!json.isEmpty()) {
+                if (!firstItem) sb.append(",");
+                sb.append(json);
+                firstItem = false;
+            }
+        }
+        sb.append("]");
+        return sb.toString();
     }
 
     /**

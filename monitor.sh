@@ -107,6 +107,59 @@ for svc in "${SERVICES[@]}"; do
   echo -e "$health_str"
 done
 
+# ── DB Connection Pools ──────────────────────────────────────────
+echo ""
+divider
+echo -e "  ${BOLD}DB Connection Pools (HikariCP)${NC}"
+divider
+
+get_metric() {
+  local port=$1 metric=$2
+  curl -s --max-time 3 "http://localhost:$port/actuator/metrics/$metric" \
+    | grep -o '"value":[0-9.]*' | head -1 | cut -d: -f2
+}
+
+total_active=0
+total_pending=0
+any_pool_warn=false
+
+for svc in "${SERVICES[@]}"; do
+  port="${PORTS[$svc]}"
+  pid=$(pgrep -f "${JARS[$svc]}" 2>/dev/null | head -1)
+  [ -z "$pid" ] && continue
+
+  active=$(get_metric  $port "hikaricp.connections.active")
+  idle=$(get_metric    $port "hikaricp.connections.idle")
+  pending=$(get_metric $port "hikaricp.connections.pending")
+  timeouts=$(get_metric $port "hikaricp.connections.timeout.total")
+  max=$(get_metric     $port "hikaricp.connections.max")
+
+  active=${active:-?}; idle=${idle:-?}; pending=${pending:-?}
+  timeouts=${timeouts:-?}; max=${max:-?}
+
+  # Colour pending: >0 = yellow warning, timeouts >0 = red
+  if [ "$timeouts" != "?" ] && [ "${timeouts%.*}" -gt 0 ] 2>/dev/null; then
+    pool_color=$RED; pool_label="TIMEOUT"; any_pool_warn=true
+  elif [ "$pending" != "?" ] && [ "${pending%.*}" -gt 0 ] 2>/dev/null; then
+    pool_color=$YELLOW; pool_label="WAITING"; any_pool_warn=true
+  else
+    pool_color=$GREEN; pool_label="OK"
+  fi
+
+  [ "$active"  != "?" ] && total_active=$(( total_active  + ${active%.*}  ))
+  [ "$pending" != "?" ] && total_pending=$(( total_pending + ${pending%.*} ))
+
+  printf "  %-12s  active: %s/%s  idle: %s  pending: %s  timeouts: %s  " \
+    "$svc" "$active" "$max" "$idle" "$pending" "$timeouts"
+  echo -e "${pool_color}${pool_label}${NC}"
+done
+
+echo -e "  ─────────────────────────────────────"
+echo -e "  Total active connections across all services: ${BOLD}${total_active}${NC}  |  pending: ${BOLD}${total_pending}${NC}"
+if [ "$any_pool_warn" = true ]; then
+  echo -e "  ${YELLOW}⚠  DB pool pressure detected — check Supabase dashboard${NC}"
+fi
+
 # ── Recent Errors ────────────────────────────────────────────────
 echo ""
 divider
@@ -150,6 +203,10 @@ fi
 
 if [ $pct_used -ge 90 ]; then
   echo -e "  ${RED}✘  RAM CRITICAL — restart services or reboot soon${NC}"
+fi
+
+if [ "$any_pool_warn" = true ]; then
+  echo -e "  ${YELLOW}⚠  DB pool pressure — pending connections waiting, watch for timeouts${NC}"
 fi
 
 echo ""

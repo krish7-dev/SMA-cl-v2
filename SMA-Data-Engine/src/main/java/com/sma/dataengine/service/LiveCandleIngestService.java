@@ -4,7 +4,6 @@ import com.sma.dataengine.model.CandleData;
 import com.sma.dataengine.model.request.LiveCandleIngestRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -30,6 +29,7 @@ import java.util.stream.Collectors;
 public class LiveCandleIngestService {
 
     private final HistoricalDataService historicalDataService;
+    private final AsyncCandleWriter     asyncCandleWriter;
 
     /**
      * Persists a batch of live-recorded candles.
@@ -53,23 +53,27 @@ public class LiveCandleIngestService {
                 .collect(Collectors.groupingBy(
                         c -> c.getInstrumentToken() + "::" + c.getInterval().getKiteValue()));
 
-        int totalPersisted = 0;
+        int totalSubmitted = 0;
         for (Map.Entry<String, List<CandleData>> entry : groups.entrySet()) {
             List<CandleData> group = entry.getValue();
-            try {
-                historicalDataService.persistCandles(group, request.getProvider(), "LIVE_RECORDED");
-                totalPersisted += group.size();
-            } catch (DataIntegrityViolationException e) {
-                log.warn("LiveCandleIngest: concurrent insert for runId={} group={}: {}",
-                        request.getRunId(), entry.getKey(), e.getMessage());
-            } catch (Exception e) {
-                log.error("LiveCandleIngest: failed to persist group={} runId={}: {}",
-                        entry.getKey(), request.getRunId(), e.getMessage(), e);
-            }
+            String groupKey = entry.getKey();
+            String runId    = request.getRunId();
+            String provider = request.getProvider();
+            asyncCandleWriter.submit(() -> {
+                try {
+                    historicalDataService.persistCandles(group, provider, "LIVE_RECORDED");
+                } catch (Exception e) {
+                    // Re-throw so AsyncCandleWriter retries — it will keep retrying until success
+                    throw new RuntimeException("LiveCandleIngest failed for group=" + groupKey +
+                            " runId=" + runId + ": " + e.getMessage(), e);
+                }
+            });
+            totalSubmitted += group.size();
         }
 
-        log.debug("LiveCandleIngest: runId={} provider={} persisted={}/{}",
-                request.getRunId(), request.getProvider(), totalPersisted, candles.size());
-        return totalPersisted;
+        log.debug("LiveCandleIngest: runId={} provider={} submitted={}/{} to async writer (queue depth={})",
+                request.getRunId(), request.getProvider(), totalSubmitted, candles.size(),
+                asyncCandleWriter.queueDepth());
+        return totalSubmitted;
     }
 }

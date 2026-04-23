@@ -7,12 +7,15 @@ import com.sma.strategyengine.model.request.BacktestRequest;
 import com.sma.strategyengine.model.request.OptionsReplayRequest;
 import com.sma.strategyengine.model.response.OptionsReplayCandleEvent;
 import com.sma.strategyengine.service.MarketRegimeDetector;
+import com.sma.strategyengine.service.SessionPersistenceService;
 import com.sma.strategyengine.strategy.StrategyRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -38,9 +41,12 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class OptionsReplayService {
 
-    private final StrategyRegistry  strategyRegistry;
-    private final DataEngineClient  dataEngineClient;
-    private final ObjectMapper      objectMapper;
+    private static final int CHUNK_SIZE = 200;
+
+    private final StrategyRegistry        strategyRegistry;
+    private final DataEngineClient        dataEngineClient;
+    private final ObjectMapper            objectMapper;
+    private final SessionPersistenceService sessionPersistenceService;
 
     public void run(OptionsReplayRequest req, SseEmitter emitter) {
         try {
@@ -53,8 +59,13 @@ public class OptionsReplayService {
 
     private void doRun(OptionsReplayRequest req, SseEmitter emitter) throws Exception {
 
-        log.info("Options replay start: NIFTY/{} {} -> {} warmup={}d",
-                req.getInterval(), req.getFromDate(), req.getToDate(), req.getWarmupDays());
+        String replaySessionId = UUID.randomUUID().toString();
+        String sessionDate     = req.getFromDate() != null
+                ? req.getFromDate().toLocalDate().toString()
+                : LocalDate.now().toString();
+
+        log.info("Options replay start: sessionId={} NIFTY/{} {} -> {} warmup={}d",
+                replaySessionId, req.getInterval(), req.getFromDate(), req.getToDate(), req.getWarmupDays());
 
         // ── 1. Compute warmup start date ──────────────────────────────────────
         LocalDateTime warmupFrom = req.getFromDate().minusDays(req.getWarmupDays());
@@ -170,10 +181,12 @@ public class OptionsReplayService {
         OptionSelectorService selectorService = OptionSelectorService.forReplay(sel, optionCandleMap);
         OptionExecutionEngine execEngine      = new OptionExecutionEngine(req);
 
-        // Emit init event
+        // Emit init event — include replaySessionId so the UI can call /feed for save-to-compare
         emitter.send(SseEmitter.event().name("init")
-                .data(Map.of("totalCandles", replayCandles.size(),
-                             "warmupCandles", warmupCandles.size())));
+                .data(objectMapper.writeValueAsString(Map.of(
+                        "totalCandles",    replayCandles.size(),
+                        "warmupCandles",   warmupCandles.size(),
+                        "replaySessionId", replaySessionId))));
 
         // Warm up NiftyDecisionEngine with pre-replay candles
         decisionEngine.warmup(warmupCandles);
@@ -184,7 +197,9 @@ public class OptionsReplayService {
         List<OptionsReplayRequest.OptionCandidate> pePool =
                 req.getPeOptions() != null ? req.getPeOptions() : List.of();
 
+        List<String> chunkBuffer = new ArrayList<>(CHUNK_SIZE);
         int total = replayCandles.size();
+
         for (int i = 0; i < total; i++) {
             CandleDto       niftyCandle = replayCandles.get(i);
             String          regime      = regimes[i];
@@ -208,13 +223,26 @@ public class OptionsReplayService {
             OptionsReplayCandleEvent event = buildEvent(i + 1, total, niftyCandle, decision,
                     execEngine, selectorService, candleTime, action);
 
-            emitter.send(SseEmitter.event().name("candle").data(objectMapper.writeValueAsString(event)));
+            String eventJson = objectMapper.writeValueAsString(event);
+            emitter.send(SseEmitter.event().name("candle").data(eventJson));
+            chunkBuffer.add(eventJson);
+
+            // Flush chunk to DB every CHUNK_SIZE events
+            if (chunkBuffer.size() >= CHUNK_SIZE) {
+                flushChunk(replaySessionId, sessionDate, req, chunkBuffer);
+                chunkBuffer = new ArrayList<>(CHUNK_SIZE);
+            }
 
             // Speed control
             if (req.getSpeedMultiplier() > 0 && req.getSpeedMultiplier() < 1000) {
                 long delayMs = Math.max(0, 1000L / req.getSpeedMultiplier());
                 if (delayMs > 0) Thread.sleep(delayMs);
             }
+        }
+
+        // Flush remaining events
+        if (!chunkBuffer.isEmpty()) {
+            flushChunk(replaySessionId, sessionDate, req, chunkBuffer);
         }
 
         // ── 7. Force-close open position at end ───────────────────────────────
@@ -227,17 +255,49 @@ public class OptionsReplayService {
 
         // ── 8. Summary event ──────────────────────────────────────────────────
         Map<String, Object> summary = new HashMap<>();
-        summary.put("totalTrades",  execEngine.getClosedTrades().size());
-        summary.put("realizedPnl",  execEngine.getRealizedPnl());
-        summary.put("finalCapital", execEngine.getCapital());
-        summary.put("closedTrades", execEngine.getClosedTrades());
-        summary.put("diagnostics",  decisionEngine.getDiagnostics());
+        summary.put("totalTrades",     execEngine.getClosedTrades().size());
+        summary.put("realizedPnl",     execEngine.getRealizedPnl());
+        summary.put("finalCapital",    execEngine.getCapital());
+        summary.put("closedTrades",    execEngine.getClosedTrades());
+        summary.put("diagnostics",     decisionEngine.getDiagnostics());
+        summary.put("replaySessionId", replaySessionId);
         emitter.send(SseEmitter.event().name("summary").data(objectMapper.writeValueAsString(summary)));
+
+        // Persist final metadata to DB so the feed is retrievable for save-to-compare
+        try {
+            String closedTradesJson = objectMapper.writeValueAsString(execEngine.getClosedTrades());
+            Map<String, Object> summaryMeta = new LinkedHashMap<>();
+            summaryMeta.put("trades",       execEngine.getClosedTrades().size());
+            summaryMeta.put("finalCapital", execEngine.getCapital());
+            summaryMeta.put("realizedPnl",  execEngine.getRealizedPnl());
+            summaryMeta.put("sessionEnd",   Instant.now().toString());
+            sessionPersistenceService.updateMetadata(
+                    replaySessionId, closedTradesJson,
+                    objectMapper.writeValueAsString(summaryMeta),
+                    objectMapper.writeValueAsString(req), "");
+        } catch (Exception e) {
+            log.warn("Replay metadata persist failed: sessionId={} error={}", replaySessionId, e.getMessage());
+        }
 
         decisionEngine.cleanup();
         emitter.complete();
-        log.info("Options replay complete: {} candles, {} trades, pnl={}",
-                total, execEngine.getClosedTrades().size(), execEngine.getRealizedPnl());
+        log.info("Options replay complete: sessionId={} candles={} trades={} pnl={}",
+                replaySessionId, total, execEngine.getClosedTrades().size(), execEngine.getRealizedPnl());
+    }
+
+    // ── Persistence helpers ───────────────────────────────────────────────────
+
+    private void flushChunk(String sessionId, String sessionDate, OptionsReplayRequest req,
+                            List<String> events) {
+        try {
+            String chunkJson = "[" + String.join(",", events) + "]";
+            sessionPersistenceService.appendFeedChunkTyped(
+                    sessionId, "TICK_REPLAY",
+                    req.getUserId(), req.getBrokerName(), sessionDate, chunkJson);
+        } catch (Exception e) {
+            log.warn("Replay chunk persist failed: sessionId={} events={} error={}",
+                    sessionId, events.size(), e.getMessage());
+        }
     }
 
     // ── Score tier rules ──────────────────────────────────────────────────────

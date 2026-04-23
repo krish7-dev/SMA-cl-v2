@@ -32,30 +32,43 @@ public interface SessionResultRepository extends JpaRepository<SessionResultReco
     void deleteBySessionId(String sessionId);
 
     /**
-     * Upserts a feed chunk into the session_result row.
-     * On the first call (no row exists) it inserts with an empty metadata skeleton.
-     * On subsequent calls it appends the new-candle JSON array to the existing feed_json via
-     * PostgreSQL JSONB concatenation — so each flush only transfers new candles, not the full day.
-     *
-     * @param chunk  JSON array string of new candle events, e.g. [{...},{...}]
+     * Ensures a session_result header row exists for this session.
+     * Called before inserting each feed chunk into session_feed_chunk.
+     * Does NOT touch feed_json — chunks are stored separately to avoid the
+     * JSONB-concatenation performance regression that caused 13-110 s queries.
      */
     @Modifying
     @Transactional
     @Query(value = """
         INSERT INTO session_result
-            (session_id, type, user_id, broker_name, session_date, label, feed_json, saved_at)
+            (session_id, type, user_id, broker_name, session_date, label, saved_at)
         VALUES
-            (:sessionId, 'LIVE', :userId, :brokerName, CAST(:sessionDate AS DATE), '', :chunk, NOW())
+            (:sessionId, 'LIVE', :userId, :brokerName, CAST(:sessionDate AS DATE), '', NOW())
         ON CONFLICT (session_id) DO UPDATE
-        SET feed_json = (COALESCE(session_result.feed_json, '[]')::jsonb || CAST(:chunk AS jsonb))::text,
-            saved_at  = NOW()
+        SET saved_at = NOW()
         """, nativeQuery = true)
-    void appendFeedChunk(
+    void ensureSessionRow(
             @Param("sessionId")   String sessionId,
             @Param("userId")      String userId,
             @Param("brokerName")  String brokerName,
-            @Param("sessionDate") String sessionDate,
-            @Param("chunk")       String chunk);
+            @Param("sessionDate") String sessionDate);
+
+    @Modifying
+    @Transactional
+    @Query(value = """
+        INSERT INTO session_result
+            (session_id, type, user_id, broker_name, session_date, label, saved_at)
+        VALUES
+            (:sessionId, :type, :userId, :brokerName, CAST(:sessionDate AS DATE), '', NOW())
+        ON CONFLICT (session_id) DO UPDATE
+        SET saved_at = NOW()
+        """, nativeQuery = true)
+    void ensureSessionRowTyped(
+            @Param("sessionId")   String sessionId,
+            @Param("type")        String type,
+            @Param("userId")      String userId,
+            @Param("brokerName")  String brokerName,
+            @Param("sessionDate") String sessionDate);
 
     /**
      * Updates the metadata fields of an existing session_result row.

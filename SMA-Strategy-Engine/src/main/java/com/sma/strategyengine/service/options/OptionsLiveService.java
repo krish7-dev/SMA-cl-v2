@@ -13,11 +13,17 @@ import com.sma.strategyengine.model.response.OptionsReplayCandleEvent;
 import com.sma.strategyengine.repository.LiveSnapshotRepository;
 import com.sma.strategyengine.repository.SessionResultRepository;
 import com.sma.strategyengine.service.MarketRegimeDetector;
+import com.sma.strategyengine.service.RedisFeedDrainer;
+import com.sma.strategyengine.service.SessionPersistenceService;
 import com.sma.strategyengine.strategy.StrategyRegistry;
+import io.micrometer.core.instrument.MeterRegistry;
+import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.connection.stream.ReadOffset;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -58,11 +64,15 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class OptionsLiveService {
 
-    private final StrategyRegistry       strategyRegistry;
-    private final DataEngineClient       dataEngineClient;
-    private final ObjectMapper           objectMapper;
-    private final LiveSnapshotRepository snapshotRepository;
-    private final SessionResultRepository sessionResultRepository;
+    private final StrategyRegistry           strategyRegistry;
+    private final DataEngineClient           dataEngineClient;
+    private final ObjectMapper               objectMapper;
+    private final LiveSnapshotRepository     snapshotRepository;
+    private final SessionResultRepository    sessionResultRepository;
+    private final SessionPersistenceService  sessionPersistenceService;
+    private final StringRedisTemplate        stringRedisTemplate;
+    private final RedisFeedDrainer           redisFeedDrainer;
+    private final MeterRegistry              meterRegistry;
 
     @Value("${strategy.data-engine.base-url:http://localhost:9005}")
     private String dataEngineBaseUrl;
@@ -70,6 +80,13 @@ public class OptionsLiveService {
     private static final ZoneId      IST          = ZoneId.of("Asia/Kolkata");
     private static final LocalTime   MARKET_OPEN  = LocalTime.of(9, 15);
     private static final LocalTime   MARKET_CLOSE = LocalTime.of(15, 30);
+
+    // ── Redis key constants ───────────────────────────────────────────────────
+    private static final String ACTIVE_FEED_SET = "sma:active:feed:sessions";
+    private static final String ACTIVE_TICK_SET  = "sma:active:tick:sessions";
+    static final String         FEED_STREAM_PFX  = "sma:feed:";
+    static final String         TICK_STREAM_PFX  = "sma:ticks:";
+    private static final String DRAINER_GROUP    = "drainer-group";
 
     private static final Map<String, Long> INTERVAL_MS = Map.of(
             "MINUTE_1",   60_000L,
@@ -82,17 +99,66 @@ public class OptionsLiveService {
             "DAY",       86_400_000L
     );
 
-    private final ConcurrentHashMap<String, LiveOptionsSession> sessions       = new ConcurrentHashMap<>();
-
-    // Feed cache for stopped sessions — expires after ~60 min
-    private final ConcurrentHashMap<String, List<String>> completedFeeds     = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Instant>      completedFeedTimes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, LiveOptionsSession> sessions = new ConcurrentHashMap<>();
 
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "opts-live-" + System.nanoTime());
         t.setDaemon(true);
         return t;
     });
+
+    // ── Startup orphan cleanup ────────────────────────────────────────────────
+
+    /**
+     * On startup, any session IDs still in the Redis active sets are orphans from a
+     * previous JVM run that crashed without a normal stop(). In-memory session state is
+     * gone and cannot be reconstructed — remove them from the active sets so the drainers
+     * stop scheduling them. The stream keys retain their TTL so any already-queued entries
+     * drain to DB before the key expires.
+     */
+    @PostConstruct
+    public void cleanupOrphanedSessions() {
+        try {
+            // 1. Remove orphaned sessions from active sets and set TTLs
+            Set<String> orphans = stringRedisTemplate.opsForSet().members(ACTIVE_FEED_SET);
+            if (orphans != null) {
+                for (String sid : orphans) {
+                    if (!sessions.containsKey(sid)) {
+                        stringRedisTemplate.opsForSet().remove(ACTIVE_FEED_SET, sid);
+                        stringRedisTemplate.opsForSet().remove(ACTIVE_TICK_SET,  sid);
+                        stringRedisTemplate.expire(FEED_STREAM_PFX + sid, Duration.ofHours(2));
+                        stringRedisTemplate.expire(TICK_STREAM_PFX + sid, Duration.ofHours(48));
+                        log.info("Orphan session cleanup: sid={} removed from active sets, TTL set", sid);
+                    }
+                }
+            }
+
+            // 2. Enforce TTL on any sma:ticks:* / sma:feed:* key that has no expiry
+            //    (streams written before crash that were never registered in the active set)
+            org.springframework.data.redis.core.ScanOptions scanOpts =
+                    org.springframework.data.redis.core.ScanOptions.scanOptions().match("sma:ticks:*").count(100).build();
+            try (var cursor = stringRedisTemplate.scan(scanOpts)) {
+                cursor.forEachRemaining(key -> {
+                    if (Long.valueOf(-1L).equals(stringRedisTemplate.getExpire(key))) {
+                        stringRedisTemplate.expire(key, Duration.ofHours(48));
+                        log.info("TTL enforced on orphaned tick stream: {}", key);
+                    }
+                });
+            }
+            org.springframework.data.redis.core.ScanOptions feedOpts =
+                    org.springframework.data.redis.core.ScanOptions.scanOptions().match("sma:feed:*").count(100).build();
+            try (var cursor = stringRedisTemplate.scan(feedOpts)) {
+                cursor.forEachRemaining(key -> {
+                    if (stringRedisTemplate.getExpire(key) == -1) {
+                        stringRedisTemplate.expire(key, Duration.ofHours(2));
+                        log.info("TTL enforced on orphaned feed stream: {}", key);
+                    }
+                });
+            }
+        } catch (Exception e) {
+            log.warn("Orphan session cleanup failed (Redis unavailable?): {}", e.getMessage());
+        }
+    }
 
     // ── Public API ────────────────────────────────────────────────────────────
 
@@ -189,13 +255,31 @@ public class OptionsLiveService {
     }
 
     /**
-     * Returns the full candle-event JSON list for a session (active or recently stopped).
-     * Used by save-to-compare to fetch server-side feed instead of relying on client SSE state.
+     * Returns the full candle-event feed for a session as a list of JSON strings.
+     * For active sessions, flushes the Redis stream to DB first (bounded drain).
+     * Assembles from DB chunks — works for both live and completed sessions.
      */
     public List<String> getFeed(String sessionId) {
-        LiveOptionsSession active = sessions.get(sessionId);
-        if (active != null) return active.getFeedList();
-        return completedFeeds.get(sessionId); // null if expired or never ran
+        // Flush any unprocessed events from the Redis stream to DB before reading
+        try {
+            redisFeedDrainer.drainFully(sessionId, 10, Duration.ofSeconds(5));
+        } catch (Exception e) {
+            log.warn("getFeed: drainFully failed for session={}: {}", sessionId, e.getMessage());
+        }
+        String json = sessionPersistenceService.assembleFeedJson(sessionId);
+        if (json == null || json.isBlank() || "[]".equals(json)) return null;
+        try {
+            List<Map<String, Object>> events = objectMapper.readValue(
+                    json, new com.fasterxml.jackson.core.type.TypeReference<>() {});
+            List<String> result = new ArrayList<>(events.size());
+            for (Map<String, Object> ev : events) {
+                result.add(objectMapper.writeValueAsString(ev));
+            }
+            return result;
+        } catch (Exception e) {
+            log.warn("getFeed: failed to parse assembled feed for session={}: {}", sessionId, e.getMessage());
+            return null;
+        }
     }
 
     /**
@@ -208,7 +292,8 @@ public class OptionsLiveService {
         if (sessions.isEmpty()) return;
         for (LiveOptionsSession session : sessions.values()) {
             session.sendHeartbeat();
-            session.flushFeed();   // incremental DB persist — keeps autoSave() batch tiny
+            // Feed persistence is handled by RedisFeedDrainer (@Scheduled every 2s).
+            // No flushFeed() call needed here.
         }
     }
 
@@ -230,17 +315,8 @@ public class OptionsLiveService {
         LiveOptionsSession session = sessions.remove(sessionId);
         if (session != null) {
             session.autoSave("");  // persist feed+trades to DB before the session is GC'd
-            completedFeeds.put(sessionId, session.getFeedList());
-            completedFeedTimes.put(sessionId, Instant.now());
             session.stop();
         }
-    }
-
-    @Scheduled(fixedDelay = 1_800_000) // every 30 min — evict feeds older than 60 min
-    public void cleanupCompletedFeeds() {
-        Instant cutoff = Instant.now().minusSeconds(3600);
-        completedFeedTimes.entrySet().removeIf(e -> e.getValue().isBefore(cutoff));
-        completedFeeds.keySet().retainAll(completedFeedTimes.keySet());
     }
 
     private void persistSnapshot(String sessionId, OptionsLiveRequest req) {
@@ -326,11 +402,6 @@ public class OptionsLiveService {
         private final Deque<String[]> eventBuffer = new ArrayDeque<>(BUFFER_SIZE);
         private final Object bufferLock = new Object();
 
-        // Full candle event history for reliable save-to-compare (unbounded, not a ring buffer).
-        private final List<String> feedList = new ArrayList<>();
-        // Tracks how many feedList entries have already been flushed to DB.
-        private volatile int lastFlushedSize = 0;
-
         // Instrument sets
         final long        niftyToken;
         final Set<Long>   optionTokens = new HashSet<>();
@@ -413,92 +484,53 @@ public class OptionsLiveService {
             broadcast("error", message);
         }
 
-        /** Returns the full candle event history (for save-to-compare). */
-        List<String> getFeedList() { return Collections.unmodifiableList(feedList); }
-
         /**
          * Auto-saves this session's feed, trades, config, and summary to the session_result table.
          * Called on stop (empty label) or at market close (label = "LIVE yyyy-MM-dd").
          *
-         * Feed data is written via incremental flushFeed() calls (heartbeat + final flush here)
-         * so the peak allocation is one small batch, not the full day's JSON at once.
+         * Feed events are persisted continuously by RedisFeedDrainer. This method does a
+         * best-effort final drain and then writes summary metadata from in-memory engine state.
          *
          * @param label  display label; empty string preserves whatever label is already in the row.
          */
         void autoSave(String label) {
-            int feedSize;
-            synchronized (feedList) { feedSize = feedList.size(); }
-            if (feedSize == 0) {
+            if (emittedCount == 0) {
                 log.info("LIVE auto-save skipped (no candles emitted): sessionId={}", sessionId);
                 return;
             }
-            // Flush any candles not yet persisted — after this the DB row has the complete feed.
-            flushFeed();
-            // Update metadata fields (summary, trades, config) in the row that flushFeed() created.
+            // Best-effort flush of any pending Redis stream events to DB before metadata write.
+            // Background drainer continues if this times out — feed chunks are not required for metadata.
+            try {
+                redisFeedDrainer.drainFully(sessionId, 10, Duration.ofSeconds(5));
+            } catch (Exception e) {
+                log.warn("LIVE auto-save: drainFully failed for session={}: {}", sessionId, e.getMessage());
+            }
+            // Build summary from in-memory execution engine state (no feedList read needed).
             try {
                 String closedTradesJson = null;
                 Map<String, Object> summaryMap = new LinkedHashMap<>();
-                try {
-                    String lastEntry;
-                    synchronized (feedList) { lastEntry = feedList.get(feedList.size() - 1); }
-                    Map<String, Object> lastEvt = objectMapper.readValue(
-                            lastEntry, new TypeReference<Map<String, Object>>() {});
-                    Object trades = lastEvt.get("closedTrades");
-                    if (trades != null) closedTradesJson = objectMapper.writeValueAsString(trades);
-                    int tradeCount = trades instanceof List ? ((List<?>) trades).size() : 0;
-                    summaryMap.put("trades",       tradeCount);
-                    summaryMap.put("finalCapital", lastEvt.getOrDefault("capital", 100000));
-                    summaryMap.put("realizedPnl",  lastEvt.getOrDefault("realizedPnl", 0));
-                    summaryMap.put("winRate",      lastEvt.getOrDefault("winRate", 0));
-                } catch (Exception e) {
-                    log.warn("LIVE auto-save: failed to parse last candle event: {}", e.getMessage());
+                if (execEngine != null) {
+                    List<?> trades = execEngine.getClosedTrades();
+                    if (trades != null && !trades.isEmpty()) {
+                        closedTradesJson = objectMapper.writeValueAsString(trades);
+                    }
+                    summaryMap.put("trades",       trades != null ? trades.size() : 0);
+                    summaryMap.put("finalCapital", execEngine.getCapital());
+                    summaryMap.put("realizedPnl",  execEngine.getRealizedPnl());
                 }
                 summaryMap.put("dataEngineSessionId", sessionId);
                 summaryMap.put("sessionEnd",          Instant.now().toString());
 
-                sessionResultRepository.updateMetadata(
+                sessionPersistenceService.updateMetadata(
                         sessionId,
                         closedTradesJson,
                         objectMapper.writeValueAsString(summaryMap),
                         objectMapper.writeValueAsString(req),
                         label);
-                log.info("LIVE auto-saved: sessionId={} candles={} trades={}",
-                        sessionId, feedSize, closedTradesJson != null ? "present" : "none");
+                log.info("LIVE auto-saved: sessionId={} emittedEvents={} trades={}",
+                        sessionId, emittedCount, closedTradesJson != null ? "present" : "none");
             } catch (Exception e) {
                 log.error("LIVE auto-save failed: sessionId={} error={}", sessionId, e.getMessage());
-            }
-        }
-
-        /**
-         * Flushes candle events added since the last flush to the DB via an incremental JSONB append.
-         * Called from the heartbeat scheduler (every 15 s) and from autoSave() on session stop.
-         * Each call only allocates a string for the new batch — never the full day's feed at once.
-         */
-        void flushFeed() {
-            int currentSize;
-            List<String> batch;
-            synchronized (feedList) {
-                currentSize = feedList.size();
-                if (currentSize <= lastFlushedSize) return;
-                batch = new ArrayList<>(feedList.subList(lastFlushedSize, currentSize));
-            }
-            String chunkJson = "[" + String.join(",", batch) + "]";
-            try {
-                sessionResultRepository.appendFeedChunk(
-                        sessionId, userId, req.getBrokerName(),
-                        LocalDate.now().toString(), chunkJson);
-                lastFlushedSize = currentSize;
-                log.debug("LIVE feed flushed: sessionId={} +{} candles (total {})",
-                        sessionId, batch.size(), currentSize);
-                // Notify connected UIs so they can show live sync status
-                try {
-                    String syncJson = objectMapper.writeValueAsString(Map.of(
-                            "flushedAt",    Instant.now().toString(),
-                            "totalCandles", lastFlushedSize));
-                    broadcast("sync", syncJson);
-                } catch (Exception ignored) {}
-            } catch (Exception e) {
-                log.warn("LIVE feed flush failed: sessionId={} error={}", sessionId, e.getMessage());
             }
         }
 
@@ -511,9 +543,10 @@ public class OptionsLiveService {
                     eventBuffer.addLast(new String[]{ eventName, data });
                 }
             }
-            // Persist full candle history server-side for reliable save-to-compare
+            // Persist candle events to Redis Stream → RedisFeedDrainer → session_feed_chunk DB.
+            // No in-memory feedList — hot path is a single XADD (sub-ms).
             if ("candle".equals(eventName)) {
-                synchronized (feedList) { feedList.add(data); }
+                xaddFeedEvent(data);
             }
             if (emitters.isEmpty()) return;
             List<SseEmitter> dead = null;
@@ -525,6 +558,22 @@ public class OptionsLiveService {
                 }
             }
             if (dead != null) emitters.removeAll(dead);
+        }
+
+        /**
+         * Appends a candle event JSON to the Redis feed stream (sma:feed:{sessionId}).
+         * On XADD failure: drops the event and increments metrics. Feed events are derived
+         * state and are intentionally NOT buffered in JVM heap (see plan: Feed-Loss Tradeoff).
+         */
+        private void xaddFeedEvent(String data) {
+            try {
+                stringRedisTemplate.opsForStream().add(
+                        FEED_STREAM_PFX + sessionId, Map.of("data", data));
+            } catch (Exception e) {
+                meterRegistry.counter("redis.feed.write.failures", "sessionId", sessionId).increment();
+                meterRegistry.counter("redis.feed.events.dropped", "sessionId", sessionId).increment();
+                log.warn("LIVE feed XADD failed (session={}): {}", sessionId, e.getMessage());
+            }
         }
 
         // ── constructor ───────────────────────────────────────────────────────
@@ -562,7 +611,8 @@ public class OptionsLiveService {
 
             // Tick recording buffer — only allocated when the user opts in
             tickBuffer = req.isRecordTicks()
-                    ? new LiveTickBuffer(sessionId, req.getBrokerName().toLowerCase(), dataEngineClient)
+                    ? new LiveTickBuffer(sessionId, req.getBrokerName().toLowerCase(),
+                                         stringRedisTemplate, objectMapper, meterRegistry)
                     : null;
         }
 
@@ -634,6 +684,12 @@ public class OptionsLiveService {
             // Phase 1b: pre-warm option candle maps with today's historical data
             // so the selector has price data immediately (before any option ticks arrive)
             warmupOptionCandles();
+
+            // Set up Redis streams and consumer groups BEFORE any XADD can occur.
+            // BUSYGROUP (group already exists) is caught and ignored — idempotent restart.
+            if (!stopped) {
+                setupRedisStreams();
+            }
 
             // Broadcast init event (buffered so reconnecting UIs see it immediately)
             try {
@@ -1157,6 +1213,48 @@ public class OptionsLiveService {
             return Instant.ofEpochMilli(epochMs).atZone(IST).toLocalDateTime();
         }
 
+        /**
+         * Creates Redis Streams + consumer groups for this session, registers the session
+         * in the active sets, and stores session metadata for the feed drainer.
+         * Called once at session start (inside run()), before any XADD occurs.
+         * BUSYGROUP errors (group already exists on idempotent restart) are silently ignored.
+         */
+        private void setupRedisStreams() {
+            String feedKey = FEED_STREAM_PFX + sessionId;
+            String tickKey = TICK_STREAM_PFX + sessionId;
+
+            // XGROUP CREATE ... $ MKSTREAM — creates stream + group atomically
+            try {
+                stringRedisTemplate.opsForStream()
+                        .createGroup(feedKey, ReadOffset.latest(), DRAINER_GROUP);
+                log.debug("Created consumer group {} for stream {}", DRAINER_GROUP, feedKey);
+            } catch (Exception e) {
+                // BUSYGROUP = group already exists (idempotent restart) — safe to ignore
+                log.debug("Feed stream group create skipped ({}): {}", feedKey, e.getMessage());
+            }
+            try {
+                stringRedisTemplate.opsForStream()
+                        .createGroup(tickKey, ReadOffset.latest(), DRAINER_GROUP);
+                log.debug("Created consumer group {} for stream {}", DRAINER_GROUP, tickKey);
+            } catch (Exception e) {
+                log.debug("Tick stream group create skipped ({}): {}", tickKey, e.getMessage());
+            }
+
+            // Register session in active sets so drainers pick it up
+            stringRedisTemplate.opsForSet().add(ACTIVE_FEED_SET, sessionId);
+            stringRedisTemplate.opsForSet().add(ACTIVE_TICK_SET,  sessionId);
+
+            // Store session metadata for the feed drainer (userId, brokerName, sessionDate)
+            String metaKey = RedisFeedDrainer.META_KEY_PFX + sessionId;
+            stringRedisTemplate.opsForHash().put(metaKey, "userId",      userId);
+            stringRedisTemplate.opsForHash().put(metaKey, "brokerName",  req.getBrokerName());
+            stringRedisTemplate.opsForHash().put(metaKey, "sessionDate", LocalDate.now(IST).toString());
+            stringRedisTemplate.expire(metaKey, Duration.ofDays(1));
+
+            log.info("Options live session {}: Redis streams ready (feed={}, tick={})",
+                    sessionId, feedKey, tickKey);
+        }
+
         void stop() {
             stopped = true;
             if (tickFuture != null) tickFuture.cancel(true);
@@ -1164,6 +1262,32 @@ public class OptionsLiveService {
             // Flush any remaining buffered candles/ticks before shutting down
             if (candleBuffer != null) candleBuffer.stop();
             if (tickBuffer  != null) tickBuffer.stop();
+
+            // ── Redis cleanup: SREM → bounded drain → re-queue if partial → TTL ──────
+            // Remove from active set FIRST so background drainer doesn't interfere during drain.
+            // If drain is partial (>2000 remaining feed events), re-add so background drainer
+            // can finish. This remove-then-conditionally-re-add is intentional.
+            try {
+                stringRedisTemplate.opsForSet().remove(ACTIVE_FEED_SET, sessionId);
+                stringRedisTemplate.opsForSet().remove(ACTIVE_TICK_SET,  sessionId);
+
+                boolean fullDrain = redisFeedDrainer.drainFully(sessionId, 10, Duration.ofSeconds(5));
+                if (!fullDrain) {
+                    // Re-queue so background drainer picks up remaining feed entries
+                    stringRedisTemplate.opsForSet().add(ACTIVE_FEED_SET, sessionId);
+                    log.warn("Options live session {}: feed drain incomplete at stop — " +
+                             "re-queued for background drainer", sessionId);
+                }
+
+                // Feed stream: 2h TTL (background drainer finishes well within this)
+                // Tick stream: 48h TTL (Data Engine drainer has more time for persistence)
+                stringRedisTemplate.expire(FEED_STREAM_PFX + sessionId, Duration.ofHours(2));
+                stringRedisTemplate.expire(TICK_STREAM_PFX + sessionId, Duration.ofHours(48));
+                stringRedisTemplate.expire(RedisFeedDrainer.META_KEY_PFX + sessionId, Duration.ofHours(2));
+            } catch (Exception e) {
+                log.warn("Options live session {}: Redis cleanup failed: {}", sessionId, e.getMessage());
+            }
+
             // Complete all connected UI emitters so browsers know the session ended
             for (SseEmitter e : emitters) {
                 try { e.complete(); } catch (Exception ignored) {}

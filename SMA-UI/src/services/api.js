@@ -48,22 +48,36 @@ export async function fetchAllHealthStatuses() {
     { name: 'Strategy Engine',  prefix: STRATEGY,   versionPath: '/api/v1/strategy/version' },
   ];
 
-  return Promise.all(
-    services.map(async (svc) => {
-      const [healthResult, infoResult] = await Promise.allSettled([
-        fetchHealth(svc.prefix),
-        fetchInfo(svc.prefix, svc.versionPath),
-      ]);
-      const health = healthResult.status === 'fulfilled' ? healthResult.value : null;
-      const info   = infoResult.status   === 'fulfilled' ? infoResult.value   : null;
-      const commitId  = null;
-      const buildTime = info?.buildTime || null;
-      const status = health
-        ? (health.status === 'UP' ? 'UP' : 'DEGRADED')
-        : 'DOWN';
-      return { ...svc, status, detail: health, commitId, buildTime, error: healthResult.reason?.message };
-    })
-  );
+  const [serviceResults, redisResult] = await Promise.all([
+    Promise.all(
+      services.map(async (svc) => {
+        const [healthResult, infoResult] = await Promise.allSettled([
+          fetchHealth(svc.prefix),
+          fetchInfo(svc.prefix, svc.versionPath),
+        ]);
+        const health = healthResult.status === 'fulfilled' ? healthResult.value : null;
+        const info   = infoResult.status   === 'fulfilled' ? infoResult.value   : null;
+        const commitId  = null;
+        const buildTime = info?.buildTime || null;
+        const status = health
+          ? (health.status === 'UP' ? 'UP' : 'DEGRADED')
+          : 'DOWN';
+        return { ...svc, status, detail: health, commitId, buildTime, error: healthResult.reason?.message };
+      })
+    ),
+    // Redis health — exposed via /actuator/health/redis group on Strategy Engine
+    Promise.allSettled([request(`${STRATEGY}/actuator/health/redis`)]),
+  ]);
+
+  const redisHealth = redisResult[0].status === 'fulfilled' ? redisResult[0].value : null;
+  const redisStatus = redisHealth
+    ? (redisHealth.status === 'UP' ? 'UP' : 'DEGRADED')
+    : 'DOWN';
+
+  return [
+    ...serviceResults,
+    { name: 'Redis', prefix: STRATEGY, status: redisStatus, detail: redisHealth, buildTime: null, error: redisResult[0].reason?.message },
+  ];
 }
 
 // ─── Broker Auth ──────────────────────────────────────────────────────────────

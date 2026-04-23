@@ -12,10 +12,14 @@ management:
   endpoint:
     health:
       show-details: never
+      group:
+        redis:
+          include: redis
+          show-details: always
   endpoints:
     web:
       exposure:
-        include: health
+        include: health,metrics
 
 logging:
   level:
