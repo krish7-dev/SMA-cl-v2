@@ -25,6 +25,21 @@ public interface SessionFeedChunkRepository extends JpaRepository<SessionFeedChu
     boolean existsBySessionId(String sessionId);
 
     /**
+     * Assembles the full feed JSON array entirely in PostgreSQL.
+     * Explodes each chunk's JSON array into individual elements, re-aggregates them
+     * ordered by chunk id, and returns one JSON array string.
+     * Avoids loading all chunk entities into Java heap (prevents OOM on long sessions).
+     * Returns null if no chunks exist for the session.
+     */
+    @Query(value = """
+            SELECT COALESCE(json_agg(elem ORDER BY c.id ASC)::text, '[]')
+            FROM session_feed_chunk c,
+                 json_array_elements(c.chunk_json::json) AS elem
+            WHERE c.session_id = :sessionId
+            """, nativeQuery = true)
+    String assembleFeedJsonNative(@Param("sessionId") String sessionId);
+
+    /**
      * Idempotent insert used by the Redis-Stream drainer.
      * ON CONFLICT on (session_id, stream_last_id) means a batch that is re-drained
      * after a crash (before XACK was written) is silently skipped.
