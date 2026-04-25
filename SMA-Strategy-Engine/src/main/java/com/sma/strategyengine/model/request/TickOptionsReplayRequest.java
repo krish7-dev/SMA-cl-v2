@@ -22,6 +22,13 @@ public class TickOptionsReplayRequest {
     private LocalDateTime fromDate;            // Optional: replay only ticks at/after this time
     private LocalDateTime toDate;              // Optional: replay only ticks at/before this time
 
+    /**
+     * When false (default) the replay runs in "fast preview" mode:
+     * no candle events are written to session_feed_chunk and autoSave is skipped.
+     * Set to true only when the session should be persisted for Save-to-Compare.
+     */
+    private boolean saveForCompare = false;
+
     // ── Auth (for warmup candle fetch — auto-resolved from Broker Engine if omitted) ──
     private String userId;
     private String brokerName;

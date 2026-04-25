@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import {
   getStrategyTypes, runBacktest,
   liveSubscribe, liveUnsubscribe, liveConnect, liveStatus,
@@ -12031,6 +12031,7 @@ function TickReplayTest() {
   const [fromDate, setFromDate] = useState(() => ls('sma_tick_from',     ''));
   const [toDate,   setToDate]   = useState(() => ls('sma_tick_to',       ''));
   const [speed,              setSpeed]              = useState(() => ls('sma_tick_speed',              '0'));
+  const [saveForCompare,     setSaveForCompare]     = useState(() => ls('sma_tick_save_for_compare',   false));
   const [tradingHoursEnabled, setTradingHoursEnabled] = useState(() => ls('sma_tick_trading_hours_on',  true));
   const [closeoutMins,        setCloseoutMins]        = useState(() => ls('sma_tick_closeout_mins',     '15'));
   const [quantity, setQuantity] = useState(() => ls('sma_tick_qty',      '0'));
@@ -12075,6 +12076,7 @@ function TickReplayTest() {
   useEffect(() => { try { localStorage.setItem('sma_tick_from',              JSON.stringify(fromDate));           } catch {} }, [fromDate]);
   useEffect(() => { try { localStorage.setItem('sma_tick_to',                JSON.stringify(toDate));             } catch {} }, [toDate]);
   useEffect(() => { try { localStorage.setItem('sma_tick_speed',             JSON.stringify(speed));                  } catch {} }, [speed]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_save_for_compare',  JSON.stringify(saveForCompare));         } catch {} }, [saveForCompare]);
   useEffect(() => { try { localStorage.setItem('sma_tick_trading_hours_on',  JSON.stringify(tradingHoursEnabled));    } catch {} }, [tradingHoursEnabled]);
   useEffect(() => { try { localStorage.setItem('sma_tick_closeout_mins',     JSON.stringify(closeoutMins));           } catch {} }, [closeoutMins]);
   useEffect(() => { try { localStorage.setItem('sma_tick_qty',               JSON.stringify(quantity));           } catch {} }, [quantity]);
@@ -12682,6 +12684,7 @@ function TickReplayTest() {
       niftyInstrumentToken: niftyToken ? parseInt(niftyToken, 10) : undefined,
       niftySymbol: niftySymbol || 'NIFTY 50', niftyExchange: niftyExchange || 'NSE',
       quantity: parseInt(quantity, 10) || 0, initialCapital: parseFloat(capital) || 100000, speedMultiplier: parseFloat(speed) || 0,
+      saveForCompare,
       ceOptions: cePool.filter(i => i.instrumentToken).map(i => ({ instrumentToken: parseInt(i.instrumentToken, 10), tradingSymbol: i.symbol, exchange: i.exchange })),
       peOptions: pePool.filter(i => i.instrumentToken).map(i => ({ instrumentToken: parseInt(i.instrumentToken, 10), tradingSymbol: i.symbol, exchange: i.exchange })),
       strategies: enabledStrats,
@@ -13126,6 +13129,14 @@ function TickReplayTest() {
           <div className="bt-form-grid">
             <div className="form-group"><label>Interval</label><select value={interval} onChange={e => setInterval(e.target.value)} disabled={isRunning}>{OPT_INTERVALS.map(([v,l]) => <option key={v} value={v}>{l}</option>)}</select></div>
             <div className="form-group"><label title="0 = max speed, 1 = real-time, 2 = 2× faster than real time">Speed Multiplier</label><input type="number" min="0" step="0.1" value={speed} onChange={e => setSpeed(e.target.value)} disabled={isRunning} /></div>
+            <div className="form-group">
+              <label title="Persist candle feed to DB during replay — required if you want to save this session for Compare tab. Leave off for fast preview runs.">Save for Compare</label>
+              <button type="button" className={`btn-sm ${saveForCompare ? 'btn-primary' : 'btn-secondary'}`}
+                onClick={() => setSaveForCompare(v => !v)} disabled={isRunning}>
+                {saveForCompare ? 'ON' : 'OFF'}
+              </button>
+              {saveForCompare && <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 6 }}>Feed will be persisted — replay may be slower</span>}
+            </div>
             <div className="form-group"><label title="Days of NIFTY candles to load before the session — primes indicators and regime (0 = cold start)">Warmup Days</label><input type="number" min="0" max="30" value={warmupDays} onChange={e => setWarmupDays(e.target.value)} disabled={isRunning} /></div>
 
             <div className="form-group"><label title="Broker name for warmup candle fetch">Broker (warmup)</label><select value={brokerName} onChange={e => setBrokerName(e.target.value)} disabled={isRunning}><option value="kite">Kite</option><option value="">Auto</option></select></div>
@@ -13649,18 +13660,16 @@ function SessionCompare() {
     setDeleting(null);
   }
 
-  // ── Parse stored JSON blobs ───────────────────────────────────────────────
-  function parseFeed(r)    { try { return r?.feedJson         ? JSON.parse(r.feedJson)         : []; } catch { return []; } }
-  function parseTrades(r)  { try { return r?.closedTradesJson ? JSON.parse(r.closedTradesJson) : []; } catch { return []; } }
-  function parseTicks(r)   { return []; } // ticks now fetched from Data Engine — see handleCompare
-  function parseSummary(r) { try { return r?.summaryJson      ? JSON.parse(r.summaryJson)      : null; } catch { return null; } }
-  function parseConfig(r)  { try { return r?.configJson       ? JSON.parse(r.configJson)       : null; } catch { return null; } }
-
-  const feedA   = parseFeed(resultA),   feedB   = parseFeed(resultB);
-  const tradesA = parseTrades(resultA), tradesB = parseTrades(resultB);
-  // ticksA / ticksB are now state, fetched in handleCompare from Data Engine
-  const sumA    = parseSummary(resultA),sumB    = parseSummary(resultB);
-  const cfgA    = parseConfig(resultA), cfgB    = parseConfig(resultB);
+  // ── Parse stored JSON blobs (memoized — avoid re-parsing on every tab switch) ─
+  const feedA   = useMemo(() => { try { return resultA?.feedJson         ? JSON.parse(resultA.feedJson)         : []; } catch { return []; } }, [resultA]);
+  const feedB   = useMemo(() => { try { return resultB?.feedJson         ? JSON.parse(resultB.feedJson)         : []; } catch { return []; } }, [resultB]);
+  const tradesA = useMemo(() => { try { return resultA?.closedTradesJson ? JSON.parse(resultA.closedTradesJson) : []; } catch { return []; } }, [resultA]);
+  const tradesB = useMemo(() => { try { return resultB?.closedTradesJson ? JSON.parse(resultB.closedTradesJson) : []; } catch { return []; } }, [resultB]);
+  const sumA    = useMemo(() => { try { return resultA?.summaryJson      ? JSON.parse(resultA.summaryJson)      : null; } catch { return null; } }, [resultA]);
+  const sumB    = useMemo(() => { try { return resultB?.summaryJson      ? JSON.parse(resultB.summaryJson)      : null; } catch { return null; } }, [resultB]);
+  const cfgA    = useMemo(() => { try { return resultA?.configJson       ? JSON.parse(resultA.configJson)       : null; } catch { return null; } }, [resultA]);
+  const cfgB    = useMemo(() => { try { return resultB?.configJson       ? JSON.parse(resultB.configJson)       : null; } catch { return null; } }, [resultB]);
+  // ticksA / ticksB are state, fetched in handleCompare from Data Engine
 
   // ── Comparison tolerances — tune to adjust matching sensitivity ───────────
   const TICK_TOL_MS    = 2000;          // ±2 s  : network/replay jitter
@@ -13671,7 +13680,7 @@ function SessionCompare() {
   // ── 1. Tick comparison ───────────────────────────────────────────────────
   // Strategy: group by token, sort by timeMs, greedy nearest-neighbour match
   // within TICK_TOL_MS. Each tick is consumed at most once.
-  const tickComparison = (() => {
+  const tickComparison = useMemo(() => {
     if (!ticksA.length && !ticksB.length) return { rows: [], stats: {}, matchPct: null };
     const groupA = new Map(), groupB = new Map();
     for (const t of ticksA) { if (!groupA.has(t.token)) groupA.set(t.token, []); groupA.get(t.token).push(t); }
@@ -13720,13 +13729,13 @@ function SessionCompare() {
     const tot = ticksA.length + ticksB.length;
     const matchPct = tot > 0 ? (totalMatched * 2 / tot * 100).toFixed(1) : null;
     return { rows, stats, matchPct };
-  })();
+  }, [ticksA, ticksB]);
 
   // ── 2. Candle comparison ─────────────────────────────────────────────────
   // Strategy: exact lookup by niftyTime ISO string. OHLC compared with OHLC_TOL.
   // Partial start buckets: first candle of A or B that the other session doesn't have
   // (caused by LIVE attaching mid-bucket). Marked PARTIAL_START_BUCKET for optional exclusion.
-  const candleComparison = (() => {
+  const candleComparison = useMemo(() => {
     if (!feedA.length && !feedB.length) return { rows: [], stats: null, partialBuckets: new Set() };
     const mapA = new Map(feedA.map(e => [e.niftyTime, e]));
     const mapB = new Map(feedB.map(e => [e.niftyTime, e]));
@@ -13759,11 +13768,11 @@ function SessionCompare() {
     const total = scored.length;
     // aCount/bCount = unique niftyTime buckets per feed (not raw feed entry count)
     return { rows, scored, partialBuckets, stats: { total, exact, mismatch, aOnly, bOnly, partial, aCount: mapA.size, bCount: mapB.size, matchPct: total > 0 ? (exact/total*100).toFixed(1) : null } };
-  })();
+  }, [feedA, feedB, skipPartialBucket]);
 
   // ── 3. Signal comparison ─────────────────────────────────────────────────
   // Strategy: same time-key as candle comparison. Compares decision-layer fields.
-  const signalComparison = (() => {
+  const signalComparison = useMemo(() => {
     if (!feedA.length && !feedB.length) return { rows: [], stats: null };
     const mapA = new Map(feedA.map(e => [e.niftyTime, e]));
     const mapB = new Map(feedB.map(e => [e.niftyTime, e]));
@@ -13790,12 +13799,12 @@ function SessionCompare() {
     const bOnly      = scored.filter(r => r.matchType === 'B_ONLY').length;
     const total = scored.length;
     return { rows, scored, stats: { total, matched, mismatch, aOnly, bOnly, aCount: mapA.size, bCount: mapB.size, matchPct: total > 0 ? (matched/total*100).toFixed(1) : null } };
-  })();
+  }, [feedA, feedB, candleComparison.partialBuckets, skipPartialBucket]);
 
   // ── 4. Trade comparison ──────────────────────────────────────────────────
   // Strategy: greedy nearest entryTime match within TRADE_TOL_MS. Each trade consumed once.
   // Flags entryPriceMismatch / exitPriceMismatch / exitReasonMismatch on BOTH rows.
-  const tradeComparison = (() => {
+  const tradeComparison = useMemo(() => {
     if (!tradesA.length && !tradesB.length) return { rows: [], stats: null };
     const usedB = new Set();
     const rows = [];
@@ -13830,10 +13839,10 @@ function SessionCompare() {
     const tot = tradesA.length + tradesB.length;
     return { rows, stats: { total: rows.length, both, aOnly, bOnly, priceMismatch,
                             matchPct: tot > 0 ? (both*2/tot*100).toFixed(1) : null } };
-  })();
+  }, [tradesA, tradesB]);
 
   // ── 5. Config diff ───────────────────────────────────────────────────────
-  const configDiff = (() => {
+  const configDiff = useMemo(() => {
     if (!cfgA || !cfgB) return [];
     function flat(obj, prefix) {
       return Object.entries(obj || {}).flatMap(([k, v]) => {
@@ -13847,13 +13856,13 @@ function SessionCompare() {
       .filter(k => String(mA[k] ?? '') !== String(mB[k] ?? ''))
       .map(k => ({ key: k, valA: mA[k], valB: mB[k] }))
       .sort((x,y) => x.key.localeCompare(y.key));
-  })();
+  }, [cfgA, cfgB]);
 
   // ── 6. Divergence trace ──────────────────────────────────────────────────
   // Walks the comparison chain (TICK → CANDLE → SIGNAL → TRADE) and reports
   // the first point of divergence at each stage that was detected.
   // Partial-start buckets are excluded when skipPartialBucket is on.
-  const divergenceTrace = (() => {
+  const divergenceTrace = useMemo(() => {
     const stages = [];
     const firstTickDiv = tickComparison.rows.find(r => r.matchType !== 'MATCHED');
     if (firstTickDiv) stages.push({
@@ -13900,7 +13909,7 @@ function SessionCompare() {
     });
     stages.sort((x,y) => x.seqNo - y.seqNo);
     return { stages, firstStage: stages[0] || null };
-  })();
+  }, [tickComparison, candleComparison, signalComparison, tradeComparison, skipPartialBucket]);
 
   const hasResults = resultA && resultB;
   const labelA = resultA?.label || resultA?.sessionDate || 'A';

@@ -593,10 +593,13 @@ public class OptionsLiveService {
             cePool = ce;
             pePool = pe;
 
-            for (OptionsReplayRequest.OptionCandidate c : ce) {
+            // Backfill optionType from pool position — UI may not set it explicitly
+            for (OptionsReplayRequest.OptionCandidate c : cePool) {
+                if (c.getOptionType() == null) c.setOptionType("CE");
                 if (c.getInstrumentToken() != null) optionTokens.add(c.getInstrumentToken());
             }
-            for (OptionsReplayRequest.OptionCandidate c : pe) {
+            for (OptionsReplayRequest.OptionCandidate c : pePool) {
+                if (c.getOptionType() == null) c.setOptionType("PE");
                 if (c.getInstrumentToken() != null) optionTokens.add(c.getInstrumentToken());
             }
             // Initialise a sorted-map slot per option token so the selector finds the map
