@@ -180,6 +180,11 @@ public class TickOptionsReplayService {
 
         volatile boolean stopped = false;
 
+        // Captured at run() completion — used by autoSave() since execEngine is local to run()
+        volatile String finalClosedTradesJson;
+        volatile double finalRealizedPnl;
+        volatile double finalCapital = 100_000.0;
+
         // ── emitter management ────────────────────────────────────────────────
 
         void addEmitter(SseEmitter e)    { emitters.add(e); }
@@ -231,7 +236,7 @@ public class TickOptionsReplayService {
         }
 
         void autoSave() {
-            // Flush any remaining buffered events to DB
+            if (!req.isSaveForCompare()) return;
             persistChunk();
 
             if (emittedChunks == 0) {
@@ -244,9 +249,11 @@ public class TickOptionsReplayService {
                 summaryMap.put("dataEngineSessionId", req.getSessionId());
                 summaryMap.put("fromDate",            req.getFromDate());
                 summaryMap.put("toDate",              req.getToDate());
+                summaryMap.put("realizedPnl",         finalRealizedPnl);
+                summaryMap.put("finalCapital",        finalCapital);
                 summaryMap.put("sessionEnd",          Instant.now().toString());
                 sessionPersistenceService.updateMetadata(
-                        sessionId, null,
+                        sessionId, finalClosedTradesJson,
                         objectMapper.writeValueAsString(summaryMap),
                         objectMapper.writeValueAsString(req), "");
                 log.info("TICK_REPLAY auto-saved: sessionId={} chunks={}", sessionId, emittedChunks);
@@ -262,8 +269,8 @@ public class TickOptionsReplayService {
                     eventBuffer.addLast(new String[]{ eventName, data });
                 }
             }
-            // Persist candle events to DB in batches for reliable save-to-compare
-            if ("candle".equals(eventName)) {
+            // Persist candle events to DB in batches — only when saveForCompare is requested
+            if (req.isSaveForCompare() && "candle".equals(eventName)) {
                 chunkBuffer.add(data);
                 if (chunkBuffer.size() >= CHUNK_SIZE) {
                     persistChunk();
@@ -527,6 +534,17 @@ public class TickOptionsReplayService {
                     && !ticks.isEmpty()) {
                 LocalDateTime lastTime = toLDT(ticks.get(ticks.size() - 1).tickTimeMs());
                 execEngine.forceClose(selectorService, lastTime);
+            }
+
+            // Capture final state so autoSave() can use it (execEngine is local to run())
+            if (req.isSaveForCompare()) {
+                try {
+                    finalClosedTradesJson = objectMapper.writeValueAsString(execEngine.getClosedTrades());
+                    finalRealizedPnl      = execEngine.getRealizedPnl();
+                    finalCapital          = execEngine.getCapital();
+                } catch (Exception e) {
+                    log.warn("Tick replay {}: failed to capture final state for save: {}", sessionId, e.getMessage());
+                }
             }
 
             // ── 6. Summary ────────────────────────────────────────────────────
