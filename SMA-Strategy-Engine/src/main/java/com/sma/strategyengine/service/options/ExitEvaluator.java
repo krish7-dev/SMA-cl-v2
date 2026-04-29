@@ -69,8 +69,9 @@ public class ExitEvaluator {
     /** True when TRENDING regime + peak pnl has cleared trendStrongModeThresholdPct. */
     @Getter private boolean inStrongTrendMode  = false;
 
-    private double entryScore       = 0.0;
-    private double entryOptionPrice = 0.0;
+    private double  entryScore          = 0.0;
+    private double  entryOptionPrice    = 0.0;
+    private boolean breakevenActivated  = false;
 
     private final Deque<CandleDto>                niftyWindow = new ArrayDeque<>();
     private final OptionsReplayRequest.ExitConfig ec;
@@ -91,6 +92,7 @@ public class ExitEvaluator {
         this.barsNegative       = 0;
         this.inHoldZone         = true;   // always start in hold zone
         this.inStrongTrendMode  = false;
+        this.breakevenActivated = false;
         this.niftyWindow.clear();
     }
 
@@ -142,6 +144,14 @@ public class ExitEvaluator {
         // Always update ratchet so the floor is ready when hold zone is cleared
         updateProfitLock(currentPnlPct);
 
+        // Activate breakeven protection once peak has reached the trigger threshold
+        if (ec.isBreakevenProtectionEnabled() && !breakevenActivated
+                && peakPnlPct >= ec.getBreakevenTriggerPct()) {
+            breakevenActivated = true;
+            log.info("[EXIT] Breakeven activated: favorableMovePct={}%",
+                    String.format("%.2f", peakPnlPct));
+        }
+
         double exitPx = currentOptPx;
 
         // ════════════════════════════════════════════════════════════════════
@@ -151,7 +161,7 @@ public class ExitEvaluator {
             double slPx = entryOptionPrice * (1 - ec.getHardStopPct() / 100.0);
             log.debug("EXIT P1 HARD_STOP pnl={}% <= -{}%",
                     String.format("%.2f", currentPnlPct), ec.getHardStopPct());
-            return new ExitSignal("HARD_STOP_LOSS", Math.min(exitPx, slPx), DesiredSideHint.NONE, true);
+            return applyBreakeven(new ExitSignal("HARD_STOP_LOSS", Math.min(exitPx, slPx), DesiredSideHint.NONE, true));
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -162,7 +172,7 @@ public class ExitEvaluator {
         if (profitLockFloor > Double.NEGATIVE_INFINITY && currentPnlPct < profitLockFloor) {
             log.debug("EXIT P2 PROFIT_LOCK_HIT pnl={}% < floor={}%",
                     String.format("%.2f", currentPnlPct), String.format("%.2f", profitLockFloor));
-            return new ExitSignal("PROFIT_LOCK_HIT", exitPx, DesiredSideHint.NONE, false);
+            return applyBreakeven(new ExitSignal("PROFIT_LOCK_HIT", exitPx, DesiredSideHint.NONE, false));
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -182,7 +192,7 @@ public class ExitEvaluator {
                         barsInTrade,
                         String.format("%.2f", currentPnlPct),
                         ec.getDeadTradePnlPct());
-                return new ExitSignal("DEAD_TRADE", exitPx, DesiredSideHint.NONE, false);
+                return applyBreakeven(new ExitSignal("DEAD_TRADE", exitPx, DesiredSideHint.NONE, false));
             }
             log.trace("HOLD_ZONE pnl={}% < {}% — waiting for zone break",
                     String.format("%.2f", currentPnlPct), ec.getHoldZonePct());
@@ -218,13 +228,13 @@ public class ExitEvaluator {
                         && confirmedBias == NiftyDecisionResult.Bias.BEARISH) {
                     log.debug("EXIT P5c STRONG_TREND_BIAS_REVERSAL LONG_CALL bearish score={}",
                             String.format("%.1f", currentScore));
-                    return new ExitSignal("BIAS_REVERSAL_STRONG", exitPx, DesiredSideHint.PE, false);
+                    return applyBreakeven(new ExitSignal("BIAS_REVERSAL_STRONG", exitPx, DesiredSideHint.PE, false));
                 }
                 if (positionType == OptionExecutionEngine.PositionState.LONG_PUT
                         && confirmedBias == NiftyDecisionResult.Bias.BULLISH) {
                     log.debug("EXIT P5c STRONG_TREND_BIAS_REVERSAL LONG_PUT bullish score={}",
                             String.format("%.1f", currentScore));
-                    return new ExitSignal("BIAS_REVERSAL_STRONG", exitPx, DesiredSideHint.CE, false);
+                    return applyBreakeven(new ExitSignal("BIAS_REVERSAL_STRONG", exitPx, DesiredSideHint.CE, false));
                 }
             }
             log.trace("STRONG_TREND_MODE — suppressing all non-trail exits pnl={}%",
@@ -251,7 +261,7 @@ public class ExitEvaluator {
                 if (niftyClose < support) {
                     log.debug("EXIT P4 STRUCTURE_FAILURE_SUPPORT close={} < support={}",
                             String.format("%.2f", niftyClose), String.format("%.2f", support));
-                    return new ExitSignal("STRUCTURE_FAILURE_SUPPORT", exitPx, DesiredSideHint.NONE, false);
+                    return applyBreakeven(new ExitSignal("STRUCTURE_FAILURE_SUPPORT", exitPx, DesiredSideHint.NONE, false));
                 }
             }
             if (positionType == OptionExecutionEngine.PositionState.LONG_PUT) {
@@ -262,7 +272,7 @@ public class ExitEvaluator {
                 if (niftyClose > resistance) {
                     log.debug("EXIT P4 STRUCTURE_FAILURE_RESISTANCE close={} > resistance={}",
                             String.format("%.2f", niftyClose), String.format("%.2f", resistance));
-                    return new ExitSignal("STRUCTURE_FAILURE_RESISTANCE", exitPx, DesiredSideHint.NONE, false);
+                    return applyBreakeven(new ExitSignal("STRUCTURE_FAILURE_RESISTANCE", exitPx, DesiredSideHint.NONE, false));
                 }
             }
         }
@@ -281,13 +291,13 @@ public class ExitEvaluator {
                         && confirmedBias == NiftyDecisionResult.Bias.BEARISH) {
                     log.debug("EXIT P5c BIAS_REVERSAL LONG_CALL bearish score={}",
                             String.format("%.1f", currentScore));
-                    return new ExitSignal("BIAS_REVERSAL", exitPx, DesiredSideHint.PE, false);
+                    return applyBreakeven(new ExitSignal("BIAS_REVERSAL", exitPx, DesiredSideHint.PE, false));
                 }
                 if (positionType == OptionExecutionEngine.PositionState.LONG_PUT
                         && confirmedBias == NiftyDecisionResult.Bias.BULLISH) {
                     log.debug("EXIT P5c BIAS_REVERSAL LONG_PUT bullish score={}",
                             String.format("%.1f", currentScore));
-                    return new ExitSignal("BIAS_REVERSAL", exitPx, DesiredSideHint.CE, false);
+                    return applyBreakeven(new ExitSignal("BIAS_REVERSAL", exitPx, DesiredSideHint.CE, false));
                 }
             }
         }
@@ -302,7 +312,7 @@ public class ExitEvaluator {
                 && !everProfitable
                 && barsInTrade >= ec.getMaxBarsNoImprovement()) {
             log.debug("EXIT P6a TIME_NO_IMPROVEMENT bars={}", barsInTrade);
-            return new ExitSignal("TIME_NO_IMPROVEMENT", exitPx, DesiredSideHint.NONE, false);
+            return applyBreakeven(new ExitSignal("TIME_NO_IMPROVEMENT", exitPx, DesiredSideHint.NONE, false));
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -316,7 +326,7 @@ public class ExitEvaluator {
                 && currentPnlPct > 0) {
             log.debug("EXIT P6b TIME_STAGNATION noNewHighBars={} pnl={}%",
                     barsWithoutNewHigh, String.format("%.2f", currentPnlPct));
-            return new ExitSignal("TIME_STAGNATION", exitPx, DesiredSideHint.NONE, false);
+            return applyBreakeven(new ExitSignal("TIME_STAGNATION", exitPx, DesiredSideHint.NONE, false));
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -324,7 +334,7 @@ public class ExitEvaluator {
         // ════════════════════════════════════════════════════════════════════
         if (isRanging && ec.getMaxBarsRanging() > 0 && barsInTrade >= ec.getMaxBarsRanging()) {
             log.debug("EXIT P6c RANGING_TIME_LIMIT bars={} >= {}", barsInTrade, ec.getMaxBarsRanging());
-            return new ExitSignal("RANGING_TIME_LIMIT", exitPx, DesiredSideHint.NONE, false);
+            return applyBreakeven(new ExitSignal("RANGING_TIME_LIMIT", exitPx, DesiredSideHint.NONE, false));
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -336,7 +346,7 @@ public class ExitEvaluator {
                 && currentPnlPct < ec.getDeadTradePnlPct()) {
             log.debug("EXIT P6d DEAD_TRADE bars={} pnl={}% < {}%",
                     barsInTrade, String.format("%.2f", currentPnlPct), ec.getDeadTradePnlPct());
-            return new ExitSignal("DEAD_TRADE", exitPx, DesiredSideHint.NONE, false);
+            return applyBreakeven(new ExitSignal("DEAD_TRADE", exitPx, DesiredSideHint.NONE, false));
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -350,10 +360,23 @@ public class ExitEvaluator {
                 && barsNegative >= ec.getNoHopeBars()) {
             log.debug("EXIT P7 NO_HOPE pnl={}% barsNeg={}",
                     String.format("%.2f", currentPnlPct), barsNegative);
-            return new ExitSignal("NO_HOPE", exitPx, DesiredSideHint.NONE, false);
+            return applyBreakeven(new ExitSignal("NO_HOPE", exitPx, DesiredSideHint.NONE, false));
         }
 
         return null; // HOLD
+    }
+
+    // ── Breakeven protection override ────────────────────────────────────────
+
+    private ExitSignal applyBreakeven(ExitSignal signal) {
+        if (signal == null || !breakevenActivated) return signal;
+        double floor = entryOptionPrice * (1.0 + ec.getBreakevenOffsetPct() / 100.0);
+        if (signal.exitPx < floor) {
+            log.info("[EXIT] Breakeven protection applied: originalExitPrice={}, adjustedExitPrice={}, reason={}",
+                    String.format("%.2f", signal.exitPx), String.format("%.2f", floor), signal.reason);
+            return new ExitSignal(signal.reason, floor, signal.desiredSide, signal.allowedInHold);
+        }
+        return signal;
     }
 
     // ── Profit lock ratchet (one-way — never decreases) ──────────────────────

@@ -148,6 +148,7 @@ public class OptionsReplayRequest {
         private boolean enabled               = false;
         private boolean rangingNoTrade        = false;
         private boolean volatileNoTrade       = false;
+        private boolean compressionNoTrade    = false;
         private boolean noSameCandleReversal  = false;
     }
 
@@ -332,6 +333,11 @@ public class OptionsReplayRequest {
         // P7 — No-hope (non-TRENDING only)
         private double noHopeThresholdPct        = 1.5;
         private int    noHopeBars                = 2;
+
+        // Breakeven Protection — once favorable move >= trigger, exit price is floored at entry
+        private boolean breakevenProtectionEnabled = true;
+        private double  breakevenTriggerPct        = 2.0;
+        private double  breakevenOffsetPct         = 0.0;
     }
 
     // Penalty config — master on/off + per-penalty on/off and value overrides
@@ -380,6 +386,71 @@ public class OptionsReplayRequest {
 
         private boolean rangeSizeEnabled         = true;   // covers TOO_NARROW / TOO_WIDE
         private double  rangeSizePenalty         = 2.0;
+    }
+
+    // Minimum movement filter — block entries when price barely moved
+    private MinMovementFilterConfig minMovementFilterConfig = new MinMovementFilterConfig();
+
+    @Data
+    public static class MinMovementFilterConfig {
+        /** Enable/disable the filter. When disabled, all entries are allowed regardless of movement. */
+        private boolean enabled                       = false;
+        /** Number of closed candles to look back when computing movement. */
+        private int     minMovementLookbackCandles    = 3;
+        /** Block entry if abs((latestClose - oldestClose) / oldestClose * 100) < this. */
+        private double  minMovementThresholdPercent   = 1.0;
+    }
+
+    // Directional consistency filter — block entries when recent candles are choppy
+    private DirectionalConsistencyFilterConfig directionalConsistencyFilterConfig = new DirectionalConsistencyFilterConfig();
+
+    @Data
+    public static class DirectionalConsistencyFilterConfig {
+        /** Enable/disable the filter. */
+        private boolean enabled                              = false;
+        /** Number of recent closed candles to examine. */
+        private int     directionalConsistencyLookbackCandles = 3;
+        /** Minimum candles in the trade direction required to allow entry. */
+        private int     minSameDirectionCandles              = 2;
+    }
+
+    // Candle strength filter — block entries when recent candles have weak bodies / large wicks
+    private CandleStrengthFilterConfig candleStrengthFilterConfig = new CandleStrengthFilterConfig();
+
+    @Data
+    public static class CandleStrengthFilterConfig {
+        /** Enable/disable the filter. */
+        private boolean enabled                   = false;
+        /** Number of recent closed candles to examine. */
+        private int     candleStrengthLookbackCandles = 3;
+        /** bodyRatio threshold: a candle is "strong" if abs(close-open)/(high-low) >= this. */
+        private double  minAverageBodyRatio        = 0.50;
+        /** Minimum count of strong candles required to allow entry. */
+        private int     minStrongCandlesRequired   = 2;
+    }
+
+    // No new trades after time — block new entries once the candle time reaches the cutoff
+    private NoNewTradesAfterTimeConfig noNewTradesAfterTimeConfig = new NoNewTradesAfterTimeConfig();
+
+    @Data
+    public static class NoNewTradesAfterTimeConfig {
+        private boolean enabled                = false;
+        /** HH:mm cutoff — any candle at or after this time will not open a new trade. */
+        private String  noNewTradesAfterTime   = "14:45";
+    }
+
+    // Stop loss cascade protection
+    private StopLossCascadeProtectionConfig stopLossCascadeProtectionConfig = new StopLossCascadeProtectionConfig();
+
+    @Data
+    public static class StopLossCascadeProtectionConfig {
+        private boolean      enabled                = false;
+        private int          cascadeStopLossCount   = 2;
+        private int          cascadeWindowMinutes   = 30;
+        private int          cascadePauseMinutes    = 30;
+        private List<String> cascadeExitReasons     = java.util.List.of("HARD_STOP_LOSS");
+        private boolean      cascadeApplyPerSymbol  = false;
+        private boolean      cascadeApplyPerSide    = false;
     }
 
     private int     speedMultiplier = 1;

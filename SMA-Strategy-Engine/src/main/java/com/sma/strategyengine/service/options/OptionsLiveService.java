@@ -800,9 +800,17 @@ public class OptionsLiveService {
                     Optional.ofNullable(req.getCompressionEntryConfig()).orElse(new OptionsReplayRequest.CompressionEntryConfig());
             OptionsReplayRequest.PenaltyConfig pc =
                     Optional.ofNullable(req.getPenaltyConfig()).orElse(new OptionsReplayRequest.PenaltyConfig());
+            OptionsReplayRequest.MinMovementFilterConfig mmfc =
+                    Optional.ofNullable(req.getMinMovementFilterConfig()).orElse(new OptionsReplayRequest.MinMovementFilterConfig());
+            OptionsReplayRequest.DirectionalConsistencyFilterConfig dcfc =
+                    Optional.ofNullable(req.getDirectionalConsistencyFilterConfig()).orElse(new OptionsReplayRequest.DirectionalConsistencyFilterConfig());
+            OptionsReplayRequest.CandleStrengthFilterConfig csfc =
+                    Optional.ofNullable(req.getCandleStrengthFilterConfig()).orElse(new OptionsReplayRequest.CandleStrengthFilterConfig());
 
+            OptionsReplayRequest.StopLossCascadeProtectionConfig slcpc =
+                    Optional.ofNullable(req.getStopLossCascadeProtectionConfig()).orElse(new OptionsReplayRequest.StopLossCascadeProtectionConfig());
             decisionEngine  = new NiftyDecisionEngine(
-                    strategyRegistry, req.getStrategies(), dc, sc, rr, rsr, cr, rqc, tqc, tec, cec, pc);
+                    strategyRegistry, req.getStrategies(), dc, sc, rr, rsr, cr, rqc, tqc, tec, cec, pc, mmfc, dcfc, csfc, null, slcpc);
 
             // Pass live map by reference — new candles added to liveOptionCandles are visible immediately
             selectorService = OptionSelectorService.forLive(sel, liveOptionCandles);
@@ -1101,6 +1109,13 @@ public class OptionsLiveService {
                     // TRADING, or in-position during CLOSING (manage/exit)
                     action = execEngine.process(decision, selectorService,
                             cePool, pePool, niftyClose, openTime, snapshot);
+                }
+
+                // Notify decision engine of any cascade-eligible exit
+                if (execEngine.getLastExitReason() != null) {
+                    java.util.List<com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade> ct = execEngine.getClosedTrades();
+                    String exitSide = ct.isEmpty() ? null : ct.get(ct.size() - 1).getOptionType();
+                    decisionEngine.recordCascadeExit(execEngine.getLastExitReason(), "NIFTY", exitSide, openTime);
                 }
 
                 emittedCount++;
@@ -1498,6 +1513,9 @@ public class OptionsLiveService {
         } else if (rules.isVolatileNoTrade() && "VOLATILE".equals(regime)) {
             decision.setEntryAllowed(false);
             decision.setBlockReason("trading rule: no trade in VOLATILE");
+        } else if (rules.isCompressionNoTrade() && "COMPRESSION".equals(regime)) {
+            decision.setEntryAllowed(false);
+            decision.setBlockReason("trading rule: no trade in COMPRESSION");
         }
     }
 

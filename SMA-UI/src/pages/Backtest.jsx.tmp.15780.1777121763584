@@ -1086,23 +1086,17 @@ function OptionsLiveTest() {
   const [holdConfig,          setHoldConfig]          = useState(() => ({ ...DEFAULT_HOLD,           ...ls('sma_live_opts_hold_config',    {}) }));
   const [exitConfig,          setExitConfig]          = useState(() => ({ ...DEFAULT_EXIT_CONFIG,    ...ls('sma_live_opts_exit_config',    {}) }));
   const [penaltyConfig,       setPenaltyConfig]       = useState(() => ({ ...DEFAULT_PENALTY_CONFIG, ...ls('sma_live_opts_penalty_config',  {}) }));
-  const [minMovementFilter,              setMinMovementFilter]              = useState(() => ls('sma_live_opts_min_movement_filter',              DEFAULT_MIN_MOVEMENT_FILTER));
-  const [directionalConsistencyFilter,   setDirectionalConsistencyFilter]   = useState(() => ls('sma_live_opts_directional_consistency_filter',   DEFAULT_DIRECTIONAL_CONSISTENCY_FILTER));
-  const [candleStrengthFilter,           setCandleStrengthFilter]           = useState(() => ls('sma_live_opts_candle_strength_filter',           DEFAULT_CANDLE_STRENGTH_FILTER));
-  const [cascadeProtection,              setCascadeProtection]              = useState(() => ls('sma_live_opts_cascade_protection',              DEFAULT_CASCADE_PROTECTION));
+  const [minMovementFilter,   setMinMovementFilter]   = useState(() => ls('sma_live_opts_min_movement_filter', DEFAULT_MIN_MOVEMENT_FILTER));
 
-  function updateOptsRisk(key, val)                    { setOptsRisk(p                      => ({ ...p, [key]: val })); }
-  function updateRangeQuality(key, val)                { setRangeQuality(p                  => ({ ...p, [key]: val })); }
-  function updateHoldConfig(key, val)                  { setHoldConfig(p                    => ({ ...p, [key]: val })); }
-  function updateExitConfig(key, val)                  { setExitConfig(p                    => ({ ...p, [key]: val })); }
-  function updatePenaltyConfig(key, val)               { setPenaltyConfig(p                 => ({ ...p, [key]: val })); }
-  function updateTradeQuality(key, val)                { setTradeQuality(p                  => ({ ...p, [key]: val })); }
-  function updateTrendEntry(key, val)                  { setTrendEntry(p                    => ({ ...p, [key]: val })); }
-  function updateCompressionEntry(key, val)            { setCompressionEntry(p              => ({ ...p, [key]: val })); }
-  function updateCascadeProtection(key, val)           { setCascadeProtection(p             => ({ ...p, [key]: val })); }
-  function updateMinMovementFilter(key, val)           { setMinMovementFilter(p             => ({ ...p, [key]: val })); }
-  function updateDirectionalConsistencyFilter(key, val){ setDirectionalConsistencyFilter(p  => ({ ...p, [key]: val })); }
-  function updateCandleStrengthFilter(key, val)        { setCandleStrengthFilter(p          => ({ ...p, [key]: val })); }
+  function updateOptsRisk(key, val)           { setOptsRisk(p          => ({ ...p, [key]: val })); }
+  function updateRangeQuality(key, val)       { setRangeQuality(p      => ({ ...p, [key]: val })); }
+  function updateHoldConfig(key, val)         { setHoldConfig(p        => ({ ...p, [key]: val })); }
+  function updateExitConfig(key, val)         { setExitConfig(p        => ({ ...p, [key]: val })); }
+  function updatePenaltyConfig(key, val)      { setPenaltyConfig(p     => ({ ...p, [key]: val })); }
+  function updateTradeQuality(key, val)       { setTradeQuality(p      => ({ ...p, [key]: val })); }
+  function updateTrendEntry(key, val)         { setTrendEntry(p        => ({ ...p, [key]: val })); }
+  function updateCompressionEntry(key, val)   { setCompressionEntry(p  => ({ ...p, [key]: val })); }
+  function updateMinMovementFilter(key, val)  { setMinMovementFilter(p => ({ ...p, [key]: val })); }
 
   // ── Config presets (shared with Options Replay — same sma_opts_presets key) ──
   const [presets, setPresets] = useState(() => {
@@ -1119,8 +1113,7 @@ function OptionsLiveTest() {
       decisionCfg, selectionCfg, switchCfg,
       optsRegimeCfg, chopRules, tradingRules, regimeRules, regimeStrategyRules,
       optsRisk, rangeQuality, tradeQuality, trendEntry, compressionEntry,
-      holdConfig, exitConfig, penaltyConfig, minMovementFilter, directionalConsistencyFilter, candleStrengthFilter,
-      cascadeProtection,
+      holdConfig, exitConfig, penaltyConfig, minMovementFilter,
     };
   }
 
@@ -1170,11 +1163,8 @@ function OptionsLiveTest() {
     if (c.compressionEntry     !== undefined) setCompressionEntry(c.compressionEntry);
     if (c.holdConfig           !== undefined) setHoldConfig(c.holdConfig);
     if (c.exitConfig           !== undefined) setExitConfig(c.exitConfig);
-    if (c.penaltyConfig                  !== undefined) setPenaltyConfig(c.penaltyConfig);
-    if (c.minMovementFilter              !== undefined) setMinMovementFilter(c.minMovementFilter);
-    if (c.directionalConsistencyFilter   !== undefined) setDirectionalConsistencyFilter(c.directionalConsistencyFilter);
-    if (c.candleStrengthFilter           !== undefined) setCandleStrengthFilter(c.candleStrengthFilter);
-    if (c.cascadeProtection              !== undefined) setCascadeProtection(c.cascadeProtection);
+    if (c.penaltyConfig        !== undefined) setPenaltyConfig(c.penaltyConfig);
+    if (c.minMovementFilter    !== undefined) setMinMovementFilter(c.minMovementFilter);
   }
 
   function deletePreset(id) {
@@ -1255,14 +1245,11 @@ function OptionsLiveTest() {
   useEffect(() => { try { localStorage.setItem('sma_live_opts_range_quality',      JSON.stringify(rangeQuality));        } catch {} }, [rangeQuality]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_trade_quality',      JSON.stringify(tradeQuality));        } catch {} }, [tradeQuality]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_trend_entry',        JSON.stringify(trendEntry));          } catch {} }, [trendEntry]);
-  useEffect(() => { try { localStorage.setItem('sma_live_opts_compression_entry',      JSON.stringify(compressionEntry));    } catch {} }, [compressionEntry]);
-  useEffect(() => { try { localStorage.setItem('sma_live_opts_hold_config',            JSON.stringify(holdConfig));          } catch {} }, [holdConfig]);
-  useEffect(() => { try { localStorage.setItem('sma_live_opts_exit_config',            JSON.stringify(exitConfig));          } catch {} }, [exitConfig]);
-  useEffect(() => { try { localStorage.setItem('sma_live_opts_penalty_config',         JSON.stringify(penaltyConfig));       } catch {} }, [penaltyConfig]);
-  useEffect(() => { try { localStorage.setItem('sma_live_opts_min_movement_filter',              JSON.stringify(minMovementFilter));             } catch {} }, [minMovementFilter]);
-  useEffect(() => { try { localStorage.setItem('sma_live_opts_directional_consistency_filter',   JSON.stringify(directionalConsistencyFilter));  } catch {} }, [directionalConsistencyFilter]);
-  useEffect(() => { try { localStorage.setItem('sma_live_opts_candle_strength_filter',           JSON.stringify(candleStrengthFilter));          } catch {} }, [candleStrengthFilter]);
-  useEffect(() => { try { localStorage.setItem('sma_live_opts_cascade_protection',            JSON.stringify(cascadeProtection));             } catch {} }, [cascadeProtection]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_compression_entry',  JSON.stringify(compressionEntry));    } catch {} }, [compressionEntry]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_hold_config',        JSON.stringify(holdConfig));          } catch {} }, [holdConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_exit_config',        JSON.stringify(exitConfig));          } catch {} }, [exitConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_penalty_config',          JSON.stringify(penaltyConfig));       } catch {} }, [penaltyConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_min_movement_filter',    JSON.stringify(minMovementFilter));   } catch {} }, [minMovementFilter]);
 
   // ── Session / run state
   const [status,    setStatus]    = useState('idle'); // idle|running|error
@@ -1582,9 +1569,6 @@ function OptionsLiveTest() {
         deadTradePnlPct:             parseFloat(exitConfig.deadTradePnlPct)             || 2,
         noHopeThresholdPct:          parseFloat(exitConfig.noHopeThresholdPct)          || 1.5,
         noHopeBars:                  parseInt(exitConfig.noHopeBars, 10)               || 2,
-        breakevenProtectionEnabled:  exitConfig.breakevenProtectionEnabled,
-        breakevenTriggerPct:         parseFloat(exitConfig.breakevenTriggerPct)        || 2,
-        breakevenOffsetPct:          parseFloat(exitConfig.breakevenOffsetPct)         || 0,
       },
       penaltyConfig: {
         enabled:                   penaltyConfig.enabled,
@@ -1613,31 +1597,6 @@ function OptionsLiveTest() {
         rangeSizeEnabled:          penaltyConfig.rangeSizeEnabled,
         rangeSizePenalty:          parseFloat(penaltyConfig.rangeSizePenalty)          || 2,
       },
-      minMovementFilterConfig: minMovementFilter.enabled ? {
-        enabled:                     true,
-        minMovementLookbackCandles:  parseInt(minMovementFilter.minMovementLookbackCandles,  10) || 3,
-        minMovementThresholdPercent: parseFloat(minMovementFilter.minMovementThresholdPercent) || 1.0,
-      } : { enabled: false },
-      directionalConsistencyFilterConfig: directionalConsistencyFilter.enabled ? {
-        enabled:                               true,
-        directionalConsistencyLookbackCandles: parseInt(directionalConsistencyFilter.directionalConsistencyLookbackCandles, 10) || 3,
-        minSameDirectionCandles:               parseInt(directionalConsistencyFilter.minSameDirectionCandles,               10) || 2,
-      } : { enabled: false },
-      candleStrengthFilterConfig: candleStrengthFilter.enabled ? {
-        enabled:                      true,
-        candleStrengthLookbackCandles: parseInt(candleStrengthFilter.candleStrengthLookbackCandles, 10) || 3,
-        minAverageBodyRatio:           parseFloat(candleStrengthFilter.minAverageBodyRatio)           || 0.50,
-        minStrongCandlesRequired:      parseInt(candleStrengthFilter.minStrongCandlesRequired,   10)  || 2,
-      } : { enabled: false },
-      stopLossCascadeProtectionConfig: cascadeProtection.enabled ? {
-        enabled:               true,
-        cascadeStopLossCount:  parseInt(cascadeProtection.cascadeStopLossCount,  10) || 2,
-        cascadeWindowMinutes:  parseInt(cascadeProtection.cascadeWindowMinutes,  10) || 30,
-        cascadePauseMinutes:   parseInt(cascadeProtection.cascadePauseMinutes,   10) || 30,
-        cascadeExitReasons:    ['HARD_STOP_LOSS'],
-        cascadeApplyPerSymbol: cascadeProtection.cascadeApplyPerSymbol,
-        cascadeApplyPerSide:   cascadeProtection.cascadeApplyPerSide,
-      } : { enabled: false },
       tradingHoursConfig: {
         enabled: tradingHoursEnabled,
         noNewEntriesMinutesBeforeClose: parseInt(closeoutMins, 10) || 15,
@@ -3048,130 +3007,6 @@ function OptionsLiveTest() {
           )}
         </div>
 
-        {/* ── Min Movement Filter ── */}
-        <div className="card bt-opts-card">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
-            <span className="bt-section-title" style={{ marginBottom: 0 }}>Min Movement Filter</span>
-            <button type="button" className={`btn-sm ${minMovementFilter.enabled ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => updateMinMovementFilter('enabled', !minMovementFilter.enabled)} disabled={isRunning}>
-              {minMovementFilter.enabled ? 'ON' : 'OFF'}
-            </button>
-            <span style={{ fontSize: 11, color: '#6366f1', fontWeight: 600 }}>pre-trade filter</span>
-          </div>
-          {minMovementFilter.enabled && (
-            <div className="bt-form-grid" style={{ marginTop: 4 }}>
-              {[
-                ['Lookback Candles', 'minMovementLookbackCandles', '1', null],
-                ['Min Movement %',   'minMovementThresholdPercent', '0.01', null],
-              ].map(([label, key, step, max]) => (
-                <div className="form-group" key={key}>
-                  <label>{label}</label>
-                  <input type="number" min="0" max={max || undefined} step={step}
-                    value={minMovementFilter[key]} disabled={isRunning}
-                    onChange={e => updateMinMovementFilter(key, e.target.value)} />
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* ── Directional Consistency Filter ── */}
-        <div className="card bt-opts-card">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
-            <span className="bt-section-title" style={{ marginBottom: 0 }}>Directional Consistency Filter</span>
-            <button type="button" className={`btn-sm ${directionalConsistencyFilter.enabled ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => updateDirectionalConsistencyFilter('enabled', !directionalConsistencyFilter.enabled)} disabled={isRunning}>
-              {directionalConsistencyFilter.enabled ? 'ON' : 'OFF'}
-            </button>
-            <span style={{ fontSize: 11, color: '#6366f1', fontWeight: 600 }}>pre-trade filter</span>
-          </div>
-          {directionalConsistencyFilter.enabled && (
-            <div className="bt-form-grid" style={{ marginTop: 4 }}>
-              {[
-                ['Lookback Candles',       'directionalConsistencyLookbackCandles', '1', null],
-                ['Min Same Direction',     'minSameDirectionCandles',               '1', null],
-              ].map(([label, key, step, max]) => (
-                <div className="form-group" key={key}>
-                  <label>{label}</label>
-                  <input type="number" min="1" max={max || undefined} step={step}
-                    value={directionalConsistencyFilter[key]} disabled={isRunning}
-                    onChange={e => updateDirectionalConsistencyFilter(key, e.target.value)} />
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* ── Candle Strength Filter ── */}
-        <div className="card bt-opts-card">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
-            <span className="bt-section-title" style={{ marginBottom: 0 }}>Candle Strength Filter</span>
-            <button type="button" className={`btn-sm ${candleStrengthFilter.enabled ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => updateCandleStrengthFilter('enabled', !candleStrengthFilter.enabled)} disabled={isRunning}>
-              {candleStrengthFilter.enabled ? 'ON' : 'OFF'}
-            </button>
-            <span style={{ fontSize: 11, color: '#6366f1', fontWeight: 600 }}>pre-trade filter</span>
-          </div>
-          {candleStrengthFilter.enabled && (
-            <div className="bt-form-grid" style={{ marginTop: 4 }}>
-              {[
-                ['Lookback Candles',        'candleStrengthLookbackCandles', '1',    null],
-                ['Min Avg Body Ratio',      'minAverageBodyRatio',           '0.01',  null],
-                ['Min Strong Candles',      'minStrongCandlesRequired',      '1',    null],
-              ].map(([label, key, step, max]) => (
-                <div className="form-group" key={key}>
-                  <label>{label}</label>
-                  <input type="number" min="0" max={max || undefined} step={step}
-                    value={candleStrengthFilter[key]} disabled={isRunning}
-                    onChange={e => updateCandleStrengthFilter(key, e.target.value)} />
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* ── Stop Loss Cascade Protection ── */}
-        <div className="card bt-opts-card">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
-            <span className="bt-section-title" style={{ marginBottom: 0 }}>SL Cascade Protection</span>
-            <button type="button" className={`btn-sm ${cascadeProtection.enabled ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => updateCascadeProtection('enabled', !cascadeProtection.enabled)} disabled={isRunning}>
-              {cascadeProtection.enabled ? 'ON' : 'OFF'}
-            </button>
-            <span style={{ fontSize: 11, color: '#ef4444', fontWeight: 600 }}>risk control</span>
-          </div>
-          {cascadeProtection.enabled && (
-            <div className="bt-form-grid" style={{ marginTop: 4 }}>
-              {[
-                ['SL Count',        'cascadeStopLossCount',  '1', null],
-                ['Window (min)',     'cascadeWindowMinutes',  '1', null],
-                ['Pause (min)',      'cascadePauseMinutes',   '1', null],
-              ].map(([label, key, step]) => (
-                <div className="form-group" key={key}>
-                  <label>{label}</label>
-                  <input type="number" min="1" step={step}
-                    value={cascadeProtection[key]} disabled={isRunning}
-                    onChange={e => updateCascadeProtection(key, e.target.value)} />
-                </div>
-              ))}
-              <div className="form-group">
-                <label>Per Symbol</label>
-                <button type="button" className={`btn-sm ${cascadeProtection.cascadeApplyPerSymbol ? 'btn-primary' : 'btn-secondary'}`}
-                  onClick={() => updateCascadeProtection('cascadeApplyPerSymbol', !cascadeProtection.cascadeApplyPerSymbol)} disabled={isRunning}>
-                  {cascadeProtection.cascadeApplyPerSymbol ? 'ON' : 'OFF'}
-                </button>
-              </div>
-              <div className="form-group">
-                <label>Per Side</label>
-                <button type="button" className={`btn-sm ${cascadeProtection.cascadeApplyPerSide ? 'btn-primary' : 'btn-secondary'}`}
-                  onClick={() => updateCascadeProtection('cascadeApplyPerSide', !cascadeProtection.cascadeApplyPerSide)} disabled={isRunning}>
-                  {cascadeProtection.cascadeApplyPerSide ? 'ON' : 'OFF'}
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-
         {/* ── Hold Config ── */}
         <div className="card bt-opts-card">
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -3288,26 +3123,6 @@ function OptionsLiveTest() {
                 {[
                   { key: 'noHopeThresholdPct', label: 'No-Hope Threshold %', step: '0.5' },
                   { key: 'noHopeBars',         label: 'No-Hope Bars',        step: '1'   },
-                ].map(({ key, label, step }) => (
-                  <div key={key} className="form-group">
-                    <label>{label}</label>
-                    <input type="number" min="0" step={step} value={exitConfig[key]} disabled={isRunning}
-                      onChange={e => updateExitConfig(key, e.target.value)} />
-                  </div>
-                ))}
-              </div>
-              <div style={{ fontSize: 11, fontWeight: 700, color: '#10b981', marginBottom: 6, marginTop: 8 }}>Breakeven Protection</div>
-              <div className="bt-form-grid">
-                <div className="form-group">
-                  <label>Enabled</label>
-                  <button type="button" className={`btn-sm ${exitConfig.breakevenProtectionEnabled ? 'btn-primary' : 'btn-secondary'}`}
-                    onClick={() => updateExitConfig('breakevenProtectionEnabled', !exitConfig.breakevenProtectionEnabled)} disabled={isRunning}>
-                    {exitConfig.breakevenProtectionEnabled ? 'ON' : 'OFF'}
-                  </button>
-                </div>
-                {[
-                  { key: 'breakevenTriggerPct', label: 'Trigger %', step: '0.5' },
-                  { key: 'breakevenOffsetPct',  label: 'Offset %',  step: '0.1' },
                 ].map(({ key, label, step }) => (
                   <div key={key} className="form-group">
                     <label>{label}</label>
@@ -9260,10 +9075,6 @@ const DEFAULT_EXIT_CONFIG = {
   // P7 — No-hope (non-TRENDING only)
   noHopeThresholdPct:           '1.5',
   noHopeBars:                   '2',
-  // Breakeven Protection — floor exit at entry once favorable move >= trigger
-  breakevenProtectionEnabled:   true,
-  breakevenTriggerPct:          '2',
-  breakevenOffsetPct:           '0',
 };
 
 const DEFAULT_PENALTY_CONFIG = {
@@ -9287,31 +9098,6 @@ const DEFAULT_MIN_MOVEMENT_FILTER = {
   enabled:                    false,
   minMovementLookbackCandles: 3,
   minMovementThresholdPercent:'1.0',
-};
-
-const DEFAULT_DIRECTIONAL_CONSISTENCY_FILTER = {
-  enabled:                              false,
-  directionalConsistencyLookbackCandles: 3,
-  minSameDirectionCandles:               2,
-};
-
-const DEFAULT_CANDLE_STRENGTH_FILTER = {
-  enabled:                    false,
-  candleStrengthLookbackCandles: 3,
-  minAverageBodyRatio:           '0.50',
-  minStrongCandlesRequired:      2,
-};
-const DEFAULT_NO_NEW_TRADES_AFTER_TIME = {
-  enabled:               false,
-  noNewTradesAfterTime:  '14:45',
-};
-const DEFAULT_CASCADE_PROTECTION = {
-  enabled:               false,
-  cascadeStopLossCount:  2,
-  cascadeWindowMinutes:  30,
-  cascadePauseMinutes:   30,
-  cascadeApplyPerSymbol: false,
-  cascadeApplyPerSide:   false,
 };
 
 function fmt2(v) { return v != null ? Number(v).toFixed(2) : '—'; }
@@ -9721,24 +9507,16 @@ function OptionsReplayTest() {
   const [holdConfig,           setHoldConfig]           = useState(() => ({ ...DEFAULT_HOLD,           ...ls('sma_opts_hold_config',    {}) }));
   const [exitConfig,           setExitConfig]           = useState(() => ({ ...DEFAULT_EXIT_CONFIG,    ...ls('sma_opts_exit_config',    {}) }));
   const [penaltyConfig,        setPenaltyConfig]        = useState(() => ({ ...DEFAULT_PENALTY_CONFIG, ...ls('sma_opts_penalty_config',  {}) }));
-  const [minMovementFilter,              setMinMovementFilter]              = useState(() => ls('sma_opts_min_movement_filter',                      DEFAULT_MIN_MOVEMENT_FILTER));
-  const [directionalConsistencyFilter,   setDirectionalConsistencyFilter]   = useState(() => ls('sma_opts_directional_consistency_filter',             DEFAULT_DIRECTIONAL_CONSISTENCY_FILTER));
-  const [candleStrengthFilter,           setCandleStrengthFilter]           = useState(() => ls('sma_opts_candle_strength_filter',                   DEFAULT_CANDLE_STRENGTH_FILTER));
-  const [cascadeProtection,              setCascadeProtection]              = useState(() => ls('sma_opts_cascade_protection',              DEFAULT_CASCADE_PROTECTION));
 
-  function updateOptsRisk(key, val)                    { setOptsRisk(p                      => ({ ...p, [key]: val })); }
-  function updateRangeQuality(key, val)                { setRangeQuality(p                  => ({ ...p, [key]: val })); }
-  function updateHoldConfig(key, val)                  { setHoldConfig(p                    => ({ ...p, [key]: val })); }
-  function updateExitConfig(key, val)                  { setExitConfig(p                    => ({ ...p, [key]: val })); }
-  function updatePenaltyConfig(key, val)               { setPenaltyConfig(p                 => ({ ...p, [key]: val })); }
-  function updateTradeQuality(key, val)                { setTradeQuality(p                  => ({ ...p, [key]: val })); }
-  function updateTrendEntry(key, val)                  { setTrendEntry(p                    => ({ ...p, [key]: val })); }
-  function updateCompressionEntry(key, val)            { setCompressionEntry(p              => ({ ...p, [key]: val })); }
-  function updateMinMovementFilter(key, val)           { setMinMovementFilter(p             => ({ ...p, [key]: val })); }
-  function updateDirectionalConsistencyFilter(key, val){ setDirectionalConsistencyFilter(p  => ({ ...p, [key]: val })); }
-  function updateCandleStrengthFilter(key, val)        { setCandleStrengthFilter(p          => ({ ...p, [key]: val })); }
+  function updateOptsRisk(key, val) { setOptsRisk(p => ({ ...p, [key]: val })); }
+  function updateRangeQuality(key, val) { setRangeQuality(p => ({ ...p, [key]: val })); }
+  function updateHoldConfig(key, val) { setHoldConfig(p => ({ ...p, [key]: val })); }
+  function updateExitConfig(key, val) { setExitConfig(p => ({ ...p, [key]: val })); }
+  function updatePenaltyConfig(key, val) { setPenaltyConfig(p => ({ ...p, [key]: val })); }
+  function updateTradeQuality(key, val) { setTradeQuality(p => ({ ...p, [key]: val })); }
+  function updateTrendEntry(key, val) { setTrendEntry(p => ({ ...p, [key]: val })); }
+  function updateCompressionEntry(key, val) { setCompressionEntry(p => ({ ...p, [key]: val })); }
 
-  function updateCascadeProtection(key, val)           { setCascadeProtection(p             => ({ ...p, [key]: val })); }
   // ── Persist to localStorage on change
   useEffect(() => { try { localStorage.setItem('sma_opts_nifty',      JSON.stringify(nifty));        } catch {} }, [nifty]);
   useEffect(() => { try { localStorage.setItem('sma_opts_ce_pool',    JSON.stringify(cePool));       } catch {} }, [cePool]);
@@ -9769,8 +9547,7 @@ function OptionsReplayTest() {
       decisionCfg, selectionCfg, switchCfg,
       optsRegimeCfg, chopRules, tradingRules, regimeRules, regimeStrategyRules,
       optsRisk, rangeQuality, tradeQuality, trendEntry, compressionEntry,
-      holdConfig, exitConfig, penaltyConfig, minMovementFilter, directionalConsistencyFilter, candleStrengthFilter,
-      cascadeProtection,
+      holdConfig, exitConfig, penaltyConfig, minMovementFilter,
     };
   }
 
@@ -9820,11 +9597,8 @@ function OptionsReplayTest() {
     if (c.compressionEntry     !== undefined) setCompressionEntry(c.compressionEntry);
     if (c.holdConfig           !== undefined) setHoldConfig(c.holdConfig);
     if (c.exitConfig           !== undefined) setExitConfig(c.exitConfig);
-    if (c.penaltyConfig                  !== undefined) setPenaltyConfig(c.penaltyConfig);
-    if (c.minMovementFilter              !== undefined) setMinMovementFilter(c.minMovementFilter);
-    if (c.directionalConsistencyFilter   !== undefined) setDirectionalConsistencyFilter(c.directionalConsistencyFilter);
-    if (c.candleStrengthFilter           !== undefined) setCandleStrengthFilter(c.candleStrengthFilter);
-    if (c.cascadeProtection              !== undefined) setCascadeProtection(c.cascadeProtection);
+    if (c.penaltyConfig        !== undefined) setPenaltyConfig(c.penaltyConfig);
+    if (c.minMovementFilter    !== undefined) setMinMovementFilter(c.minMovementFilter);
   }
 
   function deletePreset(id) {
@@ -9902,12 +9676,8 @@ function OptionsReplayTest() {
   useEffect(() => { try { localStorage.setItem('sma_opts_trend_entry',        JSON.stringify(trendEntry));          } catch {} }, [trendEntry]);
   useEffect(() => { try { localStorage.setItem('sma_opts_compression_entry',  JSON.stringify(compressionEntry));    } catch {} }, [compressionEntry]);
   useEffect(() => { try { localStorage.setItem('sma_opts_hold_config',        JSON.stringify(holdConfig));          } catch {} }, [holdConfig]);
-  useEffect(() => { try { localStorage.setItem('sma_opts_exit_config',            JSON.stringify(exitConfig));          } catch {} }, [exitConfig]);
-  useEffect(() => { try { localStorage.setItem('sma_opts_penalty_config',         JSON.stringify(penaltyConfig));       } catch {} }, [penaltyConfig]);
-  useEffect(() => { try { localStorage.setItem('sma_opts_min_movement_filter',              JSON.stringify(minMovementFilter));             } catch {} }, [minMovementFilter]);
-  useEffect(() => { try { localStorage.setItem('sma_opts_directional_consistency_filter',   JSON.stringify(directionalConsistencyFilter));  } catch {} }, [directionalConsistencyFilter]);
-  useEffect(() => { try { localStorage.setItem('sma_opts_candle_strength_filter',           JSON.stringify(candleStrengthFilter));          } catch {} }, [candleStrengthFilter]);
-  useEffect(() => { try { localStorage.setItem('sma_opts_cascade_protection',            JSON.stringify(cascadeProtection));             } catch {} }, [cascadeProtection]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_exit_config',        JSON.stringify(exitConfig));          } catch {} }, [exitConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_penalty_config',     JSON.stringify(penaltyConfig));       } catch {} }, [penaltyConfig]);
 
   // ── Run state
   const [status,   setStatus]   = useState('idle'); // idle|running|completed|error
@@ -10039,50 +9809,6 @@ function OptionsReplayTest() {
     ));
     lines.push(blank);
 
-    // ── Min Movement Filter ──────────────────────────────────────────────────
-    lines.push(row('=== Min Movement Filter ==='));
-    lines.push(row('Enabled', 'Lookback Candles', 'Threshold %'));
-    lines.push(row(
-      minMovementFilter.enabled ? 'ON' : 'OFF',
-      minMovementFilter.minMovementLookbackCandles,
-      minMovementFilter.minMovementThresholdPercent,
-    ));
-    lines.push(blank);
-
-    // ── Directional Consistency Filter ──────────────────────────────────────
-    lines.push(row('=== Directional Consistency Filter ==='));
-    lines.push(row('Enabled', 'Lookback Candles', 'Min Same Direction Candles'));
-    lines.push(row(
-      directionalConsistencyFilter.enabled ? 'ON' : 'OFF',
-      directionalConsistencyFilter.directionalConsistencyLookbackCandles,
-      directionalConsistencyFilter.minSameDirectionCandles,
-    ));
-    lines.push(blank);
-
-    // ── Candle Strength Filter ───────────────────────────────────────────────
-    lines.push(row('=== Candle Strength Filter ==='));
-    lines.push(row('Enabled', 'Lookback Candles', 'Min Avg Body Ratio', 'Min Strong Candles'));
-    lines.push(row(
-      candleStrengthFilter.enabled ? 'ON' : 'OFF',
-      candleStrengthFilter.candleStrengthLookbackCandles,
-      candleStrengthFilter.minAverageBodyRatio,
-      candleStrengthFilter.minStrongCandlesRequired,
-    ));
-    lines.push(blank);
-
-    // ── SL Cascade Protection ────────────────────────────────────────────────
-    lines.push(row('=== SL Cascade Protection ==='));
-    lines.push(row('Enabled', 'SL Count', 'Window (min)', 'Pause (min)', 'Per Symbol', 'Per Side'));
-    lines.push(row(
-      cascadeProtection.enabled ? 'ON' : 'OFF',
-      cascadeProtection.cascadeStopLossCount,
-      cascadeProtection.cascadeWindowMinutes,
-      cascadeProtection.cascadePauseMinutes,
-      cascadeProtection.cascadeApplyPerSymbol ? 'ON' : 'OFF',
-      cascadeProtection.cascadeApplyPerSide ? 'ON' : 'OFF',
-    ));
-    lines.push(blank);
-
     // ── Regime Score Rules ───────────────────────────────────────────────────
     lines.push(row('=== Regime Score Rules ==='));
     lines.push(row('Enabled', 'RANGING Min Score', 'RANGING Min Score Gap', 'TRENDING Min Score', 'TRENDING Min Score Gap', 'COMPRESSION Min Score', 'COMPRESSION Min Score Gap'));
@@ -10187,7 +9913,7 @@ function OptionsReplayTest() {
       'Trend Strong Mode Threshold %',
       'Max Bars No Improvement', 'Stagnation Bars', 'Max Bars RANGING',
       'Max Bars Dead Trade', 'Dead Trade PnL %',
-      'No-Hope Threshold %', 'No-Hope Bars', 'Breakeven Protection', 'Breakeven Trigger %', 'Breakeven Offset %'));
+      'No-Hope Threshold %', 'No-Hope Bars'));
     lines.push(row(
       exitConfig.enabled ? 'Yes' : 'No',
       exitConfig.hardStopPct, exitConfig.holdZonePct,
@@ -10201,8 +9927,6 @@ function OptionsReplayTest() {
       exitConfig.maxBarsNoImprovement, exitConfig.stagnationBars, exitConfig.maxBarsRanging,
       exitConfig.maxBarsDeadTrade, exitConfig.deadTradePnlPct,
       exitConfig.noHopeThresholdPct, exitConfig.noHopeBars,
-      exitConfig.breakevenProtectionEnabled ? 'ON' : 'OFF',
-      exitConfig.breakevenTriggerPct, exitConfig.breakevenOffsetPct,
     ));
     lines.push(blank);
 
@@ -10575,9 +10299,6 @@ function OptionsReplayTest() {
         deadTradePnlPct:              parseFloat(exitConfig.deadTradePnlPct)              || 2,
         noHopeThresholdPct:           parseFloat(exitConfig.noHopeThresholdPct)           || 1.5,
         noHopeBars:                   parseInt(exitConfig.noHopeBars, 10)                 || 2,
-        breakevenProtectionEnabled:   exitConfig.breakevenProtectionEnabled,
-        breakevenTriggerPct:          parseFloat(exitConfig.breakevenTriggerPct)          || 2,
-        breakevenOffsetPct:           parseFloat(exitConfig.breakevenOffsetPct)           || 0,
       },
       penaltyConfig: {
         enabled:                   penaltyConfig.enabled,
@@ -10606,31 +10327,6 @@ function OptionsReplayTest() {
         rangeSizeEnabled:          penaltyConfig.rangeSizeEnabled,
         rangeSizePenalty:          parseFloat(penaltyConfig.rangeSizePenalty)          || 2,
       },
-      minMovementFilterConfig: minMovementFilter.enabled ? {
-        enabled:                     true,
-        minMovementLookbackCandles:  parseInt(minMovementFilter.minMovementLookbackCandles,  10) || 3,
-        minMovementThresholdPercent: parseFloat(minMovementFilter.minMovementThresholdPercent) || 1.0,
-      } : { enabled: false },
-      directionalConsistencyFilterConfig: directionalConsistencyFilter.enabled ? {
-        enabled:                               true,
-        directionalConsistencyLookbackCandles: parseInt(directionalConsistencyFilter.directionalConsistencyLookbackCandles, 10) || 3,
-        minSameDirectionCandles:               parseInt(directionalConsistencyFilter.minSameDirectionCandles,               10) || 2,
-      } : { enabled: false },
-      candleStrengthFilterConfig: candleStrengthFilter.enabled ? {
-        enabled:                      true,
-        candleStrengthLookbackCandles: parseInt(candleStrengthFilter.candleStrengthLookbackCandles, 10) || 3,
-        minAverageBodyRatio:           parseFloat(candleStrengthFilter.minAverageBodyRatio)           || 0.50,
-        minStrongCandlesRequired:      parseInt(candleStrengthFilter.minStrongCandlesRequired,   10)  || 2,
-      } : { enabled: false },
-      stopLossCascadeProtectionConfig: cascadeProtection.enabled ? {
-        enabled:               true,
-        cascadeStopLossCount:  parseInt(cascadeProtection.cascadeStopLossCount,  10) || 2,
-        cascadeWindowMinutes:  parseInt(cascadeProtection.cascadeWindowMinutes,  10) || 30,
-        cascadePauseMinutes:   parseInt(cascadeProtection.cascadePauseMinutes,   10) || 30,
-        cascadeExitReasons:    ['HARD_STOP_LOSS'],
-        cascadeApplyPerSymbol: cascadeProtection.cascadeApplyPerSymbol,
-        cascadeApplyPerSide:   cascadeProtection.cascadeApplyPerSide,
-      } : { enabled: false },
       speedMultiplier: parseInt(speed, 10) || 1,
       persist: true,
     };
@@ -11319,8 +11015,7 @@ function OptionsReplayTest() {
              'sma_opts_chop_rules','sma_opts_trading_rules','sma_opts_regime_rules',
              'sma_opts_regime_strat_rules','sma_opts_risk','sma_opts_range_quality','sma_opts_trade_quality',
              'sma_opts_trend_entry','sma_opts_compression_entry','sma_opts_hold_config','sma_opts_exit_config',
-             'sma_opts_penalty_config','sma_opts_min_movement_filter','sma_opts_directional_consistency_filter',
-             'sma_opts_candle_strength_filter'].forEach(k => localStorage.removeItem(k));
+             'sma_opts_penalty_config'].forEach(k => localStorage.removeItem(k));
           }} disabled={isRunning}>
             Reset
           </button>
@@ -12063,131 +11758,6 @@ function OptionsReplayTest() {
           )}
         </div>
 
-        {/* ── Min Movement Filter ── */}
-        <div className="card bt-opts-card">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
-            <span className="bt-section-title" style={{ marginBottom: 0 }}>Min Movement Filter</span>
-            <button type="button"
-              className={`btn-sm ${minMovementFilter.enabled ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => updateMinMovementFilter('enabled', !minMovementFilter.enabled)}
-              disabled={isRunning}>
-              {minMovementFilter.enabled ? 'ON' : 'OFF'}
-            </button>
-            <span style={{ fontSize: 11, color: '#6366f1', fontWeight: 600 }}>pre-trade filter</span>
-          </div>
-          {minMovementFilter.enabled && (
-            <div className="bt-form-grid" style={{ marginTop: 4 }}>
-              {[
-                ['Lookback Candles', 'minMovementLookbackCandles',  '1',   null],
-                ['Min Movement %',   'minMovementThresholdPercent', '0.01', null],
-              ].map(([label, key, step, max]) => (
-                <div className="form-group" key={key}>
-                  <label>{label}</label>
-                  <input type="number" min="0" max={max || undefined} step={step}
-                    value={minMovementFilter[key]} disabled={isRunning}
-                    onChange={e => updateMinMovementFilter(key, e.target.value)} />
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* ── Directional Consistency Filter ── */}
-        <div className="card bt-opts-card">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
-            <span className="bt-section-title" style={{ marginBottom: 0 }}>Directional Consistency Filter</span>
-            <button type="button"
-              className={`btn-sm ${directionalConsistencyFilter.enabled ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => updateDirectionalConsistencyFilter('enabled', !directionalConsistencyFilter.enabled)}
-              disabled={isRunning}>
-              {directionalConsistencyFilter.enabled ? 'ON' : 'OFF'}
-            </button>
-            <span style={{ fontSize: 11, color: '#6366f1', fontWeight: 600 }}>pre-trade filter</span>
-          </div>
-          {directionalConsistencyFilter.enabled && (
-            <div className="bt-form-grid" style={{ marginTop: 4 }}>
-              {[
-                ['Lookback Candles',   'directionalConsistencyLookbackCandles', '1', null],
-                ['Min Same Direction', 'minSameDirectionCandles',               '1', null],
-              ].map(([label, key, step, max]) => (
-                <div className="form-group" key={key}>
-                  <label>{label}</label>
-                  <input type="number" min="1" max={max || undefined} step={step}
-                    value={directionalConsistencyFilter[key]} disabled={isRunning}
-                    onChange={e => updateDirectionalConsistencyFilter(key, e.target.value)} />
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* ── Candle Strength Filter ── */}
-        <div className="card bt-opts-card">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
-            <span className="bt-section-title" style={{ marginBottom: 0 }}>Candle Strength Filter</span>
-            <button type="button"
-              className={`btn-sm ${candleStrengthFilter.enabled ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => updateCandleStrengthFilter('enabled', !candleStrengthFilter.enabled)}
-              disabled={isRunning}>
-              {candleStrengthFilter.enabled ? 'ON' : 'OFF'}
-            </button>
-            <span style={{ fontSize: 11, color: '#6366f1', fontWeight: 600 }}>pre-trade filter</span>
-          </div>
-          {candleStrengthFilter.enabled && (
-            <div className="bt-form-grid" style={{ marginTop: 4 }}>
-              {[
-                ['Lookback Candles',   'candleStrengthLookbackCandles', '1',    null],
-                ['Min Avg Body Ratio', 'minAverageBodyRatio',           '0.01', null],
-                ['Min Strong Candles', 'minStrongCandlesRequired',      '1',    null],
-              ].map(([label, key, step, max]) => (
-                <div className="form-group" key={key}>
-                  <label>{label}</label>
-                  <input type="number" min="0" max={max || undefined} step={step}
-                    value={candleStrengthFilter[key]} disabled={isRunning}
-                    onChange={e => updateCandleStrengthFilter(key, e.target.value)} />
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* ── SL Cascade Protection ── */}
-        <div className="card bt-opts-card">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
-            <span className="bt-section-title" style={{ marginBottom: 0 }}>SL Cascade Protection</span>
-            <button type="button" className={`btn-sm ${cascadeProtection.enabled ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => updateCascadeProtection('enabled', !cascadeProtection.enabled)} disabled={isRunning}>
-              {cascadeProtection.enabled ? 'ON' : 'OFF'}
-            </button>
-            <span style={{ fontSize: 11, color: '#ef4444', fontWeight: 600 }}>risk control</span>
-          </div>
-          {cascadeProtection.enabled && (
-            <div className="bt-form-grid" style={{ marginTop: 4 }}>
-              {[
-                ['SL Count',     'cascadeStopLossCount', '1'],
-                ['Window (min)', 'cascadeWindowMinutes',  '1'],
-                ['Pause (min)',  'cascadePauseMinutes',   '1'],
-              ].map(([label, key, step]) => (
-                <div className="form-group" key={key}>
-                  <label>{label}</label>
-                  <input type="number" min="1" step={step} value={cascadeProtection[key]} disabled={isRunning}
-                    onChange={e => updateCascadeProtection(key, e.target.value)} />
-                </div>
-              ))}
-              <div className="form-group"><label>Per Symbol</label>
-                <button type="button" className={`btn-sm ${cascadeProtection.cascadeApplyPerSymbol ? 'btn-primary' : 'btn-secondary'}`}
-                  onClick={() => updateCascadeProtection('cascadeApplyPerSymbol', !cascadeProtection.cascadeApplyPerSymbol)} disabled={isRunning}>
-                  {cascadeProtection.cascadeApplyPerSymbol ? 'ON' : 'OFF'}</button>
-              </div>
-              <div className="form-group"><label>Per Side</label>
-                <button type="button" className={`btn-sm ${cascadeProtection.cascadeApplyPerSide ? 'btn-primary' : 'btn-secondary'}`}
-                  onClick={() => updateCascadeProtection('cascadeApplyPerSide', !cascadeProtection.cascadeApplyPerSide)} disabled={isRunning}>
-                  {cascadeProtection.cascadeApplyPerSide ? 'ON' : 'OFF'}</button>
-              </div>
-            </div>
-          )}
-        </div>
-
         {/* ── Hold Config ── */}
         <div className="card bt-opts-card">
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -12354,27 +11924,6 @@ function OptionsReplayTest() {
                   </div>
                 ))}
               </div>
-              <div style={{ fontSize: 11, fontWeight: 700, color: '#10b981', marginBottom: 6, marginTop: 8 }}>Breakeven Protection</div>
-              <div className="bt-form-grid">
-                <div className="form-group">
-                  <label>Enabled</label>
-                  <button type="button" className={`btn-sm ${exitConfig.breakevenProtectionEnabled ? 'btn-primary' : 'btn-secondary'}`}
-                    onClick={() => updateExitConfig('breakevenProtectionEnabled', !exitConfig.breakevenProtectionEnabled)} disabled={isRunning}>
-                    {exitConfig.breakevenProtectionEnabled ? 'ON' : 'OFF'}
-                  </button>
-                </div>
-                {[
-                  { key: 'breakevenTriggerPct', label: 'Trigger %', step: '0.5' },
-                  { key: 'breakevenOffsetPct',  label: 'Offset %',  step: '0.1' },
-                ].map(({ key, label, step }) => (
-                  <div key={key} className="form-group">
-                    <label>{label}</label>
-                    <input type="number" min="0" step={step}
-                      value={exitConfig[key]} disabled={isRunning}
-                      onChange={e => updateExitConfig(key, e.target.value)} />
-                  </div>
-                ))}
-              </div>
             </>
           )}
         </div>
@@ -12524,25 +12073,15 @@ function TickReplayTest() {
   const [holdConfig,          setHoldConfig]          = useState(() => ({ ...DEFAULT_HOLD,           ...ls('sma_tick_hold_config',    {}) }));
   const [exitConfig,          setExitConfig]          = useState(() => ({ ...DEFAULT_EXIT_CONFIG,    ...ls('sma_tick_exit_config',    {}) }));
   const [penaltyConfig,       setPenaltyConfig]       = useState(() => ({ ...DEFAULT_PENALTY_CONFIG, ...ls('sma_tick_penalty_config',  {}) }));
-  const [minMovementFilter,              setMinMovementFilter]              = useState(() => ls('sma_tick_min_movement_filter',                      DEFAULT_MIN_MOVEMENT_FILTER));
-  const [directionalConsistencyFilter,   setDirectionalConsistencyFilter]   = useState(() => ls('sma_tick_directional_consistency_filter',             DEFAULT_DIRECTIONAL_CONSISTENCY_FILTER));
-  const [candleStrengthFilter,           setCandleStrengthFilter]           = useState(() => ls('sma_tick_candle_strength_filter',                   DEFAULT_CANDLE_STRENGTH_FILTER));
-  const [noNewTradesAfterTime,           setNoNewTradesAfterTime]           = useState(() => ls('sma_tick_no_new_trades_after_time',                   DEFAULT_NO_NEW_TRADES_AFTER_TIME));
-  const [cascadeProtection,              setCascadeProtection]              = useState(() => ls('sma_tick_cascade_protection',              DEFAULT_CASCADE_PROTECTION));
 
-  function updateOptsRisk(key, val)                    { setOptsRisk(p                      => ({ ...p, [key]: val })); }
-  function updateRangeQuality(key, val)                { setRangeQuality(p                  => ({ ...p, [key]: val })); }
-  function updateHoldConfig(key, val)                  { setHoldConfig(p                    => ({ ...p, [key]: val })); }
-  function updateExitConfig(key, val)                  { setExitConfig(p                    => ({ ...p, [key]: val })); }
-  function updatePenaltyConfig(key, val)               { setPenaltyConfig(p                 => ({ ...p, [key]: val })); }
-  function updateTradeQuality(key, val)                { setTradeQuality(p                  => ({ ...p, [key]: val })); }
-  function updateTrendEntry(key, val)                  { setTrendEntry(p                    => ({ ...p, [key]: val })); }
-  function updateCompressionEntry(key, val)            { setCompressionEntry(p              => ({ ...p, [key]: val })); }
-  function updateMinMovementFilter(key, val)           { setMinMovementFilter(p             => ({ ...p, [key]: val })); }
-  function updateDirectionalConsistencyFilter(key, val){ setDirectionalConsistencyFilter(p  => ({ ...p, [key]: val })); }
-  function updateCandleStrengthFilter(key, val)        { setCandleStrengthFilter(p          => ({ ...p, [key]: val })); }
-  function updateNoNewTradesAfterTime(key, val)        { setNoNewTradesAfterTime(p          => ({ ...p, [key]: val })); }
-  function updateCascadeProtection(key, val)           { setCascadeProtection(p             => ({ ...p, [key]: val })); }
+  function updateOptsRisk(key, val)         { setOptsRisk(p        => ({ ...p, [key]: val })); }
+  function updateRangeQuality(key, val)     { setRangeQuality(p    => ({ ...p, [key]: val })); }
+  function updateHoldConfig(key, val)       { setHoldConfig(p      => ({ ...p, [key]: val })); }
+  function updateExitConfig(key, val)       { setExitConfig(p      => ({ ...p, [key]: val })); }
+  function updatePenaltyConfig(key, val)    { setPenaltyConfig(p   => ({ ...p, [key]: val })); }
+  function updateTradeQuality(key, val)     { setTradeQuality(p    => ({ ...p, [key]: val })); }
+  function updateTrendEntry(key, val)       { setTrendEntry(p      => ({ ...p, [key]: val })); }
+  function updateCompressionEntry(key, val) { setCompressionEntry(p=> ({ ...p, [key]: val })); }
 
   useEffect(() => { try { localStorage.setItem('sma_tick_session_id',        JSON.stringify(sessionId));          } catch {} }, [sessionId]);
 
@@ -12577,13 +12116,8 @@ function TickReplayTest() {
   useEffect(() => { try { localStorage.setItem('sma_tick_trend_entry',       JSON.stringify(trendEntry));         } catch {} }, [trendEntry]);
   useEffect(() => { try { localStorage.setItem('sma_tick_compression_entry', JSON.stringify(compressionEntry));   } catch {} }, [compressionEntry]);
   useEffect(() => { try { localStorage.setItem('sma_tick_hold_config',       JSON.stringify(holdConfig));         } catch {} }, [holdConfig]);
-  useEffect(() => { try { localStorage.setItem('sma_tick_exit_config',           JSON.stringify(exitConfig));         } catch {} }, [exitConfig]);
-  useEffect(() => { try { localStorage.setItem('sma_tick_penalty_config',        JSON.stringify(penaltyConfig));      } catch {} }, [penaltyConfig]);
-  useEffect(() => { try { localStorage.setItem('sma_tick_min_movement_filter',              JSON.stringify(minMovementFilter));             } catch {} }, [minMovementFilter]);
-  useEffect(() => { try { localStorage.setItem('sma_tick_directional_consistency_filter',   JSON.stringify(directionalConsistencyFilter));  } catch {} }, [directionalConsistencyFilter]);
-  useEffect(() => { try { localStorage.setItem('sma_tick_candle_strength_filter',           JSON.stringify(candleStrengthFilter));          } catch {} }, [candleStrengthFilter]);
-  useEffect(() => { try { localStorage.setItem('sma_tick_no_new_trades_after_time',         JSON.stringify(noNewTradesAfterTime));           } catch {} }, [noNewTradesAfterTime]);
-  useEffect(() => { try { localStorage.setItem('sma_tick_cascade_protection',            JSON.stringify(cascadeProtection));             } catch {} }, [cascadeProtection]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_exit_config',       JSON.stringify(exitConfig));         } catch {} }, [exitConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_penalty_config',    JSON.stringify(penaltyConfig));      } catch {} }, [penaltyConfig]);
 
   // ── Config presets (shared sma_opts_presets key — same presets across Live/Replay/Tick) ──
   const [presets,           setPresets]           = useState(() => { try { return JSON.parse(localStorage.getItem('sma_opts_presets') || '[]'); } catch { return []; } });
@@ -12598,9 +12132,7 @@ function TickReplayTest() {
       decisionCfg, selectionCfg, switchCfg,
       optsRegimeCfg, chopRules, tradingRules, regimeRules, regimeStrategyRules,
       optsRisk, rangeQuality, tradeQuality, trendEntry, compressionEntry,
-      holdConfig, exitConfig, penaltyConfig, minMovementFilter, directionalConsistencyFilter, candleStrengthFilter,
-      noNewTradesAfterTime,
-      cascadeProtection,
+      holdConfig, exitConfig, penaltyConfig,
     };
   }
 
@@ -12643,11 +12175,7 @@ function TickReplayTest() {
     if (c.holdConfig          !== undefined) setHoldConfig(c.holdConfig);
     if (c.exitConfig          !== undefined) setExitConfig(c.exitConfig);
     if (c.penaltyConfig       !== undefined) setPenaltyConfig(c.penaltyConfig);
-    if (c.minMovementFilter              !== undefined) setMinMovementFilter(c.minMovementFilter);
-    if (c.directionalConsistencyFilter   !== undefined) setDirectionalConsistencyFilter(c.directionalConsistencyFilter);
-    if (c.candleStrengthFilter           !== undefined) setCandleStrengthFilter(c.candleStrengthFilter);
-    if (c.noNewTradesAfterTime           !== undefined) setNoNewTradesAfterTime(c.noNewTradesAfterTime);
-    if (c.cascadeProtection              !== undefined) setCascadeProtection(c.cascadeProtection);
+    if (c.minMovementFilter   !== undefined) setMinMovementFilter(c.minMovementFilter);
   }
 
   function deletePreset(id) {
@@ -12834,60 +12362,6 @@ function TickReplayTest() {
     ));
     lines.push(blank);
 
-    // ── Min Movement Filter ──────────────────────────────────────────────────
-    lines.push(row('=== Min Movement Filter ==='));
-    lines.push(row('Enabled', 'Lookback Candles', 'Threshold %'));
-    lines.push(row(
-      minMovementFilter.enabled ? 'ON' : 'OFF',
-      minMovementFilter.minMovementLookbackCandles,
-      minMovementFilter.minMovementThresholdPercent,
-    ));
-    lines.push(blank);
-
-    // ── Directional Consistency Filter ──────────────────────────────────────
-    lines.push(row('=== Directional Consistency Filter ==='));
-    lines.push(row('Enabled', 'Lookback Candles', 'Min Same Direction Candles'));
-    lines.push(row(
-      directionalConsistencyFilter.enabled ? 'ON' : 'OFF',
-      directionalConsistencyFilter.directionalConsistencyLookbackCandles,
-      directionalConsistencyFilter.minSameDirectionCandles,
-    ));
-    lines.push(blank);
-
-    // ── Candle Strength Filter ───────────────────────────────────────────────
-    lines.push(row('=== Candle Strength Filter ==='));
-    lines.push(row('Enabled', 'Lookback Candles', 'Min Avg Body Ratio', 'Min Strong Candles'));
-    lines.push(row(
-      candleStrengthFilter.enabled ? 'ON' : 'OFF',
-      candleStrengthFilter.candleStrengthLookbackCandles,
-      candleStrengthFilter.minAverageBodyRatio,
-      candleStrengthFilter.minStrongCandlesRequired,
-    ));
-    lines.push(blank);
-
-
-    // ── No New Trades After Time ──────────────────────────────────────────────────────
-    lines.push(row('=== No New Trades After ==='));
-    lines.push(row('Enabled', 'Time'));
-    lines.push(row(
-      noNewTradesAfterTime.enabled ? 'ON' : 'OFF',
-      noNewTradesAfterTime.noNewTradesAfterTime,
-    ));
-    lines.push(blank);
-
-    // ── SL Cascade Protection ────────────────────────────────────────────────
-    lines.push(row('=== SL Cascade Protection ==='));
-    lines.push(row('Enabled', 'SL Count', 'Window (min)', 'Pause (min)', 'Per Symbol', 'Per Side'));
-    lines.push(row(
-      cascadeProtection.enabled ? 'ON' : 'OFF',
-      cascadeProtection.cascadeStopLossCount,
-      cascadeProtection.cascadeWindowMinutes,
-      cascadeProtection.cascadePauseMinutes,
-      cascadeProtection.cascadeApplyPerSymbol ? 'ON' : 'OFF',
-      cascadeProtection.cascadeApplyPerSide ? 'ON' : 'OFF',
-    ));
-    lines.push(blank);
-
     // ── Regime Score Rules ───────────────────────────────────────────────────
     lines.push(row('=== Regime Score Rules ==='));
     lines.push(row('Enabled', 'RANGING Min Score', 'RANGING Min Score Gap', 'TRENDING Min Score', 'TRENDING Min Score Gap', 'COMPRESSION Min Score', 'COMPRESSION Min Score Gap'));
@@ -12992,7 +12466,7 @@ function TickReplayTest() {
       'Trend Strong Mode Threshold %',
       'Max Bars No Improvement', 'Stagnation Bars', 'Max Bars RANGING',
       'Max Bars Dead Trade', 'Dead Trade PnL %',
-      'No-Hope Threshold %', 'No-Hope Bars', 'Breakeven Protection', 'Breakeven Trigger %', 'Breakeven Offset %'));
+      'No-Hope Threshold %', 'No-Hope Bars'));
     lines.push(row(
       exitConfig.enabled ? 'Yes' : 'No',
       exitConfig.hardStopPct, exitConfig.holdZonePct,
@@ -13006,8 +12480,6 @@ function TickReplayTest() {
       exitConfig.maxBarsNoImprovement, exitConfig.stagnationBars, exitConfig.maxBarsRanging,
       exitConfig.maxBarsDeadTrade, exitConfig.deadTradePnlPct,
       exitConfig.noHopeThresholdPct, exitConfig.noHopeBars,
-      exitConfig.breakevenProtectionEnabled ? 'ON' : 'OFF',
-      exitConfig.breakevenTriggerPct, exitConfig.breakevenOffsetPct,
     ));
     lines.push(blank);
 
@@ -13264,13 +12736,8 @@ function TickReplayTest() {
       trendEntryConfig: trendEntry.enabled ? { enabled:true, breakoutLookback: parseInt(trendEntry.breakoutLookback,10)||5, minBodyPct: parseFloat(trendEntry.minBodyPct)||45, weakBodyPct: parseFloat(trendEntry.weakBodyPct)||20, ema9Period: parseInt(trendEntry.ema9Period,10)||9 } : { enabled: false },
       compressionEntryConfig: compressionEntry.enabled ? { enabled:true, rangeLookback: parseInt(compressionEntry.rangeLookback,10)||10, longZoneMax: parseFloat(compressionEntry.longZoneMax)||0.2, shortZoneMin: parseFloat(compressionEntry.shortZoneMin)||0.8, noTradeZoneMin: parseFloat(compressionEntry.noTradeZoneMin)||0.4, noTradeZoneMax: parseFloat(compressionEntry.noTradeZoneMax)||0.6, rejectBreakoutCandle: compressionEntry.rejectBreakoutCandle } : { enabled: false },
       holdConfig: { enabled: holdConfig.enabled, defaultMinHoldBars: parseInt(holdConfig.defaultMinHoldBars,10)||3, rangingMinHoldBars: parseInt(holdConfig.rangingMinHoldBars,10)||4, trendingMinHoldBars: parseInt(holdConfig.trendingMinHoldBars,10)||2, strongOppositeScore: parseFloat(holdConfig.strongOppositeScore)||35, persistentExitBars: parseInt(holdConfig.persistentExitBars,10)||2 },
-      exitConfig: { enabled: exitConfig.enabled, hardStopPct: parseFloat(exitConfig.hardStopPct)||7, holdZonePct: parseFloat(exitConfig.holdZonePct)||5, lock1TriggerPct: parseFloat(exitConfig.lock1TriggerPct)||5, lock1FloorPct: parseFloat(exitConfig.lock1FloorPct)||2, lock2TriggerPct: parseFloat(exitConfig.lock2TriggerPct)||10, lock2FloorPct: parseFloat(exitConfig.lock2FloorPct)||5, trailTriggerPct: parseFloat(exitConfig.trailTriggerPct)||15, trailFactor: parseFloat(exitConfig.trailFactor)||0.4, firstMoveBars: parseInt(exitConfig.firstMoveBars,10)||0, firstMoveLockPct: parseFloat(exitConfig.firstMoveLockPct)||0.5, structureLookback: parseInt(exitConfig.structureLookback,10)||5, scoreDropFactor: parseFloat(exitConfig.scoreDropFactor)||0, scoreAbsoluteMin: parseFloat(exitConfig.scoreAbsoluteMin)||0, biasExitEnabled: exitConfig.biasExitEnabled, strongExitScore: parseFloat(exitConfig.strongExitScore)||40, trendStrongModeThresholdPct: parseFloat(exitConfig.trendStrongModeThresholdPct)||5, maxBarsNoImprovement: parseInt(exitConfig.maxBarsNoImprovement,10)||3, stagnationBars: parseInt(exitConfig.stagnationBars,10)||2, maxBarsRanging: parseInt(exitConfig.maxBarsRanging,10)||6, maxBarsDeadTrade: parseInt(exitConfig.maxBarsDeadTrade,10)||10, deadTradePnlPct: parseFloat(exitConfig.deadTradePnlPct)||2, noHopeThresholdPct: parseFloat(exitConfig.noHopeThresholdPct)||1.5, noHopeBars: parseInt(exitConfig.noHopeBars,10)||2, breakevenProtectionEnabled: exitConfig.breakevenProtectionEnabled, breakevenTriggerPct: parseFloat(exitConfig.breakevenTriggerPct)||2, breakevenOffsetPct: parseFloat(exitConfig.breakevenOffsetPct)||0 },
+      exitConfig: { enabled: exitConfig.enabled, hardStopPct: parseFloat(exitConfig.hardStopPct)||7, holdZonePct: parseFloat(exitConfig.holdZonePct)||5, lock1TriggerPct: parseFloat(exitConfig.lock1TriggerPct)||5, lock1FloorPct: parseFloat(exitConfig.lock1FloorPct)||2, lock2TriggerPct: parseFloat(exitConfig.lock2TriggerPct)||10, lock2FloorPct: parseFloat(exitConfig.lock2FloorPct)||5, trailTriggerPct: parseFloat(exitConfig.trailTriggerPct)||15, trailFactor: parseFloat(exitConfig.trailFactor)||0.4, firstMoveBars: parseInt(exitConfig.firstMoveBars,10)||0, firstMoveLockPct: parseFloat(exitConfig.firstMoveLockPct)||0.5, structureLookback: parseInt(exitConfig.structureLookback,10)||5, scoreDropFactor: parseFloat(exitConfig.scoreDropFactor)||0, scoreAbsoluteMin: parseFloat(exitConfig.scoreAbsoluteMin)||0, biasExitEnabled: exitConfig.biasExitEnabled, strongExitScore: parseFloat(exitConfig.strongExitScore)||40, trendStrongModeThresholdPct: parseFloat(exitConfig.trendStrongModeThresholdPct)||5, maxBarsNoImprovement: parseInt(exitConfig.maxBarsNoImprovement,10)||3, stagnationBars: parseInt(exitConfig.stagnationBars,10)||2, maxBarsRanging: parseInt(exitConfig.maxBarsRanging,10)||6, maxBarsDeadTrade: parseInt(exitConfig.maxBarsDeadTrade,10)||10, deadTradePnlPct: parseFloat(exitConfig.deadTradePnlPct)||2, noHopeThresholdPct: parseFloat(exitConfig.noHopeThresholdPct)||1.5, noHopeBars: parseInt(exitConfig.noHopeBars,10)||2 },
       penaltyConfig: { enabled: penaltyConfig.enabled, reversalEnabled: penaltyConfig.reversalEnabled, reversalMax: parseFloat(penaltyConfig.reversalMax)||25, overextensionEnabled: penaltyConfig.overextensionEnabled, overextensionMax: parseFloat(penaltyConfig.overextensionMax)||30, sameColorEnabled: penaltyConfig.sameColorEnabled, sameColorMax: parseFloat(penaltyConfig.sameColorMax)||30, mismatchEnabled: penaltyConfig.mismatchEnabled, mismatchScale: parseFloat(penaltyConfig.mismatchScale)||1.0, volatileOptionEnabled: penaltyConfig.volatileOptionEnabled, volatileOptionPenalty: parseFloat(penaltyConfig.volatileOptionPenalty)||35, movePenaltyEnabled: penaltyConfig.movePenaltyEnabled, movePenalty: parseFloat(penaltyConfig.movePenalty)||3, vwapPenaltyEnabled: penaltyConfig.vwapPenaltyEnabled, vwapPenalty: parseFloat(penaltyConfig.vwapPenalty)||5, chopPenaltyEnabled: penaltyConfig.chopPenaltyEnabled, chopPenalty: parseFloat(penaltyConfig.chopPenalty)||2, rangeDriftingEnabled: penaltyConfig.rangeDriftingEnabled, rangeDriftingPenalty: parseFloat(penaltyConfig.rangeDriftingPenalty)||3, rangePoorStructureEnabled: penaltyConfig.rangePoorStructureEnabled, rangePoorStructurePenalty: parseFloat(penaltyConfig.rangePoorStructurePenalty)||4, rangeChoppyEnabled: penaltyConfig.rangeChoppyEnabled, rangeChoppyPenalty: parseFloat(penaltyConfig.rangeChoppyPenalty)||2, rangeSizeEnabled: penaltyConfig.rangeSizeEnabled, rangeSizePenalty: parseFloat(penaltyConfig.rangeSizePenalty)||2 },
-      minMovementFilterConfig: minMovementFilter.enabled ? { enabled: true, minMovementLookbackCandles: parseInt(minMovementFilter.minMovementLookbackCandles, 10)||3, minMovementThresholdPercent: parseFloat(minMovementFilter.minMovementThresholdPercent)||1.0 } : { enabled: false },
-      directionalConsistencyFilterConfig: directionalConsistencyFilter.enabled ? { enabled: true, directionalConsistencyLookbackCandles: parseInt(directionalConsistencyFilter.directionalConsistencyLookbackCandles, 10)||3, minSameDirectionCandles: parseInt(directionalConsistencyFilter.minSameDirectionCandles, 10)||2 } : { enabled: false },
-      candleStrengthFilterConfig: candleStrengthFilter.enabled ? { enabled: true, candleStrengthLookbackCandles: parseInt(candleStrengthFilter.candleStrengthLookbackCandles, 10)||3, minAverageBodyRatio: parseFloat(candleStrengthFilter.minAverageBodyRatio)||0.50, minStrongCandlesRequired: parseInt(candleStrengthFilter.minStrongCandlesRequired, 10)||2 } : { enabled: false },
-      noNewTradesAfterTimeConfig: noNewTradesAfterTime.enabled ? { enabled: true, noNewTradesAfterTime: noNewTradesAfterTime.noNewTradesAfterTime || '14:45' } : { enabled: false },
-      stopLossCascadeProtectionConfig: cascadeProtection.enabled ? { enabled: true, cascadeStopLossCount: parseInt(cascadeProtection.cascadeStopLossCount,10)||2, cascadeWindowMinutes: parseInt(cascadeProtection.cascadeWindowMinutes,10)||30, cascadePauseMinutes: parseInt(cascadeProtection.cascadePauseMinutes,10)||30, cascadeExitReasons: ['HARD_STOP_LOSS'], cascadeApplyPerSymbol: cascadeProtection.cascadeApplyPerSymbol, cascadeApplyPerSide: cascadeProtection.cascadeApplyPerSide } : { enabled: false },
       tradingHoursConfig: { enabled: tradingHoursEnabled, noNewEntriesMinutesBeforeClose: parseInt(closeoutMins, 10) || 15 },
     };
     lastPayloadRef.current = payload;
@@ -14038,86 +13505,6 @@ function TickReplayTest() {
           )}
         </div>
 
-        {/* ── Min Movement Filter ── */}
-        <div className="card bt-opts-card">
-          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
-            <span className="bt-section-title" style={{ marginBottom:0 }}>Min Movement Filter</span>
-            <button type="button" className={`btn-sm ${minMovementFilter.enabled?'btn-primary':'btn-secondary'}`} onClick={() => updateMinMovementFilter('enabled', !minMovementFilter.enabled)} disabled={isRunning}>{minMovementFilter.enabled?'ON':'OFF'}</button>
-            <span style={{ fontSize:11, color:'#6366f1', fontWeight:600 }}>pre-trade filter</span>
-          </div>
-          {minMovementFilter.enabled && (
-            <div className="bt-form-grid">
-              {[['minMovementLookbackCandles','Lookback Candles',1,null,1],['minMovementThresholdPercent','Min Movement %',0,null,0.01]].map(([key,lbl,min,max,step]) => (
-                <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} max={max??undefined} step={step} value={minMovementFilter[key]} onChange={e => updateMinMovementFilter(key, e.target.value)} disabled={isRunning} /></div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* ── Directional Consistency Filter ── */}
-        <div className="card bt-opts-card">
-          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
-            <span className="bt-section-title" style={{ marginBottom:0 }}>Directional Consistency Filter</span>
-            <button type="button" className={`btn-sm ${directionalConsistencyFilter.enabled?'btn-primary':'btn-secondary'}`} onClick={() => updateDirectionalConsistencyFilter('enabled', !directionalConsistencyFilter.enabled)} disabled={isRunning}>{directionalConsistencyFilter.enabled?'ON':'OFF'}</button>
-            <span style={{ fontSize:11, color:'#6366f1', fontWeight:600 }}>pre-trade filter</span>
-          </div>
-          {directionalConsistencyFilter.enabled && (
-            <div className="bt-form-grid">
-              {[['directionalConsistencyLookbackCandles','Lookback Candles',1,null,1],['minSameDirectionCandles','Min Same Direction',1,null,1]].map(([key,lbl,min,max,step]) => (
-                <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} max={max??undefined} step={step} value={directionalConsistencyFilter[key]} onChange={e => updateDirectionalConsistencyFilter(key, e.target.value)} disabled={isRunning} /></div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* ── Candle Strength Filter ── */}
-        <div className="card bt-opts-card">
-          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
-            <span className="bt-section-title" style={{ marginBottom:0 }}>Candle Strength Filter</span>
-            <button type="button" className={`btn-sm ${candleStrengthFilter.enabled?'btn-primary':'btn-secondary'}`} onClick={() => updateCandleStrengthFilter('enabled', !candleStrengthFilter.enabled)} disabled={isRunning}>{candleStrengthFilter.enabled?'ON':'OFF'}</button>
-            <span style={{ fontSize:11, color:'#6366f1', fontWeight:600 }}>pre-trade filter</span>
-          </div>
-          {candleStrengthFilter.enabled && (
-            <div className="bt-form-grid">
-              {[['candleStrengthLookbackCandles','Lookback Candles',1,null,1],['minAverageBodyRatio','Min Avg Body Ratio',0,null,0.01],['minStrongCandlesRequired','Min Strong Candles',1,null,1]].map(([key,lbl,min,max,step]) => (
-                <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} max={max??undefined} step={step} value={candleStrengthFilter[key]} onChange={e => updateCandleStrengthFilter(key, e.target.value)} disabled={isRunning} /></div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* ── No New Trades After Time ── */}
-        <div className="card bt-opts-card">
-          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
-            <span className="bt-section-title" style={{ marginBottom:0 }}>No New Trades After</span>
-            <button type="button" className={`btn-sm ${noNewTradesAfterTime.enabled?'btn-primary':'btn-secondary'}`} onClick={() => updateNoNewTradesAfterTime('enabled', !noNewTradesAfterTime.enabled)} disabled={isRunning}>{noNewTradesAfterTime.enabled?'ON':'OFF'}</button>
-            <span style={{ fontSize:11, color:'#6366f1', fontWeight:600 }}>pre-trade filter</span>
-          </div>
-          {noNewTradesAfterTime.enabled && (
-            <div className="bt-form-grid">
-              <div className="form-group"><label>Time (HH:MM)</label><input type="time" value={noNewTradesAfterTime.noNewTradesAfterTime} onChange={e => updateNoNewTradesAfterTime('noNewTradesAfterTime', e.target.value)} disabled={isRunning} /></div>
-            </div>
-          )}
-        </div>
-        {/* -- SL Cascade Protection -- */}
-        <div className="card bt-opts-card">
-          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
-            <span className="bt-section-title" style={{ marginBottom:0 }}>SL Cascade Protection</span>
-            <button type="button" className={`btn-sm ${cascadeProtection.enabled ? 'btn-primary' : 'btn-secondary'}`} onClick={() => updateCascadeProtection('enabled', !cascadeProtection.enabled)} disabled={isRunning}>{cascadeProtection.enabled?'ON':'OFF'}</button>
-            <span style={{ fontSize:11, color:'#ef4444', fontWeight:600 }}>risk control</span>
-          </div>
-          {cascadeProtection.enabled && (
-            <div className="bt-form-grid">
-              {[['cascadeStopLossCount','SL Count',1,null,1],['cascadeWindowMinutes','Window (min)',1,null,1],['cascadePauseMinutes','Pause (min)',1,null,1]].map(([key,lbl,min,max,step]) => (
-                <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} max={max??undefined} step={step} value={cascadeProtection[key]} onChange={e => updateCascadeProtection(key, e.target.value)} disabled={isRunning} /></div>
-              ))}
-              <div className="form-group"><label>Per Symbol</label><button type="button" className={`btn-sm ${cascadeProtection.cascadeApplyPerSymbol ? 'btn-primary' : 'btn-secondary'}`} onClick={() => updateCascadeProtection('cascadeApplyPerSymbol', !cascadeProtection.cascadeApplyPerSymbol)} disabled={isRunning}>{cascadeProtection.cascadeApplyPerSymbol?'ON':'OFF'}</button></div>
-              <div className="form-group"><label>Per Side</label><button type="button" className={`btn-sm ${cascadeProtection.cascadeApplyPerSide ? 'btn-primary' : 'btn-secondary'}`} onClick={() => updateCascadeProtection('cascadeApplyPerSide', !cascadeProtection.cascadeApplyPerSide)} disabled={isRunning}>{cascadeProtection.cascadeApplyPerSide?'ON':'OFF'}</button></div>
-            </div>
-          )}
-        </div>
-
-
         {/* ── Hold Config ── */}
         <div className="card bt-opts-card">
           <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
@@ -14141,11 +13528,10 @@ function TickReplayTest() {
           </div>
           {exitConfig.enabled && (
             <div className="bt-form-grid">
-              {[['hardStopPct','Hard Stop %',0,null,0.1],['holdZonePct','Hold Zone %',0,null,0.1],['lock1TriggerPct','Lock1 Trigger %',0,null,0.1],['lock1FloorPct','Lock1 Floor %',0,null,0.1],['lock2TriggerPct','Lock2 Trigger %',0,null,0.1],['lock2FloorPct','Lock2 Floor %',0,null,0.1],['trailTriggerPct','Trail Trigger %',0,null,0.1],['trailFactor','Trail Factor',0,1,0.05],['firstMoveBars','First Move Bars',0,null,1],['firstMoveLockPct','First Move Lock %',0,null,0.1],['structureLookback','Structure Lookback',1,null,1],['scoreDropFactor','Score Drop Factor',0,null,0.1],['scoreAbsoluteMin','Score Abs Min',0,null,0.5],['strongExitScore','Strong Exit Score',0,null,0.5],['trendStrongModeThresholdPct','Trend Strong Mode %',0,null,0.1],['maxBarsNoImprovement','Max Bars No Improvement',0,null,1],['stagnationBars','Stagnation Bars',0,null,1],['maxBarsRanging','Max Bars RANGING',0,null,1],['maxBarsDeadTrade','Max Bars Dead Trade',0,null,1],['deadTradePnlPct','Dead Trade PnL %',0,null,0.1],['noHopeThresholdPct','No-Hope Threshold %',0,null,0.1],['noHopeBars','No-Hope Bars',0,null,1],['breakevenTriggerPct','Breakeven Trigger %',0,null,0.1],['breakevenOffsetPct','Breakeven Offset %',0,null,0.1]].map(([key,lbl,min,max,step]) => (
+              {[['hardStopPct','Hard Stop %',0,null,0.1],['holdZonePct','Hold Zone %',0,null,0.1],['lock1TriggerPct','Lock1 Trigger %',0,null,0.1],['lock1FloorPct','Lock1 Floor %',0,null,0.1],['lock2TriggerPct','Lock2 Trigger %',0,null,0.1],['lock2FloorPct','Lock2 Floor %',0,null,0.1],['trailTriggerPct','Trail Trigger %',0,null,0.1],['trailFactor','Trail Factor',0,1,0.05],['firstMoveBars','First Move Bars',0,null,1],['firstMoveLockPct','First Move Lock %',0,null,0.1],['structureLookback','Structure Lookback',1,null,1],['scoreDropFactor','Score Drop Factor',0,null,0.1],['scoreAbsoluteMin','Score Abs Min',0,null,0.5],['strongExitScore','Strong Exit Score',0,null,0.5],['trendStrongModeThresholdPct','Trend Strong Mode %',0,null,0.1],['maxBarsNoImprovement','Max Bars No Improvement',0,null,1],['stagnationBars','Stagnation Bars',0,null,1],['maxBarsRanging','Max Bars RANGING',0,null,1],['maxBarsDeadTrade','Max Bars Dead Trade',0,null,1],['deadTradePnlPct','Dead Trade PnL %',0,null,0.1],['noHopeThresholdPct','No-Hope Threshold %',0,null,0.1],['noHopeBars','No-Hope Bars',0,null,1]].map(([key,lbl,min,max,step]) => (
                 <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} max={max??undefined} step={step} value={exitConfig[key]} onChange={e => updateExitConfig(key, e.target.value)} disabled={isRunning} /></div>
               ))}
               <div className="form-group"><label>Bias Exit</label><select value={exitConfig.biasExitEnabled?'on':'off'} onChange={e => setExitConfig(p => ({ ...p, biasExitEnabled: e.target.value==='on' }))} disabled={isRunning}><option value="on">ON</option><option value="off">OFF</option></select></div>
-              <div className="form-group"><label>Breakeven</label><select value={exitConfig.breakevenProtectionEnabled?'on':'off'} onChange={e => setExitConfig(p => ({ ...p, breakevenProtectionEnabled: e.target.value==='on' }))} disabled={isRunning}><option value="on">ON</option><option value="off">OFF</option></select></div>
             </div>
           )}
         </div>

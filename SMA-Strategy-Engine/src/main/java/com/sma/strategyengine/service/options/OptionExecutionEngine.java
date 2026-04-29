@@ -105,7 +105,7 @@ public class OptionExecutionEngine {
         log.info("HoldConfig: enabled={} default={} ranging={} trending={} strongOpp={} persist={}",
                 hc.isEnabled(), hc.getDefaultMinHoldBars(), hc.getRangingMinHoldBars(),
                 hc.getTrendingMinHoldBars(), hc.getStrongOppositeScore(), hc.getPersistentExitBars());
-        log.info("ExitConfig: enabled={} hardStop={}% lock1={}/{}% lock2={}/{}% trail={}/{}x firstMove={}/{} struct={} scoreDrop={} scoreMin={} noImprove={} stagnate={} noHope={}/{}",
+        log.info("ExitConfig: enabled={} hardStop={}% lock1={}/{}% lock2={}/{}% trail={}/{}x firstMove={}/{} struct={} scoreDrop={} scoreMin={} noImprove={} stagnate={} noHope={}/{} breakeven={}/{}%",
                 req.getExitConfig() != null ? req.getExitConfig().isEnabled() : true,
                 req.getExitConfig() != null ? req.getExitConfig().getHardStopPct() : 7,
                 req.getExitConfig() != null ? req.getExitConfig().getLock1TriggerPct() : 2,
@@ -122,7 +122,9 @@ public class OptionExecutionEngine {
                 req.getExitConfig() != null ? req.getExitConfig().getMaxBarsNoImprovement() : 3,
                 req.getExitConfig() != null ? req.getExitConfig().getStagnationBars() : 2,
                 req.getExitConfig() != null ? req.getExitConfig().getNoHopeThresholdPct() : 1.5,
-                req.getExitConfig() != null ? req.getExitConfig().getNoHopeBars() : 2);
+                req.getExitConfig() != null ? req.getExitConfig().getNoHopeBars() : 2,
+                req.getExitConfig() != null ? req.getExitConfig().isBreakevenProtectionEnabled() : true,
+                req.getExitConfig() != null ? req.getExitConfig().getBreakevenTriggerPct() : 2.0);
     }
 
     public int    getBarsSinceLastTrade() { return barsSinceLastTrade; }
@@ -435,6 +437,7 @@ public class OptionExecutionEngine {
                 .exitReason(reason)
                 .barsInTrade(barsInTrade)
                 .capitalAfter(capital)
+                .entryRegime(entryRegime)
                 .build());
 
         log.info("Closed {} — exit={} pnl={} reason={} bars={}",

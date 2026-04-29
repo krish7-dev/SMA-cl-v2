@@ -177,7 +177,15 @@ public class OptionsReplayService {
                 .orElse(new OptionsReplayRequest.PenaltyConfig());
         log.info("PenaltyConfig: enabled={} (raw req.getPenaltyConfig()={})",
                 pc.isEnabled(), req.getPenaltyConfig() != null ? req.getPenaltyConfig().isEnabled() : "null");
-        NiftyDecisionEngine  decisionEngine  = new NiftyDecisionEngine(strategyRegistry, req.getStrategies(), dc, sc, rr, rsr, cr, rqc, tqc, tec, cec, pc);
+        OptionsReplayRequest.MinMovementFilterConfig mmfc = Optional.ofNullable(req.getMinMovementFilterConfig())
+                .orElse(new OptionsReplayRequest.MinMovementFilterConfig());
+        OptionsReplayRequest.DirectionalConsistencyFilterConfig dcfc = Optional.ofNullable(req.getDirectionalConsistencyFilterConfig())
+                .orElse(new OptionsReplayRequest.DirectionalConsistencyFilterConfig());
+        OptionsReplayRequest.CandleStrengthFilterConfig csfc = Optional.ofNullable(req.getCandleStrengthFilterConfig())
+                .orElse(new OptionsReplayRequest.CandleStrengthFilterConfig());
+        OptionsReplayRequest.StopLossCascadeProtectionConfig slcpc = Optional.ofNullable(req.getStopLossCascadeProtectionConfig())
+                .orElse(new OptionsReplayRequest.StopLossCascadeProtectionConfig());
+        NiftyDecisionEngine  decisionEngine  = new NiftyDecisionEngine(strategyRegistry, req.getStrategies(), dc, sc, rr, rsr, cr, rqc, tqc, tec, cec, pc, mmfc, dcfc, csfc, null, slcpc);
         OptionSelectorService selectorService = OptionSelectorService.forReplay(sel, optionCandleMap);
         OptionExecutionEngine execEngine      = new OptionExecutionEngine(req);
 
@@ -218,6 +226,13 @@ public class OptionsReplayService {
             double niftyClose = niftyCandle.close().doubleValue();
             String action = execEngine.process(decision, selectorService, cePool, pePool,
                     niftyClose, candleTime, niftyCandle);
+
+            // Notify decision engine of any cascade-eligible exit
+            if (execEngine.getLastExitReason() != null) {
+                java.util.List<com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade> ct = execEngine.getClosedTrades();
+                String exitSide = ct.isEmpty() ? null : ct.get(ct.size() - 1).getOptionType();
+                decisionEngine.recordCascadeExit(execEngine.getLastExitReason(), "NIFTY", exitSide, candleTime);
+            }
 
             // c. Build and emit event
             OptionsReplayCandleEvent event = buildEvent(i + 1, total, niftyCandle, decision,
@@ -355,6 +370,11 @@ public class OptionsReplayService {
         if (rules.isVolatileNoTrade() && "VOLATILE".equals(regime)) {
             decision.setEntryAllowed(false);
             decision.setBlockReason("trading rule: no trade in VOLATILE");
+            return;
+        }
+        if (rules.isCompressionNoTrade() && "COMPRESSION".equals(regime)) {
+            decision.setEntryAllowed(false);
+            decision.setBlockReason("trading rule: no trade in COMPRESSION");
             return;
         }
     }
