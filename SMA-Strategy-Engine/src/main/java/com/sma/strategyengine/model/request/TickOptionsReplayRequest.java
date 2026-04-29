@@ -69,5 +69,10 @@ public class TickOptionsReplayRequest {
     private OptionsReplayRequest.RiskConfig               riskConfig;
     private OptionsReplayRequest.ExitConfig               exitConfig;
     private OptionsReplayRequest.TradingRules             tradingRules;
-    private OptionsReplayRequest.TradingHoursConfig       tradingHoursConfig;
+    private OptionsReplayRequest.MinMovementFilterConfig                minMovementFilterConfig;
+    private OptionsReplayRequest.DirectionalConsistencyFilterConfig     directionalConsistencyFilterConfig;
+    private OptionsReplayRequest.CandleStrengthFilterConfig             candleStrengthFilterConfig;
+    private OptionsReplayRequest.NoNewTradesAfterTimeConfig             noNewTradesAfterTimeConfig;
+    private OptionsReplayRequest.StopLossCascadeProtectionConfig        stopLossCascadeProtectionConfig;
+    private OptionsReplayRequest.TradingHoursConfig                     tradingHoursConfig;
 }

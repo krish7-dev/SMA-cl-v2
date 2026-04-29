@@ -103,6 +103,18 @@ public class OptionsLiveRequest {
     // Penalty config
     private OptionsReplayRequest.PenaltyConfig penaltyConfig = new OptionsReplayRequest.PenaltyConfig();
 
+    // Minimum movement filter
+    private OptionsReplayRequest.MinMovementFilterConfig minMovementFilterConfig = new OptionsReplayRequest.MinMovementFilterConfig();
+
+    // Directional consistency filter
+    private OptionsReplayRequest.DirectionalConsistencyFilterConfig directionalConsistencyFilterConfig = new OptionsReplayRequest.DirectionalConsistencyFilterConfig();
+
+    // Candle strength filter
+    private OptionsReplayRequest.CandleStrengthFilterConfig candleStrengthFilterConfig = new OptionsReplayRequest.CandleStrengthFilterConfig();
+
+    // Stop loss cascade protection
+    private OptionsReplayRequest.StopLossCascadeProtectionConfig stopLossCascadeProtectionConfig = new OptionsReplayRequest.StopLossCascadeProtectionConfig();
+
     // Trading hours filtering
     private OptionsReplayRequest.TradingHoursConfig tradingHoursConfig;
 }

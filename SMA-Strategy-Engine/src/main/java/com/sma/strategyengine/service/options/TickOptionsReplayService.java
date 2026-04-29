@@ -638,6 +638,13 @@ public class TickOptionsReplayService {
                             cePool, pePool, niftyClose, openTime, snapshot);
                 }
 
+                // Notify decision engine of any cascade-eligible exit
+                if (execEngine.getLastExitReason() != null) {
+                    java.util.List<com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade> ct = execEngine.getClosedTrades();
+                    String exitSide = ct.isEmpty() ? null : ct.get(ct.size() - 1).getOptionType();
+                    decisionEngine.recordCascadeExit(execEngine.getLastExitReason(), "NIFTY", exitSide, openTime);
+                }
+
                 emittedCount++;
                 CandleDto optCandle = execEngine.getActiveToken() != null
                         ? selectorService.getCandle(execEngine.getActiveToken(), openTime) : null;
@@ -836,7 +843,17 @@ public class TickOptionsReplayService {
                     Optional.ofNullable(req.getCompressionEntryConfig())
                             .orElse(new OptionsReplayRequest.CompressionEntryConfig()),
                     Optional.ofNullable(req.getPenaltyConfig())
-                            .orElse(new OptionsReplayRequest.PenaltyConfig()));
+                            .orElse(new OptionsReplayRequest.PenaltyConfig()),
+                    Optional.ofNullable(req.getMinMovementFilterConfig())
+                            .orElse(new OptionsReplayRequest.MinMovementFilterConfig()),
+                    Optional.ofNullable(req.getDirectionalConsistencyFilterConfig())
+                            .orElse(new OptionsReplayRequest.DirectionalConsistencyFilterConfig()),
+                    Optional.ofNullable(req.getCandleStrengthFilterConfig())
+                            .orElse(new OptionsReplayRequest.CandleStrengthFilterConfig()),
+                    Optional.ofNullable(req.getNoNewTradesAfterTimeConfig())
+                            .orElse(new OptionsReplayRequest.NoNewTradesAfterTimeConfig()),
+                    Optional.ofNullable(req.getStopLossCascadeProtectionConfig())
+                            .orElse(new OptionsReplayRequest.StopLossCascadeProtectionConfig()));
         }
 
         private OptionsReplayRequest buildExecRequest() {

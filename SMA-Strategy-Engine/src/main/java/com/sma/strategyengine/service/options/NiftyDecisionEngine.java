@@ -12,6 +12,7 @@ import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 
 import java.time.Instant;
+import java.time.LocalTime;
 import java.time.ZoneId;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -43,6 +44,11 @@ public class NiftyDecisionEngine {
     private final TrendEntryValidator                       tev;
     private final CompressionEntryValidator                 cev;
     private final OptionsReplayRequest.PenaltyConfig        pc;
+    private final OptionsReplayRequest.MinMovementFilterConfig mmfc;
+    private final OptionsReplayRequest.DirectionalConsistencyFilterConfig dcfc;
+    private final OptionsReplayRequest.CandleStrengthFilterConfig csfc;
+    private final OptionsReplayRequest.NoNewTradesAfterTimeConfig nntac;
+    private final OptionsReplayRequest.StopLossCascadeProtectionConfig slcpc;
 
     // Score that was active when current confirmedBias was locked in (for switch improvement check)
     private double confirmedBiasScore = 0.0;
@@ -79,6 +85,12 @@ public class NiftyDecisionEngine {
     // Rolling winner-score history for early-entry rising-score detection (last 3 values)
     private final Deque<Double> winnerScoreHistory = new ArrayDeque<>(4);
 
+    // Stop loss cascade protection state
+    private final List<CascadeExit> cascadeExits = new ArrayList<>();
+    private java.time.LocalDateTime cascadePauseUntil = null;
+
+    private record CascadeExit(String reason, String symbol, String side, java.time.LocalDateTime time) {}
+
     // ─────────────────────────────────────────────────────────────────────────
 
     public NiftyDecisionEngine(StrategyRegistry registry,
@@ -94,7 +106,7 @@ public class NiftyDecisionEngine {
                                OptionsReplayRequest.CompressionEntryConfig compressionEntryConfig) {
         this(registry, strategies, decisionConfig, switchConfig, regimeRules, regimeStrategyRules,
                 chopRules, rangeQualityConfig, tradeQualityConfig, trendEntryConfig,
-                compressionEntryConfig, null);
+                compressionEntryConfig, null, null, null, null, null, null);
     }
 
     public NiftyDecisionEngine(StrategyRegistry registry,
@@ -108,7 +120,12 @@ public class NiftyDecisionEngine {
                                OptionsReplayRequest.TradeQualityConfig tradeQualityConfig,
                                OptionsReplayRequest.TrendEntryConfig trendEntryConfig,
                                OptionsReplayRequest.CompressionEntryConfig compressionEntryConfig,
-                               OptionsReplayRequest.PenaltyConfig penaltyConfig) {
+                               OptionsReplayRequest.PenaltyConfig penaltyConfig,
+                               OptionsReplayRequest.MinMovementFilterConfig minMovementFilterConfig,
+                               OptionsReplayRequest.DirectionalConsistencyFilterConfig directionalConsistencyFilterConfig,
+                               OptionsReplayRequest.CandleStrengthFilterConfig candleStrengthFilterConfig,
+                               OptionsReplayRequest.NoNewTradesAfterTimeConfig noNewTradesAfterTimeConfig,
+                               OptionsReplayRequest.StopLossCascadeProtectionConfig stopLossCascadeProtectionConfig) {
         this.registry   = registry;
         this.strategies = strategies;
         this.dc         = decisionConfig;
@@ -121,6 +138,11 @@ public class NiftyDecisionEngine {
         this.tev        = new TrendEntryValidator(trendEntryConfig);
         this.cev        = new CompressionEntryValidator(compressionEntryConfig);
         this.pc         = penaltyConfig != null ? penaltyConfig : new OptionsReplayRequest.PenaltyConfig();
+        this.mmfc       = minMovementFilterConfig != null ? minMovementFilterConfig : new OptionsReplayRequest.MinMovementFilterConfig();
+        this.dcfc       = directionalConsistencyFilterConfig != null ? directionalConsistencyFilterConfig : new OptionsReplayRequest.DirectionalConsistencyFilterConfig();
+        this.csfc       = candleStrengthFilterConfig != null ? candleStrengthFilterConfig : new OptionsReplayRequest.CandleStrengthFilterConfig();
+        this.nntac      = noNewTradesAfterTimeConfig != null ? noNewTradesAfterTimeConfig : new OptionsReplayRequest.NoNewTradesAfterTimeConfig();
+        this.slcpc      = stopLossCascadeProtectionConfig != null ? stopLossCascadeProtectionConfig : new OptionsReplayRequest.StopLossCascadeProtectionConfig();
 
         for (BacktestRequest.StrategyConfig cfg : strategies) {
             String id = "nifty-opts-" + cfg.getStrategyType() + "-" + System.nanoTime() + "-" + cfg.hashCode();
@@ -307,6 +329,37 @@ public class NiftyDecisionEngine {
                 CompressionEntryValidator.Result cvr = cev.validate(histList, rawBias);
                 if (!cvr.isAllowed()) { canEnter = false; block = "COMPRESSION:" + cvr.getReason(); }
             }
+        }
+
+        // ── Minimum movement filter ───────────────────────────────────────────
+        if (canEnter && mmfc.isEnabled()) {
+            String movBlock = checkMinMovementFilter(tickSnapshot.close().doubleValue());
+            if (movBlock != null) { canEnter = false; block = movBlock; }
+        }
+
+        // ── Directional consistency filter ────────────────────────────────────
+        if (canEnter && dcfc.isEnabled()) {
+            String dcBlock = checkDirectionalConsistencyFilter(rawBias);
+            if (dcBlock != null) { canEnter = false; block = dcBlock; }
+        }
+
+        // ── Candle strength filter ────────────────────────────────────────────
+        if (canEnter && csfc.isEnabled()) {
+            String csBlock = checkCandleStrengthFilter();
+            if (csBlock != null) { canEnter = false; block = csBlock; }
+        }
+
+        // ── No new trades after time ──────────────────────────────────────────
+        if (canEnter && nntac.isEnabled()) {
+            String timeBlock = checkNoNewTradesAfterTime(tickSnapshot.openTime());
+            if (timeBlock != null) { canEnter = false; block = timeBlock; }
+        }
+
+        // ── Stop loss cascade protection ──────────────────────────────────────
+        if (canEnter && slcpc.isEnabled()) {
+            String side = rawBias == NiftyDecisionResult.Bias.BULLISH ? "CE" : "PE";
+            String cascadeBlock = checkCascadeProtection(side, tickSnapshot.openTime());
+            if (cascadeBlock != null) { canEnter = false; block = cascadeBlock; }
         }
 
         // ── Trade quality tier ────────────────────────────────────────────────
@@ -652,6 +705,37 @@ public class NiftyDecisionEngine {
                     block    = "COMPRESSION:" + cvr.getReason();
                 }
             }
+        }
+
+        // ── Minimum movement filter ───────────────────────────────────────────
+        if (canEnter && mmfc.isEnabled()) {
+            String movBlock = checkMinMovementFilter(candle.close().doubleValue());
+            if (movBlock != null) { canEnter = false; block = movBlock; }
+        }
+
+        // ── Directional consistency filter ────────────────────────────────────
+        if (canEnter && dcfc.isEnabled()) {
+            String dcBlock = checkDirectionalConsistencyFilter(rawBias);
+            if (dcBlock != null) { canEnter = false; block = dcBlock; }
+        }
+
+        // ── Candle strength filter ────────────────────────────────────────────
+        if (canEnter && csfc.isEnabled()) {
+            String csBlock = checkCandleStrengthFilter();
+            if (csBlock != null) { canEnter = false; block = csBlock; }
+        }
+
+        // ── No new trades after time ──────────────────────────────────────────
+        if (canEnter && nntac.isEnabled()) {
+            String timeBlock = checkNoNewTradesAfterTime(candle.openTime());
+            if (timeBlock != null) { canEnter = false; block = timeBlock; }
+        }
+
+        // ── Stop loss cascade protection ──────────────────────────────────────
+        if (canEnter && slcpc.isEnabled()) {
+            String side = rawBias == NiftyDecisionResult.Bias.BULLISH ? "CE" : "PE";
+            String cascadeBlock = checkCascadeProtection(side, candle.openTime());
+            if (cascadeBlock != null) { canEnter = false; block = cascadeBlock; }
         }
 
         // ── Trade quality tier ────────────────────────────────────────────────
@@ -1085,6 +1169,147 @@ public class NiftyDecisionEngine {
         double start = hist.get(hist.size() - n - 1).close().doubleValue();
         double end   = hist.get(hist.size() - 1).close().doubleValue();
         return start > 0 ? Math.abs((end - start) / start * 100.0) : 0;
+    }
+
+    /**
+     * Returns a block-reason string if the minimum movement filter triggers, null otherwise.
+     * Uses the last {@code mmfc.minMovementLookbackCandles} entries in {@code history} as the
+     * "oldest" reference point and {@code latestClose} as the current price.
+     * In evaluate(), the current candle is already in history; in evaluateTick(), it is not —
+     * both cases work correctly because only the oldest close is pulled from history.
+     */
+    private String checkMinMovementFilter(double latestClose) {
+        int lookback = mmfc.getMinMovementLookbackCandles();
+        List<CandleDto> hist = new ArrayList<>(history);
+        if (hist.size() < lookback) return null;
+        double oldestClose = hist.get(hist.size() - lookback).close().doubleValue();
+        if (oldestClose == 0) return null;
+        double movementPct = Math.abs((latestClose - oldestClose) / oldestClose * 100.0);
+        if (movementPct < mmfc.getMinMovementThresholdPercent()) {
+            log.debug("[FILTER] Skipping trade due to low movement: movement={}%, threshold={}%",
+                    String.format("%.2f", movementPct), mmfc.getMinMovementThresholdPercent());
+            return String.format("min movement filter: movement=%.2f%%, threshold=%.1f%%",
+                    movementPct, mmfc.getMinMovementThresholdPercent());
+        }
+        return null;
+    }
+
+    /**
+     * Returns a block-reason string if directional consistency is insufficient, null otherwise.
+     * Counts bullish (close > open) and bearish (close < open) candles in the last
+     * {@code dcfc.directionalConsistencyLookbackCandles} closed candles (from history).
+     * Neutral candles (close == open) are ignored.
+     * Requires at least {@code dcfc.minSameDirectionCandles} in the trade direction.
+     */
+    private String checkDirectionalConsistencyFilter(NiftyDecisionResult.Bias rawBias) {
+        int lookback = dcfc.getDirectionalConsistencyLookbackCandles();
+        List<CandleDto> hist = new ArrayList<>(history);
+        if (hist.size() < lookback) return null;
+        List<CandleDto> recent = hist.subList(hist.size() - lookback, hist.size());
+        int bullishCount = 0;
+        int bearishCount = 0;
+        for (CandleDto c : recent) {
+            double o  = c.open().doubleValue();
+            double cl = c.close().doubleValue();
+            if (cl > o) bullishCount++;
+            else if (cl < o) bearishCount++;
+        }
+        boolean isBullish = rawBias == NiftyDecisionResult.Bias.BULLISH;
+        int required = dcfc.getMinSameDirectionCandles();
+        int count = isBullish ? bullishCount : bearishCount;
+        if (count < required) {
+            log.debug("[FILTER] Skipping trade due to directional inconsistency: side={}, bullishCount={}, bearishCount={}, required={}, lookback={}",
+                    isBullish ? "BULLISH" : "BEARISH", bullishCount, bearishCount, required, lookback);
+            return String.format("directional consistency filter: side=%s, sameDir=%d < required=%d (lookback=%d)",
+                    isBullish ? "BULLISH" : "BEARISH", count, required, lookback);
+        }
+        return null;
+    }
+
+    /**
+     * Returns a block-reason string if candle body strength is insufficient, null otherwise.
+     * For each of the last {@code csfc.candleStrengthLookbackCandles} closed candles:
+     *   bodyRatio = abs(close - open) / (high - low)  [0 if range == 0]
+     * A candle is "strong" if bodyRatio >= csfc.minAverageBodyRatio.
+     * Blocks entry if strongCandlesCount < minStrongCandlesRequired OR avgBodyRatio < minAverageBodyRatio.
+     */
+    private String checkCandleStrengthFilter() {
+        int lookback = csfc.getCandleStrengthLookbackCandles();
+        List<CandleDto> hist = new ArrayList<>(history);
+        if (hist.size() < lookback) return null;
+        List<CandleDto> recent = hist.subList(hist.size() - lookback, hist.size());
+        int    strongCount   = 0;
+        double totalBodyRatio = 0.0;
+        for (CandleDto c : recent) {
+            double body  = Math.abs(c.close().doubleValue() - c.open().doubleValue());
+            double range = c.high().doubleValue() - c.low().doubleValue();
+            double ratio = (range > 0) ? body / range : 0.0;
+            totalBodyRatio += ratio;
+            if (ratio >= csfc.getMinAverageBodyRatio()) strongCount++;
+        }
+        double avgBodyRatio = totalBodyRatio / lookback;
+        if (strongCount < csfc.getMinStrongCandlesRequired() || avgBodyRatio < csfc.getMinAverageBodyRatio()) {
+            log.debug("[FILTER] Skipping trade due to weak candle strength: strongCandles={}, requiredStrongCandles={}, avgBodyRatio={}, requiredAvgBodyRatio={}, lookback={}",
+                    strongCount, csfc.getMinStrongCandlesRequired(),
+                    String.format("%.3f", avgBodyRatio), csfc.getMinAverageBodyRatio(), lookback);
+            return String.format("candle strength filter: strongCandles=%d < required=%d, avgBodyRatio=%.3f < required=%.2f (lookback=%d)",
+                    strongCount, csfc.getMinStrongCandlesRequired(), avgBodyRatio, csfc.getMinAverageBodyRatio(), lookback);
+        }
+        return null;
+    }
+
+    private String checkNoNewTradesAfterTime(java.time.LocalDateTime candleTime) {
+        if (candleTime == null || nntac.getNoNewTradesAfterTime() == null) return null;
+        try {
+            LocalTime cutoff = LocalTime.parse(nntac.getNoNewTradesAfterTime());
+            LocalTime t      = candleTime.toLocalTime();
+            if (!t.isBefore(cutoff)) {
+                log.debug("[FILTER] Skipping trade — no new trades after {} (candle time {})",
+                        nntac.getNoNewTradesAfterTime(), t);
+                return String.format("no new trades after %s (candle time %s)",
+                        nntac.getNoNewTradesAfterTime(), t);
+            }
+        } catch (Exception e) {
+            log.warn("[FILTER] Invalid noNewTradesAfterTime format: {}", nntac.getNoNewTradesAfterTime());
+        }
+        return null;
+    }
+
+    public void recordCascadeExit(String reason, String symbol, String side, java.time.LocalDateTime time) {
+        if (!slcpc.isEnabled() || time == null) return;
+        if (slcpc.getCascadeExitReasons() == null || !slcpc.getCascadeExitReasons().contains(reason)) return;
+        cascadeExits.add(new CascadeExit(reason, symbol, side, time));
+        log.info("[RISK] Recorded cascade exit: reason={}, symbol={}, side={}, time={}", reason, symbol, side, time);
+        // Prune entries far outside any useful window to prevent unbounded growth
+        long pruneMinutes = Math.max(slcpc.getCascadeWindowMinutes(), slcpc.getCascadePauseMinutes()) * 2L;
+        cascadeExits.removeIf(e -> e.time() != null && e.time().isBefore(time.minusMinutes(pruneMinutes)));
+    }
+
+    private String checkCascadeProtection(String side, java.time.LocalDateTime now) {
+        if (now == null) return null;
+        // Active pause already running?
+        if (cascadePauseUntil != null && now.isBefore(cascadePauseUntil)) {
+            log.debug("[RISK] Skipping trade due to stop loss cascade pause: pauseUntil={}, now={}", cascadePauseUntil, now);
+            return String.format("stop loss cascade pause: pauseUntil=%s, now=%s", cascadePauseUntil, now);
+        }
+        // Count qualifying exits within window
+        java.time.LocalDateTime windowStart = now.minusMinutes(slcpc.getCascadeWindowMinutes());
+        List<CascadeExit> qualifying = cascadeExits.stream()
+                .filter(e -> e.time() != null && !e.time().isBefore(windowStart) && !e.time().isAfter(now))
+                .filter(e -> slcpc.getCascadeExitReasons() != null && slcpc.getCascadeExitReasons().contains(e.reason()))
+                .filter(e -> !slcpc.isCascadeApplyPerSymbol() || "NIFTY".equals(e.symbol()))
+                .filter(e -> !slcpc.isCascadeApplyPerSide() || side.equals(e.side()))
+                .collect(Collectors.toList());
+        if (qualifying.size() >= slcpc.getCascadeStopLossCount()) {
+            java.time.LocalDateTime latestExit = qualifying.stream()
+                    .map(CascadeExit::time).max(java.time.LocalDateTime::compareTo).orElse(now);
+            cascadePauseUntil = latestExit.plusMinutes(slcpc.getCascadePauseMinutes());
+            log.info("[RISK] Stop loss cascade protection activated: count={}, windowMinutes={}, pauseUntil={}",
+                    qualifying.size(), slcpc.getCascadeWindowMinutes(), cascadePauseUntil);
+            return String.format("stop loss cascade protection: count=%d >= threshold=%d, pauseUntil=%s",
+                    qualifying.size(), slcpc.getCascadeStopLossCount(), cascadePauseUntil);
+        }
+        return null;
     }
 
     private String dayOf(CandleDto c) {
