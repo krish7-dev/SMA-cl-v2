@@ -164,5 +164,6 @@ public class OptionsReplayCandleEvent {
         private int    barsInTrade;
         private double capitalAfter;
         private String entryRegime;
+        private String exitRegime;
     }
 }

@@ -55,7 +55,8 @@ public class OptionExecutionEngine {
 
     // Switch tracking
     @Getter private int    switchCountToday = 0;
-    private String currentDate = null;
+    private String currentDate   = null;
+    private String currentRegime = null;
 
     // Config
     private final int maxSwitchesPerDay;
@@ -174,6 +175,7 @@ public class OptionExecutionEngine {
                 ? 0.0 : exitEval.getProfitLockFloor();
         inHoldZone        = state != PositionState.FLAT && exitEval.isInHoldZone();
         inStrongTrendMode = state != PositionState.FLAT && exitEval.isInStrongTrendMode();
+        currentRegime     = decision != null ? decision.getRegime() : null;
 
         return switch (state) {
             case FLAT      -> processFlatState(decision, selector, cePool, pePool, niftyClose, candleTime);
@@ -438,6 +440,7 @@ public class OptionExecutionEngine {
                 .barsInTrade(barsInTrade)
                 .capitalAfter(capital)
                 .entryRegime(entryRegime)
+                .exitRegime(currentRegime)
                 .build());
 
         log.info("Closed {} — exit={} pnl={} reason={} bars={}",
