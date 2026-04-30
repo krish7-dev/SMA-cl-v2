@@ -1168,13 +1168,13 @@ function OptionsLiveTest() {
     if (c.tradeQuality         !== undefined) setTradeQuality(c.tradeQuality);
     if (c.trendEntry           !== undefined) setTrendEntry(c.trendEntry);
     if (c.compressionEntry     !== undefined) setCompressionEntry(c.compressionEntry);
-    if (c.holdConfig           !== undefined) setHoldConfig(c.holdConfig);
-    if (c.exitConfig           !== undefined) setExitConfig(c.exitConfig);
-    if (c.penaltyConfig                  !== undefined) setPenaltyConfig(c.penaltyConfig);
-    if (c.minMovementFilter              !== undefined) setMinMovementFilter(c.minMovementFilter);
-    if (c.directionalConsistencyFilter   !== undefined) setDirectionalConsistencyFilter(c.directionalConsistencyFilter);
-    if (c.candleStrengthFilter           !== undefined) setCandleStrengthFilter(c.candleStrengthFilter);
-    if (c.cascadeProtection              !== undefined) setCascadeProtection(c.cascadeProtection);
+    setHoldConfig({ ...DEFAULT_HOLD, ...(c.holdConfig ?? {}) });
+    setExitConfig({ ...DEFAULT_EXIT_CONFIG, ...(c.exitConfig ?? {}) });
+    setPenaltyConfig({ ...DEFAULT_PENALTY_CONFIG, ...(c.penaltyConfig ?? {}) });
+    setMinMovementFilter(c.minMovementFilter ?? DEFAULT_MIN_MOVEMENT_FILTER);
+    setDirectionalConsistencyFilter(c.directionalConsistencyFilter ?? DEFAULT_DIRECTIONAL_CONSISTENCY_FILTER);
+    setCandleStrengthFilter(c.candleStrengthFilter ?? DEFAULT_CANDLE_STRENGTH_FILTER);
+    setCascadeProtection(c.cascadeProtection ?? DEFAULT_CASCADE_PROTECTION);
   }
 
   function deletePreset(id) {
@@ -1879,7 +1879,7 @@ function OptionsLiveTest() {
     const closedTradesForCsv = feed[feed.length - 1]?.closedTrades || [];
     if (closedTradesForCsv.length > 0) {
       lines.push(row('=== Closed Trades ==='));
-      lines.push(row('Entry Time', 'Exit Time', 'Type', 'Symbol', 'Strike', 'Expiry', 'Entry Px', 'Exit Px', 'Qty', 'P&L', 'P&L %', 'Bars', 'Exit Reason', 'Capital After', 'Entry Regime'));
+      lines.push(row('Entry Time', 'Exit Time', 'Type', 'Symbol', 'Strike', 'Expiry', 'Entry Px', 'Exit Px', 'Qty', 'P&L', 'P&L %', 'Bars', 'Exit Reason', 'Capital After', 'Entry Regime', 'Exit Regime'));
       closedTradesForCsv.forEach(t => lines.push(row(
         (t.entryTime || '').slice(0, 16), (t.exitTime || '').slice(0, 16),
         t.optionType, t.tradingSymbol, t.strike, t.expiry,
@@ -1890,7 +1890,7 @@ function OptionsLiveTest() {
         t.pnlPct != null ? Number(t.pnlPct).toFixed(2) : '',
         t.barsInTrade, t.exitReason,
         t.capitalAfter != null ? Number(t.capitalAfter).toFixed(2) : '',
-        t.entryRegime || '',
+        t.entryRegime || '', t.exitRegime || '',
       )));
       lines.push(blank);
     }
@@ -9818,13 +9818,13 @@ function OptionsReplayTest() {
     if (c.tradeQuality         !== undefined) setTradeQuality(c.tradeQuality);
     if (c.trendEntry           !== undefined) setTrendEntry(c.trendEntry);
     if (c.compressionEntry     !== undefined) setCompressionEntry(c.compressionEntry);
-    if (c.holdConfig           !== undefined) setHoldConfig(c.holdConfig);
-    if (c.exitConfig           !== undefined) setExitConfig(c.exitConfig);
-    if (c.penaltyConfig                  !== undefined) setPenaltyConfig(c.penaltyConfig);
-    if (c.minMovementFilter              !== undefined) setMinMovementFilter(c.minMovementFilter);
-    if (c.directionalConsistencyFilter   !== undefined) setDirectionalConsistencyFilter(c.directionalConsistencyFilter);
-    if (c.candleStrengthFilter           !== undefined) setCandleStrengthFilter(c.candleStrengthFilter);
-    if (c.cascadeProtection              !== undefined) setCascadeProtection(c.cascadeProtection);
+    setHoldConfig({ ...DEFAULT_HOLD, ...(c.holdConfig ?? {}) });
+    setExitConfig({ ...DEFAULT_EXIT_CONFIG, ...(c.exitConfig ?? {}) });
+    setPenaltyConfig({ ...DEFAULT_PENALTY_CONFIG, ...(c.penaltyConfig ?? {}) });
+    setMinMovementFilter(c.minMovementFilter ?? DEFAULT_MIN_MOVEMENT_FILTER);
+    setDirectionalConsistencyFilter(c.directionalConsistencyFilter ?? DEFAULT_DIRECTIONAL_CONSISTENCY_FILTER);
+    setCandleStrengthFilter(c.candleStrengthFilter ?? DEFAULT_CANDLE_STRENGTH_FILTER);
+    setCascadeProtection(c.cascadeProtection ?? DEFAULT_CASCADE_PROTECTION);
   }
 
   function deletePreset(id) {
@@ -10241,7 +10241,7 @@ function OptionsReplayTest() {
     if (closedTradesForCsv.length > 0) {
       lines.push(row('=== Closed Trades ==='));
       lines.push(row('Entry Time', 'Exit Time', 'Type', 'Symbol', 'Strike', 'Expiry',
-        'Entry Px', 'Exit Px', 'Qty', 'P&L', 'P&L %', 'Bars', 'Exit Reason', 'Capital After', 'Entry Regime'));
+        'Entry Px', 'Exit Px', 'Qty', 'P&L', 'P&L %', 'Bars', 'Exit Reason', 'Capital After', 'Entry Regime', 'Exit Regime'));
       closedTradesForCsv.forEach(t => lines.push(row(
         (t.entryTime || '').slice(0, 16), (t.exitTime || '').slice(0, 16),
         t.optionType, t.tradingSymbol, t.strike, t.expiry,
@@ -10252,7 +10252,7 @@ function OptionsReplayTest() {
         t.pnlPct != null ? Number(t.pnlPct).toFixed(2) : '',
         t.barsInTrade, t.exitReason,
         t.capitalAfter != null ? Number(t.capitalAfter).toFixed(2) : '',
-        t.entryRegime || '',
+        t.entryRegime || '', t.exitRegime || '',
       )));
       lines.push(blank);
     }
@@ -12640,14 +12640,14 @@ function TickReplayTest() {
     if (c.tradeQuality        !== undefined) setTradeQuality(c.tradeQuality);
     if (c.trendEntry          !== undefined) setTrendEntry(c.trendEntry);
     if (c.compressionEntry    !== undefined) setCompressionEntry(c.compressionEntry);
-    if (c.holdConfig          !== undefined) setHoldConfig(c.holdConfig);
-    if (c.exitConfig          !== undefined) setExitConfig(c.exitConfig);
-    if (c.penaltyConfig       !== undefined) setPenaltyConfig(c.penaltyConfig);
-    if (c.minMovementFilter              !== undefined) setMinMovementFilter(c.minMovementFilter);
-    if (c.directionalConsistencyFilter   !== undefined) setDirectionalConsistencyFilter(c.directionalConsistencyFilter);
-    if (c.candleStrengthFilter           !== undefined) setCandleStrengthFilter(c.candleStrengthFilter);
-    if (c.noNewTradesAfterTime           !== undefined) setNoNewTradesAfterTime(c.noNewTradesAfterTime);
-    if (c.cascadeProtection              !== undefined) setCascadeProtection(c.cascadeProtection);
+    setHoldConfig({ ...DEFAULT_HOLD, ...(c.holdConfig ?? {}) });
+    setExitConfig({ ...DEFAULT_EXIT_CONFIG, ...(c.exitConfig ?? {}) });
+    setPenaltyConfig({ ...DEFAULT_PENALTY_CONFIG, ...(c.penaltyConfig ?? {}) });
+    setMinMovementFilter(c.minMovementFilter ?? DEFAULT_MIN_MOVEMENT_FILTER);
+    setDirectionalConsistencyFilter(c.directionalConsistencyFilter ?? DEFAULT_DIRECTIONAL_CONSISTENCY_FILTER);
+    setCandleStrengthFilter(c.candleStrengthFilter ?? DEFAULT_CANDLE_STRENGTH_FILTER);
+    setNoNewTradesAfterTime(c.noNewTradesAfterTime ?? DEFAULT_NO_NEW_TRADES_AFTER_TIME);
+    setCascadeProtection(c.cascadeProtection ?? DEFAULT_CASCADE_PROTECTION);
   }
 
   function deletePreset(id) {
@@ -12746,9 +12746,11 @@ function TickReplayTest() {
     setStatus('idle');
   }
 
-  function downloadCSV() {
+  function downloadCSV(mode = 'csv') {
     const q    = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    const row  = (...cols) => cols.map(q).join(',');
+    const row  = mode === 'txt'
+      ? (...cols) => cols.map(v => String(v ?? '')).join('\t')
+      : (...cols) => cols.map(q).join(',');
     const blank = '';
     const lines = [];
     const n2    = v => v != null ? Number(v).toFixed(2) : '';
@@ -13045,7 +13047,7 @@ function TickReplayTest() {
     if (ct.length > 0) {
       lines.push(row('=== Closed Trades ==='));
       lines.push(row('Entry Time', 'Exit Time', 'Type', 'Symbol', 'Strike', 'Expiry',
-        'Entry Px', 'Exit Px', 'Qty', 'P&L', 'P&L %', 'Bars', 'Exit Reason', 'Capital After', 'Entry Regime'));
+        'Entry Px', 'Exit Px', 'Qty', 'P&L', 'P&L %', 'Bars', 'Exit Reason', 'Capital After', 'Entry Regime', 'Exit Regime'));
       ct.forEach(t => lines.push(row(
         (t.entryTime || '').slice(0, 16), (t.exitTime || '').slice(0, 16),
         t.optionType, t.tradingSymbol, t.strike, t.expiry,
@@ -13056,7 +13058,7 @@ function TickReplayTest() {
         t.pnlPct != null ? Number(t.pnlPct).toFixed(2) : '',
         t.barsInTrade, t.exitReason,
         t.capitalAfter != null ? Number(t.capitalAfter).toFixed(2) : '',
-        t.entryRegime || '',
+        t.entryRegime || '', t.exitRegime || '',
       )));
       lines.push(blank);
     }
@@ -13148,12 +13150,12 @@ function TickReplayTest() {
       }
     }
 
-    const csv  = lines.join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
+    const content = lines.join('\n');
+    const blob = new Blob([content], { type: mode === 'txt' ? 'text/plain' : 'text/csv' });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
     a.href = url;
-    a.download = `tick_replay_${sessionId || 'data'}.csv`;
+    a.download = `tick_replay_${sessionId || 'data'}.${mode}`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -13437,7 +13439,8 @@ function TickReplayTest() {
               </div>
             )}
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-              <button type="button" className="btn-secondary btn-xs" onClick={downloadCSV}>Download CSV</button>
+              <button type="button" className="btn-secondary btn-xs" onClick={() => downloadCSV('csv')}>Download CSV</button>
+              <button type="button" className="btn-secondary btn-xs" onClick={() => downloadCSV('txt')}>Download Text</button>
               {feed.length > 0 && (
                 <button type="button" className="btn-secondary btn-xs" onClick={() => setFeedExpanded(x => !x)}>
                   {feedExpanded ? 'Collapse' : 'Expand'}
