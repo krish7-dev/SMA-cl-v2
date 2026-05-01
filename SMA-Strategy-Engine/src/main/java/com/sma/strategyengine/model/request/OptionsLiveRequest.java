@@ -117,4 +117,7 @@ public class OptionsLiveRequest {
 
     // Trading hours filtering
     private OptionsReplayRequest.TradingHoursConfig tradingHoursConfig;
+
+    // Real trend validation — filter fake breakouts in TRENDING regime
+    private OptionsReplayRequest.RealTrendConfig realTrendConfig = new OptionsReplayRequest.RealTrendConfig();
 }

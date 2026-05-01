@@ -853,7 +853,9 @@ public class TickOptionsReplayService {
                     Optional.ofNullable(req.getNoNewTradesAfterTimeConfig())
                             .orElse(new OptionsReplayRequest.NoNewTradesAfterTimeConfig()),
                     Optional.ofNullable(req.getStopLossCascadeProtectionConfig())
-                            .orElse(new OptionsReplayRequest.StopLossCascadeProtectionConfig()));
+                            .orElse(new OptionsReplayRequest.StopLossCascadeProtectionConfig()),
+                    Optional.ofNullable(req.getRealTrendConfig())
+                            .orElse(new OptionsReplayRequest.RealTrendConfig()));
         }
 
         private OptionsReplayRequest buildExecRequest() {

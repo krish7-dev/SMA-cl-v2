@@ -75,4 +75,5 @@ public class TickOptionsReplayRequest {
     private OptionsReplayRequest.NoNewTradesAfterTimeConfig             noNewTradesAfterTimeConfig;
     private OptionsReplayRequest.StopLossCascadeProtectionConfig        stopLossCascadeProtectionConfig;
     private OptionsReplayRequest.TradingHoursConfig                     tradingHoursConfig;
+    private OptionsReplayRequest.RealTrendConfig                        realTrendConfig;
 }

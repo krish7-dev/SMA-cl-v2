@@ -1090,6 +1090,7 @@ function OptionsLiveTest() {
   const [directionalConsistencyFilter,   setDirectionalConsistencyFilter]   = useState(() => ls('sma_live_opts_directional_consistency_filter',   DEFAULT_DIRECTIONAL_CONSISTENCY_FILTER));
   const [candleStrengthFilter,           setCandleStrengthFilter]           = useState(() => ls('sma_live_opts_candle_strength_filter',           DEFAULT_CANDLE_STRENGTH_FILTER));
   const [cascadeProtection,              setCascadeProtection]              = useState(() => ls('sma_live_opts_cascade_protection',              DEFAULT_CASCADE_PROTECTION));
+  const [realTrendConfig,                setRealTrendConfig]                = useState(() => ls('sma_live_opts_real_trend_config',                DEFAULT_REAL_TREND_CONFIG));
 
   function updateOptsRisk(key, val)                    { setOptsRisk(p                      => ({ ...p, [key]: val })); }
   function updateRangeQuality(key, val)                { setRangeQuality(p                  => ({ ...p, [key]: val })); }
@@ -1120,7 +1121,7 @@ function OptionsLiveTest() {
       optsRegimeCfg, chopRules, tradingRules, regimeRules, regimeStrategyRules,
       optsRisk, rangeQuality, tradeQuality, trendEntry, compressionEntry,
       holdConfig, exitConfig, penaltyConfig, minMovementFilter, directionalConsistencyFilter, candleStrengthFilter,
-      cascadeProtection,
+      cascadeProtection, realTrendConfig,
     };
   }
 
@@ -1166,7 +1167,7 @@ function OptionsLiveTest() {
     if (c.optsRisk             !== undefined) setOptsRisk(c.optsRisk);
     if (c.rangeQuality         !== undefined) setRangeQuality(c.rangeQuality);
     if (c.tradeQuality         !== undefined) setTradeQuality(c.tradeQuality);
-    if (c.trendEntry           !== undefined) setTrendEntry(c.trendEntry);
+    setTrendEntry({ ...DEFAULT_TREND_ENTRY, ...(c.trendEntry ?? {}) });
     if (c.compressionEntry     !== undefined) setCompressionEntry(c.compressionEntry);
     setHoldConfig({ ...DEFAULT_HOLD, ...(c.holdConfig ?? {}) });
     setExitConfig({ ...DEFAULT_EXIT_CONFIG, ...(c.exitConfig ?? {}) });
@@ -1175,6 +1176,7 @@ function OptionsLiveTest() {
     setDirectionalConsistencyFilter(c.directionalConsistencyFilter ?? DEFAULT_DIRECTIONAL_CONSISTENCY_FILTER);
     setCandleStrengthFilter(c.candleStrengthFilter ?? DEFAULT_CANDLE_STRENGTH_FILTER);
     setCascadeProtection(c.cascadeProtection ?? DEFAULT_CASCADE_PROTECTION);
+    setRealTrendConfig({ ...DEFAULT_REAL_TREND_CONFIG, ...(c.realTrendConfig ?? {}) });
   }
 
   function deletePreset(id) {
@@ -1263,6 +1265,7 @@ function OptionsLiveTest() {
   useEffect(() => { try { localStorage.setItem('sma_live_opts_directional_consistency_filter',   JSON.stringify(directionalConsistencyFilter));  } catch {} }, [directionalConsistencyFilter]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_candle_strength_filter',           JSON.stringify(candleStrengthFilter));          } catch {} }, [candleStrengthFilter]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_cascade_protection',            JSON.stringify(cascadeProtection));             } catch {} }, [cascadeProtection]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_real_trend_config',             JSON.stringify(realTrendConfig));               } catch {} }, [realTrendConfig]);
 
   // ── Session / run state
   const [status,    setStatus]    = useState('idle'); // idle|running|error
@@ -1445,7 +1448,7 @@ function OptionsLiveTest() {
         minBarsSinceTrade:           parseInt(decisionCfg.minBarsSinceTrade, 10)           || 3,
         chopFilter:                  decisionCfg.chopFilter,
         chopLookback:                parseInt(decisionCfg.chopLookback, 10)               || 8,
-        penaltyMinScore:             parseFloat(decisionCfg.penaltyMinScore)              || 25,
+        penaltyMinScore:             parseFloat(decisionCfg.penaltyMinScore)              || parseFloat(decisionCfg.minScore) || 0,
         scoreFloorTrigger:           parseFloat(decisionCfg.scoreFloorTrigger)            || 35,
         scoreFloorMin:               parseFloat(decisionCfg.scoreFloorMin)                || 25,
         bollingerBonusThreshold:     parseFloat(decisionCfg.bollingerBonusThreshold)      || 35,
@@ -1534,11 +1537,13 @@ function OptionsLiveTest() {
         trendingConfirmCandles: parseInt(tradeQuality.trendingConfirmCandles, 10) || 1,
       } : { enabled: false },
       trendEntryConfig: trendEntry.enabled ? {
-        enabled:          true,
-        breakoutLookback: parseInt(trendEntry.breakoutLookback, 10) || 5,
-        minBodyPct:       parseFloat(trendEntry.minBodyPct)         || 45,
-        weakBodyPct:      parseFloat(trendEntry.weakBodyPct)        || 20,
-        ema9Period:       parseInt(trendEntry.ema9Period, 10)       || 9,
+        enabled:                      true,
+        breakoutLookback:             parseInt(trendEntry.breakoutLookback, 10)              || 5,
+        minBodyPct:                   parseFloat(trendEntry.minBodyPct)                      || 45,
+        weakBodyPct:                  parseFloat(trendEntry.weakBodyPct)                     || 20,
+        ema9Period:                   parseInt(trendEntry.ema9Period, 10)                    || 9,
+        scoreBypassWeakBody:          trendEntry.scoreBypassWeakBody,
+        scoreBypassWeakBodyThreshold: parseFloat(trendEntry.scoreBypassWeakBodyThreshold)   || 25,
       } : { enabled: false },
       compressionEntryConfig: compressionEntry.enabled ? {
         enabled:              true,
@@ -1637,6 +1642,15 @@ function OptionsLiveTest() {
         cascadeExitReasons:    ['HARD_STOP_LOSS'],
         cascadeApplyPerSymbol: cascadeProtection.cascadeApplyPerSymbol,
         cascadeApplyPerSide:   cascadeProtection.cascadeApplyPerSide,
+      } : { enabled: false },
+      realTrendConfig: realTrendConfig.enabled ? {
+        enabled:            true,
+        maxOverlapRatio:    parseFloat(realTrendConfig.maxOverlapRatio)    || 0.6,
+        minAvgBodyRatio:    parseFloat(realTrendConfig.minAvgBodyRatio)    || 0.5,
+        minStrongBodyRatio: parseFloat(realTrendConfig.minStrongBodyRatio) || 0.6,
+        minStrongBodies:    parseInt(realTrendConfig.minStrongBodies,  10) || 2,
+        minRangeExpansion:  parseFloat(realTrendConfig.minRangeExpansion)  || 1.2,
+        minPersistBars:     parseInt(realTrendConfig.minPersistBars,   10) || 2,
       } : { enabled: false },
       tradingHoursConfig: {
         enabled: tradingHoursEnabled,
@@ -3008,6 +3022,18 @@ function OptionsLiveTest() {
                     value={trendEntry[key]} disabled={isRunning} onChange={e => updateTrendEntry(key, e.target.value)} />
                 </div>
               ))}
+              <div className="form-group">
+                <label>Score Bypass Weak Body</label>
+                <button type="button" className={`btn-sm ${trendEntry.scoreBypassWeakBody ? 'btn-primary' : 'btn-secondary'}`}
+                  onClick={() => updateTrendEntry('scoreBypassWeakBody', !trendEntry.scoreBypassWeakBody)} disabled={isRunning}>
+                  {trendEntry.scoreBypassWeakBody ? 'ON' : 'OFF'}
+                </button>
+              </div>
+              <div className="form-group">
+                <label>Bypass Score Threshold</label>
+                <input type="number" min="0" step="1" value={trendEntry.scoreBypassWeakBodyThreshold} disabled={isRunning}
+                  onChange={e => updateTrendEntry('scoreBypassWeakBodyThreshold', e.target.value)} />
+              </div>
             </div>
           )}
         </div>
@@ -3168,6 +3194,37 @@ function OptionsLiveTest() {
                   {cascadeProtection.cascadeApplyPerSide ? 'ON' : 'OFF'}
                 </button>
               </div>
+            </div>
+          )}
+        </div>
+
+        {/* ── Real Trend Validation ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Real Trend Validation</span>
+            <button type="button" className={`btn-sm ${realTrendConfig.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setRealTrendConfig(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>
+              {realTrendConfig.enabled ? 'ON' : 'OFF'}
+            </button>
+            <span style={{ fontSize: 11, color: '#f59e0b', fontWeight: 600 }}>fake trend filter</span>
+          </div>
+          {realTrendConfig.enabled && (
+            <div className="bt-form-grid" style={{ marginTop: 4 }}>
+              {[
+                ['Max Overlap Ratio', 'maxOverlapRatio',    '0.01'],
+                ['Min Avg Body',      'minAvgBodyRatio',     '0.01'],
+                ['Min Body Ratio',    'minStrongBodyRatio',  '0.01'],
+                ['Strong Bodies',     'minStrongBodies',     '1'],
+                ['Range Expansion',   'minRangeExpansion',   '0.01'],
+                ['Persist Bars',      'minPersistBars',      '1'],
+              ].map(([label, key, step]) => (
+                <div className="form-group" key={key}>
+                  <label>{label}</label>
+                  <input type="number" min="0" step={step}
+                    value={realTrendConfig[key]} disabled={isRunning}
+                    onChange={e => setRealTrendConfig(p => ({ ...p, [key]: e.target.value }))} />
+                </div>
+              ))}
             </div>
           )}
         </div>
@@ -9205,6 +9262,8 @@ const DEFAULT_TREND_ENTRY = {
   minBodyPct:      '45',
   weakBodyPct:     '20',
   ema9Period:      '9',
+  scoreBypassWeakBody:          false,
+  scoreBypassWeakBodyThreshold: '25',
 };
 const DEFAULT_COMPRESSION_ENTRY = {
   enabled:              false,
@@ -9312,6 +9371,15 @@ const DEFAULT_CASCADE_PROTECTION = {
   cascadePauseMinutes:   30,
   cascadeApplyPerSymbol: false,
   cascadeApplyPerSide:   false,
+};
+const DEFAULT_REAL_TREND_CONFIG = {
+  enabled:            false,
+  maxOverlapRatio:    '0.6',
+  minAvgBodyRatio:    '0.5',
+  minStrongBodyRatio: '0.6',
+  minStrongBodies:    2,
+  minRangeExpansion:  '1.2',
+  minPersistBars:     2,
 };
 
 function fmt2(v) { return v != null ? Number(v).toFixed(2) : '—'; }
@@ -9725,6 +9793,7 @@ function OptionsReplayTest() {
   const [directionalConsistencyFilter,   setDirectionalConsistencyFilter]   = useState(() => ls('sma_opts_directional_consistency_filter',             DEFAULT_DIRECTIONAL_CONSISTENCY_FILTER));
   const [candleStrengthFilter,           setCandleStrengthFilter]           = useState(() => ls('sma_opts_candle_strength_filter',                   DEFAULT_CANDLE_STRENGTH_FILTER));
   const [cascadeProtection,              setCascadeProtection]              = useState(() => ls('sma_opts_cascade_protection',              DEFAULT_CASCADE_PROTECTION));
+  const [realTrendConfig,                setRealTrendConfig]                = useState(() => ls('sma_opts_real_trend_config',                DEFAULT_REAL_TREND_CONFIG));
 
   function updateOptsRisk(key, val)                    { setOptsRisk(p                      => ({ ...p, [key]: val })); }
   function updateRangeQuality(key, val)                { setRangeQuality(p                  => ({ ...p, [key]: val })); }
@@ -9770,7 +9839,7 @@ function OptionsReplayTest() {
       optsRegimeCfg, chopRules, tradingRules, regimeRules, regimeStrategyRules,
       optsRisk, rangeQuality, tradeQuality, trendEntry, compressionEntry,
       holdConfig, exitConfig, penaltyConfig, minMovementFilter, directionalConsistencyFilter, candleStrengthFilter,
-      cascadeProtection,
+      cascadeProtection, realTrendConfig,
     };
   }
 
@@ -9816,7 +9885,7 @@ function OptionsReplayTest() {
     if (c.optsRisk             !== undefined) setOptsRisk(c.optsRisk);
     if (c.rangeQuality         !== undefined) setRangeQuality(c.rangeQuality);
     if (c.tradeQuality         !== undefined) setTradeQuality(c.tradeQuality);
-    if (c.trendEntry           !== undefined) setTrendEntry(c.trendEntry);
+    setTrendEntry({ ...DEFAULT_TREND_ENTRY, ...(c.trendEntry ?? {}) });
     if (c.compressionEntry     !== undefined) setCompressionEntry(c.compressionEntry);
     setHoldConfig({ ...DEFAULT_HOLD, ...(c.holdConfig ?? {}) });
     setExitConfig({ ...DEFAULT_EXIT_CONFIG, ...(c.exitConfig ?? {}) });
@@ -9825,6 +9894,7 @@ function OptionsReplayTest() {
     setDirectionalConsistencyFilter(c.directionalConsistencyFilter ?? DEFAULT_DIRECTIONAL_CONSISTENCY_FILTER);
     setCandleStrengthFilter(c.candleStrengthFilter ?? DEFAULT_CANDLE_STRENGTH_FILTER);
     setCascadeProtection(c.cascadeProtection ?? DEFAULT_CASCADE_PROTECTION);
+    setRealTrendConfig({ ...DEFAULT_REAL_TREND_CONFIG, ...(c.realTrendConfig ?? {}) });
   }
 
   function deletePreset(id) {
@@ -9908,6 +9978,7 @@ function OptionsReplayTest() {
   useEffect(() => { try { localStorage.setItem('sma_opts_directional_consistency_filter',   JSON.stringify(directionalConsistencyFilter));  } catch {} }, [directionalConsistencyFilter]);
   useEffect(() => { try { localStorage.setItem('sma_opts_candle_strength_filter',           JSON.stringify(candleStrengthFilter));          } catch {} }, [candleStrengthFilter]);
   useEffect(() => { try { localStorage.setItem('sma_opts_cascade_protection',            JSON.stringify(cascadeProtection));             } catch {} }, [cascadeProtection]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_real_trend_config',             JSON.stringify(realTrendConfig));               } catch {} }, [realTrendConfig]);
 
   // ── Run state
   const [status,   setStatus]   = useState('idle'); // idle|running|completed|error
@@ -10083,6 +10154,20 @@ function OptionsReplayTest() {
     ));
     lines.push(blank);
 
+    // ── Real Trend Validation ────────────────────────────────────────────────
+    lines.push(row('=== Real Trend Validation ==='));
+    lines.push(row('Enabled', 'Max Overlap Ratio', 'Min Avg Body', 'Min Body Ratio', 'Strong Bodies', 'Range Expansion', 'Persist Bars'));
+    lines.push(row(
+      realTrendConfig.enabled ? 'ON' : 'OFF',
+      realTrendConfig.maxOverlapRatio,
+      realTrendConfig.minAvgBodyRatio,
+      realTrendConfig.minStrongBodyRatio,
+      realTrendConfig.minStrongBodies,
+      realTrendConfig.minRangeExpansion,
+      realTrendConfig.minPersistBars,
+    ));
+    lines.push(blank);
+
     // ── Regime Score Rules ───────────────────────────────────────────────────
     lines.push(row('=== Regime Score Rules ==='));
     lines.push(row('Enabled', 'RANGING Min Score', 'RANGING Min Score Gap', 'TRENDING Min Score', 'TRENDING Min Score Gap', 'COMPRESSION Min Score', 'COMPRESSION Min Score Gap'));
@@ -10149,10 +10234,11 @@ function OptionsReplayTest() {
 
     // ── Trending Entry Structure ─────────────────────────────────────────────
     lines.push(row('=== Trending Entry Structure (TRENDING only) ==='));
-    lines.push(row('Enabled', 'Breakout Lookback', 'Min Body %', 'Weak Body %', 'EMA Period'));
+    lines.push(row('Enabled', 'Breakout Lookback', 'Min Body %', 'Weak Body %', 'EMA Period', 'Score Bypass Weak Body', 'Bypass Score Threshold'));
     lines.push(row(
       trendEntry.enabled ? 'Yes' : 'No',
       trendEntry.breakoutLookback, trendEntry.minBodyPct, trendEntry.weakBodyPct, trendEntry.ema9Period,
+      trendEntry.scoreBypassWeakBody ? 'ON' : 'OFF', trendEntry.scoreBypassWeakBodyThreshold,
     ));
     lines.push(blank);
 
@@ -10438,7 +10524,7 @@ function OptionsReplayTest() {
         minBarsSinceTrade: parseInt(decisionCfg.minBarsSinceTrade, 10) || 3,
         chopFilter:              decisionCfg.chopFilter,
         chopLookback:            parseInt(decisionCfg.chopLookback, 10)           || 8,
-        penaltyMinScore:         parseFloat(decisionCfg.penaltyMinScore)          || 25,
+        penaltyMinScore:         parseFloat(decisionCfg.penaltyMinScore)          || parseFloat(decisionCfg.minScore) || 0,
         scoreFloorTrigger:          parseFloat(decisionCfg.scoreFloorTrigger)          || 35,
         scoreFloorMin:              parseFloat(decisionCfg.scoreFloorMin)              || 25,
         bollingerBonusThreshold:    parseFloat(decisionCfg.bollingerBonusThreshold)    || 35,
@@ -10527,11 +10613,13 @@ function OptionsReplayTest() {
         trendingConfirmCandles: parseInt(tradeQuality.trendingConfirmCandles, 10) || 1,
       } : { enabled: false },
       trendEntryConfig: trendEntry.enabled ? {
-        enabled:         true,
-        breakoutLookback:parseInt(trendEntry.breakoutLookback, 10) || 5,
-        minBodyPct:      parseFloat(trendEntry.minBodyPct)         || 45,
-        weakBodyPct:     parseFloat(trendEntry.weakBodyPct)        || 20,
-        ema9Period:      parseInt(trendEntry.ema9Period, 10)       || 9,
+        enabled:                      true,
+        breakoutLookback:             parseInt(trendEntry.breakoutLookback, 10)              || 5,
+        minBodyPct:                   parseFloat(trendEntry.minBodyPct)                      || 45,
+        weakBodyPct:                  parseFloat(trendEntry.weakBodyPct)                     || 20,
+        ema9Period:                   parseInt(trendEntry.ema9Period, 10)                    || 9,
+        scoreBypassWeakBody:          trendEntry.scoreBypassWeakBody,
+        scoreBypassWeakBodyThreshold: parseFloat(trendEntry.scoreBypassWeakBodyThreshold)   || 25,
       } : { enabled: false },
       compressionEntryConfig: compressionEntry.enabled ? {
         enabled:              true,
@@ -10630,6 +10718,15 @@ function OptionsReplayTest() {
         cascadeExitReasons:    ['HARD_STOP_LOSS'],
         cascadeApplyPerSymbol: cascadeProtection.cascadeApplyPerSymbol,
         cascadeApplyPerSide:   cascadeProtection.cascadeApplyPerSide,
+      } : { enabled: false },
+      realTrendConfig: realTrendConfig.enabled ? {
+        enabled:            true,
+        maxOverlapRatio:    parseFloat(realTrendConfig.maxOverlapRatio)    || 0.6,
+        minAvgBodyRatio:    parseFloat(realTrendConfig.minAvgBodyRatio)    || 0.5,
+        minStrongBodyRatio: parseFloat(realTrendConfig.minStrongBodyRatio) || 0.6,
+        minStrongBodies:    parseInt(realTrendConfig.minStrongBodies,  10) || 2,
+        minRangeExpansion:  parseFloat(realTrendConfig.minRangeExpansion)  || 1.2,
+        minPersistBars:     parseInt(realTrendConfig.minPersistBars,   10) || 2,
       } : { enabled: false },
       speedMultiplier: parseInt(speed, 10) || 1,
       persist: true,
@@ -12015,6 +12112,18 @@ function OptionsReplayTest() {
                     onChange={e => updateTrendEntry(key, e.target.value)} />
                 </div>
               ))}
+              <div className="form-group">
+                <label>Score Bypass Weak Body</label>
+                <button type="button" className={`btn-sm ${trendEntry.scoreBypassWeakBody ? 'btn-primary' : 'btn-secondary'}`}
+                  onClick={() => updateTrendEntry('scoreBypassWeakBody', !trendEntry.scoreBypassWeakBody)} disabled={isRunning}>
+                  {trendEntry.scoreBypassWeakBody ? 'ON' : 'OFF'}
+                </button>
+              </div>
+              <div className="form-group">
+                <label>Bypass Score Threshold</label>
+                <input type="number" min="0" step="1" value={trendEntry.scoreBypassWeakBodyThreshold} disabled={isRunning}
+                  onChange={e => updateTrendEntry('scoreBypassWeakBodyThreshold', e.target.value)} />
+              </div>
             </div>
           )}
         </div>
@@ -12184,6 +12293,37 @@ function OptionsReplayTest() {
                   onClick={() => updateCascadeProtection('cascadeApplyPerSide', !cascadeProtection.cascadeApplyPerSide)} disabled={isRunning}>
                   {cascadeProtection.cascadeApplyPerSide ? 'ON' : 'OFF'}</button>
               </div>
+            </div>
+          )}
+        </div>
+
+        {/* ── Real Trend Validation ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>Real Trend Validation</span>
+            <button type="button" className={`btn-sm ${realTrendConfig.enabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setRealTrendConfig(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>
+              {realTrendConfig.enabled ? 'ON' : 'OFF'}
+            </button>
+            <span style={{ fontSize: 11, color: '#f59e0b', fontWeight: 600 }}>fake trend filter</span>
+          </div>
+          {realTrendConfig.enabled && (
+            <div className="bt-form-grid" style={{ marginTop: 4 }}>
+              {[
+                ['Max Overlap Ratio', 'maxOverlapRatio',    '0.01'],
+                ['Min Avg Body',      'minAvgBodyRatio',     '0.01'],
+                ['Min Body Ratio',    'minStrongBodyRatio',  '0.01'],
+                ['Strong Bodies',     'minStrongBodies',     '1'],
+                ['Range Expansion',   'minRangeExpansion',   '0.01'],
+                ['Persist Bars',      'minPersistBars',      '1'],
+              ].map(([label, key, step]) => (
+                <div className="form-group" key={key}>
+                  <label>{label}</label>
+                  <input type="number" min="0" step={step}
+                    value={realTrendConfig[key]} disabled={isRunning}
+                    onChange={e => setRealTrendConfig(p => ({ ...p, [key]: e.target.value }))} />
+                </div>
+              ))}
             </div>
           )}
         </div>
@@ -12529,6 +12669,7 @@ function TickReplayTest() {
   const [candleStrengthFilter,           setCandleStrengthFilter]           = useState(() => ls('sma_tick_candle_strength_filter',                   DEFAULT_CANDLE_STRENGTH_FILTER));
   const [noNewTradesAfterTime,           setNoNewTradesAfterTime]           = useState(() => ls('sma_tick_no_new_trades_after_time',                   DEFAULT_NO_NEW_TRADES_AFTER_TIME));
   const [cascadeProtection,              setCascadeProtection]              = useState(() => ls('sma_tick_cascade_protection',              DEFAULT_CASCADE_PROTECTION));
+  const [realTrendConfig,                setRealTrendConfig]                = useState(() => ls('sma_tick_real_trend_config',                DEFAULT_REAL_TREND_CONFIG));
 
   function updateOptsRisk(key, val)                    { setOptsRisk(p                      => ({ ...p, [key]: val })); }
   function updateRangeQuality(key, val)                { setRangeQuality(p                  => ({ ...p, [key]: val })); }
@@ -12584,6 +12725,7 @@ function TickReplayTest() {
   useEffect(() => { try { localStorage.setItem('sma_tick_candle_strength_filter',           JSON.stringify(candleStrengthFilter));          } catch {} }, [candleStrengthFilter]);
   useEffect(() => { try { localStorage.setItem('sma_tick_no_new_trades_after_time',         JSON.stringify(noNewTradesAfterTime));           } catch {} }, [noNewTradesAfterTime]);
   useEffect(() => { try { localStorage.setItem('sma_tick_cascade_protection',            JSON.stringify(cascadeProtection));             } catch {} }, [cascadeProtection]);
+  useEffect(() => { try { localStorage.setItem('sma_tick_real_trend_config',             JSON.stringify(realTrendConfig));               } catch {} }, [realTrendConfig]);
 
   // ── Config presets (shared sma_opts_presets key — same presets across Live/Replay/Tick) ──
   const [presets,           setPresets]           = useState(() => { try { return JSON.parse(localStorage.getItem('sma_opts_presets') || '[]'); } catch { return []; } });
@@ -12600,7 +12742,7 @@ function TickReplayTest() {
       optsRisk, rangeQuality, tradeQuality, trendEntry, compressionEntry,
       holdConfig, exitConfig, penaltyConfig, minMovementFilter, directionalConsistencyFilter, candleStrengthFilter,
       noNewTradesAfterTime,
-      cascadeProtection,
+      cascadeProtection, realTrendConfig,
     };
   }
 
@@ -12638,7 +12780,7 @@ function TickReplayTest() {
     if (c.optsRisk            !== undefined) setOptsRisk(c.optsRisk);
     if (c.rangeQuality        !== undefined) setRangeQuality(c.rangeQuality);
     if (c.tradeQuality        !== undefined) setTradeQuality(c.tradeQuality);
-    if (c.trendEntry          !== undefined) setTrendEntry(c.trendEntry);
+    setTrendEntry({ ...DEFAULT_TREND_ENTRY, ...(c.trendEntry ?? {}) });
     if (c.compressionEntry    !== undefined) setCompressionEntry(c.compressionEntry);
     setHoldConfig({ ...DEFAULT_HOLD, ...(c.holdConfig ?? {}) });
     setExitConfig({ ...DEFAULT_EXIT_CONFIG, ...(c.exitConfig ?? {}) });
@@ -12648,6 +12790,7 @@ function TickReplayTest() {
     setCandleStrengthFilter(c.candleStrengthFilter ?? DEFAULT_CANDLE_STRENGTH_FILTER);
     setNoNewTradesAfterTime(c.noNewTradesAfterTime ?? DEFAULT_NO_NEW_TRADES_AFTER_TIME);
     setCascadeProtection(c.cascadeProtection ?? DEFAULT_CASCADE_PROTECTION);
+    setRealTrendConfig({ ...DEFAULT_REAL_TREND_CONFIG, ...(c.realTrendConfig ?? {}) });
   }
 
   function deletePreset(id) {
@@ -12890,6 +13033,20 @@ function TickReplayTest() {
     ));
     lines.push(blank);
 
+    // ── Real Trend Validation ────────────────────────────────────────────────
+    lines.push(row('=== Real Trend Validation ==='));
+    lines.push(row('Enabled', 'Max Overlap Ratio', 'Min Avg Body', 'Min Body Ratio', 'Strong Bodies', 'Range Expansion', 'Persist Bars'));
+    lines.push(row(
+      realTrendConfig.enabled ? 'ON' : 'OFF',
+      realTrendConfig.maxOverlapRatio,
+      realTrendConfig.minAvgBodyRatio,
+      realTrendConfig.minStrongBodyRatio,
+      realTrendConfig.minStrongBodies,
+      realTrendConfig.minRangeExpansion,
+      realTrendConfig.minPersistBars,
+    ));
+    lines.push(blank);
+
     // ── Regime Score Rules ───────────────────────────────────────────────────
     lines.push(row('=== Regime Score Rules ==='));
     lines.push(row('Enabled', 'RANGING Min Score', 'RANGING Min Score Gap', 'TRENDING Min Score', 'TRENDING Min Score Gap', 'COMPRESSION Min Score', 'COMPRESSION Min Score Gap'));
@@ -12956,10 +13113,11 @@ function TickReplayTest() {
 
     // ── Trending Entry Structure ─────────────────────────────────────────────
     lines.push(row('=== Trending Entry Structure (TRENDING only) ==='));
-    lines.push(row('Enabled', 'Breakout Lookback', 'Min Body %', 'Weak Body %', 'EMA Period'));
+    lines.push(row('Enabled', 'Breakout Lookback', 'Min Body %', 'Weak Body %', 'EMA Period', 'Score Bypass Weak Body', 'Bypass Score Threshold'));
     lines.push(row(
       trendEntry.enabled ? 'Yes' : 'No',
       trendEntry.breakoutLookback, trendEntry.minBodyPct, trendEntry.weakBodyPct, trendEntry.ema9Period,
+      trendEntry.scoreBypassWeakBody ? 'ON' : 'OFF', trendEntry.scoreBypassWeakBodyThreshold,
     ));
     lines.push(blank);
 
@@ -13246,7 +13404,7 @@ function TickReplayTest() {
         maxRecentMove3: parseFloat(decisionCfg.maxRecentMove3)||1.5, maxRecentMove5: parseFloat(decisionCfg.maxRecentMove5)||2.5,
         maxAbsVwapDist: parseFloat(decisionCfg.maxAbsVwapDist)||1.5, minBarsSinceTrade: parseInt(decisionCfg.minBarsSinceTrade,10)||3,
         chopFilter: decisionCfg.chopFilter, chopLookback: parseInt(decisionCfg.chopLookback,10)||8,
-        penaltyMinScore: parseFloat(decisionCfg.penaltyMinScore)||25,
+        penaltyMinScore: parseFloat(decisionCfg.penaltyMinScore)||parseFloat(decisionCfg.minScore)||0,
         scoreFloorTrigger: parseFloat(decisionCfg.scoreFloorTrigger)||35, scoreFloorMin: parseFloat(decisionCfg.scoreFloorMin)||25,
         bollingerBonusThreshold: parseFloat(decisionCfg.bollingerBonusThreshold)||35, bollingerBonus: parseFloat(decisionCfg.bollingerBonus)||0,
         earlyEntryRisingBars: parseInt(decisionCfg.earlyEntryRisingBars,10)||0,
@@ -13263,7 +13421,7 @@ function TickReplayTest() {
       riskConfig: optsRisk.enabled ? { enabled:true, stopLossPct: parseFloat(optsRisk.stopLossPct)||0, takeProfitPct: parseFloat(optsRisk.takeProfitPct)||0, maxRiskPerTradePct: parseFloat(optsRisk.maxRiskPerTradePct)||0, dailyLossCapPct: parseFloat(optsRisk.dailyLossCapPct)||0, cooldownCandles: parseInt(optsRisk.cooldownCandles,10)||0 } : { enabled: false },
       rangeQualityConfig: rangeQuality.enabled ? { enabled:true, lookbackBars: parseInt(rangeQuality.lookbackBars,10)||10, minUpperTouches: parseInt(rangeQuality.minUpperTouches,10)||2, minLowerTouches: parseInt(rangeQuality.minLowerTouches,10)||2, bandTouchTolerancePct: parseFloat(rangeQuality.bandTouchTolerancePct)||0.15, minRangeWidthPct: parseFloat(rangeQuality.minRangeWidthPct)||0.3, maxRangeWidthPct: parseFloat(rangeQuality.maxRangeWidthPct)||3.0, maxDirectionalDriftPctOfRange: parseFloat(rangeQuality.maxDirectionalDriftPctOfRange)||0.6, chopFlipRatioLimit: parseFloat(rangeQuality.chopFlipRatioLimit)||0.65, enableChopCheck: rangeQuality.enableChopCheck } : { enabled: false },
       tradeQualityConfig: tradeQuality.enabled ? { enabled:true, strongScoreThreshold: parseFloat(tradeQuality.strongScoreThreshold)||40, normalScoreThreshold: parseFloat(tradeQuality.normalScoreThreshold)||32, weakTradeLossCooldown: parseInt(tradeQuality.weakTradeLossCooldown,10)||5, blockWeakInRanging: tradeQuality.blockWeakInRanging, weakRangingMinScore: parseFloat(tradeQuality.weakRangingMinScore)||28, weakRangingMinGap: parseFloat(tradeQuality.weakRangingMinGap)||3, rangingConfirmCandles: parseInt(tradeQuality.rangingConfirmCandles,10)||2, trendingConfirmCandles: parseInt(tradeQuality.trendingConfirmCandles,10)||1 } : { enabled: false },
-      trendEntryConfig: trendEntry.enabled ? { enabled:true, breakoutLookback: parseInt(trendEntry.breakoutLookback,10)||5, minBodyPct: parseFloat(trendEntry.minBodyPct)||45, weakBodyPct: parseFloat(trendEntry.weakBodyPct)||20, ema9Period: parseInt(trendEntry.ema9Period,10)||9 } : { enabled: false },
+      trendEntryConfig: trendEntry.enabled ? { enabled:true, breakoutLookback: parseInt(trendEntry.breakoutLookback,10)||5, minBodyPct: parseFloat(trendEntry.minBodyPct)||45, weakBodyPct: parseFloat(trendEntry.weakBodyPct)||20, ema9Period: parseInt(trendEntry.ema9Period,10)||9, scoreBypassWeakBody: trendEntry.scoreBypassWeakBody, scoreBypassWeakBodyThreshold: parseFloat(trendEntry.scoreBypassWeakBodyThreshold)||25 } : { enabled: false },
       compressionEntryConfig: compressionEntry.enabled ? { enabled:true, rangeLookback: parseInt(compressionEntry.rangeLookback,10)||10, longZoneMax: parseFloat(compressionEntry.longZoneMax)||0.2, shortZoneMin: parseFloat(compressionEntry.shortZoneMin)||0.8, noTradeZoneMin: parseFloat(compressionEntry.noTradeZoneMin)||0.4, noTradeZoneMax: parseFloat(compressionEntry.noTradeZoneMax)||0.6, rejectBreakoutCandle: compressionEntry.rejectBreakoutCandle } : { enabled: false },
       holdConfig: { enabled: holdConfig.enabled, defaultMinHoldBars: parseInt(holdConfig.defaultMinHoldBars,10)||3, rangingMinHoldBars: parseInt(holdConfig.rangingMinHoldBars,10)||4, trendingMinHoldBars: parseInt(holdConfig.trendingMinHoldBars,10)||2, strongOppositeScore: parseFloat(holdConfig.strongOppositeScore)||35, persistentExitBars: parseInt(holdConfig.persistentExitBars,10)||2 },
       exitConfig: { enabled: exitConfig.enabled, hardStopPct: parseFloat(exitConfig.hardStopPct)||7, holdZonePct: parseFloat(exitConfig.holdZonePct)||5, lock1TriggerPct: parseFloat(exitConfig.lock1TriggerPct)||5, lock1FloorPct: parseFloat(exitConfig.lock1FloorPct)||2, lock2TriggerPct: parseFloat(exitConfig.lock2TriggerPct)||10, lock2FloorPct: parseFloat(exitConfig.lock2FloorPct)||5, trailTriggerPct: parseFloat(exitConfig.trailTriggerPct)||15, trailFactor: parseFloat(exitConfig.trailFactor)||0.4, firstMoveBars: parseInt(exitConfig.firstMoveBars,10)||0, firstMoveLockPct: parseFloat(exitConfig.firstMoveLockPct)||0.5, structureLookback: parseInt(exitConfig.structureLookback,10)||5, scoreDropFactor: parseFloat(exitConfig.scoreDropFactor)||0, scoreAbsoluteMin: parseFloat(exitConfig.scoreAbsoluteMin)||0, biasExitEnabled: exitConfig.biasExitEnabled, strongExitScore: parseFloat(exitConfig.strongExitScore)||40, trendStrongModeThresholdPct: parseFloat(exitConfig.trendStrongModeThresholdPct)||5, maxBarsNoImprovement: parseInt(exitConfig.maxBarsNoImprovement,10)||3, stagnationBars: parseInt(exitConfig.stagnationBars,10)||2, maxBarsRanging: parseInt(exitConfig.maxBarsRanging,10)||6, maxBarsDeadTrade: parseInt(exitConfig.maxBarsDeadTrade,10)||10, deadTradePnlPct: parseFloat(exitConfig.deadTradePnlPct)||2, noHopeThresholdPct: parseFloat(exitConfig.noHopeThresholdPct)||1.5, noHopeBars: parseInt(exitConfig.noHopeBars,10)||2, breakevenProtectionEnabled: exitConfig.breakevenProtectionEnabled, breakevenTriggerPct: parseFloat(exitConfig.breakevenTriggerPct)||2, breakevenOffsetPct: parseFloat(exitConfig.breakevenOffsetPct)||0 },
@@ -13273,6 +13431,7 @@ function TickReplayTest() {
       candleStrengthFilterConfig: candleStrengthFilter.enabled ? { enabled: true, candleStrengthLookbackCandles: parseInt(candleStrengthFilter.candleStrengthLookbackCandles, 10)||3, minAverageBodyRatio: parseFloat(candleStrengthFilter.minAverageBodyRatio)||0.50, minStrongCandlesRequired: parseInt(candleStrengthFilter.minStrongCandlesRequired, 10)||2 } : { enabled: false },
       noNewTradesAfterTimeConfig: noNewTradesAfterTime.enabled ? { enabled: true, noNewTradesAfterTime: noNewTradesAfterTime.noNewTradesAfterTime || '14:45' } : { enabled: false },
       stopLossCascadeProtectionConfig: cascadeProtection.enabled ? { enabled: true, cascadeStopLossCount: parseInt(cascadeProtection.cascadeStopLossCount,10)||2, cascadeWindowMinutes: parseInt(cascadeProtection.cascadeWindowMinutes,10)||30, cascadePauseMinutes: parseInt(cascadeProtection.cascadePauseMinutes,10)||30, cascadeExitReasons: ['HARD_STOP_LOSS'], cascadeApplyPerSymbol: cascadeProtection.cascadeApplyPerSymbol, cascadeApplyPerSide: cascadeProtection.cascadeApplyPerSide } : { enabled: false },
+      realTrendConfig: realTrendConfig.enabled ? { enabled: true, maxOverlapRatio: parseFloat(realTrendConfig.maxOverlapRatio)||0.6, minAvgBodyRatio: parseFloat(realTrendConfig.minAvgBodyRatio)||0.5, minStrongBodyRatio: parseFloat(realTrendConfig.minStrongBodyRatio)||0.6, minStrongBodies: parseInt(realTrendConfig.minStrongBodies,10)||2, minRangeExpansion: parseFloat(realTrendConfig.minRangeExpansion)||1.2, minPersistBars: parseInt(realTrendConfig.minPersistBars,10)||2 } : { enabled: false },
       tradingHoursConfig: { enabled: tradingHoursEnabled, noNewEntriesMinutesBeforeClose: parseInt(closeoutMins, 10) || 15 },
     };
     lastPayloadRef.current = payload;
@@ -14021,6 +14180,8 @@ function TickReplayTest() {
               {[['breakoutLookback','Breakout Lookback',1,null,1],['minBodyPct','Min Body %',0,100,1],['weakBodyPct','Weak Body %',0,100,1],['ema9Period','EMA Period',1,null,1]].map(([key,lbl,min,max,step]) => (
                 <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} max={max??undefined} step={step} value={trendEntry[key]} onChange={e => updateTrendEntry(key, e.target.value)} disabled={isRunning} /></div>
               ))}
+              <div className="form-group"><label>Score Bypass Weak Body</label><button type="button" className={`btn-sm ${trendEntry.scoreBypassWeakBody?'btn-primary':'btn-secondary'}`} onClick={() => updateTrendEntry('scoreBypassWeakBody', !trendEntry.scoreBypassWeakBody)} disabled={isRunning}>{trendEntry.scoreBypassWeakBody?'ON':'OFF'}</button></div>
+              <div className="form-group"><label>Bypass Score Threshold</label><input type="number" min="0" step="1" value={trendEntry.scoreBypassWeakBodyThreshold} onChange={e => updateTrendEntry('scoreBypassWeakBodyThreshold', e.target.value)} disabled={isRunning} /></div>
             </div>
           )}
         </div>
@@ -14120,6 +14281,21 @@ function TickReplayTest() {
           )}
         </div>
 
+        {/* ── Real Trend Validation ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+            <span className="bt-section-title" style={{ marginBottom:0 }}>Real Trend Validation</span>
+            <button type="button" className={`btn-sm ${realTrendConfig.enabled ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setRealTrendConfig(p => ({ ...p, enabled: !p.enabled }))} disabled={isRunning}>{realTrendConfig.enabled?'ON':'OFF'}</button>
+            <span style={{ fontSize:11, color:'#f59e0b', fontWeight:600 }}>fake trend filter</span>
+          </div>
+          {realTrendConfig.enabled && (
+            <div className="bt-form-grid">
+              {[['maxOverlapRatio','Max Overlap Ratio',0,null,0.01],['minAvgBodyRatio','Min Avg Body',0,null,0.01],['minStrongBodyRatio','Min Body Ratio',0,null,0.01],['minStrongBodies','Strong Bodies',1,null,1],['minRangeExpansion','Range Expansion',0,null,0.01],['minPersistBars','Persist Bars',1,null,1]].map(([key,lbl,min,max,step]) => (
+                <div key={key} className="form-group"><label>{lbl}</label><input type="number" min={min} max={max??undefined} step={step} value={realTrendConfig[key]} onChange={e => setRealTrendConfig(p => ({ ...p, [key]: e.target.value }))} disabled={isRunning} /></div>
+              ))}
+            </div>
+          )}
+        </div>
 
         {/* ── Hold Config ── */}
         <div className="card bt-opts-card">

@@ -229,6 +229,9 @@ public class OptionsReplayRequest {
         private double  weakBodyPct      = 20.0;
         /** EMA period used for momentum slope check. */
         private int     ema9Period       = 9;
+        /** When true, bypass the weak-body hard block if winnerScore >= scoreBypassWeakBodyThreshold. */
+        private boolean scoreBypassWeakBody          = false;
+        private double  scoreBypassWeakBodyThreshold = 25.0;
     }
 
     // Compression entry structure validator (mean reversion at extremes)
@@ -451,6 +454,26 @@ public class OptionsReplayRequest {
         private List<String> cascadeExitReasons     = java.util.List.of("HARD_STOP_LOSS");
         private boolean      cascadeApplyPerSymbol  = false;
         private boolean      cascadeApplyPerSide    = false;
+    }
+
+    // Real trend validation — filter fake breakouts in TRENDING regime
+    private RealTrendConfig realTrendConfig = new RealTrendConfig();
+
+    @Data
+    public static class RealTrendConfig {
+        private boolean enabled            = false;
+        /** Max overlap ratio (minHighs - maxLows) / avgRange before classifying as compression. */
+        private double  maxOverlapRatio    = 0.6;
+        /** Minimum average body-to-range ratio across last 3 candles. */
+        private double  minAvgBodyRatio    = 0.5;
+        /** Body-to-range ratio for a single candle to count as "strong". */
+        private double  minStrongBodyRatio = 0.6;
+        /** Minimum number of strong-body candles (out of last 3) required. */
+        private int     minStrongBodies    = 2;
+        /** Current candle range must exceed avgRange * this multiplier. */
+        private double  minRangeExpansion  = 1.2;
+        /** Minimum consecutive directional (bias-aligned) candles before entry. */
+        private int     minPersistBars     = 2;
     }
 
     private int     speedMultiplier = 1;

@@ -185,7 +185,9 @@ public class OptionsReplayService {
                 .orElse(new OptionsReplayRequest.CandleStrengthFilterConfig());
         OptionsReplayRequest.StopLossCascadeProtectionConfig slcpc = Optional.ofNullable(req.getStopLossCascadeProtectionConfig())
                 .orElse(new OptionsReplayRequest.StopLossCascadeProtectionConfig());
-        NiftyDecisionEngine  decisionEngine  = new NiftyDecisionEngine(strategyRegistry, req.getStrategies(), dc, sc, rr, rsr, cr, rqc, tqc, tec, cec, pc, mmfc, dcfc, csfc, null, slcpc);
+        OptionsReplayRequest.RealTrendConfig rtc = Optional.ofNullable(req.getRealTrendConfig())
+                .orElse(new OptionsReplayRequest.RealTrendConfig());
+        NiftyDecisionEngine  decisionEngine  = new NiftyDecisionEngine(strategyRegistry, req.getStrategies(), dc, sc, rr, rsr, cr, rqc, tqc, tec, cec, pc, mmfc, dcfc, csfc, null, slcpc, rtc);
         OptionSelectorService selectorService = OptionSelectorService.forReplay(sel, optionCandleMap);
         OptionExecutionEngine execEngine      = new OptionExecutionEngine(req);
 
