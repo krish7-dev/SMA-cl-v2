@@ -85,8 +85,10 @@ public class OptionsReplayRequest {
 
     @Data
     public static class SelectionConfig {
-        private double minPremium = 50.0;
-        private double maxPremium = 300.0;
+        private double  minPremium       = 50.0;
+        private double  maxPremium       = 300.0;
+        /** When false, fallback picks nearest/cheapest/costliest candidate even outside the band. */
+        private boolean strictPremiumBand = true;
     }
 
     // Switch confirmation

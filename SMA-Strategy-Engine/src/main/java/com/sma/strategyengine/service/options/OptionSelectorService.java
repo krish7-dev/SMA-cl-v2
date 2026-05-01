@@ -76,6 +76,10 @@ public class OptionSelectorService {
                 .toList();
 
         if (priced.isEmpty()) {
+            if (selConfig.isStrictPremiumBand()) {
+                log.debug("[SELECTOR] strictPremiumBand: no priced candidates — skipping entry");
+                return null;
+            }
             // Fallback: nearest ATM by strike distance
             return pool.stream()
                     .min(java.util.Comparator.comparingDouble(c ->
@@ -92,24 +96,37 @@ public class OptionSelectorService {
 
         if (inBand.isPresent()) return inBand.get().cand();
 
+        // No in-band candidate found — strict mode blocks entry
+        if (selConfig.isStrictPremiumBand()) {
+            double minP = priced.stream().mapToDouble(Priced::premium).min().orElse(0);
+            double maxP = priced.stream().mapToDouble(Priced::premium).max().orElse(0);
+            log.debug("[SELECTOR] strictPremiumBand: no candidate in [{},{}] — pool range [{},{}] — skipping entry",
+                    selConfig.getMinPremium(), selConfig.getMaxPremium(),
+                    String.format("%.1f", minP), String.format("%.1f", maxP));
+            return null;
+        }
+
         // Step 2: Premium too high -> prefer candidates with premium closer to maxPremium (OTM shift)
         boolean allTooHigh  = priced.stream().allMatch(p -> p.premium() > selConfig.getMaxPremium());
         boolean allTooLow   = priced.stream().allMatch(p -> p.premium() < selConfig.getMinPremium());
 
         if (allTooHigh) {
             // OTM shift: pick lowest premium (most OTM) still usable
+            log.debug("[SELECTOR] allTooHigh fallback: all premiums above maxPremium={}", selConfig.getMaxPremium());
             return priced.stream()
                     .min(java.util.Comparator.comparingDouble(Priced::premium))
                     .map(Priced::cand).orElse(null);
         }
         if (allTooLow) {
             // ITM shift: pick highest premium (most ITM) still usable
+            log.debug("[SELECTOR] allTooLow fallback: all premiums below minPremium={}", selConfig.getMinPremium());
             return priced.stream()
                     .max(java.util.Comparator.comparingDouble(Priced::premium))
                     .map(Priced::cand).orElse(null);
         }
 
         // Mixed: pick nearest ATM overall
+        log.debug("[SELECTOR] mixed fallback: no candidate in band, picking nearest ATM");
         return priced.stream()
                 .min(java.util.Comparator.comparingDouble(p ->
                         Math.abs(p.cand().getStrike() - niftyPrice)))
