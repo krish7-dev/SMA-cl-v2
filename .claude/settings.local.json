@@ -158,7 +158,11 @@
       "PowerShell(netstat -ano)",
       "PowerShell(Get-Process -Id 1180 | Select-Object Id, Name, Path, StartTime, CommandLine -ErrorAction SilentlyContinue; \\(Get-WmiObject Win32_Process -Filter \"ProcessId=1180\"\\).CommandLine)",
       "Read(//c/Users/krish/AppData/Local/Temp/**)",
-      "Bash(grep -n \"noNewTradesAfterTime.*capturePreset\\\\|noNewTradesAfterTime,\\\\$\" \"g:/SMA-claude-v2/SMA-UI/src/pages/Backtest.jsx\")"
+      "Bash(grep -n \"noNewTradesAfterTime.*capturePreset\\\\|noNewTradesAfterTime,\\\\$\" \"g:/SMA-claude-v2/SMA-UI/src/pages/Backtest.jsx\")",
+      "Bash(mvn -f SMA-AI-Engine/pom.xml clean package -DskipTests)",
+      "Bash('/c/Program Files/JetBrains/IntelliJ IDEA Community Edition 2025.1.1.1/plugins/maven/lib/maven3/bin/mvn' clean package -DskipTests -f g:/SMA-claude-v2/SMA-AI-Engine/pom.xml)",
+      "Bash(\"/c/Program Files/JetBrains/IntelliJ IDEA Community Edition 2025.1.1.1/plugins/maven/lib/maven3/bin/mvn\" -f \"g:/SMA-claude-v2/SMA-Strategy-Engine/pom.xml\" compile -q)",
+      "Bash(\"/c/Program Files/JetBrains/IntelliJ IDEA Community Edition 2025.1.1.1/plugins/maven/lib/maven3/bin/mvn\" -f \"g:/SMA-claude-v2/SMA-AI-Engine/pom.xml\" compile -q)"
     ]
   }
 }

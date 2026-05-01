@@ -2,6 +2,7 @@ package com.sma.strategyengine.service.options;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sma.strategyengine.client.AiEngineClient;
 import com.sma.strategyengine.client.DataEngineClient;
 import com.sma.strategyengine.client.DataEngineClient.CandleDto;
 import com.sma.strategyengine.model.request.BacktestRequest;
@@ -65,6 +66,7 @@ public class TickOptionsReplayService {
     private final DataEngineClient          dataEngineClient;
     private final ObjectMapper              objectMapper;
     private final SessionPersistenceService sessionPersistenceService;
+    private final AiEngineClient            aiEngineClient;
 
     private final ConcurrentHashMap<String, TickReplaySession> sessions = new ConcurrentHashMap<>();
 
@@ -645,6 +647,18 @@ public class TickOptionsReplayService {
                     decisionEngine.recordCascadeExit(execEngine.getLastExitReason(), "NIFTY", exitSide, openTime);
                 }
 
+                // Non-blocking AI advisory / review (fire-and-forget, never blocks replay)
+                if (req.isAiEnabled()) {
+                    if ("ENTERED".equals(action)) {
+                        aiEngineClient.adviseAsync(buildAdvisoryPayload(decision, execEngine, snapshot, openTime));
+                    } else if ("EXITED".equals(action)) {
+                        java.util.List<com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade> closed = execEngine.getClosedTrades();
+                        if (!closed.isEmpty()) {
+                            aiEngineClient.reviewAsync(buildReviewPayload(decision, closed.get(closed.size() - 1)));
+                        }
+                    }
+                }
+
                 emittedCount++;
                 CandleDto optCandle = execEngine.getActiveToken() != null
                         ? selectorService.getCandle(execEngine.getActiveToken(), openTime) : null;
@@ -665,6 +679,72 @@ public class TickOptionsReplayService {
                 log.debug("Tick replay session {}: candle event failed: {}", sessionId, e.getMessage());
             }
             return emittedCount;
+        }
+
+        // ── AI payload builders ───────────────────────────────────────────────
+
+        private java.util.Map<String, Object> buildAdvisoryPayload(
+                NiftyDecisionResult decision, OptionExecutionEngine execEngine,
+                CandleDto snapshot, java.time.LocalDateTime openTime) {
+            java.util.Map<String, Object> m = new java.util.HashMap<>();
+            String sId = req.getSessionId() != null ? req.getSessionId() : sessionId;
+            m.put("sessionId", sId);
+            String sym = execEngine.getActiveTradingSymbol();
+            m.put("symbol", sym != null ? sym : "NIFTY");
+            String optType = execEngine.getActiveOptionType();
+            m.put("side", "CE".equals(optType) ? "BUY" : "SELL");
+            m.put("candleTime", openTime.atZone(IST).toInstant().toString());
+            m.put("entryPrice", execEngine.getEntryPrice());
+            m.put("quantity", execEngine.getQuantity());
+            m.put("regime", decision.getRegime());
+            m.put("winningStrategy", decision.getWinnerStrategy());
+            m.put("winningScore", decision.getWinnerScore());
+            m.put("oppositeScore", decision.getSecondScore());
+            m.put("scoreGap", decision.getScoreGap());
+            m.put("recentMove3CandlePct", decision.getRecentMove3());
+            m.put("recentMove5CandlePct", decision.getRecentMove5());
+            m.put("vwapDistancePct", decision.getDistanceFromVwap());
+            if (snapshot.open() != null && snapshot.close() != null
+                    && snapshot.open().doubleValue() != 0) {
+                double bodyPct = Math.abs(snapshot.close().doubleValue() - snapshot.open().doubleValue())
+                        / snapshot.open().doubleValue() * 100.0;
+                m.put("candleBodyPct", bodyPct);
+            }
+            m.put("optionPremium", execEngine.getEntryPrice());
+            m.put("barsSinceLastTrade", execEngine.getBarsSinceLastTrade());
+            m.put("capitalBefore", execEngine.getCapital());
+            return m;
+        }
+
+        private java.util.Map<String, Object> buildReviewPayload(
+                NiftyDecisionResult decision,
+                com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade ct) {
+            java.util.Map<String, Object> m = new java.util.HashMap<>();
+            String sId = req.getSessionId() != null ? req.getSessionId() : sessionId;
+            m.put("sessionId", sId);
+            m.put("tradeId", sId + "-" + ct.getEntryTime());
+            String sym = ct.getTradingSymbol();
+            m.put("symbol", sym != null ? sym : "NIFTY");
+            m.put("side", "CE".equals(ct.getOptionType()) ? "BUY" : "SELL");
+            m.put("entryTime", ct.getEntryTime());
+            m.put("exitTime", ct.getExitTime());
+            m.put("entryPrice", ct.getEntryPrice());
+            m.put("exitPrice", ct.getExitPrice());
+            m.put("quantity", ct.getQuantity());
+            m.put("pnl", ct.getPnl());
+            m.put("pnlPct", ct.getPnlPct());
+            m.put("exitReason", ct.getExitReason());
+            m.put("barsHeld", ct.getBarsInTrade());
+            m.put("capitalAfter", ct.getCapitalAfter());
+            m.put("regime", ct.getEntryRegime());
+            m.put("winningStrategy", decision.getWinnerStrategy());
+            m.put("winningScore", decision.getWinnerScore());
+            m.put("scoreGap", decision.getScoreGap());
+            m.put("recentMove3CandlePct", decision.getRecentMove3());
+            m.put("recentMove5CandlePct", decision.getRecentMove5());
+            m.put("vwapDistancePct", decision.getDistanceFromVwap());
+            m.put("optionPremium", ct.getEntryPrice());
+            return m;
         }
 
         // ── divergence debug helper ───────────────────────────────────────────
