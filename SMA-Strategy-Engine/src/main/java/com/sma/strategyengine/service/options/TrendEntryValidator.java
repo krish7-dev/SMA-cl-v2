@@ -4,6 +4,7 @@ import com.sma.strategyengine.client.DataEngineClient.CandleDto;
 import com.sma.strategyengine.model.request.OptionsReplayRequest;
 import com.sma.strategyengine.service.options.NiftyDecisionResult.Bias;
 import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 
 import java.util.List;
 
@@ -15,6 +16,7 @@ import java.util.List;
  *   B. Strong candle   — large body AND close near the favourable extreme
  *   C. Momentum        — close better than previous close AND EMA9 slope in bias direction
  */
+@Slf4j
 public class TrendEntryValidator {
 
     private final OptionsReplayRequest.TrendEntryConfig cfg;
@@ -42,6 +44,10 @@ public class TrendEntryValidator {
     // ── Main validation ───────────────────────────────────────────────────────
 
     public Result validate(List<CandleDto> history, Bias bias) {
+        return validate(history, bias, 0);
+    }
+
+    public Result validate(List<CandleDto> history, Bias bias, double winnerScore) {
         if (!cfg.isEnabled()) return Result.ok("disabled");
         if (bias == Bias.NEUTRAL) return Result.fail("no directional bias");
 
@@ -68,7 +74,13 @@ public class TrendEntryValidator {
 
         // ── Hard block B: weak candle body ────────────────────────────────────
         if (bodyPct < cfg.getWeakBodyPct()) {
-            return Result.fail(String.format("weak body %.1f%% < %.1f%%", bodyPct, cfg.getWeakBodyPct()));
+            if (cfg.isScoreBypassWeakBody() && winnerScore >= cfg.getScoreBypassWeakBodyThreshold()) {
+                log.debug("[TREND] Weak-body bypass: body={}% < {}% but score={} >= threshold={}",
+                        String.format("%.1f", bodyPct), cfg.getWeakBodyPct(),
+                        String.format("%.1f", winnerScore), cfg.getScoreBypassWeakBodyThreshold());
+            } else {
+                return Result.fail(String.format("weak body %.1f%% < %.1f%%", bodyPct, cfg.getWeakBodyPct()));
+            }
         }
 
         // ── Allow path 1: breakout ────────────────────────────────────────────

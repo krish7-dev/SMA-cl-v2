@@ -43,6 +43,7 @@ public class NiftyDecisionEngine {
     private final OptionsReplayRequest.TradeQualityConfig   tqc;
     private final TrendEntryValidator                       tev;
     private final CompressionEntryValidator                 cev;
+    private final RealTrendValidator                        rtv;
     private final OptionsReplayRequest.PenaltyConfig        pc;
     private final OptionsReplayRequest.MinMovementFilterConfig mmfc;
     private final OptionsReplayRequest.DirectionalConsistencyFilterConfig dcfc;
@@ -106,7 +107,7 @@ public class NiftyDecisionEngine {
                                OptionsReplayRequest.CompressionEntryConfig compressionEntryConfig) {
         this(registry, strategies, decisionConfig, switchConfig, regimeRules, regimeStrategyRules,
                 chopRules, rangeQualityConfig, tradeQualityConfig, trendEntryConfig,
-                compressionEntryConfig, null, null, null, null, null, null);
+                compressionEntryConfig, null, null, null, null, null, null, null);
     }
 
     public NiftyDecisionEngine(StrategyRegistry registry,
@@ -125,7 +126,8 @@ public class NiftyDecisionEngine {
                                OptionsReplayRequest.DirectionalConsistencyFilterConfig directionalConsistencyFilterConfig,
                                OptionsReplayRequest.CandleStrengthFilterConfig candleStrengthFilterConfig,
                                OptionsReplayRequest.NoNewTradesAfterTimeConfig noNewTradesAfterTimeConfig,
-                               OptionsReplayRequest.StopLossCascadeProtectionConfig stopLossCascadeProtectionConfig) {
+                               OptionsReplayRequest.StopLossCascadeProtectionConfig stopLossCascadeProtectionConfig,
+                               OptionsReplayRequest.RealTrendConfig realTrendConfig) {
         this.registry   = registry;
         this.strategies = strategies;
         this.dc         = decisionConfig;
@@ -137,6 +139,7 @@ public class NiftyDecisionEngine {
         this.tqc        = tradeQualityConfig != null ? tradeQualityConfig : new OptionsReplayRequest.TradeQualityConfig();
         this.tev        = new TrendEntryValidator(trendEntryConfig);
         this.cev        = new CompressionEntryValidator(compressionEntryConfig);
+        this.rtv        = new RealTrendValidator(realTrendConfig);
         this.pc         = penaltyConfig != null ? penaltyConfig : new OptionsReplayRequest.PenaltyConfig();
         this.mmfc       = minMovementFilterConfig != null ? minMovementFilterConfig : new OptionsReplayRequest.MinMovementFilterConfig();
         this.dcfc       = directionalConsistencyFilterConfig != null ? directionalConsistencyFilterConfig : new OptionsReplayRequest.DirectionalConsistencyFilterConfig();
@@ -323,8 +326,12 @@ public class NiftyDecisionEngine {
             List<CandleDto> histList = new ArrayList<>(history);
             histList.add(tickSnapshot);
             if ("TRENDING".equals(regime)) {
-                TrendEntryValidator.Result tr = tev.validate(histList, rawBias);
+                TrendEntryValidator.Result tr = tev.validate(histList, rawBias, winnerScore);
                 if (!tr.isAllowed()) { canEnter = false; block = "TREND:" + tr.getReason(); }
+                if (canEnter) {
+                    RealTrendValidator.Result rtr = rtv.validate(histList, rawBias);
+                    if (!rtr.isAllowed()) { canEnter = false; block = "REALTREND:" + rtr.getReason(); }
+                }
             } else if ("COMPRESSION".equals(regime)) {
                 CompressionEntryValidator.Result cvr = cev.validate(histList, rawBias);
                 if (!cvr.isAllowed()) { canEnter = false; block = "COMPRESSION:" + cvr.getReason(); }
@@ -693,10 +700,17 @@ public class NiftyDecisionEngine {
         if (canEnter) {
             List<CandleDto> histList = new ArrayList<>(history);
             if ("TRENDING".equals(regime)) {
-                TrendEntryValidator.Result tr = tev.validate(histList, rawBias);
+                TrendEntryValidator.Result tr = tev.validate(histList, rawBias, winnerScore);
                 if (!tr.isAllowed()) {
                     canEnter = false;
                     block    = "TREND:" + tr.getReason();
+                }
+                if (canEnter) {
+                    RealTrendValidator.Result rtr = rtv.validate(histList, rawBias);
+                    if (!rtr.isAllowed()) {
+                        canEnter = false;
+                        block    = "REALTREND:" + rtr.getReason();
+                    }
                 }
             } else if ("COMPRESSION".equals(regime)) {
                 CompressionEntryValidator.Result cvr = cev.validate(histList, rawBias);
@@ -1013,6 +1027,7 @@ public class NiftyDecisionEngine {
             if (block.contains("after penalties")) diagnostics.candlesBlockedByPenalty++;
             if (block.startsWith("TREND:"))        diagnostics.candlesBlockedByTrendStructure++;
             if (block.startsWith("COMPRESSION:")) diagnostics.candlesBlockedByCompressionStructure++;
+            if (block.startsWith("REALTREND:"))   diagnostics.candlesBlockedByRealTrend++;
         }
 
         // Score-level blocking (captured via neutralReason)
@@ -1373,6 +1388,7 @@ public class NiftyDecisionEngine {
         int candlesBlockedByPenalty;              // total penalty blocks (penalized score < threshold)
         int candlesBlockedByTrendStructure;       // TRENDING regime structure validator blocked
         int candlesBlockedByCompressionStructure; // COMPRESSION regime structure validator blocked
+        int candlesBlockedByRealTrend;            // RealTrendValidator blocked (fake trend)
         /** How many candles fell into each neutral-reason bucket. */
         Map<String, Integer> neutralReasonCounts = new LinkedHashMap<>();
     }
