@@ -1459,8 +1459,9 @@ function OptionsLiveTest() {
         bollingerEarlyEntryMinScore: parseFloat(decisionCfg.bollingerEarlyEntryMinScore)  || 0,
       },
       selectionConfig: {
-        minPremium: parseFloat(selectionCfg.minPremium) || 50,
-        maxPremium: parseFloat(selectionCfg.maxPremium) || 300,
+        minPremium:        parseFloat(selectionCfg.minPremium) || 50,
+        maxPremium:        parseFloat(selectionCfg.maxPremium) || 300,
+        strictPremiumBand: selectionCfg.strictPremiumBand ?? true,
       },
       switchConfig: {
         switchConfirmationCandles:    parseInt(switchCfg.switchConfirmationCandles, 10)    || 2,
@@ -2756,6 +2757,12 @@ function OptionsLiveTest() {
               <label>Max Premium (₹)</label>
               <input type="number" step="any" value={selectionCfg.maxPremium} onChange={e => setSelectionCfg(p => ({ ...p, maxPremium: e.target.value }))} disabled={isRunning} />
             </div>
+          </div>
+          <div style={{ marginTop: 8 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+              <input type="checkbox" checked={selectionCfg.strictPremiumBand ?? true} onChange={e => setSelectionCfg(p => ({ ...p, strictPremiumBand: e.target.checked }))} disabled={isRunning} />
+              Strict Premium Band (skip entry if no candidate in range)
+            </label>
           </div>
         </div>
 
@@ -9188,7 +9195,7 @@ const DEFAULT_DECISION = {
   rawScoreBypassThreshold: '30', rawScoreBypassGap: '3',
   bollingerEarlyEntryMinScore: '28',
 };
-const DEFAULT_SELECTION = { minPremium: '50', maxPremium: '300' };
+const DEFAULT_SELECTION = { minPremium: '50', maxPremium: '300', strictPremiumBand: true };
 const DEFAULT_SWITCH    = { switchConfirmationCandles: '2', maxSwitchesPerDay: '3', minScoreImprovementForSwitch: '0' };
 const DEFAULT_REGIME_RULES = {
   enabled: true,
@@ -10088,8 +10095,8 @@ function OptionsReplayTest() {
 
     // ── Selection Config ────────────────────────────────────────────────────
     lines.push(row('=== Selection Config ==='));
-    lines.push(row('Min Premium', 'Max Premium'));
-    lines.push(row(selectionCfg.minPremium, selectionCfg.maxPremium));
+    lines.push(row('Min Premium', 'Max Premium', 'Strict Premium Band'));
+    lines.push(row(selectionCfg.minPremium, selectionCfg.maxPremium, selectionCfg.strictPremiumBand ? 'ON' : 'OFF'));
     lines.push(blank);
 
     // ── Switch Config ───────────────────────────────────────────────────────
@@ -10535,8 +10542,9 @@ function OptionsReplayTest() {
         bollingerEarlyEntryMinScore:parseFloat(decisionCfg.bollingerEarlyEntryMinScore)|| 0,
       },
       selectionConfig: {
-        minPremium: parseFloat(selectionCfg.minPremium) || 50,
-        maxPremium: parseFloat(selectionCfg.maxPremium) || 300,
+        minPremium:        parseFloat(selectionCfg.minPremium) || 50,
+        maxPremium:        parseFloat(selectionCfg.maxPremium) || 300,
+        strictPremiumBand: selectionCfg.strictPremiumBand ?? true,
       },
       switchConfig: {
         switchConfirmationCandles:   parseInt(switchCfg.switchConfirmationCandles, 10)    || 2,
@@ -11791,6 +11799,12 @@ function OptionsReplayTest() {
               <input type="number" step="any" value={selectionCfg.maxPremium} onChange={e => setSelectionCfg(p => ({ ...p, maxPremium: e.target.value }))} disabled={isRunning} />
             </div>
           </div>
+          <div style={{ marginTop: 8 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+              <input type="checkbox" checked={selectionCfg.strictPremiumBand ?? true} onChange={e => setSelectionCfg(p => ({ ...p, strictPremiumBand: e.target.checked }))} disabled={isRunning} />
+              Strict Premium Band (skip entry if no candidate in range)
+            </label>
+          </div>
         </div>
 
         {/* ── Switch Config ── */}
@@ -12957,8 +12971,8 @@ function TickReplayTest() {
 
     // ── Selection Config ────────────────────────────────────────────────────
     lines.push(row('=== Selection Config ==='));
-    lines.push(row('Min Premium', 'Max Premium'));
-    lines.push(row(selectionCfg.minPremium, selectionCfg.maxPremium));
+    lines.push(row('Min Premium', 'Max Premium', 'Strict Premium Band'));
+    lines.push(row(selectionCfg.minPremium, selectionCfg.maxPremium, selectionCfg.strictPremiumBand ? 'ON' : 'OFF'));
     lines.push(blank);
 
     // ── Switch Config ───────────────────────────────────────────────────────
@@ -13411,7 +13425,7 @@ function TickReplayTest() {
         rawScoreBypassThreshold: parseFloat(decisionCfg.rawScoreBypassThreshold)||0, rawScoreBypassGap: parseFloat(decisionCfg.rawScoreBypassGap)||3,
         bollingerEarlyEntryMinScore: parseFloat(decisionCfg.bollingerEarlyEntryMinScore)||0,
       },
-      selectionConfig: { minPremium: parseFloat(selectionCfg.minPremium)||50, maxPremium: parseFloat(selectionCfg.maxPremium)||300 },
+      selectionConfig: { minPremium: parseFloat(selectionCfg.minPremium)||50, maxPremium: parseFloat(selectionCfg.maxPremium)||300, strictPremiumBand: !!selectionCfg.strictPremiumBand },
       switchConfig: { switchConfirmationCandles: parseInt(switchCfg.switchConfirmationCandles,10)||2, maxSwitchesPerDay: parseInt(switchCfg.maxSwitchesPerDay,10)||3, minScoreImprovementForSwitch: parseFloat(switchCfg.minScoreImprovementForSwitch)||0 },
       regimeConfig: optsRegimeCfg.enabled ? { enabled:true, adxPeriod: parseInt(optsRegimeCfg.adxPeriod,10)||14, atrPeriod: parseInt(optsRegimeCfg.atrPeriod,10)||14, adxTrendThreshold: parseFloat(optsRegimeCfg.adxTrendThreshold)||25, atrVolatilePct: parseFloat(optsRegimeCfg.atrVolatilePct)||2.0, atrCompressionPct: parseFloat(optsRegimeCfg.atrCompressionPct)||0.5 } : { enabled: false },
       regimeRules: { enabled: regimeRules.enabled, rangingMinScore: parseFloat(regimeRules.rangingMinScore)||35, rangingMinScoreGap: parseFloat(regimeRules.rangingMinScoreGap)||6, trendingMinScore: parseFloat(regimeRules.trendingMinScore)||25, trendingMinScoreGap: parseFloat(regimeRules.trendingMinScoreGap)||3, compressionMinScore: parseFloat(regimeRules.compressionMinScore)||25, compressionMinScoreGap: parseFloat(regimeRules.compressionMinScoreGap)||3 },
@@ -14049,6 +14063,12 @@ function TickReplayTest() {
           <div className="bt-form-grid" style={{ marginTop:8 }}>
             <div className="form-group"><label>Min Premium (₹)</label><input type="number" step="any" value={selectionCfg.minPremium} onChange={e => setSelectionCfg(p => ({ ...p, minPremium: e.target.value }))} disabled={isRunning} /></div>
             <div className="form-group"><label>Max Premium (₹)</label><input type="number" step="any" value={selectionCfg.maxPremium} onChange={e => setSelectionCfg(p => ({ ...p, maxPremium: e.target.value }))} disabled={isRunning} /></div>
+          </div>
+          <div style={{ marginTop: 8 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+              <input type="checkbox" checked={selectionCfg.strictPremiumBand ?? true} onChange={e => setSelectionCfg(p => ({ ...p, strictPremiumBand: e.target.checked }))} disabled={isRunning} />
+              Strict Premium Band (skip entry if no candidate in range)
+            </label>
           </div>
         </div>
 
