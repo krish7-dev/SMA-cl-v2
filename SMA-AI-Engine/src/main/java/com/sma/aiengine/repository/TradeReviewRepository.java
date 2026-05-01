@@ -10,11 +10,11 @@ public interface TradeReviewRepository extends JpaRepository<TradeReviewRecord, 
 
     Optional<TradeReviewRecord> findBySessionIdAndTradeId(String sessionId, String tradeId);
 
-    List<TradeReviewRecord> findBySessionIdOrderByCreatedAtDesc(String sessionId);
+    List<TradeReviewRecord> findBySessionIdOrderByCreatedAtAsc(String sessionId);
 
-    List<TradeReviewRecord> findBySymbolOrderByCreatedAtDesc(String symbol);
+    List<TradeReviewRecord> findBySymbolOrderByCreatedAtAsc(String symbol);
 
-    List<TradeReviewRecord> findBySessionIdAndSymbolOrderByCreatedAtDesc(String sessionId, String symbol);
+    List<TradeReviewRecord> findBySessionIdAndSymbolOrderByCreatedAtAsc(String sessionId, String symbol);
 
-    List<TradeReviewRecord> findAllByOrderByCreatedAtDesc();
+    List<TradeReviewRecord> findAllByOrderByCreatedAtAsc();
 }

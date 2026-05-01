@@ -7,11 +7,11 @@ import java.util.List;
 
 public interface AdvisoryRepository extends JpaRepository<AdvisoryRecord, Long> {
 
-    List<AdvisoryRecord> findBySessionIdOrderByCreatedAtDesc(String sessionId);
+    List<AdvisoryRecord> findBySessionIdOrderByCreatedAtAsc(String sessionId);
 
-    List<AdvisoryRecord> findBySymbolOrderByCreatedAtDesc(String symbol);
+    List<AdvisoryRecord> findBySymbolOrderByCreatedAtAsc(String symbol);
 
-    List<AdvisoryRecord> findBySessionIdAndSymbolOrderByCreatedAtDesc(String sessionId, String symbol);
+    List<AdvisoryRecord> findBySessionIdAndSymbolOrderByCreatedAtAsc(String sessionId, String symbol);
 
-    List<AdvisoryRecord> findAllByOrderByCreatedAtDesc();
+    List<AdvisoryRecord> findAllByOrderByCreatedAtAsc();
 }

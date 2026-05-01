@@ -153,13 +153,13 @@ public class TradeReviewService {
         }
         List<TradeReviewRecord> records;
         if (sessionId != null && !sessionId.isBlank() && symbol != null && !symbol.isBlank()) {
-            records = tradeReviewRepository.findBySessionIdAndSymbolOrderByCreatedAtDesc(sessionId, symbol);
+            records = tradeReviewRepository.findBySessionIdAndSymbolOrderByCreatedAtAsc(sessionId, symbol);
         } else if (sessionId != null && !sessionId.isBlank()) {
-            records = tradeReviewRepository.findBySessionIdOrderByCreatedAtDesc(sessionId);
+            records = tradeReviewRepository.findBySessionIdOrderByCreatedAtAsc(sessionId);
         } else if (symbol != null && !symbol.isBlank()) {
-            records = tradeReviewRepository.findBySymbolOrderByCreatedAtDesc(symbol);
+            records = tradeReviewRepository.findBySymbolOrderByCreatedAtAsc(symbol);
         } else {
-            records = tradeReviewRepository.findAllByOrderByCreatedAtDesc();
+            records = tradeReviewRepository.findAllByOrderByCreatedAtAsc();
         }
         return records.stream().map(TradeReviewResponse::from).toList();
     }

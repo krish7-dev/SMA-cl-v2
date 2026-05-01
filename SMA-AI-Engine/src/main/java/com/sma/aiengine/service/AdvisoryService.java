@@ -144,13 +144,13 @@ public class AdvisoryService {
         List<AdvisoryRecord> records;
 
         if (sessionId != null && !sessionId.isBlank() && symbol != null && !symbol.isBlank()) {
-            records = advisoryRepository.findBySessionIdAndSymbolOrderByCreatedAtDesc(sessionId, symbol);
+            records = advisoryRepository.findBySessionIdAndSymbolOrderByCreatedAtAsc(sessionId, symbol);
         } else if (sessionId != null && !sessionId.isBlank()) {
-            records = advisoryRepository.findBySessionIdOrderByCreatedAtDesc(sessionId);
+            records = advisoryRepository.findBySessionIdOrderByCreatedAtAsc(sessionId);
         } else if (symbol != null && !symbol.isBlank()) {
-            records = advisoryRepository.findBySymbolOrderByCreatedAtDesc(symbol);
+            records = advisoryRepository.findBySymbolOrderByCreatedAtAsc(symbol);
         } else {
-            records = advisoryRepository.findAllByOrderByCreatedAtDesc();
+            records = advisoryRepository.findAllByOrderByCreatedAtAsc();
         }
 
         return records.stream().map(AdvisoryResponse::from).toList();
