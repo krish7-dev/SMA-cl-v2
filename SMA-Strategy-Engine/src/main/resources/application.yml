@@ -56,6 +56,9 @@ strategy:
     base-url: ${EXECUTION_ENGINE_URL:http://127.0.0.1:9004}
   data-engine:
     base-url: ${DATA_ENGINE_URL:http://127.0.0.1:9005}
+  ai-engine:
+    base-url: ${AI_ENGINE_URL:http://localhost:9007}
+    enabled: ${AI_ENGINE_ENABLED:true}
 
 management:
   endpoints:
