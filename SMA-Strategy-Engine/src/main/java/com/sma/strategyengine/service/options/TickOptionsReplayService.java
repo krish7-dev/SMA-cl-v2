@@ -687,7 +687,7 @@ public class TickOptionsReplayService {
                 NiftyDecisionResult decision, OptionExecutionEngine execEngine,
                 CandleDto snapshot, java.time.LocalDateTime openTime) {
             java.util.Map<String, Object> m = new java.util.HashMap<>();
-            String sId = req.getSessionId() != null ? req.getSessionId() : sessionId;
+            String sId = sessionId; // replay UUID — each run is isolated in AI Engine records
             m.put("sessionId", sId);
             String sym = execEngine.getActiveTradingSymbol();
             m.put("symbol", sym != null ? sym : "NIFTY");
@@ -720,7 +720,7 @@ public class TickOptionsReplayService {
                 NiftyDecisionResult decision,
                 com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade ct) {
             java.util.Map<String, Object> m = new java.util.HashMap<>();
-            String sId = req.getSessionId() != null ? req.getSessionId() : sessionId;
+            String sId = sessionId; // replay UUID — each run is isolated in AI Engine records
             m.put("sessionId", sId);
             m.put("tradeId", sId + "-" + ct.getEntryTime());
             String sym = ct.getTradingSymbol();

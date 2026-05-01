@@ -12869,6 +12869,8 @@ function TickReplayTest() {
   const replaySessionRef      = useRef(null);
   // Preserved across completion — cleared only after a successful save. Used by save pipeline.
   const lastSaveReplaySessionIdRef = useRef(null);
+  // Preserved for AI fetch after completion (replay UUID used as sessionId in AI Engine records).
+  const lastAiReplayRunIdRef  = useRef(null);
   const lastPayloadRef        = useRef(null);
   // Accumulates raw tick events for post-session comparison. Capped at 10 000 to limit payload size.
   const ticksRef         = useRef([]);
@@ -12890,13 +12892,14 @@ function TickReplayTest() {
       .finally(() => setSessionsLoading(false));
   }, []);
 
-  // Fetch AI reviews + advisories after replay completes (only if AI was enabled and session is set)
+  // Fetch AI reviews + advisories after replay completes using the replay UUID
   useEffect(() => {
-    if (status !== 'completed' || !aiEnabled || !sessionId) return;
-    getAiReviews(sessionId)
+    if (status !== 'completed' || !aiEnabled || !lastAiReplayRunIdRef.current) return;
+    const runId = lastAiReplayRunIdRef.current;
+    getAiReviews(runId)
       .then(res => setAiReviews(res?.data ?? []))
       .catch(() => {});
-    getAiAdvisories(sessionId)
+    getAiAdvisories(runId)
       .then(res => setAiAdvisories(res?.data ?? []))
       .catch(() => {});
   }, [status]);
@@ -13475,6 +13478,9 @@ function TickReplayTest() {
       if (!sid) throw new Error('No sessionId returned from server');
       replaySessionRef.current = sid;
       lastSaveReplaySessionIdRef.current = sid;  // preserved past completion for save pipeline
+      lastAiReplayRunIdRef.current = sid;        // preserved for AI fetch after completion
+      setAiReviews([]);
+      setAiAdvisories([]);
       setReplaySessionId(sid);
 
       // Step 2: attach SSE stream
