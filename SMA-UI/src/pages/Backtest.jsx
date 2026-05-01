@@ -12,6 +12,7 @@ import {
   getOptionsLiveFeed, getTickReplayFeed,
   saveSessionResult, listSessionResults, getSessionResult, deleteSessionResult, finalizeSessionResult,
   querySessionTicksForCompare,
+  getAiReviews, getAiAdvisories,
 } from '../services/api';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { useSession } from '../context/SessionContext';
@@ -12858,6 +12859,8 @@ function TickReplayTest() {
   const [error,           setError]           = useState('');
   const [warnings,        setWarnings]        = useState([]);
   const [rightTab,        setRightTab]        = useState('feed');
+  const [aiReviews,       setAiReviews]       = useState([]);
+  const [aiAdvisories,    setAiAdvisories]    = useState([]);
   const [feedExpanded,    setFeedExpanded]    = useState(false);
   const [liveTicks,       setLiveTicks]       = useState({});
   const [replaySessionId, setReplaySessionId] = useState(null);
@@ -12886,6 +12889,17 @@ function TickReplayTest() {
       .catch(e => setSessionsError(e.message))
       .finally(() => setSessionsLoading(false));
   }, []);
+
+  // Fetch AI reviews + advisories after replay completes (only if AI was enabled and session is set)
+  useEffect(() => {
+    if (status !== 'completed' || !aiEnabled || !sessionId) return;
+    getAiReviews(sessionId)
+      .then(res => setAiReviews(res?.data ?? []))
+      .catch(() => {});
+    getAiAdvisories(sessionId)
+      .then(res => setAiAdvisories(res?.data ?? []))
+      .catch(() => {});
+  }, [status]);
 
   function updatePoolInst(pool, setPool, id, patch) { setPool(p => p.map(i => i.id === id ? { ...i, ...patch } : i)); }
   function addPoolInst(setPool)              { setPool(p => [...p, EMPTY_OPTION_INST()]); }
@@ -13538,7 +13552,7 @@ function TickReplayTest() {
     <div>
       <div className="card bt-opts-card" style={{ marginBottom: 16 }}>
         <div className="bt-live-right-tabs" style={{ marginBottom: 14 }}>
-          {[['feed','Feed'],['pnl','P&L'],['portfolio','Portfolio']].map(([k, l]) => (
+          {[['feed','Feed'],['pnl','P&L'],['portfolio','Portfolio'],['ai','AI Insights']].map(([k, l]) => (
             <button key={k} className={`bt-live-tab-btn ${rightTab === k ? 'active' : ''}`} onClick={() => setRightTab(k)}>{l}</button>
           ))}
           {feed.length > 0 && <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-secondary)' }}>{feed.length} candles · {closedTrades.length} trades</span>}
@@ -13705,6 +13719,87 @@ function TickReplayTest() {
             </div>
           ) : <p style={{ fontSize:12, color:'var(--text-muted)', textAlign:'center', padding:'24px 0' }}>No closed trades yet.</p>
         )}
+
+        {rightTab === 'ai' && (() => {
+          if (!aiEnabled) return (
+            <p style={{ fontSize:12, color:'var(--text-muted)', textAlign:'center', padding:'24px 0' }}>
+              AI Engine is OFF for this replay. Toggle it ON in Session Settings and re-run.
+            </p>
+          );
+          if (status !== 'completed' && aiReviews.length === 0) return (
+            <p style={{ fontSize:12, color:'var(--text-muted)', textAlign:'center', padding:'24px 0' }}>
+              {isRunning ? 'AI results will appear after replay completes.' : 'Run a replay with AI Engine ON to see insights.'}
+            </p>
+          );
+          const qualColor = q => q === 'GOOD' ? '#22c55e' : q === 'BAD' ? '#ef4444' : q === 'AVERAGE' ? '#f59e0b' : '#94a3b8';
+          const actColor  = a => a === 'ALLOW' ? '#22c55e' : a === 'AVOID' ? '#ef4444' : a === 'CAUTION' ? '#f59e0b' : '#94a3b8';
+          return (
+            <div>
+              {aiReviews.length > 0 && (
+                <>
+                  <div style={{ fontSize:11, fontWeight:700, color:'var(--text-secondary)', marginBottom:6 }}>
+                    Trade Reviews ({aiReviews.length})
+                  </div>
+                  <div style={{ overflowX:'auto', marginBottom:16 }}>
+                    <table className="bt-table">
+                      <thead>
+                        <tr><th>#</th><th>Symbol</th><th>Quality</th><th>Mistake</th><th>Avoidable</th><th>P&L</th><th>Exit</th><th>Source</th><th>Summary</th></tr>
+                      </thead>
+                      <tbody>
+                        {aiReviews.map((r, i) => (
+                          <tr key={r.id ?? i}>
+                            <td style={{ fontSize:10, color:'var(--text-muted)' }}>{i+1}</td>
+                            <td style={{ fontSize:10 }}>{r.symbol}</td>
+                            <td style={{ fontWeight:700, color:qualColor(r.quality) }}>{r.quality}</td>
+                            <td style={{ fontSize:10 }}>{r.mistakeType || '—'}</td>
+                            <td style={{ fontSize:11, color: r.avoidable ? '#ef4444' : '#22c55e' }}>{r.avoidable ? 'Yes' : 'No'}</td>
+                            <td style={r.pnl != null ? pnlStyle(r.pnl) : {}}>{r.pnl != null ? fmt2(r.pnl) : '—'}</td>
+                            <td style={{ fontSize:10 }}>{r.exitReason || '—'}</td>
+                            <td style={{ fontSize:10, color:'var(--text-muted)' }}>{r.source}</td>
+                            <td style={{ fontSize:10, maxWidth:220, whiteSpace:'normal', color:'var(--text-secondary)' }}>{r.summary || '—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+              {aiAdvisories.length > 0 && (
+                <>
+                  <div style={{ fontSize:11, fontWeight:700, color:'var(--text-secondary)', marginBottom:6 }}>
+                    Entry Advisories ({aiAdvisories.length})
+                  </div>
+                  <div style={{ overflowX:'auto' }}>
+                    <table className="bt-table">
+                      <thead>
+                        <tr><th>#</th><th>Symbol</th><th>Action</th><th>Risk</th><th>Confidence</th><th>Regime</th><th>Source</th><th>Summary</th></tr>
+                      </thead>
+                      <tbody>
+                        {aiAdvisories.map((a, i) => (
+                          <tr key={a.id ?? i}>
+                            <td style={{ fontSize:10, color:'var(--text-muted)' }}>{i+1}</td>
+                            <td style={{ fontSize:10 }}>{a.symbol}</td>
+                            <td style={{ fontWeight:700, color:actColor(a.action) }}>{a.action}</td>
+                            <td style={{ fontSize:10, color: a.riskLevel === 'HIGH' ? '#ef4444' : a.riskLevel === 'MEDIUM' ? '#f59e0b' : '#22c55e' }}>{a.riskLevel}</td>
+                            <td style={{ fontSize:11 }}>{a.confidence != null ? `${(a.confidence*100).toFixed(0)}%` : '—'}</td>
+                            <td style={{ fontSize:10 }}>{a.regime || '—'}</td>
+                            <td style={{ fontSize:10, color:'var(--text-muted)' }}>{a.source}</td>
+                            <td style={{ fontSize:10, maxWidth:220, whiteSpace:'normal', color:'var(--text-secondary)' }}>{a.summary || '—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+              {aiReviews.length === 0 && aiAdvisories.length === 0 && (
+                <p style={{ fontSize:12, color:'var(--text-muted)', textAlign:'center', padding:'24px 0' }}>
+                  No AI records found. Ensure AI Engine is running on port 9007 and re-run the replay.
+                </p>
+              )}
+            </div>
+          );
+        })()}
       </div>
 
       <form onSubmit={handleSubmit}>

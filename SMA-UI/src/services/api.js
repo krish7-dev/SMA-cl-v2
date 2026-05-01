@@ -5,6 +5,7 @@ const EXECUTION     = import.meta.env.VITE_EXECUTION_URL     || '/execution';
 const DATA          = import.meta.env.VITE_DATA_URL          || '/data-api';
 const STRATEGY      = import.meta.env.VITE_STRATEGY_URL      || '/strategy';
 const STRATEGY_API  = import.meta.env.VITE_STRATEGY_API_URL  || '/strategy-api';
+const AI_ENGINE     = import.meta.env.VITE_AI_ENGINE_URL     || 'http://localhost:9007';
 
 async function request(url, options = {}) {
   const res = await fetch(url, {
@@ -563,4 +564,14 @@ export async function getSessionDivergence(sessionA, sessionB) {
   return request(
     `${STRATEGY_API}/api/v1/strategy/session-results/divergence?sessionA=${encodeURIComponent(sessionA)}&sessionB=${encodeURIComponent(sessionB)}`
   );
+}
+
+// ─── AI Engine ────────────────────────────────────────────────────────────────
+
+export async function getAiReviews(sessionId) {
+  return request(`${AI_ENGINE}/api/v1/ai/review?sessionId=${encodeURIComponent(sessionId)}`);
+}
+
+export async function getAiAdvisories(sessionId) {
+  return request(`${AI_ENGINE}/api/v1/ai/advisory?sessionId=${encodeURIComponent(sessionId)}`);
 }
