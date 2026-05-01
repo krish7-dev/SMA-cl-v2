@@ -29,9 +29,6 @@ public class TickOptionsReplayRequest {
      */
     private boolean saveForCompare = false;
 
-    /** When true, fire non-blocking advisory/review calls to AI Engine during replay. */
-    private boolean aiEnabled = true;
-
     // ── Auth (for warmup candle fetch — auto-resolved from Broker Engine if omitted) ──
     private String userId;
     private String brokerName;

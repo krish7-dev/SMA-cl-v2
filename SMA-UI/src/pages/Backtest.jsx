@@ -12657,7 +12657,6 @@ function TickReplayTest() {
   const [toDate,   setToDate]   = useState(() => ls('sma_tick_to',       ''));
   const [speed,              setSpeed]              = useState(() => ls('sma_tick_speed',              '0'));
   const [saveForCompare,     setSaveForCompare]     = useState(() => ls('sma_tick_save_for_compare',   false));
-  const [aiEnabled,          setAiEnabled]          = useState(() => ls('sma_tick_ai_enabled',          true));
   const [tradingHoursEnabled, setTradingHoursEnabled] = useState(() => ls('sma_tick_trading_hours_on',  true));
   const [closeoutMins,        setCloseoutMins]        = useState(() => ls('sma_tick_closeout_mins',     '15'));
   const [quantity, setQuantity] = useState(() => ls('sma_tick_qty',      '0'));
@@ -12714,7 +12713,6 @@ function TickReplayTest() {
   useEffect(() => { try { localStorage.setItem('sma_tick_to',                JSON.stringify(toDate));             } catch {} }, [toDate]);
   useEffect(() => { try { localStorage.setItem('sma_tick_speed',             JSON.stringify(speed));                  } catch {} }, [speed]);
   useEffect(() => { try { localStorage.setItem('sma_tick_save_for_compare',  JSON.stringify(saveForCompare));         } catch {} }, [saveForCompare]);
-  useEffect(() => { try { localStorage.setItem('sma_tick_ai_enabled',        JSON.stringify(aiEnabled));               } catch {} }, [aiEnabled]);
   useEffect(() => { try { localStorage.setItem('sma_tick_trading_hours_on',  JSON.stringify(tradingHoursEnabled));    } catch {} }, [tradingHoursEnabled]);
   useEffect(() => { try { localStorage.setItem('sma_tick_closeout_mins',     JSON.stringify(closeoutMins));           } catch {} }, [closeoutMins]);
   useEffect(() => { try { localStorage.setItem('sma_tick_qty',               JSON.stringify(quantity));           } catch {} }, [quantity]);
@@ -13412,7 +13410,6 @@ function TickReplayTest() {
       niftySymbol: niftySymbol || 'NIFTY 50', niftyExchange: niftyExchange || 'NSE',
       quantity: parseInt(quantity, 10) || 0, initialCapital: parseFloat(capital) || 100000, speedMultiplier: parseFloat(speed) || 0,
       saveForCompare,
-      aiEnabled,
       ceOptions: cePool.filter(i => i.instrumentToken).map(i => ({ instrumentToken: parseInt(i.instrumentToken, 10), tradingSymbol: i.symbol, exchange: i.exchange })),
       peOptions: pePool.filter(i => i.instrumentToken).map(i => ({ instrumentToken: parseInt(i.instrumentToken, 10), tradingSymbol: i.symbol, exchange: i.exchange })),
       strategies: enabledStrats,
@@ -13871,14 +13868,6 @@ function TickReplayTest() {
                 {saveForCompare ? 'ON' : 'OFF'}
               </button>
               {saveForCompare && <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 6 }}>Feed will be persisted — replay may be slower</span>}
-            </div>
-            <div className="form-group">
-              <label title="Send advisory and review calls to AI Engine during replay. AI Engine must be running on port 9007.">AI Engine</label>
-              <button type="button" className={`btn-sm ${aiEnabled ? 'btn-primary' : 'btn-secondary'}`}
-                onClick={() => setAiEnabled(v => !v)} disabled={isRunning}>
-                {aiEnabled ? 'ON' : 'OFF'}
-              </button>
-              {aiEnabled && <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 6 }}>Advisory + review records saved to DB</span>}
             </div>
             <div className="form-group"><label title="Days of NIFTY candles to load before the session — primes indicators and regime (0 = cold start)">Warmup Days</label><input type="number" min="0" max="30" value={warmupDays} onChange={e => setWarmupDays(e.target.value)} disabled={isRunning} /></div>
 
