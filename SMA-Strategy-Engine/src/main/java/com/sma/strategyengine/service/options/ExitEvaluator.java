@@ -60,6 +60,7 @@ public class ExitEvaluator {
     // ── Per-position state ────────────────────────────────────────────────────
 
     @Getter private double  peakPnlPct         = 0.0;
+    @Getter private double  worstPnlPct        = 0.0;
     @Getter private double  profitLockFloor    = Double.NEGATIVE_INFINITY;
     @Getter private boolean everProfitable     = false;
     @Getter private int     barsWithoutNewHigh = 0;
@@ -86,6 +87,7 @@ public class ExitEvaluator {
         this.entryScore         = entryScore;
         this.entryOptionPrice   = entryOptionPrice;
         this.peakPnlPct         = 0.0;
+        this.worstPnlPct        = 0.0;
         this.profitLockFloor    = Double.NEGATIVE_INFINITY;
         this.everProfitable     = false;
         this.barsWithoutNewHigh = 0;
@@ -127,12 +129,15 @@ public class ExitEvaluator {
             }
         }
 
-        // ── Track peak / consecutive counters ─────────────────────────────────
+        // ── Track peak / worst / consecutive counters ─────────────────────────
         if (currentPnlPct > peakPnlPct) {
             peakPnlPct         = currentPnlPct;
             barsWithoutNewHigh = 0;
         } else {
             barsWithoutNewHigh++;
+        }
+        if (currentPnlPct < worstPnlPct) {
+            worstPnlPct = currentPnlPct;
         }
         if (currentPnlPct > 0) {
             everProfitable = true;

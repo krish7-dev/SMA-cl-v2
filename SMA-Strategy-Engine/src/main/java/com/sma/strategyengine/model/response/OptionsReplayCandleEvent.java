@@ -165,5 +165,7 @@ public class OptionsReplayCandleEvent {
         private double capitalAfter;
         private String entryRegime;
         private String exitRegime;
+        private double maxFavorableExcursionPct;
+        private double maxAdverseExcursionPct;
     }
 }

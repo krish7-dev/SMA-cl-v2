@@ -162,7 +162,10 @@
       "Bash(mvn -f SMA-AI-Engine/pom.xml clean package -DskipTests)",
       "Bash('/c/Program Files/JetBrains/IntelliJ IDEA Community Edition 2025.1.1.1/plugins/maven/lib/maven3/bin/mvn' clean package -DskipTests -f g:/SMA-claude-v2/SMA-AI-Engine/pom.xml)",
       "Bash(\"/c/Program Files/JetBrains/IntelliJ IDEA Community Edition 2025.1.1.1/plugins/maven/lib/maven3/bin/mvn\" -f \"g:/SMA-claude-v2/SMA-Strategy-Engine/pom.xml\" compile -q)",
-      "Bash(\"/c/Program Files/JetBrains/IntelliJ IDEA Community Edition 2025.1.1.1/plugins/maven/lib/maven3/bin/mvn\" -f \"g:/SMA-claude-v2/SMA-AI-Engine/pom.xml\" compile -q)"
+      "Bash(\"/c/Program Files/JetBrains/IntelliJ IDEA Community Edition 2025.1.1.1/plugins/maven/lib/maven3/bin/mvn\" -f \"g:/SMA-claude-v2/SMA-AI-Engine/pom.xml\" compile -q)",
+      "Bash(git checkout *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }

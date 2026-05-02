@@ -94,36 +94,41 @@ public class AdvisoryService {
                 ? AiSource.OPENAI
                 : AiSource.FALLBACK;
 
-        AdvisoryRecord record = AdvisoryRecord.builder()
-                .sessionId(request.getSessionId())
-                .symbol(request.getSymbol())
-                .side(request.getSide())
-                .regime(request.getRegime())
-                .candleTime(request.getCandleTime())
-                .action(output.action())
-                .confidence(output.confidence())
-                .tradeQualityScore(output.tradeQualityScore())
-                .riskLevel(output.riskLevel())
-                .reversalRisk(output.reversalRisk())
-                .chopRisk(output.chopRisk())
-                .lateEntryRisk(output.lateEntryRisk())
-                .overextensionRisk(output.overextensionRisk())
-                .reasonCodes(output.reasonCodes())
-                .warningCodes(output.warningCodes())
-                .summary(output.summary())
-                .source(source)
-                .latencyMs(latencyMs)
-                .requestJson(requestJson)
-                .errorDetails(errorDetails)
-                .requestId(requestId)
-                .build();
+        // Serialize AI output as responseJson before save — avoids a second DB round-trip
+        String responseJson = safeSerialize(output);
+
+        // Upsert: re-running the same tick session replaces the previous advisory for this candle
+        AdvisoryRecord record = advisoryRepository
+                .findBySessionIdAndCandleTime(request.getSessionId(), request.getCandleTime())
+                .orElseGet(() -> AdvisoryRecord.builder()
+                        .sessionId(request.getSessionId())
+                        .symbol(request.getSymbol())
+                        .side(request.getSide())
+                        .regime(request.getRegime())
+                        .candleTime(request.getCandleTime())
+                        .build());
+
+        record.setAction(output.action());
+        record.setConfidence(output.confidence());
+        record.setTradeQualityScore(output.tradeQualityScore());
+        record.setRiskLevel(output.riskLevel());
+        record.setReversalRisk(output.reversalRisk());
+        record.setChopRisk(output.chopRisk());
+        record.setLateEntryRisk(output.lateEntryRisk());
+        record.setOverextensionRisk(output.overextensionRisk());
+        record.setReasonCodes(output.reasonCodes());
+        record.setWarningCodes(output.warningCodes());
+        record.setSummary(output.summary());
+        record.setSource(source);
+        record.setLatencyMs(latencyMs);
+        record.setRequestJson(requestJson);
+        record.setResponseJson(responseJson);
+        record.setErrorDetails(errorDetails);
+        record.setRequestId(requestId);
 
         record = advisoryRepository.save(record);
 
         AdvisoryResponse response = AdvisoryResponse.from(record);
-
-        // Store the final caller-facing response as responseJson
-        record.setResponseJson(safeSerialize(response));
 
         log.info("[{}] Advisory complete: symbol={} action={} source={} latencyMs={}",
                 requestId, request.getSymbol(), output.action(), source, latencyMs);

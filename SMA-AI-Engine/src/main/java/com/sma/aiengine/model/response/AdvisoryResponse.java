@@ -37,6 +37,8 @@ public class AdvisoryResponse {
     private Long latencyMs;
     private String requestId;
     private Instant createdAt;
+    private String requestJson;
+    private String responseJson;
 
     public static AdvisoryResponse from(AdvisoryRecord r) {
         return AdvisoryResponse.builder()
@@ -61,6 +63,8 @@ public class AdvisoryResponse {
                 .latencyMs(r.getLatencyMs())
                 .requestId(r.getRequestId())
                 .createdAt(r.getCreatedAt())
+                .requestJson(r.getRequestJson())
+                .responseJson(r.getResponseJson())
                 .build();
     }
 }

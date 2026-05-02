@@ -1,5 +1,6 @@
 package com.sma.aiengine.client;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sma.aiengine.config.OpenAiConfig;
 import lombok.RequiredArgsConstructor;
@@ -84,8 +85,11 @@ public class OpenAiClient {
 
     // ── Response shape records ───────────────────────────────────────────────
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
     private record ChatCompletionResponse(List<Choice> choices) {}
+    @JsonIgnoreProperties(ignoreUnknown = true)
     private record Choice(Message message) {}
+    @JsonIgnoreProperties(ignoreUnknown = true)
     private record Message(String role, String content) {}
 
     // ── Exception ────────────────────────────────────────────────────────────

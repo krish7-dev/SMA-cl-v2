@@ -575,3 +575,7 @@ export async function getAiReviews(sessionId) {
 export async function getAiAdvisories(sessionId) {
   return request(`${AI_ENGINE}/api/v1/ai/advisory?sessionId=${encodeURIComponent(sessionId)}`);
 }
+
+export async function getAiSessions() {
+  return request(`${AI_ENGINE}/api/v1/ai/sessions`);
+}

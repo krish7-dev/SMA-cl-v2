@@ -42,6 +42,8 @@ public class TradeReviewResponse {
     private Long latencyMs;
     private String requestId;
     private Instant createdAt;
+    private String requestJson;
+    private String responseJson;
 
     public static TradeReviewResponse from(TradeReviewRecord r) {
         return TradeReviewResponse.builder()
@@ -70,6 +72,8 @@ public class TradeReviewResponse {
                 .latencyMs(r.getLatencyMs())
                 .requestId(r.getRequestId())
                 .createdAt(r.getCreatedAt())
+                .requestJson(r.getRequestJson())
+                .responseJson(r.getResponseJson())
                 .build();
     }
 }

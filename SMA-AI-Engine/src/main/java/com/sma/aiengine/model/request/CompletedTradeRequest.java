@@ -5,7 +5,6 @@ import lombok.Data;
 import lombok.EqualsAndHashCode;
 
 import java.math.BigDecimal;
-import java.time.Instant;
 
 @Data
 @EqualsAndHashCode(callSuper = true)
@@ -14,8 +13,10 @@ public class CompletedTradeRequest extends TradeCandidateRequest {
     @NotBlank
     private String tradeId;
 
-    private Instant entryTime;
-    private Instant exitTime;
+    // Stored as LocalDateTime strings ("2026-04-29T09:55") from Strategy Engine
+    private String entryTime;
+    private String exitTime;
+
     private BigDecimal exitPrice;
     private BigDecimal pnl;
     private Double pnlPct;
@@ -24,4 +25,5 @@ public class CompletedTradeRequest extends TradeCandidateRequest {
     private Double maxFavorableExcursionPct;
     private Double maxAdverseExcursionPct;
     private BigDecimal capitalAfter;
+    private Double dailyPnlAfterTrade;      // realized P&L including this trade
 }

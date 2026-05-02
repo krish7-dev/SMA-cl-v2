@@ -17,6 +17,9 @@ import org.slf4j.MDC;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -94,40 +97,45 @@ public class TradeReviewService {
                 ? AiSource.OPENAI
                 : AiSource.FALLBACK;
 
-        TradeReviewRecord record = TradeReviewRecord.builder()
-                .tradeId(request.getTradeId())
-                .sessionId(request.getSessionId())
-                .symbol(request.getSymbol())
-                .side(request.getSide())
-                .regime(request.getRegime())
-                .entryTime(request.getEntryTime())
-                .exitTime(request.getExitTime())
-                .pnl(request.getPnl())
-                .pnlPct(request.getPnlPct())
-                .exitReason(request.getExitReason())
-                .quality(output.quality())
-                .avoidable(output.avoidable())
-                .mistakeType(output.mistakeType())
-                .confidence(output.confidence())
-                .summary(output.summary())
-                .whatWorked(output.whatWorked())
-                .whatFailed(output.whatFailed())
-                .suggestedRule(output.suggestedRule())
-                .reasonCodes(output.reasonCodes())
-                .warningCodes(output.warningCodes())
-                .source(source)
-                .latencyMs(latencyMs)
-                .requestJson(requestJson)
-                .errorDetails(errorDetails)
-                .requestId(requestId)
-                .build();
+        // Serialize AI output as responseJson before save — avoids a second DB round-trip
+        String responseJson = safeSerialize(output);
+
+        // Upsert: re-running the same tick session replaces the previous review for this trade
+        TradeReviewRecord record = tradeReviewRepository
+                .findBySessionIdAndTradeId(request.getSessionId(), request.getTradeId())
+                .orElseGet(() -> TradeReviewRecord.builder()
+                        .tradeId(request.getTradeId())
+                        .sessionId(request.getSessionId())
+                        .symbol(request.getSymbol())
+                        .side(request.getSide())
+                        .regime(request.getRegime())
+                        .entryTime(parseToInstant(request.getEntryTime()))
+                        .exitTime(parseToInstant(request.getExitTime()))
+                        .pnl(request.getPnl())
+                        .pnlPct(request.getPnlPct())
+                        .exitReason(request.getExitReason())
+                        .build());
+
+        record.setQuality(output.quality());
+        record.setAvoidable(output.avoidable());
+        record.setMistakeType(output.mistakeType());
+        record.setConfidence(output.confidence());
+        record.setSummary(output.summary());
+        record.setWhatWorked(output.whatWorked());
+        record.setWhatFailed(output.whatFailed());
+        record.setSuggestedRule(output.suggestedRule());
+        record.setReasonCodes(output.reasonCodes());
+        record.setWarningCodes(output.warningCodes());
+        record.setSource(source);
+        record.setLatencyMs(latencyMs);
+        record.setRequestJson(requestJson);
+        record.setResponseJson(responseJson);
+        record.setErrorDetails(errorDetails);
+        record.setRequestId(requestId);
 
         record = tradeReviewRepository.save(record);
 
         TradeReviewResponse response = TradeReviewResponse.from(record);
-
-        // Store the final caller-facing response as responseJson
-        record.setResponseJson(safeSerialize(response));
 
         log.info("[{}] Review complete: tradeId={} quality={} source={} latencyMs={}",
                 requestId, request.getTradeId(), output.quality(), source, latencyMs);
@@ -191,6 +199,15 @@ public class TradeReviewService {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private static final ZoneId IST = ZoneId.of("Asia/Kolkata");
+
+    /** Parses "2026-04-29T09:55" (LocalDateTime string from Strategy Engine) to Instant using IST. */
+    private Instant parseToInstant(String s) {
+        if (s == null || s.isBlank()) return null;
+        try { return LocalDateTime.parse(s).atZone(IST).toInstant(); }
+        catch (Exception e) { return null; }
+    }
 
     private <E extends Enum<E>> E parseEnum(Class<E> cls, Object value, E defaultVal) {
         if (!(value instanceof String s)) return defaultVal;

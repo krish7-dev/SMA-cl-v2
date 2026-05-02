@@ -1,12 +1,16 @@
 package com.sma.aiengine.model.request;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import jakarta.validation.constraints.NotBlank;
 import lombok.Data;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.List;
+import java.util.Map;
 
 @Data
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class TradeCandidateRequest {
 
     @NotBlank
@@ -40,11 +44,28 @@ public class TradeCandidateRequest {
 
     private Integer barsSinceLastTrade;
     private Integer tradesToday;
-    private BigDecimal dailyPnl;
+    private BigDecimal dailyPnl;            // legacy alias — prefer dailyPnlBeforeTrade
+    private Double dailyPnlBeforeTrade;     // realized P&L before this trade
     private BigDecimal capitalBefore;
 
     private Boolean compressionNoTradeEnabled;
     private Boolean minMovementFilterPassed;
     private Boolean directionalConsistencyPassed;
     private Boolean candleStrengthFilterPassed;
+
+    // Current option type (CE/PE — both are bought long, not BUY/SELL)
+    private String  currentOptionType;
+
+    // Previous trade context — helps detect reversal traps (e.g. PE after strong CE win)
+    private String  previousTradeSymbol;
+    private String  previousTradeOptionType;          // CE or PE
+    private Double  previousTradePnlPct;
+    private String  previousTradeExitReason;
+    private String  previousTradeExitTime;
+    private Integer minutesSincePreviousExit;
+    private Boolean previousTradeWasStrongWinner;     // pnlPct >= 8.0
+    private Boolean isOppositeSideAfterStrongWinner;  // prevOptionType != currentOptionType && prevWasStrongWin
+
+    // Last ≤5 completed NIFTY candles — compact shape only, no raw ticks
+    private List<Map<String, Object>> recentCandles;
 }

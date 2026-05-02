@@ -44,7 +44,7 @@ public class TradeReviewRecord {
     @Column(name = "symbol", length = 50)
     private String symbol;
 
-    @Column(name = "side", length = 10)
+    @Column(name = "side", length = 20)
     private String side;
 
     @Column(name = "regime", length = 50)

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, Fragment } from 'react';
 import {
   getStrategyTypes, runBacktest,
   liveSubscribe, liveUnsubscribe, liveConnect, liveStatus,
@@ -12861,6 +12861,7 @@ function TickReplayTest() {
   const [rightTab,        setRightTab]        = useState('feed');
   const [aiReviews,       setAiReviews]       = useState([]);
   const [aiAdvisories,    setAiAdvisories]    = useState([]);
+  const [expandedAiRow,   setExpandedAiRow]   = useState(null); // { type: 'review'|'advisory', id }
   const [feedExpanded,    setFeedExpanded]    = useState(false);
   const [liveTicks,       setLiveTicks]       = useState({});
   const [replaySessionId, setReplaySessionId] = useState(null);
@@ -12892,17 +12893,29 @@ function TickReplayTest() {
       .finally(() => setSessionsLoading(false));
   }, []);
 
-  // Fetch AI reviews + advisories after replay completes using the replay UUID
+  // Fetch AI reviews + advisories after replay completes
   useEffect(() => {
-    if (status !== 'completed' || !aiEnabled || !lastAiReplayRunIdRef.current) return;
-    const runId = lastAiReplayRunIdRef.current;
-    getAiReviews(runId)
+    if (status !== 'completed' || !aiEnabled || !sessionId) return;
+    getAiReviews(sessionId)
       .then(res => setAiReviews(res?.data ?? []))
       .catch(() => {});
-    getAiAdvisories(runId)
+    getAiAdvisories(sessionId)
       .then(res => setAiAdvisories(res?.data ?? []))
       .catch(() => {});
   }, [status]);
+
+  // Auto-load AI insights when switching to AI tab (data persisted from previous runs)
+  useEffect(() => {
+    if (rightTab !== 'ai') return;
+    if (aiReviews.length > 0 || aiAdvisories.length > 0) return;
+    if (!sessionId) return;
+    getAiReviews(sessionId)
+      .then(res => { if ((res?.data?.length ?? 0) > 0) setAiReviews(res.data); })
+      .catch(() => {});
+    getAiAdvisories(sessionId)
+      .then(res => { if ((res?.data?.length ?? 0) > 0) setAiAdvisories(res.data); })
+      .catch(() => {});
+  }, [rightTab, sessionId]);
 
   function updatePoolInst(pool, setPool, id, patch) { setPool(p => p.map(i => i.id === id ? { ...i, ...patch } : i)); }
   function addPoolInst(setPool)              { setPool(p => [...p, EMPTY_OPTION_INST()]); }
@@ -13737,14 +13750,137 @@ function TickReplayTest() {
               {isRunning ? 'AI results will appear after replay completes.' : 'Run a replay with AI Engine ON to see insights.'}
             </p>
           );
+          const sessionDateStr = (() => {
+            const ts = aiAdvisories[0]?.candleTime || aiReviews[0]?.entryTime;
+            if (!ts) return new Date().toISOString().slice(0, 10);
+            return new Date(ts).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // YYYY-MM-DD
+          })();
           const qualColor = q => q === 'GOOD' ? '#22c55e' : q === 'BAD' ? '#ef4444' : q === 'AVERAGE' ? '#f59e0b' : '#94a3b8';
           const actColor  = a => a === 'ALLOW' ? '#22c55e' : a === 'AVOID' ? '#ef4444' : a === 'CAUTION' ? '#f59e0b' : '#94a3b8';
+          const fmtJson   = s => { try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s || '—'; } };
+          const jsonPanel = (label, json) => (
+            <div style={{ flex:1, minWidth:0 }}>
+              <div style={{ fontSize:10, fontWeight:700, color:'var(--text-secondary)', marginBottom:4 }}>{label}</div>
+              <pre style={{ maxHeight:320, overflow:'auto', background:'rgba(0,0,0,0.35)', padding:'8px 10px', borderRadius:4, fontSize:9.5, margin:0, whiteSpace:'pre-wrap', wordBreak:'break-all', color:'#c7d2fe' }}>{fmtJson(json)}</pre>
+            </div>
+          );
+
+          const downloadAiCsv = () => {
+            const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+            const rows = [];
+            rows.push(`"AI Insights — Session date: ${sessionDateStr}"`);
+            rows.push('');
+            // Reviews
+            if (aiReviews.length > 0) {
+              rows.push(['TYPE','#','ENTRY_TIME','EXIT_TIME','SYMBOL','OPT_TYPE','PNL','PNL_PCT','EXIT_REASON','QUALITY','AVOIDABLE','MISTAKE','CONFIDENCE','SUMMARY','SOURCE'].join(','));
+              aiReviews.forEach((r,i) => rows.push([
+                'REVIEW', i+1,
+                esc(r.entryTime ? new Date(r.entryTime).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}) : ''),
+                esc(r.exitTime  ? new Date(r.exitTime ).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}) : ''),
+                esc(r.symbol), esc(r.side), r.pnl ?? '', r.pnlPct != null ? Number(r.pnlPct).toFixed(2) : '',
+                esc(r.exitReason), esc(r.quality), r.avoidable ? 'Yes':'No',
+                esc(r.mistakeType), r.confidence != null ? Number(r.confidence).toFixed(2) : '',
+                esc(r.summary), esc(r.source)
+              ].join(',')));
+              rows.push('');
+            }
+            // Advisories
+            if (aiAdvisories.length > 0) {
+              rows.push(['TYPE','#','CANDLE_TIME','SYMBOL','OPT_TYPE','ACTION','RISK','CONFIDENCE','REGIME','REVERSAL_RISK','CHOP_RISK','WARNING_CODES','SUMMARY','SOURCE'].join(','));
+              aiAdvisories.forEach((a,i) => rows.push([
+                'ADVISORY', i+1,
+                esc(a.candleTime ? new Date(a.candleTime).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata',hour12:false}) : ''),
+                esc(a.symbol), esc(a.currentOptionType || a.side),
+                esc(a.action), esc(a.riskLevel),
+                a.confidence != null ? Number(a.confidence).toFixed(2) : '',
+                esc(a.regime),
+                a.reversalRisk != null ? Number(a.reversalRisk).toFixed(2) : '',
+                a.chopRisk     != null ? Number(a.chopRisk    ).toFixed(2) : '',
+                esc((a.warningCodes||[]).join('; ')),
+                esc(a.summary), esc(a.source)
+              ].join(',')));
+            }
+            const blob = new Blob([rows.join('\n')], { type:'text/csv' });
+            const url  = URL.createObjectURL(blob);
+            const a2   = document.createElement('a'); a2.href = url;
+            a2.download = `ai-insights-${sessionDateStr}.csv`;
+            a2.click(); URL.revokeObjectURL(url);
+          };
+
+          const downloadAiText = () => {
+            const sep  = '═'.repeat(80);
+            const sep2 = '─'.repeat(80);
+            const lines = [];
+            lines.push(sep);
+            lines.push(`  AI INSIGHTS — Session date: ${sessionDateStr}`);
+            lines.push(sep);
+
+            if (aiReviews.length > 0) {
+              lines.push(''); lines.push(`TRADE REVIEWS (${aiReviews.length})`); lines.push(sep2);
+              aiReviews.forEach((r, i) => {
+                lines.push('');
+                lines.push(`[REVIEW ${i+1}]  ${r.symbol}  ${r.quality}${r.avoidable ? '  ⚠ AVOIDABLE':''}  P&L: ${r.pnl ?? '—'}  Exit: ${r.exitReason || '—'}  Source: ${r.source}`);
+                if (r.summary) lines.push(`Summary : ${r.summary}`);
+                if (r.mistakeType && r.mistakeType !== 'NONE') lines.push(`Mistake : ${r.mistakeType}`);
+                lines.push(sep2);
+                lines.push('REQUEST PAYLOAD:');
+                lines.push(fmtJson(r.requestJson));
+                lines.push(sep2);
+                lines.push('AI RESPONSE:');
+                lines.push(fmtJson(r.responseJson));
+                lines.push(sep2);
+              });
+            }
+
+            if (aiAdvisories.length > 0) {
+              lines.push(''); lines.push(`ENTRY ADVISORIES (${aiAdvisories.length})`); lines.push(sep2);
+              aiAdvisories.forEach((a, i) => {
+                const t = a.candleTime ? new Date(a.candleTime).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata',hour12:false}) : '—';
+                lines.push('');
+                lines.push(`[ADVISORY ${i+1}]  ${t}  ${a.symbol}  ${a.currentOptionType||a.side||''}  ${a.action}  Risk: ${a.riskLevel}  Conf: ${a.confidence != null ? (a.confidence*100).toFixed(0)+'%':'—'}  Source: ${a.source}`);
+                if (a.summary) lines.push(`Summary : ${a.summary}`);
+                if ((a.warningCodes||[]).length) lines.push(`Warnings: ${a.warningCodes.join(', ')}`);
+                lines.push(sep2);
+                lines.push('REQUEST PAYLOAD:');
+                lines.push(fmtJson(a.requestJson));
+                lines.push(sep2);
+                lines.push('AI RESPONSE:');
+                lines.push(fmtJson(a.responseJson));
+                lines.push(sep2);
+              });
+            }
+
+            const blob = new Blob([lines.join('\n')], { type:'text/plain' });
+            const url  = URL.createObjectURL(blob);
+            const a2   = document.createElement('a'); a2.href = url;
+            a2.download = `ai-insights-${sessionDateStr}.txt`;
+            a2.click(); URL.revokeObjectURL(url);
+          };
+
           return (
             <div>
+              {(aiReviews.length > 0 || aiAdvisories.length > 0) && (
+                <div style={{ display:'flex', gap:8, justifyContent:'flex-end', marginBottom:12 }}>
+                  <button
+                    type="button"
+                    onClick={downloadAiCsv}
+                    style={{ fontSize:11, padding:'4px 10px', background:'rgba(59,130,246,0.15)', border:'1px solid rgba(59,130,246,0.4)', borderRadius:4, color:'#93c5fd', cursor:'pointer' }}
+                  >
+                    Download CSV
+                  </button>
+                  <button
+                    type="button"
+                    onClick={downloadAiText}
+                    style={{ fontSize:11, padding:'4px 10px', background:'rgba(139,92,246,0.15)', border:'1px solid rgba(139,92,246,0.4)', borderRadius:4, color:'#c4b5fd', cursor:'pointer' }}
+                  >
+                    Download Text
+                  </button>
+                </div>
+              )}
               {aiReviews.length > 0 && (
                 <>
                   <div style={{ fontSize:11, fontWeight:700, color:'var(--text-secondary)', marginBottom:6 }}>
-                    Trade Reviews ({aiReviews.length})
+                    Trade Reviews ({aiReviews.length}) <span style={{ fontSize:10, fontWeight:400, color:'var(--text-muted)' }}>— click row to see payload</span>
                   </div>
                   <div style={{ overflowX:'auto', marginBottom:16 }}>
                     <table className="bt-table">
@@ -13752,19 +13888,32 @@ function TickReplayTest() {
                         <tr><th>#</th><th>Symbol</th><th>Quality</th><th>Mistake</th><th>Avoidable</th><th>P&L</th><th>Exit</th><th>Source</th><th>Summary</th></tr>
                       </thead>
                       <tbody>
-                        {aiReviews.map((r, i) => (
-                          <tr key={r.id ?? i}>
-                            <td style={{ fontSize:10, color:'var(--text-muted)' }}>{i+1}</td>
-                            <td style={{ fontSize:10 }}>{r.symbol}</td>
-                            <td style={{ fontWeight:700, color:qualColor(r.quality) }}>{r.quality}</td>
-                            <td style={{ fontSize:10 }}>{r.mistakeType || '—'}</td>
-                            <td style={{ fontSize:11, color: r.avoidable ? '#ef4444' : '#22c55e' }}>{r.avoidable ? 'Yes' : 'No'}</td>
-                            <td style={r.pnl != null ? pnlStyle(r.pnl) : {}}>{r.pnl != null ? fmt2(r.pnl) : '—'}</td>
-                            <td style={{ fontSize:10 }}>{r.exitReason || '—'}</td>
-                            <td style={{ fontSize:10, color:'var(--text-muted)' }}>{r.source}</td>
-                            <td style={{ fontSize:10, maxWidth:220, whiteSpace:'normal', color:'var(--text-secondary)' }}>{r.summary || '—'}</td>
-                          </tr>
-                        ))}
+                        {aiReviews.map((r, i) => {
+                          const rowId = r.id ?? i;
+                          const expanded = expandedAiRow?.type === 'review' && expandedAiRow?.id === rowId;
+                          return (
+                            <Fragment key={rowId}>
+                              <tr onClick={() => setExpandedAiRow(expanded ? null : { type:'review', id:rowId })} style={{ cursor:'pointer' }}>
+                                <td style={{ fontSize:10, color:'var(--text-muted)' }}>{expanded ? '▼' : '▶'} {i+1}</td>
+                                <td style={{ fontSize:10 }}>{r.symbol}</td>
+                                <td style={{ fontWeight:700, color:qualColor(r.quality) }}>{r.quality}</td>
+                                <td style={{ fontSize:10 }}>{r.mistakeType || '—'}</td>
+                                <td style={{ fontSize:11, color: r.avoidable ? '#ef4444' : '#22c55e' }}>{r.avoidable ? 'Yes' : 'No'}</td>
+                                <td style={r.pnl != null ? pnlStyle(r.pnl) : {}}>{r.pnl != null ? fmt2(r.pnl) : '—'}</td>
+                                <td style={{ fontSize:10 }}>{r.exitReason || '—'}</td>
+                                <td style={{ fontSize:10, color:'var(--text-muted)' }}>{r.source}</td>
+                                <td style={{ fontSize:10, maxWidth:220, whiteSpace:'normal', color:'var(--text-secondary)' }}>{r.summary || '—'}</td>
+                              </tr>
+                              {expanded && (
+                                <tr>
+                                  <td colSpan={9} style={{ padding:'10px 12px', background:'rgba(99,102,241,0.06)', borderBottom:'1px solid rgba(99,102,241,0.2)' }}>
+                                    <div style={{ display:'flex', gap:12 }}>{jsonPanel('Request Payload', r.requestJson)}{jsonPanel('AI Response', r.responseJson)}</div>
+                                  </td>
+                                </tr>
+                              )}
+                            </Fragment>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -13773,26 +13922,41 @@ function TickReplayTest() {
               {aiAdvisories.length > 0 && (
                 <>
                   <div style={{ fontSize:11, fontWeight:700, color:'var(--text-secondary)', marginBottom:6 }}>
-                    Entry Advisories ({aiAdvisories.length})
+                    Entry Advisories ({aiAdvisories.length}) <span style={{ fontSize:10, fontWeight:400, color:'var(--text-muted)' }}>— click row to see payload</span>
                   </div>
                   <div style={{ overflowX:'auto' }}>
                     <table className="bt-table">
                       <thead>
-                        <tr><th>#</th><th>Symbol</th><th>Action</th><th>Risk</th><th>Confidence</th><th>Regime</th><th>Source</th><th>Summary</th></tr>
+                        <tr><th>#</th><th>Time</th><th>Symbol</th><th>Side</th><th>Action</th><th>Risk</th><th>Confidence</th><th>Regime</th><th>Source</th><th>Summary</th></tr>
                       </thead>
                       <tbody>
-                        {aiAdvisories.map((a, i) => (
-                          <tr key={a.id ?? i}>
-                            <td style={{ fontSize:10, color:'var(--text-muted)' }}>{i+1}</td>
-                            <td style={{ fontSize:10 }}>{a.symbol}</td>
-                            <td style={{ fontWeight:700, color:actColor(a.action) }}>{a.action}</td>
-                            <td style={{ fontSize:10, color: a.riskLevel === 'HIGH' ? '#ef4444' : a.riskLevel === 'MEDIUM' ? '#f59e0b' : '#22c55e' }}>{a.riskLevel}</td>
-                            <td style={{ fontSize:11 }}>{a.confidence != null ? `${(a.confidence*100).toFixed(0)}%` : '—'}</td>
-                            <td style={{ fontSize:10 }}>{a.regime || '—'}</td>
-                            <td style={{ fontSize:10, color:'var(--text-muted)' }}>{a.source}</td>
-                            <td style={{ fontSize:10, maxWidth:220, whiteSpace:'normal', color:'var(--text-secondary)' }}>{a.summary || '—'}</td>
-                          </tr>
-                        ))}
+                        {aiAdvisories.map((a, i) => {
+                          const rowId = a.id ?? i;
+                          const expanded = expandedAiRow?.type === 'advisory' && expandedAiRow?.id === rowId;
+                          return (
+                            <Fragment key={rowId}>
+                              <tr onClick={() => setExpandedAiRow(expanded ? null : { type:'advisory', id:rowId })} style={{ cursor:'pointer' }}>
+                                <td style={{ fontSize:10, color:'var(--text-muted)' }}>{expanded ? '▼' : '▶'} {i+1}</td>
+                                <td style={{ fontSize:10, whiteSpace:'nowrap' }}>{a.candleTime ? new Date(a.candleTime).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata',hour12:false}) : '—'}</td>
+                                <td style={{ fontSize:10 }}>{a.symbol}</td>
+                                <td style={{ fontSize:10, fontWeight:600, color: (a.currentOptionType||a.side) === 'CE' ? '#22c55e' : (a.currentOptionType||a.side) === 'PE' ? '#ef4444' : 'var(--text-secondary)' }}>{a.currentOptionType || a.side || '—'}</td>
+                                <td style={{ fontWeight:700, color:actColor(a.action) }}>{a.action}</td>
+                                <td style={{ fontSize:10, color: a.riskLevel === 'HIGH' ? '#ef4444' : a.riskLevel === 'MEDIUM' ? '#f59e0b' : '#22c55e' }}>{a.riskLevel}</td>
+                                <td style={{ fontSize:11 }}>{a.confidence != null ? `${(a.confidence*100).toFixed(0)}%` : '—'}</td>
+                                <td style={{ fontSize:10 }}>{a.regime || '—'}</td>
+                                <td style={{ fontSize:10, color:'var(--text-muted)' }}>{a.source}</td>
+                                <td style={{ fontSize:10, maxWidth:200, whiteSpace:'normal', color:'var(--text-secondary)' }}>{a.summary || '—'}</td>
+                              </tr>
+                              {expanded && (
+                                <tr>
+                                  <td colSpan={10} style={{ padding:'10px 12px', background:'rgba(99,102,241,0.06)', borderBottom:'1px solid rgba(99,102,241,0.2)' }}>
+                                    <div style={{ display:'flex', gap:12 }}>{jsonPanel('Request Payload', a.requestJson)}{jsonPanel('AI Response', a.responseJson)}</div>
+                                  </td>
+                                </tr>
+                              )}
+                            </Fragment>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>

@@ -60,6 +60,21 @@ public final class MarketRegimeDetector {
         return regimes;
     }
 
+    /**
+     * Returns [lastAdx, lastAtrPct] from the tail of the provided candle arrays.
+     * Useful for populating AI advisory/review payloads without re-running full regime detection.
+     */
+    public static double[] computeLastAdxAndAtr(double[] highs, double[] lows, double[] closes) {
+        if (closes == null || closes.length < 2) return new double[]{0.0, 0.0};
+        double[] adx = computeADX(highs, lows, closes, 14);
+        double[] atr = computeATR(highs, lows, closes, 14);
+        int last = closes.length - 1;
+        double lastAdx = Double.isNaN(adx[last]) ? 0.0 : adx[last];
+        double atrPct  = closes[last] > 0 ? (atr[last] / closes[last]) * 100.0 : 0.0;
+        if (Double.isNaN(atrPct)) atrPct = 0.0;
+        return new double[]{lastAdx, atrPct};
+    }
+
     // ─── ATR (Wilder's smoothing) ─────────────────────────────────────────────
 
     private static double[] computeATR(double[] H, double[] L, double[] C, int period) {

@@ -81,6 +81,7 @@ public class OptionExecutionEngine {
     @Getter private int     appliedMinHold  = 0;
     @Getter private boolean holdActive      = false;
     @Getter private double  peakPnlPct      = 0.0;
+    @Getter private double  worstPnlPct     = 0.0;
     @Getter private double  profitLockFloor = 0.0;
     @Getter private boolean inHoldZone      = false;
     @Getter private boolean inStrongTrendMode = false;
@@ -171,6 +172,7 @@ public class OptionExecutionEngine {
 
         // Expose latest exit-eval state for the SSE event builder
         peakPnlPct        = exitEval.getPeakPnlPct();
+        worstPnlPct       = exitEval.getWorstPnlPct();
         profitLockFloor   = exitEval.getProfitLockFloor() == Double.NEGATIVE_INFINITY
                 ? 0.0 : exitEval.getProfitLockFloor();
         inHoldZone        = state != PositionState.FLAT && exitEval.isInHoldZone();
@@ -441,6 +443,8 @@ public class OptionExecutionEngine {
                 .capitalAfter(capital)
                 .entryRegime(entryRegime)
                 .exitRegime(currentRegime)
+                .maxFavorableExcursionPct(peakPnlPct)
+                .maxAdverseExcursionPct(worstPnlPct)
                 .build());
 
         log.info("Closed {} — exit={} pnl={} reason={} bars={}",

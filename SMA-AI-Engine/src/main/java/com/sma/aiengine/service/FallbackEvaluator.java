@@ -74,6 +74,13 @@ class FallbackEvaluator {
                     List.of("PROFITABLE"), List.of(), "",
                     List.of(), List.of()
             );
+        } else if (pnl.compareTo(BigDecimal.ZERO) == 0) {
+            return new TradeReviewAiOutput(
+                    TradeQuality.AVERAGE, false, MistakeType.NONE,
+                    0.5, "Trade broke even (zero P&L).",
+                    List.of(), List.of("DEAD_TRADE"), "",
+                    List.of(), List.of()
+            );
         } else {
             return new TradeReviewAiOutput(
                     TradeQuality.BAD, true, MistakeType.UNKNOWN,

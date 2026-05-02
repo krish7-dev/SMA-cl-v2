@@ -180,6 +180,18 @@ public class TickOptionsReplayService {
         private final List<String> chunkBuffer = new ArrayList<>(CHUNK_SIZE);
         private int emittedChunks = 0;
 
+        // Rolling recent-candle buffer for AI payload context (last ≤5 completed candles)
+        private final java.util.Deque<java.util.Map<String, Object>> recentCandleBuffer
+                = new java.util.ArrayDeque<>(6);
+        private double                lastCandleClose        = 0.0;  // latest tick close (updated every tick)
+        private double                prevBucketClose        = 0.0;  // last close of previous bucket (for moveFromPrevClose)
+        private java.time.LocalDateTime lastBufferedCandleTime = null; // guards against same-bucket duplicate entries
+
+        // Regime price buffers — promoted to instance fields so AI payload builders can access them
+        private List<Double> regimeHighs  = new ArrayList<>();
+        private List<Double> regimeLows   = new ArrayList<>();
+        private List<Double> regimeCloses = new ArrayList<>();
+
         volatile boolean stopped = false;
 
         // Captured at run() completion — used by autoSave() since execEngine is local to run()
@@ -350,9 +362,6 @@ public class TickOptionsReplayService {
 
             // ── 2. NIFTY warmup (DB first → broker API fallback) ───────────────
             List<DataEngineClient.CandleDto> warmupCandles = List.of();
-            List<Double> regimeHighs  = new ArrayList<>();
-            List<Double> regimeLows   = new ArrayList<>();
-            List<Double> regimeCloses = new ArrayList<>();
 
             if (req.getWarmupDays() > 0 && niftyToken > 0) {
                 try {
@@ -645,18 +654,49 @@ public class TickOptionsReplayService {
                     java.util.List<com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade> ct = execEngine.getClosedTrades();
                     String exitSide = ct.isEmpty() ? null : ct.get(ct.size() - 1).getOptionType();
                     decisionEngine.recordCascadeExit(execEngine.getLastExitReason(), "NIFTY", exitSide, openTime);
+                    // Review fires here — catches ALL exits including BIAS_REVERSAL_STRONG
+                    if (req.isAiEnabled() && !ct.isEmpty()) {
+                        aiEngineClient.reviewAsync(buildReviewPayload(decision, execEngine, ct.get(ct.size() - 1)));
+                    }
                 }
 
-                // Non-blocking AI advisory / review (fire-and-forget, never blocks replay)
-                if (req.isAiEnabled()) {
-                    if ("ENTERED".equals(action)) {
-                        aiEngineClient.adviseAsync(buildAdvisoryPayload(decision, execEngine, snapshot, openTime));
-                    } else if ("EXITED".equals(action)) {
-                        java.util.List<com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade> closed = execEngine.getClosedTrades();
-                        if (!closed.isEmpty()) {
-                            aiEngineClient.reviewAsync(buildReviewPayload(decision, closed.get(closed.size() - 1)));
-                        }
+                // Update recent candle buffer before AI payload builders so current candle
+                // is the last element in recentCandles for both advisory and review payloads.
+                // Within a bucket, the last entry is replaced (not duplicated) so recentCandles
+                // always has ≤5 unique bucket times and reflects the latest forming state.
+                {
+                    double o = snapshot.open().doubleValue(),  h = snapshot.high().doubleValue(),
+                           lo = snapshot.low().doubleValue(),  c = snapshot.close().doubleValue();
+                    boolean isNewBucket = !openTime.equals(lastBufferedCandleTime);
+                    if (isNewBucket) {
+                        // Entering a new bucket: save the previous bucket's final close for moveFromPrevClose
+                        prevBucketClose = lastCandleClose;
+                        lastBufferedCandleTime = openTime;
                     }
+                    java.util.Map<String, Object> cc = new java.util.HashMap<>();
+                    cc.put("time",      openTime.toLocalTime().toString().substring(0, 5));
+                    cc.put("direction", c > o ? "UP" : (c < o ? "DOWN" : "DOJI"));
+                    cc.put("bodyPctOfRange",  (h - lo) > 0 ? Math.abs(c - o) / (h - lo) * 100.0 : 0.0);
+                    cc.put("bodyPctOfPrice",  o != 0 ? Math.abs(c - o) / o * 100.0 : 0.0);
+                    cc.put("closePositionInRange", (h - lo) > 0 ? (c - lo) / (h - lo) : 0.5);
+                    cc.put("vwapDistancePct", decision.getDistanceFromVwap());
+                    if (prevBucketClose > 0) {
+                        cc.put("moveFromPrevClosePct", (c - prevBucketClose) / prevBucketClose * 100.0);
+                    }
+                    if (isNewBucket) {
+                        recentCandleBuffer.addLast(cc);
+                        if (recentCandleBuffer.size() > 5) recentCandleBuffer.pollFirst();
+                    } else if (!recentCandleBuffer.isEmpty()) {
+                        // Replace last entry with latest forming state for same bucket
+                        recentCandleBuffer.pollLast();
+                        recentCandleBuffer.addLast(cc);
+                    }
+                    lastCandleClose = c; // always track latest tick close for next bucket's prevBucketClose
+                }
+
+                // Non-blocking AI advisory (fire-and-forget, never blocks replay)
+                if (req.isAiEnabled() && "ENTERED".equals(action)) {
+                    aiEngineClient.adviseAsync(buildAdvisoryPayload(decision, execEngine, snapshot, openTime));
                 }
 
                 emittedCount++;
@@ -687,12 +727,13 @@ public class TickOptionsReplayService {
                 NiftyDecisionResult decision, OptionExecutionEngine execEngine,
                 CandleDto snapshot, java.time.LocalDateTime openTime) {
             java.util.Map<String, Object> m = new java.util.HashMap<>();
-            String sId = sessionId; // replay UUID — each run is isolated in AI Engine records
-            m.put("sessionId", sId);
+            m.put("sessionId", req.getSessionId());
             String sym = execEngine.getActiveTradingSymbol();
             m.put("symbol", sym != null ? sym : "NIFTY");
             String optType = execEngine.getActiveOptionType();
-            m.put("side", "CE".equals(optType) ? "BUY" : "SELL");
+            if (optType == null) optType = deriveOptionType(sym);  // fallback: read suffix from symbol
+            m.put("side", "LONG_OPTION");  // both CE and PE are long positions
+            m.put("currentOptionType", optType);
             m.put("candleTime", openTime.atZone(IST).toInstant().toString());
             m.put("entryPrice", execEngine.getEntryPrice());
             m.put("quantity", execEngine.getQuantity());
@@ -706,26 +747,70 @@ public class TickOptionsReplayService {
             m.put("vwapDistancePct", decision.getDistanceFromVwap());
             if (snapshot.open() != null && snapshot.close() != null
                     && snapshot.open().doubleValue() != 0) {
-                double bodyPct = Math.abs(snapshot.close().doubleValue() - snapshot.open().doubleValue())
-                        / snapshot.open().doubleValue() * 100.0;
-                m.put("candleBodyPct", bodyPct);
+                m.put("candleBodyPct", Math.abs(snapshot.close().doubleValue() - snapshot.open().doubleValue())
+                        / snapshot.open().doubleValue() * 100.0);
             }
             m.put("optionPremium", execEngine.getEntryPrice());
             m.put("barsSinceLastTrade", execEngine.getBarsSinceLastTrade());
             m.put("capitalBefore", execEngine.getCapital());
+            // ADX / ATR from regime buffers (computed at payload time, not in tick path)
+            try {
+                double[] adxAtr = com.sma.strategyengine.service.MarketRegimeDetector
+                        .computeLastAdxAndAtr(toDoubleArray(regimeHighs), toDoubleArray(regimeLows), toDoubleArray(regimeCloses));
+                m.put("adx",    adxAtr[0]);
+                m.put("atrPct", adxAtr[1]);
+            } catch (Exception ignored) {}
+            // Filter pass/fail
+            m.put("minMovementFilterPassed",      decision.getMinMovementFilterPassed());
+            m.put("directionalConsistencyPassed", decision.getDirectionalConsistencyPassed());
+            m.put("candleStrengthFilterPassed",   decision.getCandleStrengthFilterPassed());
+            // Session context
+            m.put("compressionNoTradeEnabled",
+                    req.getTradingRules() != null && req.getTradingRules().isCompressionNoTrade());
+            java.util.List<com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade> allTrades
+                    = execEngine.getClosedTrades();
+            m.put("tradesToday",        allTrades.size());
+            m.put("dailyPnlBeforeTrade", execEngine.getRealizedPnl());
+            // Previous trade context
+            if (!allTrades.isEmpty()) {
+                com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade prev
+                        = allTrades.get(allTrades.size() - 1);
+                String prevOptType = prev.getOptionType();
+                if (prevOptType == null) prevOptType = deriveOptionType(prev.getTradingSymbol());
+                boolean strongWin  = prev.getPnlPct() >= 8.0;
+                m.put("previousTradeSymbol",             prev.getTradingSymbol());
+                m.put("previousTradeOptionType",         prevOptType);
+                m.put("previousTradePnlPct",             prev.getPnlPct());
+                m.put("previousTradeExitReason",         prev.getExitReason());
+                m.put("previousTradeExitTime",           prev.getExitTime());
+                m.put("previousTradeWasStrongWinner",    strongWin);
+                m.put("isOppositeSideAfterStrongWinner",
+                        strongWin && optType != null && prevOptType != null && !optType.equals(prevOptType));
+                try {
+                    java.time.LocalDateTime prevExit = java.time.LocalDateTime.parse(prev.getExitTime());
+                    m.put("minutesSincePreviousExit",
+                            (int) java.time.Duration.between(prevExit, openTime).toMinutes());
+                } catch (Exception ignored) {}
+            }
+            // Recent candle context (current candle is last element — buffer updated before this call)
+            m.put("recentCandles", new java.util.ArrayList<>(recentCandleBuffer));
             return m;
         }
 
         private java.util.Map<String, Object> buildReviewPayload(
                 NiftyDecisionResult decision,
+                OptionExecutionEngine execEngine,
                 com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade ct) {
             java.util.Map<String, Object> m = new java.util.HashMap<>();
-            String sId = sessionId; // replay UUID — each run is isolated in AI Engine records
+            String sId = req.getSessionId();
             m.put("sessionId", sId);
             m.put("tradeId", sId + "-" + ct.getEntryTime());
             String sym = ct.getTradingSymbol();
             m.put("symbol", sym != null ? sym : "NIFTY");
-            m.put("side", "CE".equals(ct.getOptionType()) ? "BUY" : "SELL");
+            String curOptType = ct.getOptionType();
+            if (curOptType == null) curOptType = deriveOptionType(sym);
+            m.put("side", "LONG_OPTION");
+            m.put("currentOptionType", curOptType);
             m.put("entryTime", ct.getEntryTime());
             m.put("exitTime", ct.getExitTime());
             m.put("entryPrice", ct.getEntryPrice());
@@ -735,7 +820,6 @@ public class TickOptionsReplayService {
             m.put("pnlPct", ct.getPnlPct());
             m.put("exitReason", ct.getExitReason());
             m.put("barsHeld", ct.getBarsInTrade());
-            m.put("capitalAfter", ct.getCapitalAfter());
             m.put("regime", ct.getEntryRegime());
             m.put("winningStrategy", decision.getWinnerStrategy());
             m.put("winningScore", decision.getWinnerScore());
@@ -744,6 +828,55 @@ public class TickOptionsReplayService {
             m.put("recentMove5CandlePct", decision.getRecentMove5());
             m.put("vwapDistancePct", decision.getDistanceFromVwap());
             m.put("optionPremium", ct.getEntryPrice());
+            // Capital before/after (capitalBefore derived: after - pnl)
+            m.put("capitalAfter",  ct.getCapitalAfter());
+            m.put("capitalBefore", ct.getCapitalAfter() - ct.getPnl());
+            // MFE / MAE
+            m.put("maxFavorableExcursionPct", ct.getMaxFavorableExcursionPct());
+            m.put("maxAdverseExcursionPct",   ct.getMaxAdverseExcursionPct());
+            // ADX / ATR from regime buffers (computed at payload time)
+            try {
+                double[] adxAtr = com.sma.strategyengine.service.MarketRegimeDetector
+                        .computeLastAdxAndAtr(toDoubleArray(regimeHighs), toDoubleArray(regimeLows), toDoubleArray(regimeCloses));
+                m.put("adx",    adxAtr[0]);
+                m.put("atrPct", adxAtr[1]);
+            } catch (Exception ignored) {}
+            // Session context
+            m.put("compressionNoTradeEnabled",
+                    req.getTradingRules() != null && req.getTradingRules().isCompressionNoTrade());
+            java.util.List<com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade> allTrades
+                    = execEngine.getClosedTrades();
+            m.put("tradesToday", allTrades.size());
+            m.put("dailyPnlAfterTrade",  execEngine.getRealizedPnl());
+            m.put("dailyPnlBeforeTrade", execEngine.getRealizedPnl() - ct.getPnl());
+            // Filter pass/fail (from the exit-candle decision)
+            m.put("minMovementFilterPassed",      decision.getMinMovementFilterPassed());
+            m.put("directionalConsistencyPassed", decision.getDirectionalConsistencyPassed());
+            m.put("candleStrengthFilterPassed",   decision.getCandleStrengthFilterPassed());
+            // Previous trade context (trade BEFORE this reviewed trade = second-to-last)
+            if (allTrades.size() >= 2) {
+                com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade prev
+                        = allTrades.get(allTrades.size() - 2);
+                String prevOptType = prev.getOptionType();
+                if (prevOptType == null) prevOptType = deriveOptionType(prev.getTradingSymbol());
+                boolean strongWin  = prev.getPnlPct() >= 8.0;
+                m.put("previousTradeSymbol",          prev.getTradingSymbol());
+                m.put("previousTradeOptionType",      prevOptType);
+                m.put("previousTradePnlPct",          prev.getPnlPct());
+                m.put("previousTradeExitReason",      prev.getExitReason());
+                m.put("previousTradeExitTime",        prev.getExitTime());
+                m.put("previousTradeWasStrongWinner", strongWin);
+                m.put("isOppositeSideAfterStrongWinner",
+                        strongWin && curOptType != null && prevOptType != null && !curOptType.equals(prevOptType));
+                try {
+                    java.time.LocalDateTime prevExit  = java.time.LocalDateTime.parse(prev.getExitTime());
+                    java.time.LocalDateTime thisEntry = java.time.LocalDateTime.parse(ct.getEntryTime());
+                    m.put("minutesSincePreviousExit",
+                            (int) java.time.Duration.between(prevExit, thisEntry).toMinutes());
+                } catch (Exception ignored) {}
+            }
+            // Recent candle context (last ≤5 completed candles at time of exit)
+            m.put("recentCandles", new java.util.ArrayList<>(recentCandleBuffer));
             return m;
         }
 
@@ -1073,6 +1206,18 @@ public class TickOptionsReplayService {
         }
 
         // ── helpers ───────────────────────────────────────────────────────────
+
+        private double[] toDoubleArray(List<Double> list) {
+            return list.stream().mapToDouble(Double::doubleValue).toArray();
+        }
+
+        /** Derives CE or PE from a trading symbol suffix when execEngine doesn't track it. */
+        private static String deriveOptionType(String symbol) {
+            if (symbol == null) return null;
+            if (symbol.endsWith("CE")) return "CE";
+            if (symbol.endsWith("PE")) return "PE";
+            return null;
+        }
 
         private static LocalDateTime toLDT(long epochMs) {
             return Instant.ofEpochMilli(epochMs).atZone(IST).toLocalDateTime();

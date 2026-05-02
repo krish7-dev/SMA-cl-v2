@@ -27,6 +27,14 @@ public class NiftyDecisionResult {
 
     private boolean entryAllowed;
     private String  blockReason;
+
+    // ADX and ATR% for AI payload enrichment (set by payload builder, not decision engine)
+    private Double  adx;
+    private Double  atrPct;
+    // Per-filter pass/fail: null = filter disabled or not reached (blocked by prior filter)
+    private Boolean minMovementFilterPassed;
+    private Boolean directionalConsistencyPassed;
+    private Boolean candleStrengthFilterPassed;
     /** Winner score after entry penalties subtracted. Equal to winnerScore when no penalties fired. */
     private double  penalizedScore;
 

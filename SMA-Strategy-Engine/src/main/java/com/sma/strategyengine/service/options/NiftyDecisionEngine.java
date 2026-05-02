@@ -339,21 +339,25 @@ public class NiftyDecisionEngine {
         }
 
         // ── Minimum movement filter ───────────────────────────────────────────
+        Boolean mmfPassed = null, dcfPassed = null, csfPassed = null;
         if (canEnter && mmfc.isEnabled()) {
             String movBlock = checkMinMovementFilter(tickSnapshot.close().doubleValue());
-            if (movBlock != null) { canEnter = false; block = movBlock; }
+            if (movBlock != null) { canEnter = false; block = movBlock; mmfPassed = false; }
+            else { mmfPassed = true; }
         }
 
         // ── Directional consistency filter ────────────────────────────────────
         if (canEnter && dcfc.isEnabled()) {
             String dcBlock = checkDirectionalConsistencyFilter(rawBias);
-            if (dcBlock != null) { canEnter = false; block = dcBlock; }
+            if (dcBlock != null) { canEnter = false; block = dcBlock; dcfPassed = false; }
+            else { dcfPassed = true; }
         }
 
         // ── Candle strength filter ────────────────────────────────────────────
         if (canEnter && csfc.isEnabled()) {
             String csBlock = checkCandleStrengthFilter();
-            if (csBlock != null) { canEnter = false; block = csBlock; }
+            if (csBlock != null) { canEnter = false; block = csBlock; csfPassed = false; }
+            else { csfPassed = true; }
         }
 
         // ── No new trades after time ──────────────────────────────────────────
@@ -474,6 +478,9 @@ public class NiftyDecisionEngine {
                 .switchReason(switchReason)
                 .switchCountToday(switchCountToday)
                 .candidates(allCandidates)
+                .minMovementFilterPassed(mmfPassed)
+                .directionalConsistencyPassed(dcfPassed)
+                .candleStrengthFilterPassed(csfPassed)
                 .build();
     }
 
@@ -722,21 +729,25 @@ public class NiftyDecisionEngine {
         }
 
         // ── Minimum movement filter ───────────────────────────────────────────
+        Boolean mmfPassed = null, dcfPassed = null, csfPassed = null;
         if (canEnter && mmfc.isEnabled()) {
             String movBlock = checkMinMovementFilter(candle.close().doubleValue());
-            if (movBlock != null) { canEnter = false; block = movBlock; }
+            if (movBlock != null) { canEnter = false; block = movBlock; mmfPassed = false; }
+            else { mmfPassed = true; }
         }
 
         // ── Directional consistency filter ────────────────────────────────────
         if (canEnter && dcfc.isEnabled()) {
             String dcBlock = checkDirectionalConsistencyFilter(rawBias);
-            if (dcBlock != null) { canEnter = false; block = dcBlock; }
+            if (dcBlock != null) { canEnter = false; block = dcBlock; dcfPassed = false; }
+            else { dcfPassed = true; }
         }
 
         // ── Candle strength filter ────────────────────────────────────────────
         if (canEnter && csfc.isEnabled()) {
             String csBlock = checkCandleStrengthFilter();
-            if (csBlock != null) { canEnter = false; block = csBlock; }
+            if (csBlock != null) { canEnter = false; block = csBlock; csfPassed = false; }
+            else { csfPassed = true; }
         }
 
         // ── No new trades after time ──────────────────────────────────────────
@@ -877,6 +888,9 @@ public class NiftyDecisionEngine {
                 .switchCountToday(switchCountToday)
                 // Full candidate list (all strategies, including HOLD)
                 .candidates(allCandidates)
+                .minMovementFilterPassed(mmfPassed)
+                .directionalConsistencyPassed(dcfPassed)
+                .candleStrengthFilterPassed(csfPassed)
                 .build();
     }
 
