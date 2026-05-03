@@ -44,6 +44,9 @@ public class TradeReviewResponse {
     private Instant createdAt;
     private String requestJson;
     private String responseJson;
+    private String rawResponseJson;
+    private Boolean normalized;
+    private List<String> normalizationReasons;
 
     public static TradeReviewResponse from(TradeReviewRecord r) {
         return TradeReviewResponse.builder()
@@ -74,6 +77,9 @@ public class TradeReviewResponse {
                 .createdAt(r.getCreatedAt())
                 .requestJson(r.getRequestJson())
                 .responseJson(r.getResponseJson())
+                .rawResponseJson(r.getRawResponseJson())
+                .normalized(r.getNormalized())
+                .normalizationReasons(r.getNormalizationReasons() != null ? r.getNormalizationReasons() : List.of())
                 .build();
     }
 }

@@ -187,6 +187,17 @@ public class TickOptionsReplayService {
         private double                prevBucketClose        = 0.0;  // last close of previous bucket (for moveFromPrevClose)
         private java.time.LocalDateTime lastBufferedCandleTime = null; // guards against same-bucket duplicate entries
 
+        // AI call tracking — attempted incremented synchronously; succeeded/failed updated via future callbacks
+        private int aiAdvisoriesAttempted   = 0;
+        private int aiAdvisoriesPostSucceeded = 0;
+        private int aiAdvisoriesPostFailed  = 0;
+        private int aiReviewsAttempted      = 0;
+        private int aiReviewsPostSucceeded  = 0;
+        private int aiReviewsPostFailed     = 0;
+        // Futures collected for bounded end-of-replay wait
+        private final java.util.List<java.util.concurrent.CompletableFuture<Boolean>> pendingAiFutures
+                = new java.util.concurrent.CopyOnWriteArrayList<>();
+
         // Regime price buffers — promoted to instance fields so AI payload builders can access them
         private List<Double> regimeHighs  = new ArrayList<>();
         private List<Double> regimeLows   = new ArrayList<>();
@@ -558,13 +569,34 @@ public class TickOptionsReplayService {
                 }
             }
 
-            // ── 6. Summary ────────────────────────────────────────────────────
+            // ── 6. Bounded wait for pending AI posts (max 10 s) ─────────────────
+            int aiPending = 0;
+            if (req.isAiEnabled() && !pendingAiFutures.isEmpty()) {
+                try {
+                    java.util.concurrent.CompletableFuture
+                            .allOf(pendingAiFutures.toArray(new java.util.concurrent.CompletableFuture[0]))
+                            .get(10, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (java.util.concurrent.TimeoutException te) {
+                    aiPending = (int) pendingAiFutures.stream().filter(f -> !f.isDone()).count();
+                    log.warn("Tick replay {}: {} AI post(s) still pending after 10 s timeout", sessionId, aiPending);
+                } catch (Exception ignored) {}
+            }
+
+            // ── 7. Summary ────────────────────────────────────────────────────
             Map<String, Object> summary = new LinkedHashMap<>();
             summary.put("totalTrades",  execEngine.getClosedTrades().size());
             summary.put("realizedPnl",  execEngine.getRealizedPnl());
             summary.put("finalCapital", execEngine.getCapital());
             summary.put("closedTrades", execEngine.getClosedTrades());
             summary.put("emittedCount", emittedCount);
+            summary.put("aiAdvisoriesAttempted",    aiAdvisoriesAttempted);
+            summary.put("aiAdvisoriesPostSucceeded", aiAdvisoriesPostSucceeded);
+            summary.put("aiAdvisoriesPostFailed",   aiAdvisoriesPostFailed);
+            summary.put("aiAdvisoriesPending",      aiPending > 0 ? aiPending : 0);
+            summary.put("aiReviewsAttempted",       aiReviewsAttempted);
+            summary.put("aiReviewsPostSucceeded",   aiReviewsPostSucceeded);
+            summary.put("aiReviewsPostFailed",      aiReviewsPostFailed);
+            summary.put("aiReviewsPending",         aiPending > 0 ? aiPending : 0);
             broadcast("summary", objectMapper.writeValueAsString(summary));
 
             decisionEngine.cleanup();
@@ -656,7 +688,14 @@ public class TickOptionsReplayService {
                     decisionEngine.recordCascadeExit(execEngine.getLastExitReason(), "NIFTY", exitSide, openTime);
                     // Review fires here — catches ALL exits including BIAS_REVERSAL_STRONG
                     if (req.isAiEnabled() && !ct.isEmpty()) {
-                        aiEngineClient.reviewAsync(buildReviewPayload(decision, execEngine, ct.get(ct.size() - 1)));
+                        aiReviewsAttempted++;
+                        java.util.concurrent.CompletableFuture<Boolean> rf =
+                                aiEngineClient.reviewAsync(buildReviewPayload(decision, execEngine, ct.get(ct.size() - 1)));
+                        pendingAiFutures.add(rf);
+                        rf.whenComplete((ok, ex) -> {
+                            if (ex != null || Boolean.FALSE.equals(ok)) aiReviewsPostFailed++;
+                            else aiReviewsPostSucceeded++;
+                        });
                     }
                 }
 
@@ -694,9 +733,16 @@ public class TickOptionsReplayService {
                     lastCandleClose = c; // always track latest tick close for next bucket's prevBucketClose
                 }
 
-                // Non-blocking AI advisory (fire-and-forget, never blocks replay)
+                // Non-blocking AI advisory (future tracked for end-of-replay reporting)
                 if (req.isAiEnabled() && "ENTERED".equals(action)) {
-                    aiEngineClient.adviseAsync(buildAdvisoryPayload(decision, execEngine, snapshot, openTime));
+                    aiAdvisoriesAttempted++;
+                    java.util.concurrent.CompletableFuture<Boolean> af =
+                            aiEngineClient.adviseAsync(buildAdvisoryPayload(decision, execEngine, snapshot, openTime));
+                    pendingAiFutures.add(af);
+                    af.whenComplete((ok, ex) -> {
+                        if (ex != null || Boolean.FALSE.equals(ok)) aiAdvisoriesPostFailed++;
+                        else aiAdvisoriesPostSucceeded++;
+                    });
                 }
 
                 emittedCount++;
@@ -794,6 +840,50 @@ public class TickOptionsReplayService {
             }
             // Recent candle context (current candle is last element — buffer updated before this call)
             m.put("recentCandles", new java.util.ArrayList<>(recentCandleBuffer));
+
+            // ── Derived fields for AI reversal-trap intelligence ───────────────
+            {
+                java.util.List<java.util.Map<String, Object>> rc = new java.util.ArrayList<>(recentCandleBuffer);
+                int upCnt = 0, downCnt = 0, strongUpCnt = 0, strongDownCnt = 0;
+                for (java.util.Map<String, Object> c : rc) {
+                    String dir = (String) c.getOrDefault("direction", "DOJI");
+                    Object bpObj = c.get("bodyPctOfRange");
+                    double bp = bpObj instanceof Number ? ((Number) bpObj).doubleValue() : 0.0;
+                    if ("UP".equals(dir))        { upCnt++;   if (bp > 60) strongUpCnt++;   }
+                    else if ("DOWN".equals(dir)) { downCnt++; if (bp > 60) strongDownCnt++; }
+                }
+                String domDir = upCnt > downCnt ? "UP" : downCnt > upCnt ? "DOWN" : "MIXED";
+                double domStrength = rc.isEmpty() ? 0.0 : (double) Math.max(upCnt, downCnt) / rc.size();
+                m.put("recentUpCandles",                upCnt);
+                m.put("recentDownCandles",              downCnt);
+                m.put("recentStrongUpCandles",          strongUpCnt);
+                m.put("recentStrongDownCandles",        strongDownCnt);
+                m.put("dominantRecentDirection",        domDir);
+                m.put("dominantRecentDirectionStrength", domStrength);
+                // currentTradeDirection: CE=BULLISH, PE=BEARISH
+                String ctDir = "CE".equals(optType) ? "BULLISH" : "PE".equals(optType) ? "BEARISH" : null;
+                m.put("currentTradeDirection", ctDir);
+                m.put("currentTradeAlignedWithRecentDirection",
+                        ("BULLISH".equals(ctDir) && "UP".equals(domDir)) ||
+                        ("BEARISH".equals(ctDir) && "DOWN".equals(domDir)));
+                Object minsObj = m.get("minutesSincePreviousExit");
+                int mins = minsObj instanceof Number ? ((Number) minsObj).intValue() : -1;
+                boolean isOpp  = Boolean.TRUE.equals(m.get("isOppositeSideAfterStrongWinner"));
+                boolean wasWin = Boolean.TRUE.equals(m.get("previousTradeWasStrongWinner"));
+                m.put("sameCandleFlip",           isOpp && mins == 0);
+                m.put("candlesSincePreviousExit", mins >= 0 ? mins / 5 : null);
+                m.put("oppositeSideFlipRisk",
+                        (isOpp && wasWin && mins >= 0 && mins <= 1) ? "HIGH" :
+                        (isOpp && wasWin) ? "MEDIUM" : "LOW");
+                m.put("reversalConfirmationCandles",
+                        "BEARISH".equals(ctDir) ? strongDownCnt : "BULLISH".equals(ctDir) ? strongUpCnt : 0);
+                // Explicit direction facts — prevents AI hallucination about CE/PE direction
+                m.put("favorableUnderlyingDirection",
+                        "CE".equals(optType) ? "UP" : "PE".equals(optType) ? "DOWN" : null);
+                m.put("currentTradeDirectionExplanation",
+                        "CE".equals(optType) ? "CE (Call) benefits when NIFTY moves UP. UP candles are favorable." :
+                        "PE".equals(optType) ? "PE (Put) benefits when NIFTY moves DOWN. DOWN candles are favorable." : null);
+            }
             return m;
         }
 
@@ -877,6 +967,30 @@ public class TickOptionsReplayService {
             }
             // Recent candle context (last ≤5 completed candles at time of exit)
             m.put("recentCandles", new java.util.ArrayList<>(recentCandleBuffer));
+
+            // ── Derived fields for AI root-cause analysis ──────────────────────
+            {
+                double mfe = ct.getMaxFavorableExcursionPct();
+                double mae = ct.getMaxAdverseExcursionPct();
+                double pnlPctVal = ct.getPnlPct();
+                int barsHeldVal = ct.getBarsInTrade();
+                m.put("tradeHadFollowThrough", mfe >= 1.5);
+                m.put("mfeQuality",  mfe < 0.5 ? "VERY_LOW" : mfe < 1.5 ? "LOW" : mfe < 4.0 ? "OK" : "STRONG");
+                m.put("maeSeverity", mae <= -4.0 ? "HIGH" : mae <= -2.0 ? "MEDIUM" : "LOW");
+                m.put("lossHappenedQuickly", pnlPctVal < 0 && barsHeldVal <= 3);
+                // sameCandleFlip for review context (entry candle = same as previous exit candle)
+                Object minsObj = m.get("minutesSincePreviousExit");
+                int mins = minsObj instanceof Number ? ((Number) minsObj).intValue() : -1;
+                m.put("sameCandleFlip", Boolean.TRUE.equals(m.get("isOppositeSideAfterStrongWinner")) && mins == 0);
+                // Explicit direction facts — prevents AI hallucination about CE/PE direction
+                m.put("favorableUnderlyingDirection",
+                        "CE".equals(curOptType) ? "UP" : "PE".equals(curOptType) ? "DOWN" : null);
+                m.put("currentTradeDirectionExplanation",
+                        "CE".equals(curOptType) ? "CE (Call) benefits when NIFTY moves UP. UP candles are favorable." :
+                        "PE".equals(curOptType) ? "PE (Put) benefits when NIFTY moves DOWN. DOWN candles are favorable." : null);
+                // pnlPctVal already declared above — reuse for outcome label
+                m.put("tradeOutcome", pnlPctVal > 0 ? "PROFIT" : pnlPctVal < 0 ? "LOSS" : "BREAKEVEN");
+            }
             return m;
         }
 

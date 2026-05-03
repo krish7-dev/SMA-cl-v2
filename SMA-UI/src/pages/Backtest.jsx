@@ -13772,7 +13772,7 @@ function TickReplayTest() {
             rows.push('');
             // Reviews
             if (aiReviews.length > 0) {
-              rows.push(['TYPE','#','ENTRY_TIME','EXIT_TIME','SYMBOL','OPT_TYPE','PNL','PNL_PCT','EXIT_REASON','QUALITY','AVOIDABLE','MISTAKE','CONFIDENCE','SUMMARY','SOURCE'].join(','));
+              rows.push(['TYPE','#','ENTRY_TIME','EXIT_TIME','SYMBOL','OPT_TYPE','PNL','PNL_PCT','EXIT_REASON','QUALITY','AVOIDABLE','MISTAKE','CONFIDENCE','SUMMARY','SOURCE','NORMALIZED','NORMALIZATION_REASONS'].join(','));
               aiReviews.forEach((r,i) => rows.push([
                 'REVIEW', i+1,
                 esc(r.entryTime ? new Date(r.entryTime).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}) : ''),
@@ -13780,7 +13780,9 @@ function TickReplayTest() {
                 esc(r.symbol), esc(r.side), r.pnl ?? '', r.pnlPct != null ? Number(r.pnlPct).toFixed(2) : '',
                 esc(r.exitReason), esc(r.quality), r.avoidable ? 'Yes':'No',
                 esc(r.mistakeType), r.confidence != null ? Number(r.confidence).toFixed(2) : '',
-                esc(r.summary), esc(r.source)
+                esc(r.summary), esc(r.source),
+                r.normalized ? 'Yes' : 'No',
+                esc((r.normalizationReasons||[]).join(' | '))
               ].join(',')));
               rows.push('');
             }
@@ -13822,12 +13824,21 @@ function TickReplayTest() {
                 lines.push(`[REVIEW ${i+1}]  ${r.symbol}  ${r.quality}${r.avoidable ? '  ⚠ AVOIDABLE':''}  P&L: ${r.pnl ?? '—'}  Exit: ${r.exitReason || '—'}  Source: ${r.source}`);
                 if (r.summary) lines.push(`Summary : ${r.summary}`);
                 if (r.mistakeType && r.mistakeType !== 'NONE') lines.push(`Mistake : ${r.mistakeType}`);
+                if (r.normalized && (r.normalizationReasons||[]).length > 0) {
+                  lines.push(`VALIDATION WARNINGS (normalized):`);
+                  (r.normalizationReasons).forEach(reason => lines.push(`  • ${reason}`));
+                }
                 lines.push(sep2);
                 lines.push('REQUEST PAYLOAD:');
                 lines.push(fmtJson(r.requestJson));
                 lines.push(sep2);
-                lines.push('AI RESPONSE:');
+                lines.push('AI RESPONSE (normalized):');
                 lines.push(fmtJson(r.responseJson));
+                if (r.rawResponseJson) {
+                  lines.push(sep2);
+                  lines.push('RAW AI RESPONSE:');
+                  lines.push(fmtJson(r.rawResponseJson));
+                }
                 lines.push(sep2);
               });
             }
@@ -13880,12 +13891,14 @@ function TickReplayTest() {
               {aiReviews.length > 0 && (
                 <>
                   <div style={{ fontSize:11, fontWeight:700, color:'var(--text-secondary)', marginBottom:6 }}>
-                    Trade Reviews ({aiReviews.length}) <span style={{ fontSize:10, fontWeight:400, color:'var(--text-muted)' }}>— click row to see payload</span>
+                    Trade Reviews ({aiReviews.length}{summary?.aiReviewsAttempted != null && summary.aiReviewsAttempted !== aiReviews.length
+                      ? <span style={{ color:'#f59e0b' }}> — {summary.aiReviewsAttempted} attempted, {summary.aiReviewsPostSucceeded ?? 0} posted, {(summary.aiReviewsPostFailed ?? 0) + (summary.aiReviewsPending ?? 0)} failed/pending</span>
+                      : null}){' '}<span style={{ fontSize:10, fontWeight:400, color:'var(--text-muted)' }}>— click row to see payload</span>
                   </div>
                   <div style={{ overflowX:'auto', marginBottom:16 }}>
                     <table className="bt-table">
                       <thead>
-                        <tr><th>#</th><th>Symbol</th><th>Quality</th><th>Mistake</th><th>Avoidable</th><th>P&L</th><th>Exit</th><th>Source</th><th>Summary</th></tr>
+                        <tr><th>#</th><th>Symbol</th><th>Quality</th><th>Mistake</th><th>Avoidable</th><th>P&L</th><th>Exit</th><th>Source</th><th>Summary</th><th>N</th></tr>
                       </thead>
                       <tbody>
                         {aiReviews.map((r, i) => {
@@ -13903,11 +13916,24 @@ function TickReplayTest() {
                                 <td style={{ fontSize:10 }}>{r.exitReason || '—'}</td>
                                 <td style={{ fontSize:10, color:'var(--text-muted)' }}>{r.source}</td>
                                 <td style={{ fontSize:10, maxWidth:220, whiteSpace:'normal', color:'var(--text-secondary)' }}>{r.summary || '—'}</td>
+                                <td style={{ fontSize:10, textAlign:'center' }} title={r.normalized ? (r.normalizationReasons||[]).join('\n') : ''}>{r.normalized ? <span style={{ color:'#f59e0b' }}>⚠</span> : ''}</td>
                               </tr>
                               {expanded && (
                                 <tr>
-                                  <td colSpan={9} style={{ padding:'10px 12px', background:'rgba(99,102,241,0.06)', borderBottom:'1px solid rgba(99,102,241,0.2)' }}>
-                                    <div style={{ display:'flex', gap:12 }}>{jsonPanel('Request Payload', r.requestJson)}{jsonPanel('AI Response', r.responseJson)}</div>
+                                  <td colSpan={10} style={{ padding:'10px 12px', background:'rgba(99,102,241,0.06)', borderBottom:'1px solid rgba(99,102,241,0.2)' }}>
+                                    {r.normalized && (r.normalizationReasons?.length > 0) && (
+                                      <div style={{ marginBottom:8, padding:'6px 10px', background:'rgba(245,158,11,0.12)', border:'1px solid rgba(245,158,11,0.3)', borderRadius:4 }}>
+                                        <div style={{ fontSize:10, fontWeight:700, color:'#f59e0b', marginBottom:3 }}>VALIDATION WARNINGS (normalized)</div>
+                                        {r.normalizationReasons.map((reason, ri) => (
+                                          <div key={ri} style={{ fontSize:10, color:'#fbbf24' }}>• {reason}</div>
+                                        ))}
+                                      </div>
+                                    )}
+                                    <div style={{ display:'flex', gap:12 }}>
+                                      {jsonPanel('Request Payload', r.requestJson)}
+                                      {jsonPanel('AI Response (normalized)', r.responseJson)}
+                                      {r.rawResponseJson && jsonPanel('Raw AI Response', r.rawResponseJson)}
+                                    </div>
                                   </td>
                                 </tr>
                               )}
@@ -13922,12 +13948,14 @@ function TickReplayTest() {
               {aiAdvisories.length > 0 && (
                 <>
                   <div style={{ fontSize:11, fontWeight:700, color:'var(--text-secondary)', marginBottom:6 }}>
-                    Entry Advisories ({aiAdvisories.length}) <span style={{ fontSize:10, fontWeight:400, color:'var(--text-muted)' }}>— click row to see payload</span>
+                    Entry Advisories ({aiAdvisories.length}{summary?.aiAdvisoriesAttempted != null && summary.aiAdvisoriesAttempted !== aiAdvisories.length
+                      ? <span style={{ color:'#f59e0b' }}> — {summary.aiAdvisoriesAttempted} attempted, {summary.aiAdvisoriesPostSucceeded ?? 0} posted, {(summary.aiAdvisoriesPostFailed ?? 0) + (summary.aiAdvisoriesPending ?? 0)} failed/pending</span>
+                      : null}){' '}<span style={{ fontSize:10, fontWeight:400, color:'var(--text-muted)' }}>— click row to see payload</span>
                   </div>
                   <div style={{ overflowX:'auto' }}>
                     <table className="bt-table">
                       <thead>
-                        <tr><th>#</th><th>Time</th><th>Symbol</th><th>Side</th><th>Action</th><th>Risk</th><th>Confidence</th><th>Regime</th><th>Source</th><th>Summary</th></tr>
+                        <tr><th>#</th><th>Time</th><th>Symbol</th><th>Side</th><th>Action</th><th>Risk</th><th>Confidence</th><th>Regime</th><th>Source</th><th>Summary</th><th>W</th></tr>
                       </thead>
                       <tbody>
                         {aiAdvisories.map((a, i) => {
@@ -13946,11 +13974,24 @@ function TickReplayTest() {
                                 <td style={{ fontSize:10 }}>{a.regime || '—'}</td>
                                 <td style={{ fontSize:10, color:'var(--text-muted)' }}>{a.source}</td>
                                 <td style={{ fontSize:10, maxWidth:200, whiteSpace:'normal', color:'var(--text-secondary)' }}>{a.summary || '—'}</td>
+                                <td style={{ fontSize:10, textAlign:'center' }} title={a.normalized ? (a.normalizationReasons||[]).join('\n') : ''}>{a.normalized ? <span style={{ color:'#f59e0b' }}>⚠</span> : ''}</td>
                               </tr>
                               {expanded && (
                                 <tr>
-                                  <td colSpan={10} style={{ padding:'10px 12px', background:'rgba(99,102,241,0.06)', borderBottom:'1px solid rgba(99,102,241,0.2)' }}>
-                                    <div style={{ display:'flex', gap:12 }}>{jsonPanel('Request Payload', a.requestJson)}{jsonPanel('AI Response', a.responseJson)}</div>
+                                  <td colSpan={11} style={{ padding:'10px 12px', background:'rgba(99,102,241,0.06)', borderBottom:'1px solid rgba(99,102,241,0.2)' }}>
+                                    {a.normalized && (a.normalizationReasons?.length > 0) && (
+                                      <div style={{ marginBottom:8, padding:'6px 10px', background:'rgba(245,158,11,0.12)', border:'1px solid rgba(245,158,11,0.3)', borderRadius:4 }}>
+                                        <div style={{ fontSize:10, fontWeight:700, color:'#f59e0b', marginBottom:3 }}>VALIDATION WARNINGS</div>
+                                        {a.normalizationReasons.map((reason, ri) => (
+                                          <div key={ri} style={{ fontSize:10, color:'#fbbf24' }}>• {reason}</div>
+                                        ))}
+                                      </div>
+                                    )}
+                                    <div style={{ display:'flex', gap:12 }}>
+                                      {jsonPanel('Request Payload', a.requestJson)}
+                                      {jsonPanel('AI Response', a.responseJson)}
+                                      {a.rawResponseJson && jsonPanel('Raw AI Response', a.rawResponseJson)}
+                                    </div>
                                   </td>
                                 </tr>
                               )}

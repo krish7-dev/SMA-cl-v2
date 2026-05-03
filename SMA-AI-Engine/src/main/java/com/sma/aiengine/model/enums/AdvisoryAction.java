@@ -4,5 +4,6 @@ public enum AdvisoryAction {
     ALLOW,
     CAUTION,
     AVOID,
+    BLOCK,
     UNKNOWN
 }

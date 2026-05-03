@@ -2,11 +2,14 @@ package com.sma.aiengine.model.enums;
 
 public enum MistakeType {
     NONE,
+    BAD_ENTRY,
+    BAD_EXIT,
+    REVERSAL_TRAP,
+    COUNTER_TREND_ENTRY,
     LATE_ENTRY,
     CHOP_ENTRY,
-    REVERSAL_TRAP,
     OVEREXTENDED_ENTRY,
     WEAK_SIGNAL,
-    BAD_EXIT,
+    MARKET_NOISE,
     UNKNOWN
 }

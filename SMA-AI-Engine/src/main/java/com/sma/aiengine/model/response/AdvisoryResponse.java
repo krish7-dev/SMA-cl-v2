@@ -39,6 +39,9 @@ public class AdvisoryResponse {
     private Instant createdAt;
     private String requestJson;
     private String responseJson;
+    private String rawResponseJson;
+    private Boolean normalized;
+    private List<String> normalizationReasons;
 
     public static AdvisoryResponse from(AdvisoryRecord r) {
         return AdvisoryResponse.builder()
@@ -65,6 +68,9 @@ public class AdvisoryResponse {
                 .createdAt(r.getCreatedAt())
                 .requestJson(r.getRequestJson())
                 .responseJson(r.getResponseJson())
+                .rawResponseJson(r.getRawResponseJson())
+                .normalized(r.getNormalized())
+                .normalizationReasons(r.getNormalizationReasons() != null ? r.getNormalizationReasons() : List.of())
                 .build();
     }
 }

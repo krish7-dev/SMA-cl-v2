@@ -11,12 +11,13 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
  * Non-blocking HTTP client for SMA-AI-Engine advisory and review endpoints.
- * All calls fire-and-forget — exceptions are swallowed so the strategy loop is never affected.
+ * Returns CompletableFuture<Boolean> so callers can track post success/failure without blocking.
  */
 @Slf4j
 @Component
@@ -45,19 +46,26 @@ public class AiEngineClient {
         });
     }
 
-    /** Fire-and-forget: POST trade candidate snapshot to /api/v1/ai/advisory. */
-    public void adviseAsync(Map<String, Object> payload) {
-        if (!enabled) return;
-        executor.execute(() -> post("/api/v1/ai/advisory", payload));
+    /** Non-blocking POST to /api/v1/ai/advisory. Returns future that resolves true on HTTP 2xx, false otherwise. */
+    public CompletableFuture<Boolean> adviseAsync(Map<String, Object> payload) {
+        if (!enabled) return CompletableFuture.completedFuture(true);
+        return CompletableFuture.supplyAsync(() -> post("/api/v1/ai/advisory", payload), executor);
     }
 
-    /** Fire-and-forget: POST completed trade snapshot to /api/v1/ai/review. */
-    public void reviewAsync(Map<String, Object> payload) {
-        if (!enabled) return;
-        executor.execute(() -> post("/api/v1/ai/review", payload));
+    /** Non-blocking POST to /api/v1/ai/review. Returns future that resolves true on HTTP 2xx, false otherwise. */
+    public CompletableFuture<Boolean> reviewAsync(Map<String, Object> payload) {
+        if (!enabled) return CompletableFuture.completedFuture(true);
+        return CompletableFuture.supplyAsync(() -> post("/api/v1/ai/review", payload), executor);
     }
 
-    private void post(String path, Map<String, Object> payload) {
+    private boolean post(String path, Map<String, Object> payload) {
+        // Extract identifiers from payload for log correlation (best-effort, no NPE risk)
+        String sessionId = extractStr(payload, "sessionId");
+        String tradeId   = extractStr(payload, "tradeId");
+        String candleTime = extractStr(payload, "candleTime");
+        String logId     = tradeId != null ? "tradeId=" + tradeId
+                         : candleTime != null ? "candle=" + candleTime
+                         : "sessionId=" + sessionId;
         try {
             String body = mapper.writeValueAsString(payload);
             HttpRequest request = HttpRequest.newBuilder()
@@ -68,10 +76,18 @@ public class AiEngineClient {
                     .build();
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                log.debug("AI Engine {} returned {}", path, response.statusCode());
+                log.warn("AI Engine {} [{}] returned HTTP {}", path, logId, response.statusCode());
+                return false;
             }
+            return true;
         } catch (Exception e) {
-            log.debug("AI Engine {} call failed (non-blocking): {}", path, e.getMessage());
+            log.warn("AI Engine {} [{}] call failed: {}", path, logId, e.getMessage());
+            return false;
         }
+    }
+
+    private static String extractStr(Map<String, Object> m, String key) {
+        Object v = m.get(key);
+        return v != null ? v.toString() : null;
     }
 }

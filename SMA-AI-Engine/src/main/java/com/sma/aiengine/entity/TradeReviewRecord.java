@@ -122,6 +122,17 @@ public class TradeReviewRecord {
     @Column(name = "request_id", length = 100)
     private String requestId;
 
+    @Column(name = "normalized")
+    @Builder.Default
+    private Boolean normalized = false;
+
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "normalization_reasons", columnDefinition = "jsonb")
+    private List<String> normalizationReasons;
+
+    @Column(name = "raw_response_json", columnDefinition = "TEXT")
+    private String rawResponseJson;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     @Builder.Default
     private Instant createdAt = Instant.now();
