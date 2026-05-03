@@ -579,3 +579,11 @@ export async function getAiAdvisories(sessionId) {
 export async function getAiSessions() {
   return request(`${AI_ENGINE}/api/v1/ai/sessions`);
 }
+
+export async function getAiEngineConfig() {
+  return request(`${AI_ENGINE}/api/v1/ai/config`);
+}
+
+export async function getAiExperimentSummary() {
+  return request(`${AI_ENGINE}/api/v1/ai/experiment-summary`);
+}

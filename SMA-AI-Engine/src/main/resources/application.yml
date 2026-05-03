@@ -57,10 +57,38 @@ cors:
 ai:
   openai:
     api-key: ${OPENAI_API_KEY:}
-    model: ${OPENAI_MODEL:gpt-4o-mini}
     enabled: ${OPENAI_ENABLED:false}
     timeout-seconds: ${OPENAI_TIMEOUT_SECONDS:15}
     max-tokens: ${OPENAI_MAX_TOKENS:1000}
+    reasoning-timeout-seconds: ${OPENAI_REASONING_TIMEOUT_SECONDS:60}
+    reasoning-max-tokens: ${OPENAI_REASONING_MAX_TOKENS:16000}
+
+    # ── Uncomment ONE experiment block, comment the rest, then restart ────────
+    #
+    # [1] Baseline — gpt-4o-mini · chat_completions · strict
+    # model: gpt-4o-mini
+    # api-mode: chat_completions
+    # prompt-mode: strict
+    # reasoning-effort:
+    #
+    # [2] Reasoning Strict — o3 · responses · strict · effort=medium
+    # model: o3
+    # api-mode: responses
+    # prompt-mode: strict
+    # reasoning-effort: medium
+    #
+    # [3] Reasoning Minimal — o3 · responses · minimal · effort=medium
+    # model: o3
+    # api-mode: responses
+    # prompt-mode: minimal
+    # reasoning-effort: medium
+    #
+    # [4] Reasoning Hybrid — o3 · responses · hybrid · effort=medium
+    model: o3
+    api-mode: responses
+    prompt-mode: hybrid
+    reasoning-effort: medium
+    # ─────────────────────────────────────────────────────────────────────────
 
 logging:
   level:

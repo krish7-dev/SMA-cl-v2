@@ -105,6 +105,18 @@ public class AdvisoryRecord {
     @Column(name = "request_id", length = 100)
     private String requestId;
 
+    @Column(name = "ai_model", length = 100)
+    private String aiModel;
+
+    @Column(name = "ai_api_mode", length = 50)
+    private String aiApiMode;
+
+    @Column(name = "ai_prompt_mode", length = 20)
+    private String aiPromptMode;
+
+    @Column(name = "error_category", length = 20)
+    private String errorCategory;
+
     @Column(name = "normalized")
     @Builder.Default
     private Boolean normalized = false;

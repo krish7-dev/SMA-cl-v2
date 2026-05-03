@@ -11,5 +11,7 @@ public enum MistakeType {
     OVEREXTENDED_ENTRY,
     WEAK_SIGNAL,
     MARKET_NOISE,
+    WEAK_CONFIRMATION,
+    OVEREXTENSION,
     UNKNOWN
 }

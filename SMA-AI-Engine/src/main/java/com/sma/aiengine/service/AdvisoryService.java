@@ -10,6 +10,7 @@ import com.sma.aiengine.model.enums.AiSource;
 import com.sma.aiengine.model.enums.RiskLevel;
 import com.sma.aiengine.model.request.TradeCandidateRequest;
 import com.sma.aiengine.model.response.AdvisoryResponse;
+import com.sma.aiengine.model.response.ExperimentSummaryResponse;
 import com.sma.aiengine.repository.AdvisoryRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -30,6 +31,42 @@ import java.util.stream.Collectors;
 @Service
 @RequiredArgsConstructor
 public class AdvisoryService {
+
+    // ── Prompt modes ─────────────────────────────────────────────────────────
+
+    private static final String SYSTEM_PROMPT_MINIMAL = """
+            You are a trading analyst reviewing a NIFTY options trade candidate.
+
+            In this system:
+            - CE is a call option and generally benefits when NIFTY moves up.
+            - PE is a put option and generally benefits when NIFTY moves down.
+            - side = LONG_OPTION means the option is bought.
+
+            Analyze the provided payload and decide whether the candidate should be ALLOW, CAUTION, AVOID, or UNKNOWN.
+
+            Use the available data: recent candles, option type, strategy scores, regime, ADX, ATR, previous trade context, filters, and current trade context.
+
+            tradeQualityScore calibration: 0.00-0.30 = poor/avoid, 0.31-0.60 = risky/caution, 0.61-0.80 = acceptable, 0.81-1.00 = excellent. Must be consistent with action and riskLevel.
+
+            Return only valid JSON. Do not include markdown, explanation, or text outside the JSON object.
+            """;
+
+    private static final String SYSTEM_PROMPT_HYBRID = """
+            You are a trading analyst reviewing a NIFTY options trade candidate.
+
+            In this system:
+            - CE is a call option and generally benefits when NIFTY moves up.
+            - PE is a put option and generally benefits when NIFTY moves down.
+            - side = LONG_OPTION means the option is bought.
+
+            Think like a cautious intraday options trader. Evaluate whether the trade has enough confirmation, whether the recent candles support the option direction, whether the previous trade creates reversal risk, and whether the market regime/score context supports the entry.
+
+            Do not mechanically follow one field. Weigh the full context.
+
+            tradeQualityScore calibration: 0.00-0.30 = poor/avoid, 0.31-0.60 = risky/caution, 0.61-0.80 = acceptable, 0.81-1.00 = excellent. Must be consistent with action and riskLevel.
+
+            Return only valid JSON. Do not include markdown, explanation, or text outside the JSON object.
+            """;
 
     private static final String SYSTEM_PROMPT = """
             You are a quantitative trade analyst for Indian NIFTY options (CE and PE).
@@ -148,8 +185,38 @@ public class AdvisoryService {
               "warningCodes": ["UPPERCASE_SNAKE_CASE"],
               "summary": "1-2 sentences on the PRIMARY risk or confirmation. State direction correctly (CE=bullish, PE=bearish)."
             }
+            tradeQualityScore calibration: 0.00-0.30 = poor/avoid, 0.31-0.60 = risky/caution, 0.61-0.80 = acceptable, 0.81-1.00 = excellent. Must be consistent with action and riskLevel (e.g. CAUTION+HIGH should be 0.30-0.60, not 0.80+).
             Clamp all numeric scores to [0.0, 1.0]. Do not hallucinate data not present in the input.
+            Return only valid JSON. Do not include markdown, explanation, or text outside the JSON object.
             """;
+
+    // ── JSON Schema for Responses API structured output ──────────────────────
+
+    private static final Map<String, Object> ADVISORY_SCHEMA = Map.ofEntries(
+        Map.entry("type", "object"),
+        Map.entry("additionalProperties", false),
+        Map.entry("required", List.of(
+                "action", "confidence", "tradeQualityScore", "riskLevel",
+                "reversalRisk", "chopRisk", "lateEntryRisk", "overextensionRisk",
+                "reasonCodes", "warningCodes", "summary")),
+        Map.entry("properties", Map.ofEntries(
+                Map.entry("action",           Map.of("type", "string", "enum",
+                        List.of("ALLOW", "CAUTION", "AVOID", "BLOCK", "UNKNOWN"))),
+                Map.entry("confidence",        Map.of("type", "number")),
+                Map.entry("tradeQualityScore", Map.of("type", "number")),
+                Map.entry("riskLevel",         Map.of("type", "string", "enum",
+                        List.of("LOW", "MEDIUM", "HIGH", "UNKNOWN"))),
+                Map.entry("reversalRisk",      Map.of("type", "number")),
+                Map.entry("chopRisk",          Map.of("type", "number")),
+                Map.entry("lateEntryRisk",     Map.of("type", "number")),
+                Map.entry("overextensionRisk", Map.of("type", "number")),
+                Map.entry("reasonCodes",       Map.of("type", "array",
+                        "items", Map.of("type", "string"))),
+                Map.entry("warningCodes",      Map.of("type", "array",
+                        "items", Map.of("type", "string"))),
+                Map.entry("summary",           Map.of("type", "string"))
+        ))
+    );
 
     private final AdvisoryRepository   advisoryRepository;
     private final OpenAiClient         openAiClient;
@@ -168,6 +235,7 @@ public class AdvisoryService {
 
         String requestJson = safeSerialize(request);
         String errorDetails = null;
+        String errorCategory = null;
         AdvisoryAiOutput output;
 
         String rawResponseJson = null;
@@ -176,9 +244,20 @@ public class AdvisoryService {
 
         if (openAiConfig.isEnabled()) {
             try {
-                String rawContent = openAiClient.chat(SYSTEM_PROMPT, requestJson);
+                String effort = openAiConfig.getReasoningEffort();
+                log.info("[{}] AI call: type=advisory model={} apiMode={} promptMode={} reasoningEffort={}",
+                        requestId, openAiConfig.getModel(), openAiConfig.getApiMode(),
+                        openAiConfig.getPromptMode(),
+                        (effort != null && !effort.isBlank()) ? effort : "(none)");
+
+                String rawContent = openAiClient.chat(selectAdvisoryPrompt(), requestJson,
+                        "advisory_response", ADVISORY_SCHEMA);
+                rawResponseJson = rawContent;  // raw extracted text from OpenAI, before our parsing
+
                 output = parseAndValidateAdvisory(rawContent);
-                rawResponseJson = safeSerialize(output);
+                log.info("[{}] Parsed advisory: action={} riskLevel={} confidence={} summaryLen={} reasonCodes={}",
+                        requestId, output.action(), output.riskLevel(), output.confidence(),
+                        output.summary() != null ? output.summary().length() : 0, output.reasonCodes());
 
                 AdvisoryValidation validation = validateAdvisory(output, request, requestId);
                 output = validation.output();  // apply normalization (e.g. BLOCK→AVOID)
@@ -190,10 +269,12 @@ public class AdvisoryService {
             } catch (OpenAiException e) {
                 log.warn("[{}] OpenAI advisory failed — using fallback. error={}", requestId, e.getMessage());
                 errorDetails = e.getMessage();
+                errorCategory = e.getCategory() != null ? e.getCategory().name() : "UNKNOWN";
                 output = fallbackEvaluator.advisory(request);
             }
         } else {
             log.debug("[{}] OpenAI disabled — using fallback advisory", requestId);
+            errorCategory = "FALLBACK";
             output = fallbackEvaluator.advisory(request);
         }
 
@@ -234,7 +315,12 @@ public class AdvisoryService {
         record.setNormalized(hasWarnings);
         record.setNormalizationReasons(validationWarnings.isEmpty() ? null : validationWarnings);
         record.setErrorDetails(errorDetails);
+        if (hasWarnings && errorCategory == null) errorCategory = "VALIDATION_ADJUSTED";
+        record.setErrorCategory(errorCategory);
         record.setRequestId(requestId);
+        record.setAiModel(openAiConfig.isEnabled() ? openAiConfig.getModel() : null);
+        record.setAiApiMode(openAiConfig.isEnabled() ? openAiConfig.getApiMode() : null);
+        record.setAiPromptMode(openAiConfig.isEnabled() ? openAiConfig.getPromptMode() : null);
 
         record = advisoryRepository.save(record);
 
@@ -269,6 +355,34 @@ public class AdvisoryService {
         }
 
         return records.stream().map(AdvisoryResponse::from).toList();
+    }
+
+    @Transactional(readOnly = true)
+    public List<ExperimentSummaryResponse> listExperimentSummaries() {
+        return advisoryRepository.findExperimentSummaries().stream()
+                .map(row -> ExperimentSummaryResponse.builder()
+                        .sessionId((String) row[0])
+                        .aiModel((String) row[1])
+                        .aiApiMode((String) row[2])
+                        .aiPromptMode((String) row[3])
+                        .advisoryCount((Long) row[4])
+                        .latestCreatedAt(toInstant(row[5]))
+                        .build())
+                .toList();
+    }
+
+    private static java.time.Instant toInstant(Object o) {
+        if (o instanceof java.time.Instant i) return i;
+        if (o instanceof java.sql.Timestamp ts) return ts.toInstant();
+        return null;
+    }
+
+    private String selectAdvisoryPrompt() {
+        return switch (openAiConfig.getPromptMode().toLowerCase(Locale.ROOT)) {
+            case "minimal" -> SYSTEM_PROMPT_MINIMAL;
+            case "hybrid"  -> SYSTEM_PROMPT_HYBRID;
+            default        -> SYSTEM_PROMPT;
+        };
     }
 
     // ── Advisory direction validation ────────────────────────────────────────
@@ -379,6 +493,27 @@ public class AdvisoryService {
             }
         }
 
+        // ── tradeQualityScore calibration caps ────────────────────────────────
+        double cap;
+        if (action == AdvisoryAction.AVOID) {
+            cap = 0.35;
+        } else if (action == AdvisoryAction.CAUTION && output.riskLevel() == RiskLevel.HIGH) {
+            cap = 0.55;
+        } else if (action == AdvisoryAction.CAUTION) {
+            cap = 0.75;
+        } else if (output.riskLevel() == RiskLevel.HIGH) {
+            cap = 0.60;
+        } else {
+            cap = 1.0;
+        }
+        if (normalizedTradeQualityScore > cap) {
+            warnings.add("TRADE_QUALITY_SCORE_CAPPED: " + normalizedTradeQualityScore + "→" + cap
+                    + " (action=" + action + " riskLevel=" + output.riskLevel() + ")");
+            log.info("[{}] tradeQualityScore capped: {}→{} action={} riskLevel={}",
+                    requestId, normalizedTradeQualityScore, cap, action, output.riskLevel());
+            normalizedTradeQualityScore = cap;
+        }
+
         // ── Build normalized output ────────────────────────────────────────────
         boolean anyChange = action != output.action()
                 || normalizedConfidence != output.confidence()
@@ -400,6 +535,9 @@ public class AdvisoryService {
     private AdvisoryAiOutput parseAndValidateAdvisory(String content) {
         try {
             Map<?, ?> raw = objectMapper.readValue(content, Map.class);
+            log.info("Advisory JSON keys={} action='{}' confidence={} summaryLen={}",
+                    raw.keySet(), raw.get("action"), raw.get("confidence"),
+                    raw.get("summary") instanceof String s ? s.length() : "null/missing");
 
             AdvisoryAction action         = parseEnum(AdvisoryAction.class, raw.get("action"), AdvisoryAction.UNKNOWN);
             RiskLevel riskLevel           = parseEnum(RiskLevel.class, raw.get("riskLevel"), RiskLevel.UNKNOWN);
@@ -419,7 +557,7 @@ public class AdvisoryService {
 
         } catch (Exception e) {
             log.warn("Failed to parse OpenAI advisory response — falling back. error={}", e.getMessage());
-            throw new OpenAiException("Advisory JSON parse failed: " + e.getMessage(), e);
+            throw new OpenAiException("Advisory JSON parse failed: " + e.getMessage(), e, OpenAiClient.OpenAiException.Category.PARSE_FAILURE);
         }
     }
 

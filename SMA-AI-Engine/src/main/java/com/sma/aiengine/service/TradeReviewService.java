@@ -32,6 +32,40 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class TradeReviewService {
 
+    // ── Prompt modes ─────────────────────────────────────────────────────────
+
+    private static final String SYSTEM_PROMPT_MINIMAL = """
+            You are a trading analyst reviewing a completed NIFTY options trade.
+
+            In this system:
+            - CE is a call option and generally benefits when NIFTY moves up.
+            - PE is a put option and generally benefits when NIFTY moves down.
+            - side = LONG_OPTION means the option is bought.
+
+            Analyze the provided payload and judge the trade quality, whether it was avoidable, what worked, what failed, and whether a useful rule can be learned.
+
+            Use the available data: P&L, P&L %, entry/exit reason, MFE/MAE, recent candles, option type, strategy scores, regime, ADX, ATR, previous trade context, filters, and trade context.
+
+            Return only valid JSON using exactly these keys — no other keys allowed:
+            {"quality":"GOOD|BAD|NEUTRAL|UNKNOWN","avoidable":true|false,"mistakeType":"NONE|REVERSAL_TRAP|LATE_ENTRY|BAD_EXIT|WEAK_CONFIRMATION|OVEREXTENSION|CHOP_ENTRY|UNKNOWN","confidence":0.0,"summary":"","whatWorked":[],"whatFailed":[],"suggestedRule":"","reasonCodes":[],"warningCodes":[]}
+            """;
+
+    private static final String SYSTEM_PROMPT_HYBRID = """
+            You are a trading analyst reviewing a completed NIFTY options trade.
+
+            In this system:
+            - CE is a call option and generally benefits when NIFTY moves up.
+            - PE is a put option and generally benefits when NIFTY moves down.
+            - side = LONG_OPTION means the option is bought.
+
+            Think like a trade journal reviewer. Judge whether the trade was good, bad, or neutral using the actual outcome and the information available around entry. Identify if the mistake was avoidable, whether there was a reversal trap, weak confirmation, late entry, chop entry, bad exit, or no clear mistake.
+
+            Do not mechanically follow one field. Weigh the full context.
+
+            Return only valid JSON using exactly these keys — no other keys allowed:
+            {"quality":"GOOD|BAD|NEUTRAL|UNKNOWN","avoidable":true|false,"mistakeType":"NONE|REVERSAL_TRAP|LATE_ENTRY|BAD_EXIT|WEAK_CONFIRMATION|OVEREXTENSION|CHOP_ENTRY|UNKNOWN","confidence":0.0,"summary":"","whatWorked":[],"whatFailed":[],"suggestedRule":"","reasonCodes":[],"warningCodes":[]}
+            """;
+
     private static final String SYSTEM_PROMPT = """
             You are a trade quality reviewer for Indian NIFTY options (CE and PE).
             This is a POST-TRADE review. Analyze the completed trade and return ONLY valid JSON.
@@ -88,12 +122,12 @@ public class TradeReviewService {
 
             mistakeType options:
               NONE              = No mistake. Trade executed well.
-              BAD_ENTRY         = Entered in wrong direction or at wrong time. Trade never moved favorably.
               BAD_EXIT          = Entry was valid (tradeHadFollowThrough=true) but exit was poorly timed.
               REVERSAL_TRAP     = Entered opposite direction immediately after a strong winner before structure reversed.
-              COUNTER_TREND_ENTRY = Entered against current market direction without structural confirmation.
               LATE_ENTRY        = Entered after the move was already largely complete.
-              MARKET_NOISE      = Reasonable setup stopped by short-term volatility.
+              WEAK_CONFIRMATION = Setup lacked sufficient confirmation signals; entry was premature or poorly supported.
+              OVEREXTENSION     = Entered after the move was already overextended; reversion risk was high.
+              CHOP_ENTRY        = Entered during a choppy/ranging market without clear direction.
               UNKNOWN           = Insufficient data.
 
             ══════════════════════════════════════════════════════════
@@ -137,11 +171,11 @@ public class TradeReviewService {
             BAD     = Trade lost due to bad entry, reversal trap, or counter-trend entry. avoidable = true.
             NEUTRAL = Trade lost but had a valid setup; loss due to market noise or reasonable stop.
 
-            Return ONLY valid JSON — no markdown, no text outside the JSON object:
+            Return ONLY valid JSON using exactly these keys — no other keys allowed:
             {
-              "quality": "GOOD | BAD | NEUTRAL",
+              "quality": "GOOD | BAD | NEUTRAL | UNKNOWN",
               "avoidable": true | false,
-              "mistakeType": "NONE | BAD_ENTRY | BAD_EXIT | REVERSAL_TRAP | COUNTER_TREND_ENTRY | LATE_ENTRY | MARKET_NOISE | UNKNOWN",
+              "mistakeType": "NONE | REVERSAL_TRAP | LATE_ENTRY | BAD_EXIT | WEAK_CONFIRMATION | OVEREXTENSION | CHOP_ENTRY | UNKNOWN",
               "confidence": 0.0-1.0,
               "summary": "1-2 sentences on root cause. State direction correctly (CE=bullish, PE=bearish).",
               "whatWorked": ["factor"],
@@ -152,7 +186,38 @@ public class TradeReviewService {
             }
             whatWorked/whatFailed: 1–4 key factors each.
             suggestedRule: specific and actionable, or empty string if no suggestion.
+            Return only valid JSON. Do not include markdown, explanation, or text outside the JSON object.
             """;
+
+    // ── JSON Schema for Responses API structured output ──────────────────────
+
+    private static final Map<String, Object> REVIEW_SCHEMA = Map.ofEntries(
+        Map.entry("type", "object"),
+        Map.entry("additionalProperties", false),
+        Map.entry("required", List.of(
+                "quality", "avoidable", "mistakeType", "confidence",
+                "summary", "whatWorked", "whatFailed", "suggestedRule",
+                "reasonCodes", "warningCodes")),
+        Map.entry("properties", Map.ofEntries(
+                Map.entry("quality",       Map.of("type", "string", "enum",
+                        List.of("GOOD", "BAD", "NEUTRAL", "UNKNOWN"))),
+                Map.entry("avoidable",     Map.of("type", "boolean")),
+                Map.entry("mistakeType",   Map.of("type", "string", "enum",
+                        List.of("NONE", "REVERSAL_TRAP", "LATE_ENTRY", "BAD_EXIT",
+                                "WEAK_CONFIRMATION", "OVEREXTENSION", "CHOP_ENTRY", "UNKNOWN"))),
+                Map.entry("confidence",    Map.of("type", "number")),
+                Map.entry("summary",       Map.of("type", "string")),
+                Map.entry("whatWorked",    Map.of("type", "array",
+                        "items", Map.of("type", "string"))),
+                Map.entry("whatFailed",    Map.of("type", "array",
+                        "items", Map.of("type", "string"))),
+                Map.entry("suggestedRule", Map.of("type", "string")),
+                Map.entry("reasonCodes",   Map.of("type", "array",
+                        "items", Map.of("type", "string"))),
+                Map.entry("warningCodes",  Map.of("type", "array",
+                        "items", Map.of("type", "string")))
+        ))
+    );
 
     private final TradeReviewRepository tradeReviewRepository;
     private final OpenAiClient          openAiClient;
@@ -171,6 +236,7 @@ public class TradeReviewService {
 
         String requestJson = safeSerialize(request);
         String errorDetails = null;
+        String errorCategory = null;
         TradeReviewAiOutput output;
 
         String rawResponseJson = null;
@@ -179,9 +245,22 @@ public class TradeReviewService {
 
         if (openAiConfig.isEnabled()) {
             try {
-                String rawContent = openAiClient.chat(SYSTEM_PROMPT, requestJson);
+                String effort = openAiConfig.getReasoningEffort();
+                log.info("[{}] AI call: type=review model={} apiMode={} promptMode={} reasoningEffort={}",
+                        requestId, openAiConfig.getModel(), openAiConfig.getApiMode(),
+                        openAiConfig.getPromptMode(),
+                        (effort != null && !effort.isBlank()) ? effort : "(none)");
+
+                String rawContent = openAiClient.chat(selectReviewPrompt(), requestJson,
+                        "trade_review_response", REVIEW_SCHEMA);
+                rawResponseJson = rawContent;  // raw extracted text from OpenAI, before our parsing
+
                 TradeReviewAiOutput rawOutput = parseAndValidateReview(rawContent);
-                rawResponseJson = safeSerialize(rawOutput);
+                log.info("[{}] Parsed review: quality={} mistakeType={} avoidable={} confidence={} summaryLen={} whatFailed={}",
+                        requestId, rawOutput.quality(), rawOutput.mistakeType(), rawOutput.avoidable(),
+                        rawOutput.confidence(),
+                        rawOutput.summary() != null ? rawOutput.summary().length() : 0,
+                        rawOutput.whatFailed());
 
                 NormalizedReview norm = normalizeReview(rawOutput, request, requestId);
                 output = norm.output();
@@ -193,10 +272,12 @@ public class TradeReviewService {
             } catch (OpenAiException e) {
                 log.warn("[{}] OpenAI review failed — using fallback. error={}", requestId, e.getMessage());
                 errorDetails = e.getMessage();
+                errorCategory = e.getCategory() != null ? e.getCategory().name() : "UNKNOWN";
                 output = fallbackEvaluator.review(request);
             }
         } else {
             log.debug("[{}] OpenAI disabled — using fallback review", requestId);
+            errorCategory = "FALLBACK";
             output = fallbackEvaluator.review(request);
         }
 
@@ -241,7 +322,12 @@ public class TradeReviewService {
         record.setNormalized(wasNormalized);
         record.setNormalizationReasons(normalizationReasons.isEmpty() ? null : normalizationReasons);
         record.setErrorDetails(errorDetails);
+        if (wasNormalized && errorCategory == null) errorCategory = "VALIDATION_ADJUSTED";
+        record.setErrorCategory(errorCategory);
         record.setRequestId(requestId);
+        record.setAiModel(openAiConfig.isEnabled() ? openAiConfig.getModel() : null);
+        record.setAiApiMode(openAiConfig.isEnabled() ? openAiConfig.getApiMode() : null);
+        record.setAiPromptMode(openAiConfig.isEnabled() ? openAiConfig.getPromptMode() : null);
 
         record = tradeReviewRepository.save(record);
 
@@ -280,6 +366,14 @@ public class TradeReviewService {
             records = tradeReviewRepository.findAllByOrderByCreatedAtAsc();
         }
         return records.stream().map(TradeReviewResponse::from).toList();
+    }
+
+    private String selectReviewPrompt() {
+        return switch (openAiConfig.getPromptMode().toLowerCase(Locale.ROOT)) {
+            case "minimal" -> SYSTEM_PROMPT_MINIMAL;
+            case "hybrid"  -> SYSTEM_PROMPT_HYBRID;
+            default        -> SYSTEM_PROMPT;
+        };
     }
 
     // ── Normalization ─────────────────────────────────────────────────────────
@@ -523,25 +617,109 @@ public class TradeReviewService {
     private TradeReviewAiOutput parseAndValidateReview(String content) {
         try {
             Map<?, ?> raw = objectMapper.readValue(content, Map.class);
+            log.info("Review JSON keys={} quality='{}' mistakeType='{}' confidence={} summaryLen={}",
+                    raw.keySet(), raw.get("quality"), raw.get("mistakeType"), raw.get("confidence"),
+                    raw.get("summary") instanceof String s ? s.length() : "null/missing");
 
-            TradeQuality quality       = parseEnum(TradeQuality.class, raw.get("quality"), TradeQuality.UNKNOWN);
-            MistakeType mistakeType    = parseEnum(MistakeType.class, raw.get("mistakeType"), MistakeType.UNKNOWN);
-            boolean avoidable          = raw.get("avoidable") instanceof Boolean b && b;
-            double confidence          = clamp(raw.get("confidence"));
-            String summary             = raw.get("summary") instanceof String s ? s : "";
-            List<String> whatWorked    = parseStringList(raw.get("whatWorked"));
-            List<String> whatFailed    = parseStringList(raw.get("whatFailed"));
-            String suggestedRule       = raw.get("suggestedRule") instanceof String s ? s : "";
-            List<String> reasonCodes   = parseStringList(raw.get("reasonCodes"));
-            List<String> warningCodes  = parseStringList(raw.get("warningCodes"));
+            List<String> aliasesUsed = new ArrayList<>();
+
+            // quality — primary key, then alias fallbacks
+            Object qualityRaw = raw.get("quality");
+            String qualityKey = "quality";
+            if (qualityRaw == null || (qualityRaw instanceof String qs && qs.isBlank())) {
+                for (String alt : List.of("verdict", "tradeRating", "judgement", "rating", "grade")) {
+                    if (raw.containsKey(alt)) { qualityRaw = raw.get(alt); qualityKey = alt; break; }
+                }
+            }
+            TradeQuality quality = resolveQuality(qualityRaw);
+            if (!"quality".equals(qualityKey)) aliasesUsed.add("quality←" + qualityKey);
+
+            // mistakeType — primary key, then alias fallbacks
+            Object mistakeRaw = raw.get("mistakeType");
+            String mistakeKey = "mistakeType";
+            if (mistakeRaw == null || (mistakeRaw instanceof String ms && ms.isBlank())) {
+                for (String alt : List.of("mistake", "primaryIssue", "mistakeCategory", "mistakes")) {
+                    if (raw.containsKey(alt)) { mistakeRaw = raw.get(alt); mistakeKey = alt; break; }
+                }
+            }
+            MistakeType mistakeType = resolveMistakeType(mistakeRaw);
+            if (!"mistakeType".equals(mistakeKey)) aliasesUsed.add("mistakeType←" + mistakeKey);
+
+            // avoidable — primary key, then "avoidability" string fallback
+            boolean avoidable = resolveAvoidable(raw, aliasesUsed);
+
+            // summary — primary key, then alias fallbacks
+            Object summaryRaw = raw.get("summary");
+            String summaryKey = "summary";
+            if (summaryRaw == null || (summaryRaw instanceof String ss && ss.isBlank())) {
+                for (String alt : List.of("notes", "commentary", "comment", "rationale", "remarks")) {
+                    if (raw.containsKey(alt)) { summaryRaw = raw.get(alt); summaryKey = alt; break; }
+                }
+            }
+            String summary = summaryRaw instanceof String s ? s : "";
+            if (!"summary".equals(summaryKey)) aliasesUsed.add("summary←" + summaryKey);
+
+            if (!aliasesUsed.isEmpty()) {
+                log.warn("Review alias fallback used — schema enforcement may have failed. aliases={} keys={}",
+                        aliasesUsed, raw.keySet());
+            }
+
+            double confidence         = clamp(raw.get("confidence"));
+            List<String> whatWorked   = parseStringList(raw.get("whatWorked"));
+            List<String> whatFailed   = parseStringList(raw.get("whatFailed"));
+            String suggestedRule      = raw.get("suggestedRule") instanceof String s ? s : "";
+            List<String> reasonCodes  = parseStringList(raw.get("reasonCodes"));
+            List<String> warningCodes = parseStringList(raw.get("warningCodes"));
 
             return new TradeReviewAiOutput(quality, avoidable, mistakeType, confidence,
                     summary, whatWorked, whatFailed, suggestedRule, reasonCodes, warningCodes);
 
         } catch (Exception e) {
             log.warn("Failed to parse OpenAI review response — falling back. error={}", e.getMessage());
-            throw new OpenAiException("Review JSON parse failed: " + e.getMessage(), e);
+            throw new OpenAiException("Review JSON parse failed: " + e.getMessage(), e, OpenAiClient.OpenAiException.Category.PARSE_FAILURE);
         }
+    }
+
+    private TradeQuality resolveQuality(Object raw) {
+        if (!(raw instanceof String s)) return TradeQuality.UNKNOWN;
+        return switch (s.trim().toUpperCase()) {
+            case "GOOD", "GOOD_TRADE"       -> TradeQuality.GOOD;
+            case "BAD",  "BAD_TRADE"        -> TradeQuality.BAD;
+            case "NEUTRAL", "NEUTRAL_TRADE" -> TradeQuality.NEUTRAL;
+            case "AVERAGE"                  -> TradeQuality.AVERAGE;
+            default                         -> TradeQuality.UNKNOWN;
+        };
+    }
+
+    private MistakeType resolveMistakeType(Object raw) {
+        // Handle "mistakes": ["REVERSAL_TRAP", ...] — take first element
+        if (raw instanceof List<?> list) raw = list.isEmpty() ? null : list.get(0);
+        if (!(raw instanceof String s)) return MistakeType.UNKNOWN;
+        return switch (s.trim().toUpperCase()) {
+            case "NONE", "NO_CLEAR_MISTAKE", "NO_MISTAKE" -> MistakeType.NONE;
+            case "REVERSAL_TRAP"                          -> MistakeType.REVERSAL_TRAP;
+            case "LATE_ENTRY"                             -> MistakeType.LATE_ENTRY;
+            case "BAD_EXIT"                               -> MistakeType.BAD_EXIT;
+            case "BAD_ENTRY"                              -> MistakeType.BAD_ENTRY;
+            case "WEAK_CONFIRMATION", "WEAK_SIGNAL"       -> MistakeType.WEAK_CONFIRMATION;
+            case "OVEREXTENSION", "OVEREXTENDED_ENTRY"    -> MistakeType.OVEREXTENSION;
+            case "CHOP_ENTRY"                             -> MistakeType.CHOP_ENTRY;
+            case "COUNTER_TREND_ENTRY"                    -> MistakeType.COUNTER_TREND_ENTRY;
+            case "MARKET_NOISE"                           -> MistakeType.MARKET_NOISE;
+            default                                       -> MistakeType.UNKNOWN;
+        };
+    }
+
+    private boolean resolveAvoidable(Map<?, ?> raw, List<String> aliasesUsed) {
+        Object val = raw.get("avoidable");
+        if (val instanceof Boolean b) return b;
+        // "avoidability": "AVOIDABLE" / "NOT_AVOIDABLE"
+        Object avoidability = raw.get("avoidability");
+        if (avoidability instanceof String s) {
+            aliasesUsed.add("avoidable←avoidability");
+            return "AVOIDABLE".equalsIgnoreCase(s.trim());
+        }
+        return false;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

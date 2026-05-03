@@ -47,6 +47,11 @@ public class TradeReviewResponse {
     private String rawResponseJson;
     private Boolean normalized;
     private List<String> normalizationReasons;
+    private String aiModel;
+    private String aiApiMode;
+    private String aiPromptMode;
+    private String errorDetails;
+    private String errorCategory;
 
     public static TradeReviewResponse from(TradeReviewRecord r) {
         return TradeReviewResponse.builder()
@@ -80,6 +85,11 @@ public class TradeReviewResponse {
                 .rawResponseJson(r.getRawResponseJson())
                 .normalized(r.getNormalized())
                 .normalizationReasons(r.getNormalizationReasons() != null ? r.getNormalizationReasons() : List.of())
+                .aiModel(r.getAiModel())
+                .aiApiMode(r.getAiApiMode())
+                .aiPromptMode(r.getAiPromptMode())
+                .errorDetails(r.getErrorDetails())
+                .errorCategory(r.getErrorCategory())
                 .build();
     }
 }

@@ -21,4 +21,10 @@ public interface AdvisoryRepository extends JpaRepository<AdvisoryRecord, Long> 
 
     @Query("SELECT a.sessionId, COUNT(a), MAX(a.createdAt) FROM AdvisoryRecord a WHERE a.sessionId IS NOT NULL GROUP BY a.sessionId")
     List<Object[]> findSessionSummaries();
+
+    @Query("SELECT a.sessionId, a.aiModel, a.aiApiMode, a.aiPromptMode, COUNT(a), MAX(a.createdAt) " +
+           "FROM AdvisoryRecord a WHERE a.sessionId IS NOT NULL " +
+           "GROUP BY a.sessionId, a.aiModel, a.aiApiMode, a.aiPromptMode " +
+           "ORDER BY MAX(a.createdAt) DESC")
+    List<Object[]> findExperimentSummaries();
 }

@@ -12,7 +12,7 @@ import {
   getOptionsLiveFeed, getTickReplayFeed,
   saveSessionResult, listSessionResults, getSessionResult, deleteSessionResult, finalizeSessionResult,
   querySessionTicksForCompare,
-  getAiReviews, getAiAdvisories,
+  getAiReviews, getAiAdvisories, getAiEngineConfig, getAiExperimentSummary,
 } from '../services/api';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { useSession } from '../context/SessionContext';
@@ -12859,9 +12859,13 @@ function TickReplayTest() {
   const [error,           setError]           = useState('');
   const [warnings,        setWarnings]        = useState([]);
   const [rightTab,        setRightTab]        = useState('feed');
-  const [aiReviews,       setAiReviews]       = useState([]);
-  const [aiAdvisories,    setAiAdvisories]    = useState([]);
-  const [expandedAiRow,   setExpandedAiRow]   = useState(null); // { type: 'review'|'advisory', id }
+  const [aiReviews,          setAiReviews]          = useState([]);
+  const [aiAdvisories,       setAiAdvisories]       = useState([]);
+  const [aiEngineConfig,     setAiEngineConfig]     = useState(null);
+  const [aiLoading,          setAiLoading]          = useState(false);
+  const [experimentSessions, setExperimentSessions] = useState([]);
+  const [selectedExpSession, setSelectedExpSession] = useState('');
+  const [expandedAiRow,      setExpandedAiRow]      = useState(null); // { type: 'review'|'advisory', id }
   const [feedExpanded,    setFeedExpanded]    = useState(false);
   const [liveTicks,       setLiveTicks]       = useState({});
   const [replaySessionId, setReplaySessionId] = useState(null);
@@ -12896,26 +12900,51 @@ function TickReplayTest() {
   // Fetch AI reviews + advisories after replay completes
   useEffect(() => {
     if (status !== 'completed' || !aiEnabled || !sessionId) return;
-    getAiReviews(sessionId)
-      .then(res => setAiReviews(res?.data ?? []))
-      .catch(() => {});
-    getAiAdvisories(sessionId)
-      .then(res => setAiAdvisories(res?.data ?? []))
-      .catch(() => {});
+    setAiLoading(true);
+    Promise.all([
+      getAiReviews(sessionId).then(res => setAiReviews(res?.data ?? [])).catch(() => {}),
+      getAiAdvisories(sessionId).then(res => setAiAdvisories(res?.data ?? [])).catch(() => {}),
+    ]).finally(() => setAiLoading(false));
   }, [status]);
 
   // Auto-load AI insights when switching to AI tab (data persisted from previous runs)
   useEffect(() => {
     if (rightTab !== 'ai') return;
+    getAiEngineConfig().then(res => { if (res?.data) setAiEngineConfig(res.data); }).catch(() => {});
+    getAiExperimentSummary().then(res => { if (res?.data) setExperimentSessions(res.data); }).catch(() => {});
     if (aiReviews.length > 0 || aiAdvisories.length > 0) return;
     if (!sessionId) return;
-    getAiReviews(sessionId)
-      .then(res => { if ((res?.data?.length ?? 0) > 0) setAiReviews(res.data); })
-      .catch(() => {});
-    getAiAdvisories(sessionId)
-      .then(res => { if ((res?.data?.length ?? 0) > 0) setAiAdvisories(res.data); })
-      .catch(() => {});
+    setAiLoading(true);
+    Promise.all([
+      getAiReviews(sessionId).then(res => { if ((res?.data?.length ?? 0) > 0) setAiReviews(res.data); }).catch(() => {}),
+      getAiAdvisories(sessionId).then(res => { if ((res?.data?.length ?? 0) > 0) setAiAdvisories(res.data); }).catch(() => {}),
+    ]).finally(() => setAiLoading(false));
   }, [rightTab, sessionId]);
+
+  // Load records for a selected experiment session
+  useEffect(() => {
+    if (!selectedExpSession) return;
+    setAiLoading(true);
+    setExpandedAiRow(null);
+    Promise.all([
+      getAiReviews(selectedExpSession).then(res => setAiReviews(res?.data ?? [])).catch(() => {}),
+      getAiAdvisories(selectedExpSession).then(res => setAiAdvisories(res?.data ?? [])).catch(() => {}),
+    ]).finally(() => setAiLoading(false));
+  }, [selectedExpSession]);
+
+  // If the session-based auto-load found nothing, fall back to the most recent experiment session.
+  // This handles records stored under a run UUID instead of the data session UUID.
+  useEffect(() => {
+    if (aiReviews.length > 0 || aiAdvisories.length > 0) return;
+    if (experimentSessions.length === 0) return;
+    const latest = experimentSessions[0]; // ordered by MAX(createdAt) DESC from backend
+    if (!latest?.sessionId) return;
+    setAiLoading(true);
+    Promise.all([
+      getAiReviews(latest.sessionId).then(r => { if ((r?.data?.length ?? 0) > 0) setAiReviews(r.data); }).catch(() => {}),
+      getAiAdvisories(latest.sessionId).then(a => { if ((a?.data?.length ?? 0) > 0) setAiAdvisories(a.data); }).catch(() => {}),
+    ]).finally(() => setAiLoading(false));
+  }, [experimentSessions]);
 
   function updatePoolInst(pool, setPool, id, patch) { setPool(p => p.map(i => i.id === id ? { ...i, ...patch } : i)); }
   function addPoolInst(setPool)              { setPool(p => [...p, EMPTY_OPTION_INST()]); }
@@ -13745,7 +13774,16 @@ function TickReplayTest() {
               AI Engine is OFF for this replay. Toggle it ON in Session Settings and re-run.
             </p>
           );
-          if (status !== 'completed' && aiReviews.length === 0) return (
+          if (aiLoading) return (
+            <>
+              <style>{`@keyframes sma-ai-spin { to { transform: rotate(360deg); } }`}</style>
+              <div style={{ display:'flex', alignItems:'center', justifyContent:'center', padding:'32px 0', gap:10 }}>
+                <div style={{ width:18, height:18, border:'2px solid rgba(99,102,241,0.25)', borderTopColor:'#818cf8', borderRadius:'50%', animation:'sma-ai-spin 0.75s linear infinite', flexShrink:0 }} />
+                <span style={{ fontSize:12, color:'var(--text-muted)' }}>Loading AI insights…</span>
+              </div>
+            </>
+          );
+          if (status !== 'completed' && aiReviews.length === 0 && aiAdvisories.length === 0) return (
             <p style={{ fontSize:12, color:'var(--text-muted)', textAlign:'center', padding:'24px 0' }}>
               {isRunning ? 'AI results will appear after replay completes.' : 'Run a replay with AI Engine ON to see insights.'}
             </p>
@@ -13769,6 +13807,16 @@ function TickReplayTest() {
             const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
             const rows = [];
             rows.push(`"AI Insights — Session date: ${sessionDateStr}"`);
+            if (aiEngineConfig) {
+              rows.push(`"ENGINE CONFIG"`);
+              rows.push(esc(aiEngineConfig.enabled ? 'OpenAI ON' : 'OpenAI OFF (fallback)'));
+              if (aiEngineConfig.enabled) {
+                if (aiEngineConfig.model)          rows.push(esc(aiEngineConfig.model));
+                if (aiEngineConfig.apiMode)        rows.push(esc(aiEngineConfig.apiMode));
+                if (aiEngineConfig.promptMode)     rows.push(esc(aiEngineConfig.promptMode));
+                if (aiEngineConfig.reasoningEffort) rows.push(esc(`effort: ${aiEngineConfig.reasoningEffort}`));
+              }
+            }
             rows.push('');
             // Reviews
             if (aiReviews.length > 0) {
@@ -13816,6 +13864,18 @@ function TickReplayTest() {
             lines.push(sep);
             lines.push(`  AI INSIGHTS — Session date: ${sessionDateStr}`);
             lines.push(sep);
+            if (aiEngineConfig) {
+              lines.push('');
+              lines.push('ENGINE CONFIG');
+              lines.push(`  ${aiEngineConfig.enabled ? 'OpenAI ON' : 'OpenAI OFF (fallback)'}`);
+              if (aiEngineConfig.enabled) {
+                if (aiEngineConfig.model)           lines.push(`  ${aiEngineConfig.model}`);
+                if (aiEngineConfig.apiMode)         lines.push(`  ${aiEngineConfig.apiMode}`);
+                if (aiEngineConfig.promptMode)      lines.push(`  ${aiEngineConfig.promptMode}`);
+                if (aiEngineConfig.reasoningEffort) lines.push(`  effort: ${aiEngineConfig.reasoningEffort}`);
+              }
+              lines.push(sep);
+            }
 
             if (aiReviews.length > 0) {
               lines.push(''); lines.push(`TRADE REVIEWS (${aiReviews.length})`); lines.push(sep2);
@@ -13868,8 +13928,57 @@ function TickReplayTest() {
             a2.click(); URL.revokeObjectURL(url);
           };
 
+          const EXPERIMENT_PRESETS = [
+            { label: 'Baseline',          match: s => !s.aiModel || s.aiModel.toLowerCase().includes('4o-mini') },
+            { label: 'Reasoning Strict',  match: s => s.aiModel && !s.aiModel.toLowerCase().includes('4o-mini') && (s.aiPromptMode||'').toLowerCase() === 'strict' },
+            { label: 'Reasoning Minimal', match: s => (s.aiPromptMode||'').toLowerCase() === 'minimal' },
+            { label: 'Reasoning Hybrid',  match: s => (s.aiPromptMode||'').toLowerCase() === 'hybrid' },
+          ];
+          const presetOptions = EXPERIMENT_PRESETS.map(p => ({
+            ...p,
+            session: experimentSessions.find(s => p.match(s)) ?? null,
+          }));
+
           return (
             <div>
+              {experimentSessions.length > 0 && (
+                <div style={{ marginBottom:10, display:'flex', alignItems:'center', gap:8 }}>
+                  <span style={{ fontSize:10, color:'var(--text-muted)', whiteSpace:'nowrap' }}>View experiment:</span>
+                  <select
+                    value={selectedExpSession}
+                    onChange={e => setSelectedExpSession(e.target.value)}
+                    style={{ fontSize:11, padding:'3px 8px', background:'var(--bg-secondary,#1e1e2e)', color:'var(--text-primary,#cdd6f4)', border:'1px solid rgba(99,102,241,0.3)', borderRadius:4, cursor:'pointer' }}
+                  >
+                    <option value="">Current session</option>
+                    {presetOptions.map(p => (
+                      <option key={p.label} value={p.session?.sessionId ?? ''} disabled={!p.session}>
+                        {p.label}{p.session ? ` — ${p.session.advisoryCount} advisories` : ' (no data)'}
+                      </option>
+                    ))}
+                  </select>
+                  {selectedExpSession && (
+                    <button
+                      type="button"
+                      onClick={() => { setSelectedExpSession(''); if (sessionId) { getAiReviews(sessionId).then(r => setAiReviews(r?.data??[])).catch(()=>{}); getAiAdvisories(sessionId).then(r => setAiAdvisories(r?.data??[])).catch(()=>{}); } }}
+                      style={{ fontSize:10, padding:'2px 7px', background:'rgba(99,102,241,0.12)', border:'1px solid rgba(99,102,241,0.3)', borderRadius:4, color:'#818cf8', cursor:'pointer' }}
+                    >✕ Clear</button>
+                  )}
+                </div>
+              )}
+              {aiEngineConfig && (
+                <div style={{ marginBottom:10, padding:'6px 10px', background:'rgba(99,102,241,0.08)', border:'1px solid rgba(99,102,241,0.2)', borderRadius:4, display:'flex', gap:12, alignItems:'center', flexWrap:'wrap' }}>
+                  <span style={{ fontSize:10, fontWeight:700, color:'var(--text-secondary)', letterSpacing:'0.05em' }}>ENGINE CONFIG</span>
+                  <span style={{ fontSize:10, color: aiEngineConfig.enabled ? '#22c55e' : '#ef4444', fontWeight:600 }}>
+                    {aiEngineConfig.enabled ? 'OpenAI ON' : 'OpenAI OFF (fallback)'}
+                  </span>
+                  {aiEngineConfig.enabled && <>
+                    <span style={{ fontSize:10, color:'var(--text-secondary)' }}>{aiEngineConfig.model}</span>
+                    <span style={{ fontSize:10, color:'var(--text-muted)' }}>{aiEngineConfig.apiMode}</span>
+                    <span style={{ fontSize:10, background:'rgba(99,102,241,0.15)', padding:'1px 6px', borderRadius:3, color:'#818cf8' }}>{aiEngineConfig.promptMode}</span>
+                    {aiEngineConfig.reasoningEffort && <span style={{ fontSize:10, color:'var(--text-muted)' }}>effort: {aiEngineConfig.reasoningEffort}</span>}
+                  </>}
+                </div>
+              )}
               {(aiReviews.length > 0 || aiAdvisories.length > 0) && (
                 <div style={{ display:'flex', gap:8, justifyContent:'flex-end', marginBottom:12 }}>
                   <button
@@ -13895,6 +14004,21 @@ function TickReplayTest() {
                       ? <span style={{ color:'#f59e0b' }}> — {summary.aiReviewsAttempted} attempted, {summary.aiReviewsPostSucceeded ?? 0} posted, {(summary.aiReviewsPostFailed ?? 0) + (summary.aiReviewsPending ?? 0)} failed/pending</span>
                       : null}){' '}<span style={{ fontSize:10, fontWeight:400, color:'var(--text-muted)' }}>— click row to see payload</span>
                   </div>
+                  {(() => {
+                    const success  = aiReviews.filter(r => r.source === 'OPENAI').length;
+                    const fallback = aiReviews.filter(r => r.source === 'FALLBACK' && !r.errorDetails).length;
+                    const errors   = aiReviews.filter(r => r.errorDetails).length;
+                    const adjusted = aiReviews.filter(r => r.errorCategory === 'VALIDATION_ADJUSTED').length;
+                    return (
+                      <div style={{ marginBottom:6, display:'flex', gap:10, fontSize:10, color:'var(--text-muted)' }}>
+                        <span>{aiReviews.length} total</span>
+                        {success  > 0 && <span style={{ color:'#22c55e' }}>{success} success</span>}
+                        {fallback > 0 && <span style={{ color:'#94a3b8' }}>{fallback} fallback</span>}
+                        {adjusted > 0 && <span style={{ color:'#f59e0b' }}>{adjusted} adjusted</span>}
+                        {errors   > 0 && <span style={{ color:'#ef4444' }}>{errors} error</span>}
+                      </div>
+                    );
+                  })()}
                   <div style={{ overflowX:'auto', marginBottom:16 }}>
                     <table className="bt-table">
                       <thead>
@@ -13914,7 +14038,7 @@ function TickReplayTest() {
                                 <td style={{ fontSize:11, color: r.avoidable ? '#ef4444' : '#22c55e' }}>{r.avoidable ? 'Yes' : 'No'}</td>
                                 <td style={r.pnl != null ? pnlStyle(r.pnl) : {}}>{r.pnl != null ? fmt2(r.pnl) : '—'}</td>
                                 <td style={{ fontSize:10 }}>{r.exitReason || '—'}</td>
-                                <td style={{ fontSize:10, color:'var(--text-muted)' }}>{r.source}</td>
+                                <td style={{ fontSize:10, color:'var(--text-muted)' }} title={r.aiApiMode && r.aiPromptMode ? `${r.aiApiMode} · ${r.aiPromptMode}` : ''}>{r.source === 'OPENAI' && r.aiModel ? r.aiModel : r.source}</td>
                                 <td style={{ fontSize:10, maxWidth:220, whiteSpace:'normal', color:'var(--text-secondary)' }}>{r.summary || '—'}</td>
                                 <td style={{ fontSize:10, textAlign:'center' }} title={r.normalized ? (r.normalizationReasons||[]).join('\n') : ''}>{r.normalized ? <span style={{ color:'#f59e0b' }}>⚠</span> : ''}</td>
                               </tr>
@@ -13927,6 +14051,21 @@ function TickReplayTest() {
                                         {r.normalizationReasons.map((reason, ri) => (
                                           <div key={ri} style={{ fontSize:10, color:'#fbbf24' }}>• {reason}</div>
                                         ))}
+                                      </div>
+                                    )}
+                                    {(r.aiModel || r.aiPromptMode) && (
+                                      <div style={{ marginBottom:8, display:'flex', gap:8, alignItems:'center', fontSize:10 }}>
+                                        <span style={{ color:'var(--text-muted)' }}>Model:</span>
+                                        <span style={{ color:'var(--text-secondary)', fontWeight:600 }}>{r.aiModel || '—'}</span>
+                                        {r.aiApiMode && <span style={{ color:'var(--text-muted)' }}>via {r.aiApiMode}</span>}
+                                        {r.aiPromptMode && <span style={{ background:'rgba(99,102,241,0.15)', padding:'1px 5px', borderRadius:3, color:'#818cf8' }}>{r.aiPromptMode}</span>}
+                                        {r.latencyMs != null && <span style={{ color:'var(--text-muted)', marginLeft:4 }}>{r.latencyMs}ms</span>}
+                                      </div>
+                                    )}
+                                    {(r.errorCategory || r.errorDetails) && (
+                                      <div style={{ marginBottom:8, padding:'4px 8px', background:'rgba(239,68,68,0.08)', border:'1px solid rgba(239,68,68,0.2)', borderRadius:4, display:'flex', gap:8, alignItems:'flex-start', flexWrap:'wrap' }}>
+                                        {r.errorCategory && <span style={{ fontSize:10, fontWeight:700, color:'#ef4444', whiteSpace:'nowrap' }}>{r.errorCategory}</span>}
+                                        {r.errorDetails && <span style={{ fontSize:10, color:'var(--text-muted)', wordBreak:'break-all' }}>{r.errorDetails}</span>}
                                       </div>
                                     )}
                                     <div style={{ display:'flex', gap:12 }}>
@@ -13952,6 +14091,21 @@ function TickReplayTest() {
                       ? <span style={{ color:'#f59e0b' }}> — {summary.aiAdvisoriesAttempted} attempted, {summary.aiAdvisoriesPostSucceeded ?? 0} posted, {(summary.aiAdvisoriesPostFailed ?? 0) + (summary.aiAdvisoriesPending ?? 0)} failed/pending</span>
                       : null}){' '}<span style={{ fontSize:10, fontWeight:400, color:'var(--text-muted)' }}>— click row to see payload</span>
                   </div>
+                  {(() => {
+                    const success  = aiAdvisories.filter(a => a.source === 'OPENAI').length;
+                    const fallback = aiAdvisories.filter(a => a.source === 'FALLBACK' && !a.errorDetails).length;
+                    const errors   = aiAdvisories.filter(a => a.errorDetails).length;
+                    const adjusted = aiAdvisories.filter(a => a.errorCategory === 'VALIDATION_ADJUSTED').length;
+                    return (
+                      <div style={{ marginBottom:6, display:'flex', gap:10, fontSize:10, color:'var(--text-muted)' }}>
+                        <span>{aiAdvisories.length} total</span>
+                        {success  > 0 && <span style={{ color:'#22c55e' }}>{success} success</span>}
+                        {fallback > 0 && <span style={{ color:'#94a3b8' }}>{fallback} fallback</span>}
+                        {adjusted > 0 && <span style={{ color:'#f59e0b' }}>{adjusted} adjusted</span>}
+                        {errors   > 0 && <span style={{ color:'#ef4444' }}>{errors} error</span>}
+                      </div>
+                    );
+                  })()}
                   <div style={{ overflowX:'auto' }}>
                     <table className="bt-table">
                       <thead>
@@ -13972,7 +14126,7 @@ function TickReplayTest() {
                                 <td style={{ fontSize:10, color: a.riskLevel === 'HIGH' ? '#ef4444' : a.riskLevel === 'MEDIUM' ? '#f59e0b' : '#22c55e' }}>{a.riskLevel}</td>
                                 <td style={{ fontSize:11 }}>{a.confidence != null ? `${(a.confidence*100).toFixed(0)}%` : '—'}</td>
                                 <td style={{ fontSize:10 }}>{a.regime || '—'}</td>
-                                <td style={{ fontSize:10, color:'var(--text-muted)' }}>{a.source}</td>
+                                <td style={{ fontSize:10, color:'var(--text-muted)' }} title={a.aiApiMode && a.aiPromptMode ? `${a.aiApiMode} · ${a.aiPromptMode}` : ''}>{a.source === 'OPENAI' && a.aiModel ? a.aiModel : a.source}</td>
                                 <td style={{ fontSize:10, maxWidth:200, whiteSpace:'normal', color:'var(--text-secondary)' }}>{a.summary || '—'}</td>
                                 <td style={{ fontSize:10, textAlign:'center' }} title={a.normalized ? (a.normalizationReasons||[]).join('\n') : ''}>{a.normalized ? <span style={{ color:'#f59e0b' }}>⚠</span> : ''}</td>
                               </tr>
@@ -13985,6 +14139,21 @@ function TickReplayTest() {
                                         {a.normalizationReasons.map((reason, ri) => (
                                           <div key={ri} style={{ fontSize:10, color:'#fbbf24' }}>• {reason}</div>
                                         ))}
+                                      </div>
+                                    )}
+                                    {(a.aiModel || a.aiPromptMode) && (
+                                      <div style={{ marginBottom:8, display:'flex', gap:8, alignItems:'center', fontSize:10 }}>
+                                        <span style={{ color:'var(--text-muted)' }}>Model:</span>
+                                        <span style={{ color:'var(--text-secondary)', fontWeight:600 }}>{a.aiModel || '—'}</span>
+                                        {a.aiApiMode && <span style={{ color:'var(--text-muted)' }}>via {a.aiApiMode}</span>}
+                                        {a.aiPromptMode && <span style={{ background:'rgba(99,102,241,0.15)', padding:'1px 5px', borderRadius:3, color:'#818cf8' }}>{a.aiPromptMode}</span>}
+                                        {a.latencyMs != null && <span style={{ color:'var(--text-muted)', marginLeft:4 }}>{a.latencyMs}ms</span>}
+                                      </div>
+                                    )}
+                                    {(a.errorCategory || a.errorDetails) && (
+                                      <div style={{ marginBottom:8, padding:'4px 8px', background:'rgba(239,68,68,0.08)', border:'1px solid rgba(239,68,68,0.2)', borderRadius:4, display:'flex', gap:8, alignItems:'flex-start', flexWrap:'wrap' }}>
+                                        {a.errorCategory && <span style={{ fontSize:10, fontWeight:700, color:'#ef4444', whiteSpace:'nowrap' }}>{a.errorCategory}</span>}
+                                        {a.errorDetails && <span style={{ fontSize:10, color:'var(--text-muted)', wordBreak:'break-all' }}>{a.errorDetails}</span>}
                                       </div>
                                     )}
                                     <div style={{ display:'flex', gap:12 }}>

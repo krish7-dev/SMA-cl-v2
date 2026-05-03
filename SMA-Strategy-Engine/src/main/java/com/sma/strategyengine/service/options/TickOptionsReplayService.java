@@ -773,7 +773,7 @@ public class TickOptionsReplayService {
                 NiftyDecisionResult decision, OptionExecutionEngine execEngine,
                 CandleDto snapshot, java.time.LocalDateTime openTime) {
             java.util.Map<String, Object> m = new java.util.HashMap<>();
-            m.put("sessionId", req.getSessionId());
+            m.put("sessionId", sessionId);
             String sym = execEngine.getActiveTradingSymbol();
             m.put("symbol", sym != null ? sym : "NIFTY");
             String optType = execEngine.getActiveOptionType();
@@ -892,7 +892,7 @@ public class TickOptionsReplayService {
                 OptionExecutionEngine execEngine,
                 com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade ct) {
             java.util.Map<String, Object> m = new java.util.HashMap<>();
-            String sId = req.getSessionId();
+            String sId = sessionId;
             m.put("sessionId", sId);
             m.put("tradeId", sId + "-" + ct.getEntryTime());
             String sym = ct.getTradingSymbol();

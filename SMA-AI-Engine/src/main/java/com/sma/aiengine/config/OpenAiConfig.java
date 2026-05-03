@@ -16,4 +16,9 @@ public class OpenAiConfig {
     private boolean enabled = false;
     private int timeoutSeconds = 15;
     private int maxTokens = 1000;
+    private String apiMode = "chat_completions";  // chat_completions | responses
+    private String promptMode = "strict";          // strict | minimal | hybrid
+    private String reasoningEffort = "";           // low | medium | high (empty = omit)
+    private int reasoningTimeoutSeconds = 60;
+    private int reasoningMaxTokens = 16000;
 }
