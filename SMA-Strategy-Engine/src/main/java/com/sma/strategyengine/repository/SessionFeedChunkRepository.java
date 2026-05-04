@@ -1,6 +1,7 @@
 package com.sma.strategyengine.repository;
 
 import com.sma.strategyengine.entity.SessionFeedChunkRecord;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -25,11 +26,26 @@ public interface SessionFeedChunkRepository extends JpaRepository<SessionFeedChu
     boolean existsBySessionId(String sessionId);
 
     /**
+     * Cursor-based fetch: returns up to {@code pageable.pageSize} chunks with id > afterId, ordered ASC.
+     * Use last returned id as afterId in subsequent calls to walk forward without offset pagination.
+     * Prefer this over assembleFeedJsonNative for UI/API responses.
+     */
+    @Query("SELECT c FROM SessionFeedChunkRecord c WHERE c.sessionId = :sessionId AND c.id > :afterId ORDER BY c.id ASC")
+    List<SessionFeedChunkRecord> findBySessionIdAfterIdOrderByIdAsc(
+            @Param("sessionId") String sessionId,
+            @Param("afterId")   Long afterId,
+            Pageable pageable);
+
+    /**
      * Assembles the full feed JSON array entirely in PostgreSQL.
      * Explodes each chunk's JSON array into individual elements, re-aggregates them
      * ordered by chunk id, and returns one JSON array string.
      * Avoids loading all chunk entities into Java heap (prevents OOM on long sessions).
      * Returns null if no chunks exist for the session.
+     *
+     * <p><b>WARNING — heavy path:</b> can return 100+ MB for large sessions.
+     * Use the cursor-based {@link #findBySessionIdAfterIdOrderByIdAsc} endpoint for UI/API access.
+     * This method is retained for server-side divergence analysis only.
      */
     @Query(value = """
             SELECT COALESCE(json_agg(elem ORDER BY c.id ASC)::text, '[]')

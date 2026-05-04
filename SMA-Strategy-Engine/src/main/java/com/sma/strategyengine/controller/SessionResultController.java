@@ -1,6 +1,7 @@
 package com.sma.strategyengine.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sma.strategyengine.entity.SessionFeedChunkRecord;
 import com.sma.strategyengine.entity.SessionResultRecord;
 import com.sma.strategyengine.model.response.ApiResponse;
 import com.sma.strategyengine.repository.SessionFeedChunkRepository;
@@ -9,13 +10,17 @@ import com.sma.strategyengine.service.options.SessionDivergenceAnalyzer;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Endpoints for persisting and retrieving session comparison results.
@@ -170,6 +175,48 @@ public class SessionResultController {
      * GET /api/v1/strategy/session-results/divergence?sessionA={liveId}&sessionB={replayId}
      * </pre>
      */
+    // ── Feed chunk DTO ────────────────────────────────────────────────────────
+
+    public record FeedChunkDto(
+            Long          id,
+            String        sessionId,
+            String        chunkJson,
+            OffsetDateTime savedAt,
+            String        streamLastId) {}
+
+    // ── Paginated feed-chunks endpoint ────────────────────────────────────────
+
+    /**
+     * Cursor-paginated access to raw session_feed_chunk rows.
+     * Walk forward by passing the last returned {@code id} as {@code afterId} in the next call.
+     * Each item's {@code chunkJson} is a JSON array of candle events (up to 200 per row).
+     *
+     * <pre>
+     * GET /api/v1/strategy/session-results/{sessionId}/feed-chunks?afterId=0&amp;limit=10
+     * </pre>
+     */
+    @GetMapping("/{sessionId}/feed-chunks")
+    public ResponseEntity<ApiResponse<List<FeedChunkDto>>> getFeedChunks(
+            @PathVariable String sessionId,
+            @RequestParam(defaultValue = "0")  long afterId,
+            @RequestParam(defaultValue = "10") int  limit) {
+
+        int capped = Math.min(limit, 50);
+        List<SessionFeedChunkRecord> rows = chunkRepository.findBySessionIdAfterIdOrderByIdAsc(
+                sessionId, afterId, PageRequest.of(0, capped));
+
+        List<FeedChunkDto> dtos = rows.stream()
+                .map(r -> new FeedChunkDto(
+                        r.getId(),
+                        r.getSessionId(),
+                        r.getChunkJson(),
+                        r.getSavedAt() != null ? r.getSavedAt().atOffset(ZoneOffset.UTC) : null,
+                        r.getStreamLastId()))
+                .collect(Collectors.toList());
+
+        return ResponseEntity.ok(ApiResponse.ok(dtos));
+    }
+
     @GetMapping("/divergence")
     public ResponseEntity<ApiResponse<SessionDivergenceAnalyzer.DivergenceReport>> divergence(
             @RequestParam String sessionA,

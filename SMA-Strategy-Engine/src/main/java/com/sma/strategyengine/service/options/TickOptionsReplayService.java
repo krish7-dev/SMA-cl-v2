@@ -240,6 +240,17 @@ public class TickOptionsReplayService {
 
         void broadcastError(String message) { broadcast("error", "\"" + message + "\""); }
 
+        /** Strips closedTrades and candidates for DB storage — SSE broadcast still sends the full event. */
+        private String toChunkJson(OptionsReplayCandleEvent event) {
+            try {
+                return objectMapper.writeValueAsString(
+                        event.toBuilder().closedTrades(null).candidates(null).build());
+            } catch (Exception e) {
+                log.warn("TICK_REPLAY toChunkJson failed session={}: {}", sessionId, e.getMessage());
+                try { return objectMapper.writeValueAsString(event); } catch (Exception ex) { return "{}"; }
+            }
+        }
+
         void persistChunk() {
             if (chunkBuffer.isEmpty()) return;
             try {
@@ -253,6 +264,8 @@ public class TickOptionsReplayService {
                         req.getBrokerName() != null ? req.getBrokerName() : "kite",
                         sessionDate, json);
                 emittedChunks++;
+                log.debug("TICK_REPLAY chunk persisted: sessionId={} chunk={} bytes={}",
+                        sessionId, emittedChunks, json.length());
             } catch (Exception e) {
                 log.warn("TICK_REPLAY chunk persist failed: sessionId={} size={} error={}",
                         sessionId, chunkBuffer.size(), e.getMessage());
@@ -288,15 +301,25 @@ public class TickOptionsReplayService {
         }
 
         private void broadcast(String eventName, String data) {
+            broadcast(eventName, data, null);
+        }
+
+        /**
+         * @param data      Full event JSON — sent to SSE emitters unchanged.
+         * @param chunkData Compact event JSON (closedTrades/candidates stripped) — stored in session_feed_chunk.
+         *                  If null, falls back to data for storage (non-candle events).
+         */
+        private void broadcast(String eventName, String data, String chunkData) {
             if ("candle".equals(eventName) || "init".equals(eventName) || "summary".equals(eventName) || "warning".equals(eventName)) {
                 synchronized (bufferLock) {
                     if (eventBuffer.size() >= BUFFER_SIZE) eventBuffer.pollFirst();
                     eventBuffer.addLast(new String[]{ eventName, data });
                 }
             }
-            // Persist candle events to DB in batches — only when saveForCompare is requested
+            // Persist compact chunkData (closedTrades/candidates stripped) to avoid repeated bloat.
+            // saveForCompare gate is unchanged — no chunks written when false.
             if (req.isSaveForCompare() && "candle".equals(eventName)) {
-                chunkBuffer.add(data);
+                chunkBuffer.add(chunkData != null ? chunkData : data);
                 if (chunkBuffer.size() >= CHUNK_SIZE) {
                     persistChunk();
                 }
@@ -753,7 +776,9 @@ public class TickOptionsReplayService {
                         emittedCount, snapshot, decision, execEngine, selectorService,
                         openTime, action, optCandle, marketPhase, tradable);
 
-                broadcast("candle", objectMapper.writeValueAsString(event));
+                String fullJson  = objectMapper.writeValueAsString(event);
+                String chunkJson = req.isSaveForCompare() ? toChunkJson(event) : null;
+                broadcast("candle", fullJson, chunkJson);
 
                 // ── divergence debug (log.debug — enable via logging.level.com.sma=DEBUG) ─
                 if (log.isDebugEnabled()) {

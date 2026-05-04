@@ -534,8 +534,28 @@ public class OptionsLiveService {
             }
         }
 
+        /** Strips closedTrades and candidates for DB/Redis storage — SSE broadcast still sends the full event. */
+        private String toChunkJson(OptionsReplayCandleEvent event) {
+            try {
+                return objectMapper.writeValueAsString(
+                        event.toBuilder().closedTrades(null).candidates(null).build());
+            } catch (Exception e) {
+                log.warn("LIVE toChunkJson failed session={}: {}", sessionId, e.getMessage());
+                try { return objectMapper.writeValueAsString(event); } catch (Exception ex) { return "{}"; }
+            }
+        }
+
         /** Sends a named event to all connected emitters; silently removes dead ones. */
         private void broadcast(String eventName, String data) {
+            broadcast(eventName, data, null);
+        }
+
+        /**
+         * @param data      Full event JSON — sent to SSE emitters unchanged.
+         * @param chunkData Compact event JSON (closedTrades/candidates stripped) — sent to Redis/DB.
+         *                  If null, falls back to data (used by non-candle events).
+         */
+        private void broadcast(String eventName, String data, String chunkData) {
             // Buffer the event for late-joining UIs (candle, init, warning events)
             if ("candle".equals(eventName) || "init".equals(eventName) || "warning".equals(eventName)) {
                 synchronized (bufferLock) {
@@ -543,10 +563,11 @@ public class OptionsLiveService {
                     eventBuffer.addLast(new String[]{ eventName, data });
                 }
             }
-            // Persist candle events to Redis Stream → RedisFeedDrainer → session_feed_chunk DB.
-            // No in-memory feedList — hot path is a single XADD (sub-ms).
+            // Persist compact chunkData to Redis → RedisFeedDrainer → session_feed_chunk.
+            // Unconditional for live: prevents OOM from end-of-day single-save.
+            // SSE fan-out (below) still receives the full data unchanged.
             if ("candle".equals(eventName)) {
-                xaddFeedEvent(data);
+                xaddFeedEvent(chunkData != null ? chunkData : data);
             }
             if (emitters.isEmpty()) return;
             List<SseEmitter> dead = null;
@@ -1125,7 +1146,12 @@ public class OptionsLiveService {
                         emittedCount, snapshot, decision, execEngine, selectorService,
                         openTime, action, marketPhase, tradable);
 
-                broadcast("candle", objectMapper.writeValueAsString(event));
+                String fullJson  = objectMapper.writeValueAsString(event);
+                String chunkJson = toChunkJson(event);
+                log.debug("LIVE candle event: sessionId={} fullBytes={} chunkBytes={} reduction={}%",
+                        sessionId, fullJson.length(), chunkJson.length(),
+                        (int) ((1.0 - (double) chunkJson.length() / fullJson.length()) * 100));
+                broadcast("candle", fullJson, chunkJson);
 
                 // ── divergence debug (enable via logging.level.com.sma=DEBUG) ──
                 if (log.isDebugEnabled()) {
