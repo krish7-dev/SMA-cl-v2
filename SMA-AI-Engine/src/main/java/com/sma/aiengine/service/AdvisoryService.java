@@ -42,6 +42,14 @@ public class AdvisoryService {
             - PE is a put option and generally benefits when NIFTY moves down.
             - side = LONG_OPTION means the option is bought.
 
+            CANDLE SEMANTICS (instrumentContext=UNDERLYING — recentCandles are NIFTY price candles, not option premium):
+            - Long PE (bearish): DOWN underlying candles SUPPORT the trade. UP candles OPPOSE the trade.
+            - Long CE (bullish): UP underlying candles SUPPORT the trade. DOWN candles OPPOSE the trade.
+            Use the precomputed field recentMomentumAlignment (SUPPORTS_TRADE | OPPOSES_TRADE | MIXED) directly.
+            Do NOT re-derive direction alignment from raw candles if recentMomentumAlignment is provided.
+            If recentMomentumAlignment=SUPPORTS_TRADE → candles favor entry. Do NOT say candles contradict this trade.
+            If recentMomentumAlignment=OPPOSES_TRADE → candles work against entry. Increase reversalRisk.
+
             Analyze the provided payload and decide whether the candidate should be ALLOW, CAUTION, AVOID, or UNKNOWN.
 
             Use the available data: recent candles, option type, strategy scores, regime, ADX, ATR, previous trade context, filters, and current trade context.
@@ -58,6 +66,14 @@ public class AdvisoryService {
             - CE is a call option and generally benefits when NIFTY moves up.
             - PE is a put option and generally benefits when NIFTY moves down.
             - side = LONG_OPTION means the option is bought.
+
+            CANDLE SEMANTICS (instrumentContext=UNDERLYING — recentCandles are NIFTY price candles, not option premium):
+            - Long PE (bearish): DOWN underlying candles SUPPORT the trade. UP candles OPPOSE the trade.
+            - Long CE (bullish): UP underlying candles SUPPORT the trade. DOWN candles OPPOSE the trade.
+            Use the precomputed field recentMomentumAlignment (SUPPORTS_TRADE | OPPOSES_TRADE | MIXED) directly.
+            Do NOT re-derive direction alignment from raw candles if recentMomentumAlignment is provided.
+            If recentMomentumAlignment=SUPPORTS_TRADE → candles favor entry. Do NOT say candles contradict this trade.
+            If recentMomentumAlignment=OPPOSES_TRADE → candles work against entry. Increase reversalRisk.
 
             Think like a cautious intraday options trader. Evaluate whether the trade has enough confirmation, whether the recent candles support the option direction, whether the previous trade creates reversal risk, and whether the market regime/score context supports the entry.
 
@@ -97,6 +113,17 @@ public class AdvisoryService {
             Both CE and PE are BUY (long) positions. side = LONG_OPTION for both.
             Use currentTradeDirection from the payload (BULLISH for CE, BEARISH for PE).
             NEVER describe PE as bullish. NEVER describe CE as bearish.
+
+            CANDLE SEMANTICS — instrumentContext=UNDERLYING means recentCandles are NIFTY price candles (NOT option premium).
+            The payload includes precomputed alignment fields. Use them directly — do NOT re-derive from raw candle data:
+              recentMomentumAlignment        = SUPPORTS_TRADE | OPPOSES_TRADE | MIXED
+              recentCandlesSupportTradeCount = candles that favor this trade (DOWN for PE, UP for CE)
+              recentCandlesOpposeTradeCount  = candles that work against this trade
+              lastCandleSupportsTrade        = true/false — whether the most recent candle favors this trade
+            RULE: If recentMomentumAlignment=SUPPORTS_TRADE → candles favor this entry. Do NOT say candles contradict or oppose this trade.
+            RULE: If recentMomentumAlignment=OPPOSES_TRADE  → candles work against entry. Increase reversalRisk and consider CAUTION.
+            RULE: If recentMomentumAlignment=MIXED          → neutral momentum; evaluate other factors.
+            NEVER call DOWN candles unfavorable for PE. NEVER call UP candles unfavorable for CE.
 
             ══════════════════════════════════════════════════════════
             SECTION 2 — BOOLEAN GATING (check payload booleans first, always)
@@ -490,6 +517,40 @@ public class AdvisoryService {
             }
             if (!warningCodes.contains("AI_DIRECTION_REASONING_INVALID")) {
                 warningCodes.add("AI_DIRECTION_REASONING_INVALID");
+            }
+        }
+
+        // ── Momentum alignment contradiction check ────────────────────────────
+        // Catches AI saying "candles contradict PE" when DOWN candles actually support PE, etc.
+        String momentumAlignment = req.getRecentMomentumAlignment();
+        if (momentumAlignment != null && output.summary() != null) {
+            String sl = output.summary().toLowerCase(Locale.ROOT);
+            if ("SUPPORTS_TRADE".equals(momentumAlignment)) {
+                boolean aiSaysContradicts = sl.contains("contradict") || sl.contains("candles oppose")
+                        || sl.contains("momentum opposite") || sl.contains("momentum_opposite")
+                        || sl.contains("candles work against") || sl.contains("recent candles against");
+                if (aiSaysContradicts) {
+                    String msg = "MOMENTUM_ALIGNMENT_CONTRADICTION: recentMomentumAlignment=SUPPORTS_TRADE "
+                            + "but summary implies candles contradict trade direction.";
+                    warnings.add(msg);
+                    log.warn("[{}] VALIDATION_WARNING: {}", requestId, msg);
+                    if (!warningCodes.contains("AI_DIRECTION_REASONING_INVALID")) {
+                        warningCodes.add("AI_DIRECTION_REASONING_INVALID");
+                    }
+                }
+            } else if ("OPPOSES_TRADE".equals(momentumAlignment)) {
+                boolean aiSaysSupports = (sl.contains("candles support") || sl.contains("momentum supports")
+                        || sl.contains("candles align") || sl.contains("candles favor"))
+                        && !sl.contains("not") && !sl.contains("don't") && !sl.contains("do not");
+                if (aiSaysSupports) {
+                    String msg = "MOMENTUM_ALIGNMENT_CONTRADICTION: recentMomentumAlignment=OPPOSES_TRADE "
+                            + "but summary implies candles support trade direction.";
+                    warnings.add(msg);
+                    log.warn("[{}] VALIDATION_WARNING: {}", requestId, msg);
+                    if (!warningCodes.contains("AI_DIRECTION_REASONING_INVALID")) {
+                        warningCodes.add("AI_DIRECTION_REASONING_INVALID");
+                    }
+                }
             }
         }
 

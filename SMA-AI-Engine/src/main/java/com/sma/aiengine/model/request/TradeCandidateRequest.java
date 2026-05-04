@@ -68,4 +68,11 @@ public class TradeCandidateRequest {
 
     // Last ≤5 completed NIFTY candles — compact shape only, no raw ticks
     private List<Map<String, Object>> recentCandles;
+
+    // Precomputed candle alignment — prevents AI from re-deriving direction and getting it wrong
+    private String  instrumentContext;              // UNDERLYING (recentCandles = NIFTY candles, not option premium)
+    private Integer recentCandlesSupportTradeCount; // DOWN count for PE, UP count for CE
+    private Integer recentCandlesOpposeTradeCount;  // UP count for PE, DOWN count for CE
+    private Boolean lastCandleSupportsTrade;         // true if most recent candle favors this trade
+    private String  recentMomentumAlignment;         // SUPPORTS_TRADE | OPPOSES_TRADE | MIXED
 }

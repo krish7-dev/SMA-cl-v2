@@ -46,6 +46,9 @@ public class TradeReviewService {
 
             Use the available data: P&L, P&L %, entry/exit reason, MFE/MAE, recent candles, option type, strategy scores, regime, ADX, ATR, previous trade context, filters, and trade context.
 
+            confidence = your certainty in this review classification (NOT trade-taking confidence):
+              clear GOOD trade: 0.70–0.90 | clear BAD avoidable mistake: 0.75–0.95 | NEUTRAL/mixed/debatable: 0.45–0.70 | UNKNOWN/insufficient data: 0.00–0.40
+
             Return only valid JSON using exactly these keys — no other keys allowed:
             {"quality":"GOOD|BAD|NEUTRAL|UNKNOWN","avoidable":true|false,"mistakeType":"NONE|REVERSAL_TRAP|LATE_ENTRY|BAD_EXIT|WEAK_CONFIRMATION|OVEREXTENSION|CHOP_ENTRY|UNKNOWN","confidence":0.0,"summary":"","whatWorked":[],"whatFailed":[],"suggestedRule":"","reasonCodes":[],"warningCodes":[]}
             """;
@@ -61,6 +64,9 @@ public class TradeReviewService {
             Think like a trade journal reviewer. Judge whether the trade was good, bad, or neutral using the actual outcome and the information available around entry. Identify if the mistake was avoidable, whether there was a reversal trap, weak confirmation, late entry, chop entry, bad exit, or no clear mistake.
 
             Do not mechanically follow one field. Weigh the full context.
+
+            confidence = your certainty in this review classification (NOT trade-taking confidence):
+              clear GOOD trade: 0.70–0.90 | clear BAD avoidable mistake: 0.75–0.95 | NEUTRAL/mixed/debatable: 0.45–0.70 | UNKNOWN/insufficient data: 0.00–0.40
 
             Return only valid JSON using exactly these keys — no other keys allowed:
             {"quality":"GOOD|BAD|NEUTRAL|UNKNOWN","avoidable":true|false,"mistakeType":"NONE|REVERSAL_TRAP|LATE_ENTRY|BAD_EXIT|WEAK_CONFIRMATION|OVEREXTENSION|CHOP_ENTRY|UNKNOWN","confidence":0.0,"summary":"","whatWorked":[],"whatFailed":[],"suggestedRule":"","reasonCodes":[],"warningCodes":[]}
@@ -176,7 +182,7 @@ public class TradeReviewService {
               "quality": "GOOD | BAD | NEUTRAL | UNKNOWN",
               "avoidable": true | false,
               "mistakeType": "NONE | REVERSAL_TRAP | LATE_ENTRY | BAD_EXIT | WEAK_CONFIRMATION | OVEREXTENSION | CHOP_ENTRY | UNKNOWN",
-              "confidence": 0.0-1.0,
+              "confidence": 0.0-1.0  (certainty in this review — clear GOOD: 0.70-0.90, clear BAD avoidable: 0.75-0.95, NEUTRAL/mixed: 0.45-0.70, UNKNOWN/insufficient: 0.00-0.40),
               "summary": "1-2 sentences on root cause. State direction correctly (CE=bullish, PE=bearish).",
               "whatWorked": ["factor"],
               "whatFailed": ["factor"],
@@ -423,6 +429,15 @@ public class TradeReviewService {
             "opposing trade direction", "moved against", "failed to confirm"
     );
 
+    // Sentences that mention an adverse outcome should NOT be flagged as direction contradictions,
+    // even if they contain a direction keyword and a favorable-sounding word.
+    // e.g. "market resumed upward, hitting the stop and producing a -6% loss" is correct PE analysis.
+    private static final Set<String> ADVERSE_OUTCOME_KEYWORDS = Set.of(
+            "loss", "lost", "losing", "stopped out", "hit the stop", "hitting the stop",
+            "adverse", "failed", "against the", "hurt the", "causing a loss",
+            "resulted in a loss", "producing a loss", "cost the trade", "causing the trade to fail"
+    );
+
     private NormalizedReview normalizeReview(TradeReviewAiOutput raw, CompletedTradeRequest req, String requestId) {
         List<String> reasons = new ArrayList<>();
 
@@ -581,12 +596,43 @@ public class TradeReviewService {
             }
         }
 
+        // ── Confidence floor guardrails ───────────────────────────────────────
+        double confidence = raw.confidence();
+
+        // Clear GOOD: strong profit, minimal adverse excursion, no mistake
+        if (quality == TradeQuality.GOOD && !avoidable && mistakeType == MistakeType.NONE
+                && pnlPct != null && pnlPct > 3.0
+                && (req.getMaxAdverseExcursionPct() == null || req.getMaxAdverseExcursionPct() > -3.0)
+                && confidence < 0.65) {
+            reasons.add("CONFIDENCE_FLOOR: GOOD clear trade (pnlPct=" + pnlPct + ") → floor 0.65");
+            log.info("[{}] Confidence floored: {}→0.65 (GOOD trade pnlPct={} lowMAE)", requestId, confidence, pnlPct);
+            confidence = 0.65;
+        }
+
+        // Clear BAD: avoidable, significant loss
+        if (quality == TradeQuality.BAD && avoidable && pnlPct != null && pnlPct < -3.0
+                && confidence < 0.70) {
+            reasons.add("CONFIDENCE_FLOOR: BAD avoidable trade (pnlPct=" + pnlPct + ") → floor 0.70");
+            log.info("[{}] Confidence floored: {}→0.70 (BAD avoidable pnlPct={})", requestId, confidence, pnlPct);
+            confidence = 0.70;
+        }
+
+        // Confirmed reversal trap: boolean flags leave no ambiguity
+        if (mistakeType == MistakeType.REVERSAL_TRAP
+                && Boolean.TRUE.equals(req.getPreviousTradeWasStrongWinner())
+                && Boolean.TRUE.equals(req.getIsOppositeSideAfterStrongWinner())
+                && confidence < 0.75) {
+            reasons.add("CONFIDENCE_FLOOR: REVERSAL_TRAP confirmed by boolean flags → floor 0.75");
+            log.info("[{}] Confidence floored: {}→0.75 (REVERSAL_TRAP confirmed)", requestId, confidence);
+            confidence = 0.75;
+        }
+
         if (!reasons.isEmpty()) {
             log.info("[{}] Normalization applied for tradeId={}: {}", requestId, req.getTradeId(), reasons);
         }
 
         TradeReviewAiOutput normalized = new TradeReviewAiOutput(
-                quality, avoidable, mistakeType, raw.confidence(),
+                quality, avoidable, mistakeType, confidence,
                 raw.summary(), raw.whatWorked(), whatFailed,
                 raw.suggestedRule(), reasonCodes, warningCodes);
 
@@ -597,11 +643,14 @@ public class TradeReviewService {
         String[] sentences = summary.split("[.!?]+\\s*");
         for (String s : sentences) {
             if (s.isBlank()) continue;
-            boolean hasDir  = directionKeywords.stream().anyMatch(s::contains);
-            boolean hasFav  = FAVORABLE_OUTCOME_KEYWORDS.stream().anyMatch(s::contains);
-            boolean hasPrev = PREVIOUS_CONTEXT_PHRASES.stream().anyMatch(s::contains);
-            boolean hasNeg  = NEGATION_PHRASES.stream().anyMatch(s::contains);
-            if (hasDir && hasFav && !hasPrev && !hasNeg) return true;
+            boolean hasDir     = directionKeywords.stream().anyMatch(s::contains);
+            boolean hasFav     = FAVORABLE_OUTCOME_KEYWORDS.stream().anyMatch(s::contains);
+            boolean hasPrev    = PREVIOUS_CONTEXT_PHRASES.stream().anyMatch(s::contains);
+            boolean hasNeg     = NEGATION_PHRASES.stream().anyMatch(s::contains);
+            // Only flag if the sentence does NOT describe the direction as causing a loss.
+            // e.g. "market resumed upward, hitting the stop at -6% loss" is correct PE analysis.
+            boolean hasAdverse = ADVERSE_OUTCOME_KEYWORDS.stream().anyMatch(s::contains);
+            if (hasDir && hasFav && !hasPrev && !hasNeg && !hasAdverse) return true;
         }
         return false;
     }

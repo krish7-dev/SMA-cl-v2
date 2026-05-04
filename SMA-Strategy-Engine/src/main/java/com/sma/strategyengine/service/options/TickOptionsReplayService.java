@@ -883,6 +883,26 @@ public class TickOptionsReplayService {
                 m.put("currentTradeDirectionExplanation",
                         "CE".equals(optType) ? "CE (Call) benefits when NIFTY moves UP. UP candles are favorable." :
                         "PE".equals(optType) ? "PE (Put) benefits when NIFTY moves DOWN. DOWN candles are favorable." : null);
+
+                // Precomputed candle alignment — AI must use these instead of re-deriving from raw candles
+                // PE is bearish: DOWN candles support, UP candles oppose.
+                // CE is bullish: UP candles support, DOWN candles oppose.
+                m.put("instrumentContext", "UNDERLYING");
+                int supportCount = "CE".equals(optType) ? upCnt : "PE".equals(optType) ? downCnt : 0;
+                int opposeCount  = "CE".equals(optType) ? downCnt : "PE".equals(optType) ? upCnt : 0;
+                m.put("recentCandlesSupportTradeCount", supportCount);
+                m.put("recentCandlesOpposeTradeCount",  opposeCount);
+                boolean lastSupports = false;
+                if (!rc.isEmpty()) {
+                    String lastDir = (String) rc.get(rc.size() - 1).getOrDefault("direction", "DOJI");
+                    lastSupports = ("CE".equals(optType) && "UP".equals(lastDir))
+                               || ("PE".equals(optType) && "DOWN".equals(lastDir));
+                }
+                m.put("lastCandleSupportsTrade", lastSupports);
+                String momentumAlignment = supportCount > opposeCount ? "SUPPORTS_TRADE"
+                                         : opposeCount > supportCount ? "OPPOSES_TRADE"
+                                         : "MIXED";
+                m.put("recentMomentumAlignment", momentumAlignment);
             }
             return m;
         }
