@@ -811,8 +811,10 @@ public class OptionsLiveService {
                     Optional.ofNullable(req.getStopLossCascadeProtectionConfig()).orElse(new OptionsReplayRequest.StopLossCascadeProtectionConfig());
             OptionsReplayRequest.RealTrendConfig rtc =
                     Optional.ofNullable(req.getRealTrendConfig()).orElse(new OptionsReplayRequest.RealTrendConfig());
+            OptionsReplayRequest.NoNewTradesAfterTimeConfig nntac =
+                    Optional.ofNullable(req.getNoNewTradesAfterTimeConfig()).orElse(new OptionsReplayRequest.NoNewTradesAfterTimeConfig());
             decisionEngine  = new NiftyDecisionEngine(
-                    strategyRegistry, req.getStrategies(), dc, sc, rr, rsr, cr, rqc, tqc, tec, cec, pc, mmfc, dcfc, csfc, null, slcpc, rtc);
+                    strategyRegistry, req.getStrategies(), dc, sc, rr, rsr, cr, rqc, tqc, tec, cec, pc, mmfc, dcfc, csfc, nntac, slcpc, rtc);
 
             // Pass live map by reference — new candles added to liveOptionCandles are visible immediately
             selectorService = OptionSelectorService.forLive(sel, liveOptionCandles);

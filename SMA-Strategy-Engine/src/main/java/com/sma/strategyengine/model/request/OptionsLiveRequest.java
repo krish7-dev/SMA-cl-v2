@@ -115,6 +115,9 @@ public class OptionsLiveRequest {
     // Stop loss cascade protection
     private OptionsReplayRequest.StopLossCascadeProtectionConfig stopLossCascadeProtectionConfig = new OptionsReplayRequest.StopLossCascadeProtectionConfig();
 
+    // No new trades after a specified time
+    private OptionsReplayRequest.NoNewTradesAfterTimeConfig noNewTradesAfterTimeConfig = new OptionsReplayRequest.NoNewTradesAfterTimeConfig();
+
     // Trading hours filtering
     private OptionsReplayRequest.TradingHoursConfig tradingHoursConfig;
 

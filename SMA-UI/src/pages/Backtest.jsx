@@ -1092,6 +1092,7 @@ function OptionsLiveTest() {
   const [candleStrengthFilter,           setCandleStrengthFilter]           = useState(() => ls('sma_live_opts_candle_strength_filter',           DEFAULT_CANDLE_STRENGTH_FILTER));
   const [cascadeProtection,              setCascadeProtection]              = useState(() => ls('sma_live_opts_cascade_protection',              DEFAULT_CASCADE_PROTECTION));
   const [realTrendConfig,                setRealTrendConfig]                = useState(() => ls('sma_live_opts_real_trend_config',                DEFAULT_REAL_TREND_CONFIG));
+  const [noNewTradesAfterTime,           setNoNewTradesAfterTime]           = useState(() => ls('sma_live_opts_no_new_trades_after_time',          DEFAULT_NO_NEW_TRADES_AFTER_TIME));
 
   function updateOptsRisk(key, val)                    { setOptsRisk(p                      => ({ ...p, [key]: val })); }
   function updateRangeQuality(key, val)                { setRangeQuality(p                  => ({ ...p, [key]: val })); }
@@ -1105,6 +1106,7 @@ function OptionsLiveTest() {
   function updateMinMovementFilter(key, val)           { setMinMovementFilter(p             => ({ ...p, [key]: val })); }
   function updateDirectionalConsistencyFilter(key, val){ setDirectionalConsistencyFilter(p  => ({ ...p, [key]: val })); }
   function updateCandleStrengthFilter(key, val)        { setCandleStrengthFilter(p          => ({ ...p, [key]: val })); }
+  function updateNoNewTradesAfterTime(key, val)        { setNoNewTradesAfterTime(p          => ({ ...p, [key]: val })); }
 
   // ── Config presets (shared with Options Replay — same sma_opts_presets key) ──
   const [presets, setPresets] = useState(() => {
@@ -1122,16 +1124,19 @@ function OptionsLiveTest() {
       optsRegimeCfg, chopRules, tradingRules, regimeRules, regimeStrategyRules,
       optsRisk, rangeQuality, tradeQuality, trendEntry, compressionEntry,
       holdConfig, exitConfig, penaltyConfig, minMovementFilter, directionalConsistencyFilter, candleStrengthFilter,
+      noNewTradesAfterTime,
       cascadeProtection, realTrendConfig,
     };
   }
 
   const selectedPresetId = (() => {
-    const { nifty: _n, cePool: _ce, pePool: _pe, ...currentCmp } = capturePresetConfig();
-    const current = JSON.stringify(currentCmp);
+    const { nifty: _n, cePool: _ce, pePool: _pe, warmupDays: _w, ...currentCmp } = capturePresetConfig();
+    const sortKeys = o => Object.keys(o).sort().reduce((a, k) => { a[k] = o[k]; return a; }, {});
     return presets.find(p => {
-      const { nifty: _n2, cePool: _ce2, pePool: _pe2, ...presetCmp } = p.config;
-      return JSON.stringify(presetCmp) === current;
+      const { nifty: _n2, cePool: _ce2, pePool: _pe2, warmupDays: _w2, ...presetCmp } = p.config;
+      // Only compare keys the preset actually has — fields added after a preset was saved don't disqualify it
+      const c = Object.keys(presetCmp).reduce((a, k) => { if (k in currentCmp) a[k] = currentCmp[k]; return a; }, {});
+      return JSON.stringify(sortKeys(c)) === JSON.stringify(sortKeys(presetCmp));
     })?.id ?? null;
   })();
 
@@ -1178,6 +1183,7 @@ function OptionsLiveTest() {
     setCandleStrengthFilter(c.candleStrengthFilter ?? DEFAULT_CANDLE_STRENGTH_FILTER);
     setCascadeProtection(c.cascadeProtection ?? DEFAULT_CASCADE_PROTECTION);
     setRealTrendConfig({ ...DEFAULT_REAL_TREND_CONFIG, ...(c.realTrendConfig ?? {}) });
+    setNoNewTradesAfterTime(c.noNewTradesAfterTime ?? DEFAULT_NO_NEW_TRADES_AFTER_TIME);
   }
 
   function deletePreset(id) {
@@ -1267,6 +1273,7 @@ function OptionsLiveTest() {
   useEffect(() => { try { localStorage.setItem('sma_live_opts_candle_strength_filter',           JSON.stringify(candleStrengthFilter));          } catch {} }, [candleStrengthFilter]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_cascade_protection',            JSON.stringify(cascadeProtection));             } catch {} }, [cascadeProtection]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_real_trend_config',             JSON.stringify(realTrendConfig));               } catch {} }, [realTrendConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_no_new_trades_after_time',      JSON.stringify(noNewTradesAfterTime));          } catch {} }, [noNewTradesAfterTime]);
 
   // ── Session / run state
   const [status,    setStatus]    = useState('idle'); // idle|running|error
@@ -1654,6 +1661,7 @@ function OptionsLiveTest() {
         minRangeExpansion:  parseFloat(realTrendConfig.minRangeExpansion)  || 1.2,
         minPersistBars:     parseInt(realTrendConfig.minPersistBars,   10) || 2,
       } : { enabled: false },
+      noNewTradesAfterTimeConfig: noNewTradesAfterTime.enabled ? { enabled: true, noNewTradesAfterTime: noNewTradesAfterTime.noNewTradesAfterTime || '14:45' } : { enabled: false },
       tradingHoursConfig: {
         enabled: tradingHoursEnabled,
         noNewEntriesMinutesBeforeClose: parseInt(closeoutMins, 10) || 15,
@@ -3160,6 +3168,20 @@ function OptionsLiveTest() {
                     onChange={e => updateCandleStrengthFilter(key, e.target.value)} />
                 </div>
               ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── No New Trades After Time ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>No New Trades After</span>
+            <button type="button" className={`btn-sm ${noNewTradesAfterTime.enabled ? 'btn-primary' : 'btn-secondary'}`} onClick={() => updateNoNewTradesAfterTime('enabled', !noNewTradesAfterTime.enabled)} disabled={isRunning}>{noNewTradesAfterTime.enabled ? 'ON' : 'OFF'}</button>
+            <span style={{ fontSize: 11, color: '#6366f1', fontWeight: 600 }}>pre-trade filter</span>
+          </div>
+          {noNewTradesAfterTime.enabled && (
+            <div className="bt-form-grid">
+              <div className="form-group"><label>Time (HH:MM)</label><input type="time" value={noNewTradesAfterTime.noNewTradesAfterTime} onChange={e => updateNoNewTradesAfterTime('noNewTradesAfterTime', e.target.value)} disabled={isRunning} /></div>
             </div>
           )}
         </div>
@@ -9802,6 +9824,7 @@ function OptionsReplayTest() {
   const [candleStrengthFilter,           setCandleStrengthFilter]           = useState(() => ls('sma_opts_candle_strength_filter',                   DEFAULT_CANDLE_STRENGTH_FILTER));
   const [cascadeProtection,              setCascadeProtection]              = useState(() => ls('sma_opts_cascade_protection',              DEFAULT_CASCADE_PROTECTION));
   const [realTrendConfig,                setRealTrendConfig]                = useState(() => ls('sma_opts_real_trend_config',                DEFAULT_REAL_TREND_CONFIG));
+  const [noNewTradesAfterTime,           setNoNewTradesAfterTime]           = useState(() => ls('sma_opts_no_new_trades_after_time',          DEFAULT_NO_NEW_TRADES_AFTER_TIME));
 
   function updateOptsRisk(key, val)                    { setOptsRisk(p                      => ({ ...p, [key]: val })); }
   function updateRangeQuality(key, val)                { setRangeQuality(p                  => ({ ...p, [key]: val })); }
@@ -9814,6 +9837,7 @@ function OptionsReplayTest() {
   function updateMinMovementFilter(key, val)           { setMinMovementFilter(p             => ({ ...p, [key]: val })); }
   function updateDirectionalConsistencyFilter(key, val){ setDirectionalConsistencyFilter(p  => ({ ...p, [key]: val })); }
   function updateCandleStrengthFilter(key, val)        { setCandleStrengthFilter(p          => ({ ...p, [key]: val })); }
+  function updateNoNewTradesAfterTime(key, val)        { setNoNewTradesAfterTime(p          => ({ ...p, [key]: val })); }
 
   function updateCascadeProtection(key, val)           { setCascadeProtection(p             => ({ ...p, [key]: val })); }
   // ── Persist to localStorage on change
@@ -9847,16 +9871,18 @@ function OptionsReplayTest() {
       optsRegimeCfg, chopRules, tradingRules, regimeRules, regimeStrategyRules,
       optsRisk, rangeQuality, tradeQuality, trendEntry, compressionEntry,
       holdConfig, exitConfig, penaltyConfig, minMovementFilter, directionalConsistencyFilter, candleStrengthFilter,
+      noNewTradesAfterTime,
       cascadeProtection, realTrendConfig,
     };
   }
 
   const selectedPresetId = (() => {
-    const { nifty: _n, cePool: _ce, pePool: _pe, ...currentCmp } = capturePresetConfig();
-    const current = JSON.stringify(currentCmp);
+    const { nifty: _n, cePool: _ce, pePool: _pe, warmupDays: _w, ...currentCmp } = capturePresetConfig();
+    const sortKeys = o => Object.keys(o).sort().reduce((a, k) => { a[k] = o[k]; return a; }, {});
     return presets.find(p => {
-      const { nifty: _n2, cePool: _ce2, pePool: _pe2, ...presetCmp } = p.config;
-      return JSON.stringify(presetCmp) === current;
+      const { nifty: _n2, cePool: _ce2, pePool: _pe2, warmupDays: _w2, ...presetCmp } = p.config;
+      const c = Object.keys(presetCmp).reduce((a, k) => { if (k in currentCmp) a[k] = currentCmp[k]; return a; }, {});
+      return JSON.stringify(sortKeys(c)) === JSON.stringify(sortKeys(presetCmp));
     })?.id ?? null;
   })();
 
@@ -9901,6 +9927,7 @@ function OptionsReplayTest() {
     setMinMovementFilter(c.minMovementFilter ?? DEFAULT_MIN_MOVEMENT_FILTER);
     setDirectionalConsistencyFilter(c.directionalConsistencyFilter ?? DEFAULT_DIRECTIONAL_CONSISTENCY_FILTER);
     setCandleStrengthFilter(c.candleStrengthFilter ?? DEFAULT_CANDLE_STRENGTH_FILTER);
+    setNoNewTradesAfterTime(c.noNewTradesAfterTime ?? DEFAULT_NO_NEW_TRADES_AFTER_TIME);
     setCascadeProtection(c.cascadeProtection ?? DEFAULT_CASCADE_PROTECTION);
     setRealTrendConfig({ ...DEFAULT_REAL_TREND_CONFIG, ...(c.realTrendConfig ?? {}) });
   }
@@ -9987,6 +10014,7 @@ function OptionsReplayTest() {
   useEffect(() => { try { localStorage.setItem('sma_opts_candle_strength_filter',           JSON.stringify(candleStrengthFilter));          } catch {} }, [candleStrengthFilter]);
   useEffect(() => { try { localStorage.setItem('sma_opts_cascade_protection',            JSON.stringify(cascadeProtection));             } catch {} }, [cascadeProtection]);
   useEffect(() => { try { localStorage.setItem('sma_opts_real_trend_config',             JSON.stringify(realTrendConfig));               } catch {} }, [realTrendConfig]);
+  useEffect(() => { try { localStorage.setItem('sma_opts_no_new_trades_after_time',      JSON.stringify(noNewTradesAfterTime));           } catch {} }, [noNewTradesAfterTime]);
 
   // ── Run state
   const [status,   setStatus]   = useState('idle'); // idle|running|completed|error
@@ -10737,6 +10765,7 @@ function OptionsReplayTest() {
         minRangeExpansion:  parseFloat(realTrendConfig.minRangeExpansion)  || 1.2,
         minPersistBars:     parseInt(realTrendConfig.minPersistBars,   10) || 2,
       } : { enabled: false },
+      noNewTradesAfterTimeConfig: noNewTradesAfterTime.enabled ? { enabled: true, noNewTradesAfterTime: noNewTradesAfterTime.noNewTradesAfterTime || '14:45' } : { enabled: false },
       speedMultiplier: parseInt(speed, 10) || 1,
       persist: true,
     };
@@ -12275,6 +12304,20 @@ function OptionsReplayTest() {
           )}
         </div>
 
+        {/* ── No New Trades After Time ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>No New Trades After</span>
+            <button type="button" className={`btn-sm ${noNewTradesAfterTime.enabled ? 'btn-primary' : 'btn-secondary'}`} onClick={() => updateNoNewTradesAfterTime('enabled', !noNewTradesAfterTime.enabled)} disabled={isRunning}>{noNewTradesAfterTime.enabled ? 'ON' : 'OFF'}</button>
+            <span style={{ fontSize: 11, color: '#6366f1', fontWeight: 600 }}>pre-trade filter</span>
+          </div>
+          {noNewTradesAfterTime.enabled && (
+            <div className="bt-form-grid">
+              <div className="form-group"><label>Time (HH:MM)</label><input type="time" value={noNewTradesAfterTime.noNewTradesAfterTime} onChange={e => updateNoNewTradesAfterTime('noNewTradesAfterTime', e.target.value)} disabled={isRunning} /></div>
+            </div>
+          )}
+        </div>
+
         {/* ── SL Cascade Protection ── */}
         <div className="card bt-opts-card">
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
@@ -12764,10 +12807,12 @@ function TickReplayTest() {
   }
 
   const selectedPresetId = (() => {
-    const current = JSON.stringify(capturePresetConfig());
+    const { nifty: _n, cePool: _ce, pePool: _pe, warmupDays: _w, ...currentCmp } = capturePresetConfig();
+    const sortKeys = o => Object.keys(o).sort().reduce((a, k) => { a[k] = o[k]; return a; }, {});
     return presets.find(p => {
-      const { nifty: _n, cePool: _ce, pePool: _pe, warmupDays: _w, ...presetCmp } = p.config;
-      return JSON.stringify(presetCmp) === current;
+      const { nifty: _n2, cePool: _ce2, pePool: _pe2, warmupDays: _w2, ...presetCmp } = p.config;
+      const c = Object.keys(presetCmp).reduce((a, k) => { if (k in currentCmp) a[k] = currentCmp[k]; return a; }, {});
+      return JSON.stringify(sortKeys(c)) === JSON.stringify(sortKeys(presetCmp));
     })?.id ?? null;
   })();
 
