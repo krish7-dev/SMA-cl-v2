@@ -42,6 +42,14 @@ public class TradeReviewService {
             - PE is a put option and generally benefits when NIFTY moves down.
             - side = LONG_OPTION means the option is bought.
 
+            Field quick guide: pnlPct>0=PROFIT (no loss language); pnlPct<0=LOSS (no profit language).
+            exitReason=HARD_STOP_LOSS=HOW it ended, not WHY. maxFavorableExcursionPct<1.5%+pnlPct<0=entry was wrong (not exit).
+            recentMove3/5CandlePct are UNSIGNED NIFTY % moves (always>=0) — use recentMomentumAlignment for direction context.
+            SUPPORTS_TRADE+recentMove3>=1.5%=overextension risk. OPPOSES_TRADE+>=1.5%=counter-trend entry.
+            CRITICAL UNIT RULE: recentMove3/5CandlePct are already % values — 0.169=0.169% NOT 16.9%. Classify overextension ONLY when recentMove3>=1.5 or recentMove5>=2.5. If both<1.0, NEVER use overextension/surge/stretched/chased language.
+            isOppositeSideAfterStrongWinner=true=apply reversal trap logic.
+            PE winner=NIFTY moved DOWN. CE winner=NIFTY moved UP. NEVER reverse this.
+
             Analyze the provided payload and judge the trade quality, whether it was avoidable, what worked, what failed, and whether a useful rule can be learned.
 
             Use the available data: P&L, P&L %, entry/exit reason, MFE/MAE, recent candles, option type, strategy scores, regime, ADX, ATR, previous trade context, filters, and trade context.
@@ -64,6 +72,19 @@ public class TradeReviewService {
             Think like a trade journal reviewer. Judge whether the trade was good, bad, or neutral using the actual outcome and the information available around entry. Identify if the mistake was avoidable, whether there was a reversal trap, weak confirmation, late entry, chop entry, bad exit, or no clear mistake.
 
             Do not mechanically follow one field. Weigh the full context.
+
+            Field interpretation guide:
+              pnlPct: ground truth. >0=PROFIT (GOOD candidate). <0=LOSS (BAD or NEUTRAL).
+              exitReason: HOW trade ended. HARD_STOP_LOSS alone does not explain why it was a bad trade.
+              maxFavorableExcursionPct <1.5% + pnlPct<0: entry was simply wrong. Do NOT blame exit. Do NOT suggest trailing stops.
+              maxFavorableExcursionPct >5% + pnlPct<0: valid start that gave back gains. Consider BAD_EXIT.
+              maxAdverseExcursionPct deep (<-5%) then recovered: MARKET_NOISE. Straight to stop ≈ pnlPct: use entry-quality mistake.
+              recentMove3/5CandlePct: UNSIGNED NIFTY % move before entry (always>=0; 0.28=0.28%). Not directional alone.
+                SUPPORTS_TRADE + >=1.5% = entered late in strong same-direction move = OVEREXTENSION risk.
+                OPPOSES_TRADE + >=1.5% = large counter-trend move before entry = reversal risk.
+              CRITICAL UNIT RULE: recentMove3/5CandlePct are already % values — 0.169=0.169% NOT 16.9%. Classify OVEREXTENSION ONLY when recentMove3>=1.5 or recentMove5>=2.5. If both<1.0, NEVER use overextension/surge/stretched/chased language.
+              isOppositeSideAfterStrongWinner=true: apply reversal trap logic (Section 4).
+              PE profits from NIFTY DOWN. CE profits from NIFTY UP. NEVER reverse this.
 
             confidence = your certainty in this review classification (NOT trade-taking confidence):
               clear GOOD trade: 0.70–0.90 | clear BAD avoidable mistake: 0.75–0.95 | NEUTRAL/mixed/debatable: 0.45–0.70 | UNKNOWN/insufficient data: 0.00–0.40
@@ -119,6 +140,55 @@ public class TradeReviewService {
             NEVER describe a PE trade as bullish. NEVER describe a CE trade as bearish.
             A PE that won did so because NIFTY moved DOWN (bearish movement, favorable for PE).
             A CE that won did so because NIFTY moved UP (bullish movement, favorable for CE).
+
+            ══════════════════════════════════════════════════════════
+            SECTION 1B — FIELD INTERPRETATION FOR REVIEW (read before classifying)
+            ══════════════════════════════════════════════════════════
+            Null fields = not available. Do not penalize for missing data.
+
+            DIRECTION HARD RULE (absolute — violating this is an error):
+              PE profited → NIFTY moved DOWN during the trade. NEVER say UP movement helped the PE.
+              CE profited → NIFTY moved UP during the trade. NEVER say DOWN movement helped the CE.
+              PE lost → NIFTY moved UP (adverse for PE). CE lost → NIFTY moved DOWN (adverse for CE).
+
+            OUTCOME FIELDS:
+              pnlPct: ground truth P&L %. >0=PROFIT, <0=LOSS. This drives quality classification.
+              barsHeld: 1–2=very quick trade (wrong from start, or very fast profit lock). 5+=patient hold.
+              exitReason: HOW the trade ended — not WHY it failed. HARD_STOP_LOSS = stop was triggered.
+                Evaluate entry conditions to find root cause. Do not assign BAD_EXIT when entry was the problem.
+                PROFIT_LOCK_HIT: profit lock triggered. Check if maxFavorableExcursionPct >> pnlPct (potential to have held longer).
+
+            MFE/MAE INTERPRETATION:
+              maxFavorableExcursionPct: best unrealized gain during the trade (unsigned %, always >= 0).
+                < 1.5% AND pnlPct < 0 → trade NEVER moved favorably. Entry was wrong. exitReason is irrelevant.
+                  Do NOT suggest trailing stops — they cannot fix an entry that never moved favorably.
+                  Classify using entry-quality mistakes: REVERSAL_TRAP, OVEREXTENSION, WEAK_CONFIRMATION, or UNKNOWN.
+                > 5.0% AND pnlPct < 0 → trade had a valid start but gave back gains. Consider BAD_EXIT or MARKET_NOISE.
+                > 5.0% AND pnlPct > 0 → strong trade. High confidence GOOD.
+              maxAdverseExcursionPct: worst unrealized loss during trade (negative number).
+                > -1.5% (shallow) AND profit → clean trade. High confidence GOOD.
+                < -5.0% (deep) AND recovered → stressful but valid. Consider MARKET_NOISE.
+                maxAdverseExcursionPct ≈ pnlPct (loss, e.g. both ≈ -5%) → straight to stop, no recovery → classify using entry-quality mistake: REVERSAL_TRAP, OVEREXTENSION, WEAK_CONFIRMATION, or UNKNOWN.
+
+            ENTRY QUALITY SIGNALS (IMPORTANT: recentMove3/5CandlePct are UNSIGNED — always >= 0):
+              recentMove3CandlePct: absolute % NIFTY move over last 3 candles before entry (0.28 = 0.28%). NOT directional.
+                Direction context requires recentMomentumAlignment:
+                SUPPORTS_TRADE + recentMove3CandlePct >= 1.5%: entered late in a strong same-direction move = OVEREXTENSION risk.
+                  (1.5% is the strategy's own penalty threshold — entries at/above this were already penalized.)
+                OPPOSES_TRADE + recentMove3CandlePct >= 1.5%: large counter-trend move before entry = reversal risk.
+              CRITICAL UNIT RULE: recentMove3/5CandlePct are already % values — 0.169 means 0.169%, NOT 16.9%. Never multiply by 100.
+                Classify OVEREXTENSION ONLY when recentMove3CandlePct >= 1.5 OR recentMove5CandlePct >= 2.5.
+                If BOTH recentMove3CandlePct < 1.0 AND recentMove5CandlePct < 1.0: small moves — NEVER classify as overextension or use surge/stretched/chased language.
+              scoreGap < 5 OR winningScore < 20: weak entry signal → WEAK_CONFIRMATION candidate.
+              recentMomentumAlignment=OPPOSES_TRADE at entry: candles were warning against this trade.
+              recentCandlesOpposeTradeCount >= 4 at entry: strong headwind → WEAK_CONFIRMATION or counter-trend entry.
+              directionalConsistencyPassed=false: system detected candle inconsistency at entry.
+
+            PREVIOUS TRADE CONTEXT:
+              isOppositeSideAfterStrongWinner=true: this was the opposite direction after a strong winner.
+                Apply Section 4 (REVERSAL TRAP detection) when this is true.
+              minutesSincePreviousExit <=1 + isOppositeSideAfterStrongWinner=true: classic reversal trap timing.
+              previousTradePnlPct >= 5.0: prior trade was a strong winner even if previousTradeWasStrongWinner not set.
 
             ══════════════════════════════════════════════════════════
             SECTION 2 — ROOT CAUSE RULE (do not judge by exitReason alone)
@@ -488,6 +558,43 @@ public class TradeReviewService {
                 reasons.add("LOSS_WITH_MISTAKE_REQUIRES_AVOIDABLE: pnlPct=" + pnlPct
                         + " mistakeType=" + mistakeType + ", avoidable forced to true");
                 avoidable = true;
+            }
+        }
+
+        // ── Rule A2b: OVEREXTENSION auto-detection from entry conditions ───────
+        // Only applies when AI left mistakeType as UNKNOWN/NONE; uses alignment field for direction.
+        // Threshold 1.5 matches strategy's own maxRecentMove3 penalty threshold — entries here were penalized.
+        // mfe < 1.5 guard: if trade had a valid favorable move, failure was due to exit/management not overextension.
+        if (pnlPct != null && pnlPct < -2.0
+                && (mistakeType == MistakeType.UNKNOWN || mistakeType == MistakeType.NONE)) {
+            Double m3  = req.getRecentMove3CandlePct();
+            Double mfe = req.getMaxFavorableExcursionPct();
+            boolean overextendedEntry = m3 != null && m3 >= 1.5
+                    && "SUPPORTS_TRADE".equals(req.getRecentMomentumAlignment())
+                    && (mfe == null || mfe < 1.5);
+            if (overextendedEntry) {
+                reasons.add("OVEREXTENSION_AUTO: pnlPct=" + pnlPct
+                        + " recentMove3CandlePct=" + m3 + " mfe=" + mfe
+                        + " recentMomentumAlignment=SUPPORTS_TRADE"
+                        + " → mistakeType=OVEREXTENSION avoidable=true quality=BAD");
+                mistakeType = MistakeType.OVEREXTENSION;
+                avoidable = true;
+                quality = TradeQuality.BAD;
+            }
+        }
+
+        // ── Rule A2c: OVEREXTENSION_UNIT_ERROR — AI misread tiny move as overextended ──
+        // Fires when AI classified OVEREXTENSION but both recentMove fields are below 1.0% (small moves).
+        // Reclassifies to UNKNOWN; does not touch quality so a BAD loss stays BAD.
+        if (mistakeType == MistakeType.OVEREXTENSION) {
+            Double m3r = req.getRecentMove3CandlePct();
+            Double m5r = req.getRecentMove5CandlePct();
+            boolean bothTiny = (m3r == null || m3r < 1.0) && (m5r == null || m5r < 1.0);
+            if (bothTiny) {
+                reasons.add("OVEREXTENSION_UNIT_ERROR: mistakeType=OVEREXTENSION but recentMove3CandlePct="
+                        + m3r + " recentMove5CandlePct=" + m5r
+                        + " (both < 1.0%) — reclassified to UNKNOWN");
+                mistakeType = MistakeType.UNKNOWN;
             }
         }
 

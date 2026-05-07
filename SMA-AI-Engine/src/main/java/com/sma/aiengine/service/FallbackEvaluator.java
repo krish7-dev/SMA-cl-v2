@@ -6,6 +6,7 @@ import com.sma.aiengine.model.request.TradeCandidateRequest;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.List;
 
 @Component
@@ -13,48 +14,173 @@ class FallbackEvaluator {
 
     /**
      * Deterministic advisory when OpenAI is disabled or unavailable.
-     * Rules evaluated top-to-bottom; first match wins.
+     * Accumulates risk signals from all available fields; action determined by
+     * combined signal weight, not a single first-match rule.
      */
     AdvisoryAiOutput advisory(TradeCandidateRequest req) {
         String regime = req.getRegime();
 
-        // 1. Compression → AVOID (high chop risk)
+        // ── 1. Compression → AVOID immediately ───────────────────────────────
         if ("COMPRESSION".equalsIgnoreCase(regime)) {
             return new AdvisoryAiOutput(
-                    AdvisoryAction.AVOID, 0.8, 0.2, RiskLevel.HIGH,
-                    0.0, 0.9, 0.0, 0.0,
+                    AdvisoryAction.AVOID, 0.80, 0.20, RiskLevel.HIGH,
+                    0.0, 0.90, 0.0, 0.0,
                     List.of("COMPRESSION_REGIME"), List.of(),
                     "Compression regime detected — high chop risk, avoid entry."
             );
         }
 
-        // 2. Overextended recent move → CAUTION
-        Double move3 = req.getRecentMove3CandlePct();
-        if (move3 != null && move3 > 1.5) {
-            return new AdvisoryAiOutput(
-                    AdvisoryAction.CAUTION, 0.6, 0.4, RiskLevel.MEDIUM,
-                    0.0, 0.0, 0.0, 0.8,
-                    List.of("OVEREXTENDED_MOVE"), List.of(),
-                    "Recent 3-candle move exceeds 1.5% — overextension risk, proceed with caution."
-            );
+        // ── 2. Collect risk signals ───────────────────────────────────────────
+        double reversalRisk      = 0.0;
+        double overextensionRisk = 0.0;
+        double lateEntryRisk     = 0.0;
+
+        List<String> reasonCodes  = new ArrayList<>();
+        List<String> warningCodes = new ArrayList<>();
+        List<String> summaryParts = new ArrayList<>();
+        boolean forceCaution = false;
+
+        String  alignment        = req.getRecentMomentumAlignment();
+        Integer opposeCount      = req.getRecentCandlesOpposeTradeCount();
+        Integer supportCount     = req.getRecentCandlesSupportTradeCount();
+        boolean isOppositeWinner = Boolean.TRUE.equals(req.getIsOppositeSideAfterStrongWinner());
+        Double  winningScore     = req.getWinningScore();
+        Double  scoreGap         = req.getScoreGap();
+        Double  move3            = req.getRecentMove3CandlePct();
+        String  optType          = req.getCurrentOptionType();
+
+        boolean momentumOpposes  = "OPPOSES_TRADE".equals(alignment);
+        boolean momentumSupports = "SUPPORTS_TRADE".equals(alignment);
+        boolean strongScore      = winningScore != null && scoreGap != null
+                && winningScore >= 30.0 && scoreGap >= 8.0;
+        boolean weakScore        = winningScore == null || scoreGap == null
+                || winningScore < 20.0 || scoreGap < 5.0;
+        int opp  = opposeCount  != null ? opposeCount  : 0;
+        int supp = supportCount != null ? supportCount : 0;
+
+        // ── Signal: momentum alignment ────────────────────────────────────────
+        if (momentumOpposes) {
+            reversalRisk += 0.45;
+            reasonCodes.add("MOMENTUM_OPPOSES_TRADE");
+            summaryParts.add("momentum opposes " + tradeLabel(optType) + " entry");
+            forceCaution = true;
+        } else if ("MIXED".equals(alignment)) {
+            lateEntryRisk += 0.15;
         }
 
-        // 3. Strong score gap with non-compression regime → ALLOW
-        Double winningScore = req.getWinningScore();
-        Double scoreGap     = req.getScoreGap();
-        if (winningScore != null && scoreGap != null
-                && winningScore >= 30.0 && scoreGap >= 8.0
-                && !"COMPRESSION".equalsIgnoreCase(regime)) {
-            return new AdvisoryAiOutput(
-                    AdvisoryAction.ALLOW, 0.7, 0.7, RiskLevel.LOW,
-                    0.0, 0.0, 0.0, 0.0,
-                    List.of("STRONG_SCORE_GAP"), List.of(),
-                    "Strong winning score with clear gap — setup looks acceptable."
-            );
+        // ── Signal: candle opposition count ───────────────────────────────────
+        if (opp >= 4 && supp <= 1) {
+            reversalRisk += 0.20;
+            warningCodes.add("CANDLES_STRONGLY_OPPOSE");
+            summaryParts.add("recent candles strongly oppose trade (" + opp + "/5 opposing)");
+            forceCaution = true;
+            // All candles oppose + alignment confirms = maximum contradiction signal
+            if (opp >= 5 && momentumOpposes) {
+                reversalRisk = Math.max(reversalRisk, 0.85);
+            }
+        } else if (opp >= 3) {
+            reversalRisk += 0.10;
         }
 
-        // 4. Insufficient data or no rule matched
-        return AdvisoryAiOutput.unknown();
+        // ── Signal: opposite side after strong winner ─────────────────────────
+        if (isOppositeWinner) {
+            reversalRisk = Math.max(reversalRisk, 0.70);
+            warningCodes.add("REVERSAL_TRAP_RISK");
+            summaryParts.add("counter-trend reversal attempt after strong winner");
+            // Allow through only when candles clearly confirm AND score is very strong
+            boolean candleConfirm = momentumSupports && supp >= 3;
+            boolean veryStrong    = winningScore != null && scoreGap != null
+                    && winningScore >= 60.0 && scoreGap >= 30.0;
+            if (!candleConfirm || !veryStrong) {
+                forceCaution = true;
+            }
+        }
+
+        // ── Signal: overextended recent move ──────────────────────────────────
+        if (move3 != null && move3 >= 1.5) {
+            overextensionRisk = Math.max(overextensionRisk, 0.60);
+            if (!momentumOpposes) {
+                // SUPPORTS_TRADE or unknown: entered late in same-direction move
+                reasonCodes.add("OVEREXTENDED_MOVE");
+                summaryParts.add("recent 3-candle move " + move3 + "% — overextension risk");
+            } else {
+                // OPPOSES_TRADE: large counter-trend surge before entry = higher reversal risk
+                reversalRisk = Math.max(reversalRisk, reversalRisk + 0.15);
+            }
+            forceCaution = true;
+        }
+
+        // ── Signal: score quality ─────────────────────────────────────────────
+        if (strongScore && !forceCaution) {
+            reasonCodes.add("STRONG_SCORE_GAP");
+        }
+        if (weakScore) {
+            lateEntryRisk += 0.20;
+        }
+
+        // ── Determine action ──────────────────────────────────────────────────
+        AdvisoryAction action;
+        if (forceCaution) {
+            action = AdvisoryAction.CAUTION;
+        } else if (strongScore && (momentumSupports || "MIXED".equals(alignment) || alignment == null)) {
+            action = AdvisoryAction.ALLOW;
+        } else {
+            action = AdvisoryAction.CAUTION;
+        }
+
+        // ── Determine risk level ──────────────────────────────────────────────
+        RiskLevel riskLevel;
+        if (reversalRisk >= 0.75 || (action == AdvisoryAction.CAUTION && reversalRisk >= 0.50)) {
+            riskLevel = RiskLevel.HIGH;
+        } else if (reversalRisk >= 0.35 || overextensionRisk >= 0.50 || action == AdvisoryAction.CAUTION) {
+            riskLevel = RiskLevel.MEDIUM;
+        } else {
+            riskLevel = RiskLevel.LOW;
+        }
+
+        // Safety: ALLOW + HIGH is contradictory → upgrade action to CAUTION
+        if (action == AdvisoryAction.ALLOW && riskLevel == RiskLevel.HIGH) {
+            action = AdvisoryAction.CAUTION;
+        }
+
+        // ── Trade quality score ───────────────────────────────────────────────
+        double tradeQualityScore;
+        if (action == AdvisoryAction.CAUTION && riskLevel == RiskLevel.HIGH) {
+            tradeQualityScore = 0.28;
+        } else if (action == AdvisoryAction.CAUTION) {
+            tradeQualityScore = 0.48;
+        } else {
+            tradeQualityScore = 0.70;
+        }
+
+        // ── Confidence ────────────────────────────────────────────────────────
+        double confidence = 0.60;
+        if (momentumOpposes)  confidence -= 0.10;
+        if (opp >= 4)         confidence -= 0.05;
+        if (strongScore)      confidence += 0.10;
+        if (isOppositeWinner) confidence -= 0.05;
+        confidence = Math.max(0.40, Math.min(0.80, confidence));
+
+        // ── Build summary ─────────────────────────────────────────────────────
+        String summary;
+        if (summaryParts.isEmpty()) {
+            summary = action == AdvisoryAction.ALLOW
+                    ? "Strong score gap with aligned candles — setup looks acceptable."
+                    : "Elevated risk without strong confirmation — caution advised.";
+        } else {
+            String joined = String.join("; ", summaryParts);
+            summary = Character.toUpperCase(joined.charAt(0)) + joined.substring(1) + ".";
+        }
+
+        return new AdvisoryAiOutput(action, confidence, tradeQualityScore, riskLevel,
+                reversalRisk, 0.0, lateEntryRisk, overextensionRisk,
+                List.copyOf(reasonCodes), List.copyOf(warningCodes), summary);
+    }
+
+    private String tradeLabel(String optType) {
+        if ("CE".equalsIgnoreCase(optType)) return "CE (bullish call)";
+        if ("PE".equalsIgnoreCase(optType)) return "PE (bearish put)";
+        return "trade";
     }
 
     /**

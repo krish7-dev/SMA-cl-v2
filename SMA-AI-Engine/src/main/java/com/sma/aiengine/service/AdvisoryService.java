@@ -50,6 +50,12 @@ public class AdvisoryService {
             If recentMomentumAlignment=SUPPORTS_TRADE → candles favor entry. Do NOT say candles contradict this trade.
             If recentMomentumAlignment=OPPOSES_TRADE → candles work against entry. Increase reversalRisk.
 
+            Field quick guide: scoreGap<5=weak setup; recentMove3/5CandlePct are UNSIGNED NIFTY % moves (always>=0; 0.28=0.28%)
+            — use recentMomentumAlignment for direction context (SUPPORTS_TRADE+>=1.5%=overextension; OPPOSES_TRADE+>=1.5%=reversal risk);
+            adx>=25+aligned=strong trend; regime values: COMPRESSION/TRENDING/VOLATILE/RANGING;
+            barsSinceLastTrade<=1+isOppositeSideAfterStrongWinner=reversal trap; recentCandlesOpposeTradeCount>=4=CAUTION minimum.
+            CRITICAL UNIT RULE: recentMove3/5CandlePct are already % values — 0.169=0.169% NOT 16.9%. Flag overextension ONLY when recentMove3CandlePct>=1.5 or recentMove5CandlePct>=2.5. If both<1.0, NEVER use overextension/surge/stretched/chased language.
+
             Analyze the provided payload and decide whether the candidate should be ALLOW, CAUTION, AVOID, or UNKNOWN.
 
             Use the available data: recent candles, option type, strategy scores, regime, ADX, ATR, previous trade context, filters, and current trade context.
@@ -74,6 +80,20 @@ public class AdvisoryService {
             Do NOT re-derive direction alignment from raw candles if recentMomentumAlignment is provided.
             If recentMomentumAlignment=SUPPORTS_TRADE → candles favor entry. Do NOT say candles contradict this trade.
             If recentMomentumAlignment=OPPOSES_TRADE → candles work against entry. Increase reversalRisk.
+
+            Field interpretation guide:
+              winningScore/scoreGap: <20/<5 = weak setup (consider CAUTION). >=30/>=8 = strong (consider ALLOW if candles agree).
+              recentMove3/5CandlePct: UNSIGNED absolute NIFTY % move (0.28=0.28%). Always >= 0. Use with recentMomentumAlignment:
+                SUPPORTS_TRADE + >=1.5% = entered late in strong same-direction move → overextension risk. Flag OVEREXTENDED_MOVE.
+                OPPOSES_TRADE + >=1.5% = large counter-trend move before entry → reversal risk.
+              CRITICAL UNIT RULE: recentMove3/5CandlePct are already % values — 0.169=0.169% NOT 16.9%. Flag overextension ONLY when recentMove3CandlePct>=1.5 or recentMove5CandlePct>=2.5. If both<1.0, NEVER use overextension/surge/stretched/chased language.
+              vwapDistancePct: signed (+ve=above VWAP). CE above / PE below = VWAP confirms direction. Reverse = counter-VWAP entry.
+              adx >= 25: positive when trade direction aligns with trend; headwind when trade opposes existing trend.
+              regime: COMPRESSION=avoid; TRENDING=trending market (direction from strategy signals not regime label); VOLATILE=high risk; RANGING=normal.
+              directionalConsistencyPassed=false: candle inconsistency at entry. Increase chopRisk.
+              barsSinceLastTrade <=1 + isOppositeSideAfterStrongWinner=true: reversal trap risk — apply Section 3.
+              recentCandlesOpposeTradeCount >= 4: strong candle headwind → CAUTION minimum.
+              dailyPnlBeforeTrade: context only. Negative = possible recovery-mode; not a hard block.
 
             Think like a cautious intraday options trader. Evaluate whether the trade has enough confirmation, whether the recent candles support the option direction, whether the previous trade creates reversal risk, and whether the market regime/score context supports the entry.
 
@@ -124,6 +144,75 @@ public class AdvisoryService {
             RULE: If recentMomentumAlignment=OPPOSES_TRADE  → candles work against entry. Increase reversalRisk and consider CAUTION.
             RULE: If recentMomentumAlignment=MIXED          → neutral momentum; evaluate other factors.
             NEVER call DOWN candles unfavorable for PE. NEVER call UP candles unfavorable for CE.
+
+            ══════════════════════════════════════════════════════════
+            SECTION 1B — FIELD INTERPRETATION GUIDE (read before scoring)
+            ══════════════════════════════════════════════════════════
+            These fields give context — use them holistically, not mechanically. Null = not available; do not penalize.
+
+            STRATEGY SCORES:
+              winningScore (0–100): strategy confidence for this direction. <20=weak, 20–29=moderate, >=30=strong.
+              oppositeScore: score for opposing direction. High = contested setup.
+              scoreGap = winningScore − oppositeScore: <5=WEAK_SCORE_GAP (add to warningCodes), >=8=strong confirmation.
+              regime: exact values are TRENDING, RANGING, VOLATILE, COMPRESSION.
+                COMPRESSION → mandatory AVOID (tight range, no directional energy).
+                TRENDING → strong trend detected (ADX > threshold). Direction comes from strategy signals, not the regime label.
+                VOLATILE → large swings but no clear direction. Increased risk.
+                RANGING → moderate conditions. Normal evaluation applies.
+
+            MOVEMENT FIELDS (IMPORTANT: recentMove3CandlePct and recentMove5CandlePct are UNSIGNED — always >= 0):
+              recentMove3CandlePct: absolute % price change of NIFTY over last 3 candles (0.28 means 0.28%).
+                This is a MAGNITUDE only — does NOT tell you direction. Direction comes from recentMomentumAlignment.
+                >1.0%: notable move. >=1.5%: strategy's own penalty threshold (entries here were penalized; if still allowed, score was very high). >2.0%: significant.
+                Interpret WITH recentMomentumAlignment:
+                  SUPPORTS_TRADE + recentMove3CandlePct >= 1.5% = entered late in a strong same-direction move → OVEREXTENSION risk.
+                  OPPOSES_TRADE + recentMove3CandlePct >= 1.5% = large counter-direction move before entry → reversal risk.
+              recentMove5CandlePct: same pattern over 5 candles. Strategy penalty threshold: 2.5%.
+                SUPPORTS_TRADE + recentMove5CandlePct > 2.0% = trend may be exhausted → overextension risk.
+                OPPOSES_TRADE + recentMove5CandlePct > 2.0% = strong counter-trend momentum → high reversal risk.
+              CRITICAL UNIT RULE: recentMove3/5CandlePct are already % values — 0.169 means 0.169%, NOT 16.9%. Never multiply by 100.
+                Flag OVEREXTENDED_MOVE or use overextension/surge/stretched/chased language ONLY when recentMove3CandlePct >= 1.5 OR recentMove5CandlePct >= 2.5.
+                If BOTH recentMove3CandlePct < 1.0 AND recentMove5CandlePct < 1.0: small moves — NEVER use overextension, surge, stretched, or chased language based on these fields.
+              vwapDistancePct: signed distance from VWAP (+ve=NIFTY above VWAP, −ve=NIFTY below VWAP).
+                CE (bullish): NIFTY above VWAP (positive) = VWAP confirms bullish momentum.
+                PE (bearish): NIFTY below VWAP (negative) = VWAP confirms bearish momentum.
+                Counter-VWAP (CE below VWAP OR PE above VWAP) = trade is against VWAP direction → increase reversalRisk.
+              candleBodyPct: |close − open| / open * 100 (unsigned, % of NIFTY price). Both candleBodyPct and atrPct are in the same unit, so compare them directly.
+                candleBodyPct < atrPct * 0.1 = very weak/doji candle (body much smaller than typical range).
+                candleBodyPct > atrPct * 0.5 = meaningful conviction candle (body is half the typical range).
+                candleBodyPct > atrPct * 0.8 = strong momentum candle.
+                If atrPct is null: rough thresholds are <0.05% = very weak, >0.15% = strong (5-min NIFTY typical range).
+              adx: trend strength. <20=choppy, 20–25=developing, >=25=trending, >=40=strongly trending.
+                HIGH ADX aligned with trade direction = positive (strong trend supports entry).
+                HIGH ADX against trade direction = momentum headwind (existing trend may resist reversal).
+              atrPct: volatility as % of price. Higher ATR = wider expected swings; riskier entry timing.
+
+            FILTER BOOLEANS:
+              compressionNoTradeEnabled=true + regime=COMPRESSION → system-detected block. Use AVOID.
+              minMovementFilterPassed=false → insufficient price movement. Increase chopRisk.
+              directionalConsistencyPassed=false → candles inconsistent with this direction. Increase reversalRisk.
+              candleStrengthFilterPassed=false → current candle too weak. Add WEAK_CANDLE_SIGNAL warning.
+              Multiple false filters → strong CAUTION or AVOID signal.
+
+            TRADE SESSION CONTEXT:
+              barsSinceLastTrade: <2 = rapid re-entry. Combined with isOppositeSideAfterStrongWinner = reversal risk.
+              tradesToday: context only. High count alone does not block entry.
+              dailyPnlBeforeTrade: psychological context only. Very negative = possible recovery-mode trading. Not a hard block.
+              optionPremium: cost of entry. Very high relative to capital = outsized risk per trade.
+
+            PREVIOUS TRADE CONTEXT:
+              isOppositeSideAfterStrongWinner=true: this trade is OPPOSITE direction after a strong winner. Gate for Section 3.
+              previousTradeWasStrongWinner=true: prior trade gained >8%. Strong momentum existed in that direction.
+              minutesSincePreviousExit <=1: same-candle or immediate re-entry. + isOppositeSideAfterStrongWinner = high reversal trap risk.
+              previousTradePnlPct >= 5.0: treated as strong winner even if previousTradeWasStrongWinner not explicitly set.
+
+            CANDLE ALIGNMENT (PRECOMPUTED — use as primary source; lower confidence if raw candles appear to conflict):
+              instrumentContext=UNDERLYING: recentCandles are NIFTY price candles, NOT option premium.
+              recentCandlesSupportTradeCount: candles favoring this trade. >=3 of 5 = momentum confirmed.
+              recentCandlesOpposeTradeCount: candles working against this trade. >=4 of 5 = strong headwind → CAUTION minimum.
+              lastCandleSupportsTrade=false: most recent candle does NOT support entry → momentum may be fading.
+              recentMomentumAlignment: SUPPORTS_TRADE=candles confirm, OPPOSES_TRADE=candles headwind, MIXED=neutral.
+              If recentMomentumAlignment conflicts with what raw recentCandles appear to show: trust recentMomentumAlignment and lower your confidence slightly rather than overriding it — the precomputed value uses the correct CE/PE direction semantics.
 
             ══════════════════════════════════════════════════════════
             SECTION 2 — BOOLEAN GATING (check payload booleans first, always)
@@ -181,21 +270,37 @@ public class AdvisoryService {
             SECTION 6 — OTHER RISK CHECKS
             ══════════════════════════════════════════════════════════
             COMPRESSION: If regime = COMPRESSION: action = AVOID, chopRisk = 0.9, riskLevel = HIGH.
-            OVEREXTENSION: If recentMove3CandlePct > 2.0: overextensionRisk += 0.3. Flag OVEREXTENDED_MOVE.
+            OVEREXTENSION (recentMove3/5 are UNSIGNED magnitudes — combine with recentMomentumAlignment for direction context):
+              Overextension INCREASES risk — it does NOT mechanically force CAUTION or AVOID if scoreGap, ADX, and candle alignment are strong.
+              recentMove3CandlePct >= 1.0% + SUPPORTS_TRADE: notable late-entry risk. overextensionRisk += 0.15.
+              recentMove3CandlePct >= 1.5% + SUPPORTS_TRADE: strategy's penalty threshold — likely overextended. overextensionRisk += 0.30. Add OVEREXTENDED_MOVE to warningCodes. If other risk factors are also elevated, consider CAUTION.
+              recentMove3CandlePct >= 1.5% + OPPOSES_TRADE: large counter-trend move before entry. Increase reversalRisk instead (not overextensionRisk).
+              recentMove5CandlePct >= 2.0% + SUPPORTS_TRADE: additional overextensionRisk += 0.15 (5-candle trend may be exhausted).
             WEAK SETUP: If scoreGap < 5 or winningScore < 20: lateEntryRisk += 0.2. Flag WEAK_SCORE_GAP.
 
             ══════════════════════════════════════════════════════════
-            SECTION 7 — ACTION CALIBRATION
+            SECTION 7 — DECISION HIERARCHY (evaluate steps in order, stop at first match)
             ══════════════════════════════════════════════════════════
-            ALLOW  = Trade direction aligns with recent candles, no trap condition present. Risks manageable.
-            CAUTION = Meaningful risk present but not decisive. Strategy may still enter; AI flags concern.
-            BLOCK  = Clear invalid setup: reversal trap confirmed (gate + no direction confirmation), or COMPRESSION.
-            AVOID  = Reserved for COMPRESSION regime only.
+            Step 1 — COMPRESSION: regime = COMPRESSION → AVOID, chopRisk=0.90, riskLevel=HIGH. STOP.
+            Step 2 — Confirmed reversal trap: ALL Section 3 gate conditions met AND direction NOT confirmed
+                     → AVOID (clear invalid entry), reversalRisk>=0.80, riskLevel=HIGH, warningCodes include REVERSAL_TRAP.
+            Step 3 — Strong reversal warning (gate partial or unconfirmed): isOppositeSideAfterStrongWinner=true
+                     AND no reversal confirmation → CAUTION minimum, reversalRisk>=0.65.
+            Step 4 — Candle headwind: recentMomentumAlignment=OPPOSES_TRADE AND recentCandlesOpposeTradeCount>=4
+                     → CAUTION minimum. Do not assign ALLOW.
+            Step 5 — Weak setup: scoreGap<5 OR winningScore<20 → lateEntryRisk+=0.2. Consider CAUTION.
+            Step 6 — Filter failures: directionalConsistencyPassed=false OR candleStrengthFilterPassed=false
+                     → increase risk flags. Consider CAUTION.
+            Step 7 — Strong setup: recentMomentumAlignment=SUPPORTS_TRADE AND scoreGap>=8 AND no trap conditions
+                     → ALLOW, riskLevel=LOW or MEDIUM.
+            Step 8 — Default: Use CAUTION for ambiguous setups. ALLOW only when confirmation is clear and risks are low.
 
-            Do NOT use BLOCK when:
-              - isOppositeSideAfterStrongWinner == false
-              - currentTradeAlignedWithRecentDirection == true
-              - The only concern is high ADX without direction conflict
+            ALLOW   = Direction confirmed by candles, solid score gap, no trap or headwind. Proceed.
+            CAUTION = Meaningful risk — candle headwind, weak score, rapid re-entry, mild overextension, filter failure. Strategy may enter; AI flags concern.
+            AVOID   = COMPRESSION regime OR confirmed reversal trap (clear invalid setup).
+            BLOCK   = Reserved for future hard-block conditions requiring downstream override (currently: do not use).
+
+            NEVER use AVOID for mild concerns (weak score, slight overextension). NEVER use BLOCK as a substitute for AVOID.
 
             ══════════════════════════════════════════════════════════
             Return ONLY valid JSON — no markdown, no text outside the JSON object:
@@ -433,6 +538,10 @@ public class AdvisoryService {
     private static final Set<String> SUPPORT_FRAMING_KEYWORDS = Set.of(
             "support", "align", "confirm", "favorable", "beneficial", "indicates strength"
     );
+    private static final Set<String> OPPOSITION_FRAMING_KEYWORDS = Set.of(
+            "oppose", "opposes", "opposing", "headwind", "unfavorable", "contrary",
+            "works against", "not supporting", "counter to"
+    );
 
     private AdvisoryValidation validateAdvisory(AdvisoryAiOutput output, TradeCandidateRequest req, String requestId) {
         List<String> warnings = new ArrayList<>();
@@ -463,21 +572,72 @@ public class AdvisoryService {
                         .collect(Collectors.toCollection(ArrayList::new))
                 : new ArrayList<>();
 
-        boolean hasUpKeyword   = UP_DIRECTION_KEYWORDS.stream().anyMatch(summary::contains);
-        boolean hasDownKeyword = DOWN_DIRECTION_KEYWORDS.stream().anyMatch(summary::contains);
-        boolean hasSupportWord = SUPPORT_FRAMING_KEYWORDS.stream().anyMatch(summary::contains);
+        // ── ALLOW + OPPOSES_TRADE + high oppose count → CAUTION ────────────────
+        if (action == AdvisoryAction.ALLOW
+                && "OPPOSES_TRADE".equals(req.getRecentMomentumAlignment())
+                && req.getRecentCandlesOpposeTradeCount() != null
+                && req.getRecentCandlesOpposeTradeCount() >= 4) {
+            String msg = "MOMENTUM_OPPOSES_ALLOW_ACTION: ALLOW downgraded to CAUTION — "
+                    + "recentMomentumAlignment=OPPOSES_TRADE + opposeCount="
+                    + req.getRecentCandlesOpposeTradeCount();
+            warnings.add(msg);
+            log.warn("[{}] VALIDATION_WARNING: {}", requestId, msg);
+            action = AdvisoryAction.CAUTION;
+            if (!warningCodes.contains("MOMENTUM_OPPOSES_ALLOW_ACTION")) {
+                warningCodes.add("MOMENTUM_OPPOSES_ALLOW_ACTION");
+            }
+        }
+
+        // ── ALLOW + isOppositeSideAfterStrongWinner + candles not confirming → CAUTION ─
+        if (action == AdvisoryAction.ALLOW
+                && Boolean.TRUE.equals(req.getIsOppositeSideAfterStrongWinner())
+                && !"SUPPORTS_TRADE".equals(req.getRecentMomentumAlignment())) {
+            String msg = "REVERSAL_TRAP_ALLOW_DOWNGRADE: ALLOW downgraded to CAUTION — "
+                    + "isOppositeSideAfterStrongWinner=true + recentMomentumAlignment="
+                    + req.getRecentMomentumAlignment() + " (candles not confirming reversal)";
+            warnings.add(msg);
+            log.warn("[{}] VALIDATION_WARNING: {}", requestId, msg);
+            action = AdvisoryAction.CAUTION;
+            if (!warningCodes.contains("REVERSAL_TRAP_ALLOW_DOWNGRADE")) {
+                warningCodes.add("REVERSAL_TRAP_ALLOW_DOWNGRADE");
+            }
+        }
+
+        // ── OVEREXTENSION_UNIT_ERROR: AI flagged overextension but both moves are tiny ─
+        {
+            Double m3u = req.getRecentMove3CandlePct();
+            Double m5u = req.getRecentMove5CandlePct();
+            if (m3u != null && m3u < 1.0 && m5u != null && m5u < 1.0) {
+                boolean hadOverextCode = warningCodes.stream().anyMatch(c ->
+                        c.equals("OVEREXTENDED_MOVE") || c.contains("OVEREXTENSION") || c.contains("OVEREXTENDED"));
+                if (hadOverextCode) {
+                    warningCodes.removeIf(c ->
+                            c.equals("OVEREXTENDED_MOVE") || c.contains("OVEREXTENSION") || c.contains("OVEREXTENDED"));
+                    String msg = "OVEREXTENSION_UNIT_ERROR: removed overextension codes — "
+                            + "recentMove3CandlePct=" + m3u + " recentMove5CandlePct=" + m5u
+                            + " (both < 1.0%; these are small moves — not overextended)";
+                    warnings.add(msg);
+                    log.warn("[{}] VALIDATION_WARNING: {}", requestId, msg);
+                    if (action == AdvisoryAction.AVOID) {
+                        warnings.add("OVEREXTENSION_UNIT_ERROR_DOWNGRADE: AVOID→CAUTION — overextension was the only basis but moves are tiny");
+                        action = AdvisoryAction.CAUTION;
+                    }
+                }
+            }
+        }
+
         boolean directionContradictionFound = false;
 
-        // ── PE direction contradiction ─────────────────────────────────────────
-        if ("PE".equals(optType) && hasUpKeyword && hasSupportWord) {
+        // ── PE direction contradiction (per-sentence to avoid false positives on opposition framing) ──
+        if ("PE".equals(optType) && hasAdvisoryDirectionContradiction(summary, UP_DIRECTION_KEYWORDS)) {
             String msg = "DIRECTION_EXPLANATION_CONTRADICTION: PE is bearish (benefits from DOWN). "
                     + "Summary describes upward/bullish movement as supportive — this is incorrect.";
             warnings.add(msg);
             log.warn("[{}] VALIDATION_WARNING: {}", requestId, msg);
             directionContradictionFound = true;
         }
-        // ── CE direction contradiction ─────────────────────────────────────────
-        if ("CE".equals(optType) && hasDownKeyword && hasSupportWord) {
+        // ── CE direction contradiction (per-sentence to avoid false positives on opposition framing) ──
+        if ("CE".equals(optType) && hasAdvisoryDirectionContradiction(summary, DOWN_DIRECTION_KEYWORDS)) {
             String msg = "DIRECTION_EXPLANATION_CONTRADICTION: CE is bullish (benefits from UP). "
                     + "Summary describes downward/bearish movement as supportive — this is incorrect.";
             warnings.add(msg);
@@ -589,6 +749,18 @@ public class AdvisoryService {
                 : output;
 
         return new AdvisoryValidation(normalizedOutput, !warnings.isEmpty(), List.copyOf(warnings));
+    }
+
+    private boolean hasAdvisoryDirectionContradiction(String summary, Set<String> directionKeywords) {
+        String[] sentences = summary.split("[.!?]+\\s*");
+        for (String sentence : sentences) {
+            if (sentence.isBlank()) continue;
+            boolean hasDir    = directionKeywords.stream().anyMatch(sentence::contains);
+            boolean hasSupp   = SUPPORT_FRAMING_KEYWORDS.stream().anyMatch(sentence::contains);
+            boolean hasOppFrm = OPPOSITION_FRAMING_KEYWORDS.stream().anyMatch(sentence::contains);
+            if (hasDir && hasSupp && !hasOppFrm) return true;
+        }
+        return false;
     }
 
     // ── OpenAI response parsing + validation ─────────────────────────────────

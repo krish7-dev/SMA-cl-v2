@@ -26,4 +26,9 @@ public class CompletedTradeRequest extends TradeCandidateRequest {
     private Double maxAdverseExcursionPct;
     private BigDecimal capitalAfter;
     private Double dailyPnlAfterTrade;      // realized P&L including this trade
+
+    // TODO: add candle alignment fields once Strategy Engine sends them for completed trades:
+    // instrumentContext, recentCandlesSupportTradeCount, recentCandlesOpposeTradeCount,
+    // lastCandleSupportsTrade, recentMomentumAlignment — would improve review accuracy for
+    // OVEREXTENSION_AUTO detection and reversal trap classification in normalizeReview().
 }
