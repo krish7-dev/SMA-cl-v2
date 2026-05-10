@@ -4,6 +4,7 @@
     { "source": "/api/execution/:path*", "destination": "http://16.16.119.222:9004/:path*" },
     { "source": "/api/data/:path*",      "destination": "http://16.16.119.222:9005/:path*" },
     { "source": "/api/strategy/:path*",  "destination": "http://16.16.119.222:9006/:path*" },
+    { "source": "/api/ai/:path*",        "destination": "http://16.16.119.222:9007/:path*" },
     { "source": "/(.*)",                 "destination": "/index.html" }
   ]
 }
