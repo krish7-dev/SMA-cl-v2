@@ -2,6 +2,7 @@ package com.sma.strategyengine.service.options;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sma.strategyengine.client.AiEngineClient;
 import com.sma.strategyengine.client.DataEngineClient;
 import com.sma.strategyengine.client.DataEngineClient.CandleDto;
 import com.sma.strategyengine.entity.LiveSnapshotRecord;
@@ -39,7 +40,7 @@ import java.net.http.HttpResponse;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 /**
@@ -64,6 +65,7 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class OptionsLiveService {
 
+    private final AiEngineClient              aiEngineClient;
     private final StrategyRegistry           strategyRegistry;
     private final DataEngineClient           dataEngineClient;
     private final ObjectMapper               objectMapper;
@@ -175,7 +177,7 @@ public class OptionsLiveService {
                 .map(s -> s.sessionId)
                 .forEach(this::stopSession);
 
-        String sessionId = UUID.randomUUID().toString();
+        String sessionId = "live-" + UUID.randomUUID();
         LiveOptionsSession session = new LiveOptionsSession(sessionId, req);
         sessions.put(sessionId, session);
 
@@ -448,6 +450,36 @@ public class OptionsLiveService {
 
         // Live tick persistence buffer — null when recordTicks=false
         final LiveTickBuffer tickBuffer;
+
+        // ── AI Market Context ─────────────────────────────────────────────────
+        private volatile AiEngineClient.CachedAiMarketContext latestMarketContext = null;
+        private int candlesSinceLastContextFire = 0;
+        private volatile NiftyDecisionResult lastDecision = null;
+
+        private final AtomicInteger aiContextAttempted  = new AtomicInteger();
+        private final AtomicInteger aiContextSucceeded  = new AtomicInteger();
+        private final AtomicInteger aiContextFailed     = new AtomicInteger();
+        private final AtomicInteger aiAdvisoryAttempted = new AtomicInteger();
+        private final AtomicInteger aiAdvisorySucceeded = new AtomicInteger();
+        private final AtomicInteger aiAdvisoryFailed    = new AtomicInteger();
+        private final AtomicInteger aiReviewAttempted   = new AtomicInteger();
+        private final AtomicInteger aiReviewSucceeded   = new AtomicInteger();
+        private final AtomicInteger aiReviewFailed      = new AtomicInteger();
+
+        // Dedup key for post-trade review: entryTime + "|" + exitTime
+        private volatile String lastReviewedTradeKey = null;
+
+        // Recent candle buffer for AI market context payloads (cap 5)
+        private final Deque<Map<String, Object>> recentCandleBuffer = new ArrayDeque<>(6);
+        private double prevBucketClose     = 0.0;
+        private double lastCandleClose     = 0.0;
+        private LocalDateTime lastBufferedCandleTime = null;
+
+        // Pending AI futures — cleaned up on each candle close
+        private final List<CompletableFuture<?>> pendingAiFutures = new CopyOnWriteArrayList<>();
+
+        // Entry-time snapshot — captured the tick a trade is entered, used by buildReviewPayload
+        private volatile Map<String, Object> entrySnapshot = null;
 
         // ── emitter management ────────────────────────────────────────────────
 
@@ -1098,6 +1130,30 @@ public class OptionsLiveService {
                 applyScoreTierRules(decision, currentRegime,
                         req.getTradeQualityConfig(), execEngine.getBarsSinceLastLoss());
 
+                lastDecision = decision;
+
+                // ── AI Market Context Gate ────────────────────────────────────
+                AiEngineClient.CachedAiMarketContext aiCtxForEvent = null;
+                String aiBlockReason = null;
+                if (req.isAiEnabled()
+                        && execEngine.getState() == OptionExecutionEngine.PositionState.FLAT
+                        && decision.isEntryAllowed()) {
+                    AiEngineClient.CachedAiMarketContext ctx = latestMarketContext;
+                    if (ctx != null && !ctx.isExpired()) {
+                        aiCtxForEvent = ctx;
+                        String optType = biasToOptionType(decision.getConfirmedBias());
+                        double threshold = req.getAiGateConfidenceThreshold();
+                        boolean blockMarket = !ctx.marketTradable() && ctx.confidence() >= threshold;
+                        boolean blockCE = ctx.avoidCE() && "CE".equals(optType) && ctx.confidence() >= threshold;
+                        boolean blockPE = ctx.avoidPE() && "PE".equals(optType) && ctx.confidence() >= threshold;
+                        if (req.isAiGateEnabled() && (blockMarket || blockCE || blockPE)) {
+                            decision.setEntryAllowed(false);
+                            aiBlockReason = "AI_MARKET_CONTEXT";
+                        }
+                    }
+                    // ctx null or expired → fail-open, no block
+                }
+
                 // Gate execution by market phase
                 double niftyClose = snapshot.close().doubleValue();
                 String action;
@@ -1115,6 +1171,11 @@ public class OptionsLiveService {
                             cePool, pePool, niftyClose, openTime, snapshot);
                 }
 
+                // Capture entry snapshot at the exact tick a trade is entered
+                if ("ENTERED".equals(action)) {
+                    entrySnapshot = buildEntrySnapshot(decision, snapshot);
+                }
+
                 // Notify decision engine of any cascade-eligible exit
                 if (execEngine.getLastExitReason() != null) {
                     java.util.List<com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade> ct = execEngine.getClosedTrades();
@@ -1122,10 +1183,63 @@ public class OptionsLiveService {
                     decisionEngine.recordCascadeExit(execEngine.getLastExitReason(), "NIFTY", exitSide, openTime);
                 }
 
+                // ── Post-exit Review (async, deduped by entryTime+exitTime) ──
+                if (req.isAiEnabled() && execEngine.getLastExitReason() != null) {
+                    java.util.List<com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade> ct =
+                            execEngine.getClosedTrades();
+                    if (!ct.isEmpty()) {
+                        com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade last =
+                                ct.get(ct.size() - 1);
+                        String tradeKey = last.getEntryTime() + "|" + last.getExitTime();
+                        if (!tradeKey.equals(lastReviewedTradeKey)) {
+                            lastReviewedTradeKey = tradeKey;
+                            aiReviewAttempted.incrementAndGet();
+                            CompletableFuture<Boolean> rf =
+                                    aiEngineClient.reviewAsync(buildReviewPayload(decision, execEngine, last));
+                            pendingAiFutures.add(rf);
+                            rf.whenComplete((ok, ex) -> {
+                                if (Boolean.TRUE.equals(ok)) aiReviewSucceeded.incrementAndGet();
+                                else                         aiReviewFailed.incrementAndGet();
+                            });
+                        }
+                    }
+                }
+
+                // ── Risky-Candidate Advisory (async, log only) ────────────────
+                if (req.isAiEnabled() && req.isAiTradeAdvisoryEnabled() && "ENTERED".equals(action)) {
+                    if (isRiskyCandidate(decision, execEngine)) {
+                        aiAdvisoryAttempted.incrementAndGet();
+                        CompletableFuture<Boolean> af =
+                                aiEngineClient.adviseAsync(buildAdvisoryPayload(decision, execEngine, snapshot, openTime));
+                        pendingAiFutures.add(af);
+                        af.whenComplete((ok, ex) -> {
+                            if (Boolean.TRUE.equals(ok)) aiAdvisorySucceeded.incrementAndGet();
+                            else                         aiAdvisoryFailed.incrementAndGet();
+                        });
+                    }
+                }
+
                 emittedCount++;
                 OptionsReplayCandleEvent event = buildEvent(
                         emittedCount, snapshot, decision, execEngine, selectorService,
                         openTime, action, marketPhase, tradable);
+
+                // Attach AI context snapshot for SSE debugging
+                if (aiCtxForEvent != null) {
+                    Map<String, Object> ctxMap = new LinkedHashMap<>();
+                    ctxMap.put("marketTradable", aiCtxForEvent.marketTradable());
+                    ctxMap.put("avoidCE",        aiCtxForEvent.avoidCE());
+                    ctxMap.put("avoidPE",        aiCtxForEvent.avoidPE());
+                    ctxMap.put("confidence",     aiCtxForEvent.confidence());
+                    ctxMap.put("summary",        aiCtxForEvent.summary());
+                    ctxMap.put("reasonCodes",    aiCtxForEvent.reasonCodes());
+                    ctxMap.put("warningCodes",   aiCtxForEvent.warningCodes());
+                    ctxMap.put("source",         aiCtxForEvent.source());
+                    ctxMap.put("timestampMs",    aiCtxForEvent.timestampMs());
+                    ctxMap.put("validUntilMs",   aiCtxForEvent.validUntilMs());
+                    event.setAiMarketContext(ctxMap);
+                }
+                event.setAiBlockReason(aiBlockReason);
 
                 broadcast("candle", objectMapper.writeValueAsString(event));
 
@@ -1201,6 +1315,29 @@ public class OptionsLiveService {
 
             // Push closed candle into scorer/VWAP history — no decision or execution here
             decisionEngine.pushCandle(niftyCandle);
+
+            // Update recent candle buffer (used for AI market context payloads)
+            updateRecentCandleBuffer(niftyCandle);
+
+            // Cleanup completed AI futures before adding new ones
+            pendingAiFutures.removeIf(CompletableFuture::isDone);
+
+            // Fire AI market context evaluation (async, result used in NEXT decision cycle)
+            if (req.isAiEnabled()) {
+                candlesSinceLastContextFire++;
+                if (candlesSinceLastContextFire >= req.getAiContextIntervalCandles()) {
+                    candlesSinceLastContextFire = 0;
+                    aiContextAttempted.incrementAndGet();
+                    Map<String, Object> ctxPayload = buildMarketContextPayload(niftyCandle);
+                    CompletableFuture<AiEngineClient.CachedAiMarketContext> f =
+                            aiEngineClient.fetchMarketContextAsync(ctxPayload, req.getAiContextTtlSeconds());
+                    pendingAiFutures.add(f);
+                    f.whenComplete((ctx, ex) -> {
+                        if (ctx != null) { latestMarketContext = ctx; aiContextSucceeded.incrementAndGet(); }
+                        else             {                            aiContextFailed.incrementAndGet();    }
+                    });
+                }
+            }
         }
 
         // ── regime detection ──────────────────────────────────────────────────
@@ -1501,6 +1638,406 @@ public class OptionsLiveService {
                         snap != null ? snap.low()   : "-",
                         snap != null ? snap.close() : "-");
             }
+        }
+
+        // ── AI helper methods ─────────────────────────────────────────────────
+
+        private void updateRecentCandleBuffer(CandleDto candle) {
+            double o = candle.open().doubleValue(),  h = candle.high().doubleValue(),
+                   lo = candle.low().doubleValue(),  c = candle.close().doubleValue();
+            LocalDateTime openTime = candle.openTime();
+
+            Map<String, Object> cc = new HashMap<>();
+            cc.put("time", openTime != null ? openTime.toLocalTime().toString().substring(0, 5) : "");
+            cc.put("direction",  c > o ? "UP" : (c < o ? "DOWN" : "DOJI"));
+            cc.put("bodyPctOfRange",  (h - lo) > 0 ? Math.abs(c - o) / (h - lo) * 100.0 : 0.0);
+            cc.put("bodyPctOfPrice",  o != 0 ? Math.abs(c - o) / o * 100.0 : 0.0);
+            cc.put("closePositionInRange", (h - lo) > 0 ? (c - lo) / (h - lo) : 0.5);
+            if (lastDecision != null) cc.put("vwapDistancePct", lastDecision.getDistanceFromVwap());
+            if (prevBucketClose > 0)  cc.put("moveFromPrevClosePct", (c - prevBucketClose) / prevBucketClose * 100.0);
+
+            prevBucketClose      = lastCandleClose;
+            lastCandleClose      = c;
+            lastBufferedCandleTime = openTime;
+
+            recentCandleBuffer.addLast(cc);
+            if (recentCandleBuffer.size() > 5) recentCandleBuffer.pollFirst();
+        }
+
+        private Map<String, Object> buildMarketContextPayload(CandleDto closedCandle) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("sessionId", sessionId);
+
+            LocalDateTime openTime = closedCandle.openTime();
+            Instant candleInstant  = openTime != null
+                    ? openTime.atZone(IST).toInstant()
+                    : Instant.now();
+            m.put("candleTime", candleInstant.toString());
+            m.put("timeOfDay",  openTime != null
+                    ? openTime.toLocalTime().toString().substring(0, 5) : "");
+            m.put("regime", currentRegime);
+
+            // Direction of the just-closed candle
+            double o = closedCandle.open().doubleValue(), c = closedCandle.close().doubleValue();
+            m.put("niftyDirection", c > o ? "UP" : (c < o ? "DOWN" : "DOJI"));
+
+            // Short-term trend: compare current close vs close 3 bars ago from buffer
+            List<Map<String, Object>> buf = new ArrayList<>(recentCandleBuffer);
+            if (buf.size() >= 4) {
+                Object prev3 = buf.get(buf.size() - 4).get("moveFromPrevClosePct");
+                // Sum last 3 candle moves to get net 3-candle move
+                double net = 0.0;
+                for (int i = Math.max(0, buf.size() - 3); i < buf.size(); i++) {
+                    Object mv = buf.get(i).get("moveFromPrevClosePct");
+                    if (mv instanceof Number) net += ((Number) mv).doubleValue();
+                }
+                m.put("shortTermTrend", net > 0.3 ? "UPTREND" : net < -0.3 ? "DOWNTREND" : "SIDEWAYS");
+            } else {
+                m.put("shortTermTrend", "SIDEWAYS");
+            }
+
+            // Candle counts
+            int upCnt = 0, downCnt = 0;
+            for (Map<String, Object> b : buf) {
+                String dir = (String) b.getOrDefault("direction", "DOJI");
+                if ("UP".equals(dir))        upCnt++;
+                else if ("DOWN".equals(dir)) downCnt++;
+            }
+            m.put("upCandlesCount",   upCnt);
+            m.put("downCandlesCount", downCnt);
+
+            // Move metrics and decision state from last decision
+            if (lastDecision != null) {
+                m.put("recentMove3CandlePct",  lastDecision.getRecentMove3());
+                m.put("recentMove5CandlePct",  lastDecision.getRecentMove5());
+                m.put("vwapDistancePct",        lastDecision.getDistanceFromVwap());
+                m.put("winningScore",           lastDecision.getWinnerScore());
+                m.put("scoreGap",               lastDecision.getScoreGap());
+            }
+
+            // ADX / ATR from regime buffers
+            try {
+                double[] adxAtr = MarketRegimeDetector.computeLastAdxAndAtr(
+                        toDoubleArray(regimeHighs), toDoubleArray(regimeLows), toDoubleArray(regimeCloses));
+                m.put("adx",    adxAtr[0]);
+                m.put("atrPct", adxAtr[1]);
+            } catch (Exception ignored) {}
+
+            // Candle body %
+            if (closedCandle.open() != null && closedCandle.close() != null
+                    && closedCandle.open().doubleValue() != 0) {
+                m.put("candleBodyPct", Math.abs(c - o) / o * 100.0);
+            }
+
+            // Session context
+            if (execEngine != null) {
+                m.put("tradesToday",    execEngine.getClosedTrades().size());
+                m.put("dailyPnl",       execEngine.getRealizedPnl());
+                m.put("sessionCapital", execEngine.getCapital());
+            }
+
+            m.put("recentCandles", buf);
+            return m;
+        }
+
+        private boolean isRiskyCandidate(NiftyDecisionResult decision, OptionExecutionEngine exec) {
+            // 1. Opposite side after strong winner
+            java.util.List<com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade> trades =
+                    exec.getClosedTrades();
+            if (!trades.isEmpty()) {
+                com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade prev =
+                        trades.get(trades.size() - 1);
+                if (prev.getPnlPct() >= 8.0) {
+                    String prevType = prev.getOptionType() != null
+                            ? prev.getOptionType() : deriveOptionType(prev.getTradingSymbol());
+                    String curType  = biasToOptionType(decision.getConfirmedBias());
+                    if (curType != null && prevType != null && !curType.equals(prevType)) return true;
+                }
+            }
+            // 2. Choppy regime
+            String regime = decision.getRegime();
+            if ("COMPRESSION".equalsIgnoreCase(regime) || "RANGING".equalsIgnoreCase(regime)) return true;
+            // 3. Weak score gap
+            if (decision.getScoreGap() < 5.0) return true;
+            // 4. Overextended recent move
+            if (decision.getRecentMove3() >= 1.5) return true;
+            // 5. Last 2 trades both losses
+            if (trades.size() >= 2
+                    && trades.get(trades.size() - 1).getPnl() < 0
+                    && trades.get(trades.size() - 2).getPnl() < 0) return true;
+            // 6. Session P&L below -3% of initial capital
+            if (exec.getRealizedPnl() < -(0.03 * req.getInitialCapital().doubleValue())) return true;
+            return false;
+        }
+
+        private Map<String, Object> buildAdvisoryPayload(
+                NiftyDecisionResult decision, OptionExecutionEngine exec,
+                CandleDto snapshot, LocalDateTime openTime) {
+            Map<String, Object> m = new HashMap<>();
+            m.put("sessionId", sessionId);
+            String sym = exec.getActiveTradingSymbol();
+            m.put("symbol", sym != null ? sym : "NIFTY");
+            String optType = exec.getActiveOptionType();
+            if (optType == null) optType = deriveOptionType(sym);
+            m.put("side", "LONG_OPTION");
+            m.put("currentOptionType", optType);
+            m.put("candleTime", openTime.atZone(IST).toInstant().toString());
+            m.put("entryPrice",     exec.getEntryPrice());
+            m.put("quantity",       exec.getQuantity());
+            m.put("regime",         decision.getRegime());
+            m.put("winningStrategy", decision.getWinnerStrategy());
+            m.put("winningScore",   decision.getWinnerScore());
+            m.put("oppositeScore",  decision.getSecondScore());
+            m.put("scoreGap",       decision.getScoreGap());
+            m.put("recentMove3CandlePct", decision.getRecentMove3());
+            m.put("recentMove5CandlePct", decision.getRecentMove5());
+            m.put("vwapDistancePct",       decision.getDistanceFromVwap());
+            if (snapshot.open() != null && snapshot.close() != null
+                    && snapshot.open().doubleValue() != 0) {
+                m.put("candleBodyPct", Math.abs(snapshot.close().doubleValue() - snapshot.open().doubleValue())
+                        / snapshot.open().doubleValue() * 100.0);
+            }
+            m.put("optionPremium",     exec.getEntryPrice());
+            m.put("barsSinceLastTrade", exec.getBarsSinceLastTrade());
+            m.put("capitalBefore",     exec.getCapital());
+            try {
+                double[] adxAtr = MarketRegimeDetector.computeLastAdxAndAtr(
+                        toDoubleArray(regimeHighs), toDoubleArray(regimeLows), toDoubleArray(regimeCloses));
+                m.put("adx",    adxAtr[0]);
+                m.put("atrPct", adxAtr[1]);
+            } catch (Exception ignored) {}
+            m.put("minMovementFilterPassed",      decision.getMinMovementFilterPassed());
+            m.put("directionalConsistencyPassed", decision.getDirectionalConsistencyPassed());
+            m.put("candleStrengthFilterPassed",   decision.getCandleStrengthFilterPassed());
+            m.put("compressionNoTradeEnabled",
+                    req.getTradingRules() != null && req.getTradingRules().isCompressionNoTrade());
+            java.util.List<com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade> allTrades =
+                    exec.getClosedTrades();
+            m.put("tradesToday",         allTrades.size());
+            m.put("dailyPnlBeforeTrade", exec.getRealizedPnl());
+            if (!allTrades.isEmpty()) {
+                com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade prev =
+                        allTrades.get(allTrades.size() - 1);
+                String prevOptType = prev.getOptionType() != null
+                        ? prev.getOptionType() : deriveOptionType(prev.getTradingSymbol());
+                boolean strongWin = prev.getPnlPct() >= 8.0;
+                m.put("previousTradeSymbol",          prev.getTradingSymbol());
+                m.put("previousTradeOptionType",      prevOptType);
+                m.put("previousTradePnlPct",          prev.getPnlPct());
+                m.put("previousTradeExitReason",      prev.getExitReason());
+                m.put("previousTradeExitTime",        prev.getExitTime());
+                m.put("previousTradeWasStrongWinner", strongWin);
+                m.put("isOppositeSideAfterStrongWinner",
+                        strongWin && optType != null && prevOptType != null && !optType.equals(prevOptType));
+                try {
+                    LocalDateTime prevExit = LocalDateTime.parse(prev.getExitTime());
+                    m.put("minutesSincePreviousExit",
+                            (int) Duration.between(prevExit, openTime).toMinutes());
+                } catch (Exception ignored) {}
+            }
+            m.put("recentCandles", new ArrayList<>(recentCandleBuffer));
+
+            // Derived candle alignment fields
+            List<Map<String, Object>> rc = new ArrayList<>(recentCandleBuffer);
+            int upCnt = 0, downCnt = 0, strongUpCnt = 0, strongDownCnt = 0;
+            for (Map<String, Object> cb : rc) {
+                String dir = (String) cb.getOrDefault("direction", "DOJI");
+                Object bpObj = cb.get("bodyPctOfRange");
+                double bp = bpObj instanceof Number ? ((Number) bpObj).doubleValue() : 0.0;
+                if ("UP".equals(dir))        { upCnt++;   if (bp > 60) strongUpCnt++;   }
+                else if ("DOWN".equals(dir)) { downCnt++; if (bp > 60) strongDownCnt++; }
+            }
+            String domDir = upCnt > downCnt ? "UP" : downCnt > upCnt ? "DOWN" : "MIXED";
+            m.put("recentUpCandles",    upCnt);
+            m.put("recentDownCandles",  downCnt);
+            m.put("recentStrongUpCandles",   strongUpCnt);
+            m.put("recentStrongDownCandles", strongDownCnt);
+            m.put("dominantRecentDirection", domDir);
+            m.put("dominantRecentDirectionStrength", rc.isEmpty() ? 0.0 : (double) Math.max(upCnt, downCnt) / rc.size());
+            String curOptType = optType;
+            String ctDir = "CE".equals(curOptType) ? "BULLISH" : "PE".equals(curOptType) ? "BEARISH" : null;
+            m.put("currentTradeDirection", ctDir);
+            m.put("currentTradeAlignedWithRecentDirection",
+                    ("BULLISH".equals(ctDir) && "UP".equals(domDir)) ||
+                    ("BEARISH".equals(ctDir) && "DOWN".equals(domDir)));
+            Object minsObj = m.get("minutesSincePreviousExit");
+            int mins = minsObj instanceof Number ? ((Number) minsObj).intValue() : -1;
+            boolean isOpp  = Boolean.TRUE.equals(m.get("isOppositeSideAfterStrongWinner"));
+            boolean wasWin = Boolean.TRUE.equals(m.get("previousTradeWasStrongWinner"));
+            m.put("sameCandleFlip", isOpp && mins == 0);
+            m.put("candlesSincePreviousExit", mins >= 0 ? mins / 5 : null);
+            m.put("oppositeSideFlipRisk",
+                    (isOpp && wasWin && mins >= 0 && mins <= 1) ? "HIGH" :
+                    (isOpp && wasWin) ? "MEDIUM" : "LOW");
+            m.put("reversalConfirmationCandles",
+                    "BEARISH".equals(ctDir) ? strongDownCnt : "BULLISH".equals(ctDir) ? strongUpCnt : 0);
+            m.put("favorableUnderlyingDirection",
+                    "CE".equals(curOptType) ? "UP" : "PE".equals(curOptType) ? "DOWN" : null);
+            m.put("currentTradeDirectionExplanation",
+                    "CE".equals(curOptType) ? "CE (Call) benefits when NIFTY moves UP. UP candles are favorable." :
+                    "PE".equals(curOptType) ? "PE (Put) benefits when NIFTY moves DOWN. DOWN candles are favorable." : null);
+            m.put("instrumentContext", "UNDERLYING");
+            int supportCount = "CE".equals(curOptType) ? upCnt : "PE".equals(curOptType) ? downCnt : 0;
+            int opposeCount  = "CE".equals(curOptType) ? downCnt : "PE".equals(curOptType) ? upCnt : 0;
+            m.put("recentCandlesSupportTradeCount", supportCount);
+            m.put("recentCandlesOpposeTradeCount",  opposeCount);
+            boolean lastSupports = false;
+            if (!rc.isEmpty()) {
+                String lastDir = (String) rc.get(rc.size() - 1).getOrDefault("direction", "DOJI");
+                lastSupports = ("CE".equals(curOptType) && "UP".equals(lastDir))
+                           || ("PE".equals(curOptType) && "DOWN".equals(lastDir));
+            }
+            m.put("lastCandleSupportsTrade", lastSupports);
+            m.put("recentMomentumAlignment",
+                    supportCount > opposeCount ? "SUPPORTS_TRADE"
+                    : opposeCount > supportCount ? "OPPOSES_TRADE"
+                    : "MIXED");
+            return m;
+        }
+
+        private Map<String, Object> buildReviewPayload(
+                NiftyDecisionResult decision, OptionExecutionEngine exec,
+                com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade ct) {
+            Map<String, Object> m = new HashMap<>();
+            // ── Identity & trade result ───────────────────────────────────────
+            m.put("sessionId", sessionId);
+            m.put("tradeId",   sessionId + "-" + ct.getEntryTime());
+            String sym = ct.getTradingSymbol();
+            m.put("symbol", sym != null ? sym : "NIFTY");
+            String curOptType = ct.getOptionType() != null ? ct.getOptionType() : deriveOptionType(sym);
+            m.put("side", "LONG_OPTION");
+            m.put("currentOptionType", curOptType);
+            m.put("entryTime",  ct.getEntryTime());
+            m.put("exitTime",   ct.getExitTime());
+            m.put("entryPrice", ct.getEntryPrice());
+            m.put("exitPrice",  ct.getExitPrice());
+            m.put("quantity",   ct.getQuantity());
+            m.put("pnl",        ct.getPnl());
+            m.put("pnlPct",     ct.getPnlPct());
+            m.put("exitReason", ct.getExitReason());
+            m.put("barsHeld",   ct.getBarsInTrade());
+            m.put("optionPremium",  ct.getEntryPrice());
+            m.put("capitalAfter",   ct.getCapitalAfter());
+            m.put("capitalBefore",  ct.getCapitalAfter() - ct.getPnl());
+            m.put("maxFavorableExcursionPct", ct.getMaxFavorableExcursionPct());
+            m.put("maxAdverseExcursionPct",   ct.getMaxAdverseExcursionPct());
+            m.put("compressionNoTradeEnabled",
+                    req.getTradingRules() != null && req.getTradingRules().isCompressionNoTrade());
+            java.util.List<com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade> allTrades =
+                    exec.getClosedTrades();
+            m.put("tradesToday",         allTrades.size());
+            m.put("dailyPnlAfterTrade",  exec.getRealizedPnl());
+            m.put("dailyPnlBeforeTrade", exec.getRealizedPnl() - ct.getPnl());
+            // ── Entry-time context snapshot (all entry* fields) ───────────────
+            if (entrySnapshot != null) {
+                m.putAll(entrySnapshot);
+            }
+            // ── Previous trade context ────────────────────────────────────────
+            if (allTrades.size() >= 2) {
+                com.sma.strategyengine.model.response.OptionsReplayCandleEvent.ClosedTrade prev =
+                        allTrades.get(allTrades.size() - 2);
+                String prevOptType = prev.getOptionType() != null
+                        ? prev.getOptionType() : deriveOptionType(prev.getTradingSymbol());
+                boolean strongWin = prev.getPnlPct() >= 8.0;
+                m.put("previousTradeSymbol",          prev.getTradingSymbol());
+                m.put("previousTradeOptionType",      prevOptType);
+                m.put("previousTradePnlPct",          prev.getPnlPct());
+                m.put("previousTradeExitReason",      prev.getExitReason());
+                m.put("previousTradeExitTime",        prev.getExitTime());
+                m.put("previousTradeWasStrongWinner", strongWin);
+                m.put("isOppositeSideAfterStrongWinner",
+                        strongWin && curOptType != null && prevOptType != null && !curOptType.equals(prevOptType));
+                try {
+                    LocalDateTime prevExit  = LocalDateTime.parse(prev.getExitTime());
+                    LocalDateTime thisEntry = LocalDateTime.parse(ct.getEntryTime());
+                    m.put("minutesSincePreviousExit",
+                            (int) Duration.between(prevExit, thisEntry).toMinutes());
+                } catch (Exception ignored) {}
+            }
+            // ── Derived analytics ─────────────────────────────────────────────
+            double mfe = ct.getMaxFavorableExcursionPct(), mae = ct.getMaxAdverseExcursionPct();
+            double pnlPct = ct.getPnlPct();
+            int    bars   = ct.getBarsInTrade();
+            m.put("tradeHadFollowThrough", mfe >= 1.5);
+            m.put("mfeQuality",  mfe < 0.5 ? "VERY_LOW" : mfe < 1.5 ? "LOW" : mfe < 4.0 ? "OK" : "STRONG");
+            m.put("maeSeverity", mae <= -4.0 ? "HIGH" : mae <= -2.0 ? "MEDIUM" : "LOW");
+            m.put("lossHappenedQuickly", pnlPct < 0 && bars <= 3);
+            Object minsObj = m.get("minutesSincePreviousExit");
+            int mins = minsObj instanceof Number ? ((Number) minsObj).intValue() : -1;
+            m.put("sameCandleFlip",
+                    Boolean.TRUE.equals(m.get("isOppositeSideAfterStrongWinner")) && mins == 0);
+            m.put("favorableUnderlyingDirection",
+                    "CE".equals(curOptType) ? "UP" : "PE".equals(curOptType) ? "DOWN" : null);
+            m.put("currentTradeDirectionExplanation",
+                    "CE".equals(curOptType) ? "CE (Call) benefits when NIFTY moves UP. UP candles are favorable." :
+                    "PE".equals(curOptType) ? "PE (Put) benefits when NIFTY moves DOWN. DOWN candles are favorable." : null);
+            m.put("tradeOutcome", pnlPct > 0 ? "PROFIT" : pnlPct < 0 ? "LOSS" : "BREAKEVEN");
+            return m;
+        }
+
+        private Map<String, Object> buildEntrySnapshot(NiftyDecisionResult decision, CandleDto snap) {
+            Map<String, Object> m = new HashMap<>();
+            m.put("entryWinningStrategy",              decision.getWinnerStrategy());
+            m.put("entryWinningScore",                 decision.getWinnerScore());
+            m.put("entryOppositeScore",                decision.getSecondScore());
+            m.put("entryScoreGap",                     decision.getScoreGap());
+            m.put("entryRegime",                       decision.getRegime());
+            m.put("entryRecentMove3CandlePct",         decision.getRecentMove3());
+            m.put("entryRecentMove5CandlePct",         decision.getRecentMove5());
+            m.put("entryVwapDistancePct",              decision.getDistanceFromVwap());
+            if (snap != null) {
+                double o = snap.open().doubleValue(), c = snap.close().doubleValue();
+                m.put("entryCandleBodyPct", o > 0 ? Math.abs((c - o) / o * 100.0) : 0.0);
+            }
+            m.put("entryMinMovementFilterPassed",      decision.getMinMovementFilterPassed());
+            m.put("entryDirectionalConsistencyPassed", decision.getDirectionalConsistencyPassed());
+            m.put("entryCandleStrengthFilterPassed",   decision.getCandleStrengthFilterPassed());
+            try {
+                double[] adxAtr = MarketRegimeDetector.computeLastAdxAndAtr(
+                        toDoubleArray(regimeHighs), toDoubleArray(regimeLows), toDoubleArray(regimeCloses));
+                m.put("entryAdx",    adxAtr[0]);
+                m.put("entryAtrPct", adxAtr[1]);
+            } catch (Exception ignored) {}
+            List<Map<String, Object>> candlesCopy = new ArrayList<>(recentCandleBuffer);
+            m.put("entryRecentCandles", candlesCopy);
+            NiftyDecisionResult.Bias bias = decision.getConfirmedBias();
+            boolean isBullish = bias == NiftyDecisionResult.Bias.BULLISH;
+            int supportCount = 0, opposeCount = 0;
+            for (Map<String, Object> cc : candlesCopy) {
+                String dir = (String) cc.get("direction");
+                if (isBullish) { if ("UP".equals(dir)) supportCount++; else if ("DOWN".equals(dir)) opposeCount++; }
+                else           { if ("DOWN".equals(dir)) supportCount++; else if ("UP".equals(dir)) opposeCount++; }
+            }
+            boolean lastSupports = false;
+            if (!candlesCopy.isEmpty()) {
+                String lastDir = (String) candlesCopy.get(candlesCopy.size() - 1).get("direction");
+                lastSupports = isBullish ? "UP".equals(lastDir) : "DOWN".equals(lastDir);
+            }
+            m.put("entryRecentCandlesSupportTradeCount", supportCount);
+            m.put("entryRecentCandlesOpposeTradeCount",  opposeCount);
+            m.put("entryLastCandleSupportsTrade",        lastSupports);
+            int total = supportCount + opposeCount;
+            m.put("entryRecentMomentumAlignment",
+                    total == 0 ? "MIXED" : supportCount > opposeCount ? "SUPPORTS_TRADE"
+                    : supportCount < opposeCount ? "OPPOSES_TRADE" : "MIXED");
+            return m;
+        }
+
+        private static String biasToOptionType(NiftyDecisionResult.Bias bias) {
+            if (bias == NiftyDecisionResult.Bias.BULLISH) return "CE";
+            if (bias == NiftyDecisionResult.Bias.BEARISH) return "PE";
+            return null;
+        }
+
+        private static String deriveOptionType(String symbol) {
+            if (symbol == null) return null;
+            if (symbol.endsWith("CE")) return "CE";
+            if (symbol.endsWith("PE")) return "PE";
+            return null;
+        }
+
+        private double[] toDoubleArray(List<Double> list) {
+            return list.stream().mapToDouble(Double::doubleValue).toArray();
         }
     }
 

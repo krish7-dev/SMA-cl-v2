@@ -2,7 +2,9 @@ package com.sma.aiengine.service;
 
 import com.sma.aiengine.model.enums.*;
 import com.sma.aiengine.model.request.CompletedTradeRequest;
+import com.sma.aiengine.model.request.MarketContextRequest;
 import com.sma.aiengine.model.request.TradeCandidateRequest;
+import com.sma.aiengine.model.response.MarketContextResponse;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
@@ -175,6 +177,98 @@ class FallbackEvaluator {
         return new AdvisoryAiOutput(action, confidence, tradeQualityScore, riskLevel,
                 reversalRisk, 0.0, lateEntryRisk, overextensionRisk,
                 List.copyOf(reasonCodes), List.copyOf(warningCodes), summary);
+    }
+
+    /**
+     * Deterministic market context evaluation when OpenAI is disabled or unavailable.
+     *
+     * Step 1 — marketTradable (regime-based):
+     *   COMPRESSION → false (confidence 0.80)
+     *   RANGING     → false (confidence 0.65)
+     *   TRENDING + adx >= 25 → true (confidence 0.65)
+     *   default → true (confidence 0.50)
+     *
+     * Step 2 — avoidCE / avoidPE (independent of marketTradable):
+     *   downCandlesCount >= 4 → avoidCE=true (confidence max 0.70)
+     *   upCandlesCount >= 4   → avoidPE=true (confidence max 0.70)
+     *
+     * COMPRESSION/RANGING rules always preserve marketTradable=false even if candle rules fire.
+     */
+    MarketContextResponse marketContext(MarketContextRequest req) {
+        String regime = req.getRegime();
+
+        boolean marketTradable = true;
+        boolean avoidCE = false;
+        boolean avoidPE = false;
+        double  confidence = 0.50;
+        List<String> reasonCodes  = new ArrayList<>();
+        List<String> warningCodes = new ArrayList<>();
+
+        // ── Step 1: marketTradable via regime ────────────────────────────────
+        boolean regimeLocked = false;
+        if ("COMPRESSION".equalsIgnoreCase(regime)) {
+            marketTradable = false;
+            confidence     = Math.max(confidence, 0.80);
+            reasonCodes.add("COMPRESSION_REGIME");
+            regimeLocked = true;
+        } else if ("RANGING".equalsIgnoreCase(regime)) {
+            marketTradable = false;
+            confidence     = Math.max(confidence, 0.65);
+            reasonCodes.add("RANGING_REGIME");
+            regimeLocked = true;
+        } else if ("TRENDING".equalsIgnoreCase(regime)
+                && req.getAdx() != null && req.getAdx() >= 25.0) {
+            marketTradable = true;
+            confidence     = Math.max(confidence, 0.65);
+            reasonCodes.add("TRENDING_STRONG_ADX");
+        }
+
+        // ── Step 2: avoidCE / avoidPE (candle flow, regime-independent) ─────
+        if (req.getDownCandlesCount() >= 4) {
+            avoidCE    = true;
+            confidence = Math.max(confidence, 0.70);
+            reasonCodes.add("BEARISH_CANDLE_FLOW");
+        }
+        if (req.getUpCandlesCount() >= 4) {
+            avoidPE    = true;
+            confidence = Math.max(confidence, 0.70);
+            reasonCodes.add("BULLISH_CANDLE_FLOW");
+        }
+
+        // COMPRESSION / RANGING always lock marketTradable=false even if candle rules are present
+        if (regimeLocked) {
+            marketTradable = false;
+        }
+
+        // ── Build summary ────────────────────────────────────────────────────
+        String summary;
+        if (!marketTradable && reasonCodes.contains("COMPRESSION_REGIME")) {
+            summary = "Compression regime detected — high chop risk, market not tradable.";
+        } else if (!marketTradable && reasonCodes.contains("RANGING_REGIME")) {
+            summary = "Ranging regime detected — directional edge absent, market not tradable.";
+        } else if (reasonCodes.contains("TRENDING_STRONG_ADX")) {
+            summary = "Trending regime with strong ADX — market tradable"
+                    + (avoidCE || avoidPE ? "; candle flow caution applied." : ".");
+        } else if (avoidCE && avoidPE) {
+            summary = "Mixed candle flow — both CE and PE entries cautioned.";
+        } else if (avoidCE) {
+            summary = "Bearish candle flow (" + req.getDownCandlesCount() + "/5 down candles) — CE entry cautioned.";
+        } else if (avoidPE) {
+            summary = "Bullish candle flow (" + req.getUpCandlesCount() + "/5 up candles) — PE entry cautioned.";
+        } else {
+            summary = "No strong directional signal — default market context, proceed normally.";
+        }
+
+        return MarketContextResponse.builder()
+                .marketTradable(marketTradable)
+                .avoidCE(avoidCE)
+                .avoidPE(avoidPE)
+                .confidence(confidence)
+                .summary(summary)
+                .reasonCodes(List.copyOf(reasonCodes))
+                .warningCodes(List.copyOf(warningCodes))
+                .source("FALLBACK")
+                .build();
     }
 
     private String tradeLabel(String optType) {

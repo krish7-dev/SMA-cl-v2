@@ -123,4 +123,24 @@ public class OptionsLiveRequest {
 
     // Real trend validation — filter fake breakouts in TRENDING regime
     private OptionsReplayRequest.RealTrendConfig realTrendConfig = new OptionsReplayRequest.RealTrendConfig();
+
+    // ── AI Market Context ─────────────────────────────────────────────────────
+
+    /** Enable AI market context evaluation and risky-trade advisory. */
+    private boolean aiEnabled                 = false;
+
+    /** Gate new entries when AI market context is unfavorable (observe mode by default). */
+    private boolean aiGateEnabled             = false;
+
+    /** Minimum AI confidence required to block an entry (0.65 = 65%). */
+    private double  aiGateConfidenceThreshold = 0.65;
+
+    /** Fire market context call every N closed NIFTY candles (1 = every candle). */
+    private int     aiContextIntervalCandles  = 1;
+
+    /** How long the cached market context stays valid in seconds (default 5 min). */
+    private int     aiContextTtlSeconds       = 300;
+
+    /** Enable async per-trade advisory for risky candidates (log-only, never gates). */
+    private boolean aiTradeAdvisoryEnabled    = false;
 }

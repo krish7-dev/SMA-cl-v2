@@ -12,7 +12,8 @@ import {
   getOptionsLiveFeed, getTickReplayFeed,
   saveSessionResult, listSessionResults, getSessionResult, deleteSessionResult, finalizeSessionResult,
   querySessionTicksForCompare,
-  getAiReviews, getAiAdvisories, getAiEngineConfig, getAiExperimentSummary,
+  getAiReviews, getAiAdvisories, getAiEngineConfig, getAiExperimentSummary, getAiMarketContexts,
+  getAiSessions,
 } from '../services/api';
 import { createChart, CandlestickSeries, LineSeries, createSeriesMarkers, CrosshairMode, LineStyle } from 'lightweight-charts';
 import { useSession } from '../context/SessionContext';
@@ -1020,6 +1021,7 @@ export default function Backtest() {
           ['options-replay',  'Options Replay Test'],
           ['tick-replay',     'Tick Replay Test'],
           ['options-live',    'Options Live Test'],
+          ['ai-insights',     'AI Insights'],
           ['compare',         'Compare'],
         ].map(([key, label]) => (
           <button
@@ -1038,6 +1040,7 @@ export default function Backtest() {
       {tab === 'options-replay' && <OptionsReplayTest />}
       {tab === 'tick-replay'    && <TickReplayTest />}
       {tab === 'options-live'   && <OptionsLiveTest />}
+      {tab === 'ai-insights'   && <AiInsightsDashboard />}
       {tab === 'compare'        && <SessionCompare />}
     </div>
   );
@@ -1093,6 +1096,12 @@ function OptionsLiveTest() {
   const [cascadeProtection,              setCascadeProtection]              = useState(() => ls('sma_live_opts_cascade_protection',              DEFAULT_CASCADE_PROTECTION));
   const [realTrendConfig,                setRealTrendConfig]                = useState(() => ls('sma_live_opts_real_trend_config',                DEFAULT_REAL_TREND_CONFIG));
   const [noNewTradesAfterTime,           setNoNewTradesAfterTime]           = useState(() => ls('sma_live_opts_no_new_trades_after_time',          DEFAULT_NO_NEW_TRADES_AFTER_TIME));
+  const [aiEnabled,                      setAiEnabled]                      = useState(() => ls('sma_live_opts_ai_enabled',         true));
+  const [aiGateEnabled,                  setAiGateEnabled]                  = useState(() => ls('sma_live_opts_ai_gate',            false));
+  const [aiGateConfidenceThreshold,      setAiGateConf]                     = useState(() => ls('sma_live_opts_ai_gate_conf',       0.65));
+  const [aiContextIntervalCandles,       setAiCtxInterval]                  = useState(() => ls('sma_live_opts_ai_ctx_interval',    1));
+  const [aiContextTtlSeconds,            setAiCtxTtl]                       = useState(() => ls('sma_live_opts_ai_ctx_ttl',         300));
+  const [aiTradeAdvisoryEnabled,         setAiTradeAdvisory]                = useState(() => ls('sma_live_opts_ai_trade_advisory',  true));
 
   function updateOptsRisk(key, val)                    { setOptsRisk(p                      => ({ ...p, [key]: val })); }
   function updateRangeQuality(key, val)                { setRangeQuality(p                  => ({ ...p, [key]: val })); }
@@ -1126,6 +1135,8 @@ function OptionsLiveTest() {
       holdConfig, exitConfig, penaltyConfig, minMovementFilter, directionalConsistencyFilter, candleStrengthFilter,
       noNewTradesAfterTime,
       cascadeProtection, realTrendConfig,
+      aiEnabled, aiGateEnabled, aiGateConfidenceThreshold,
+      aiContextIntervalCandles, aiContextTtlSeconds, aiTradeAdvisoryEnabled,
     };
   }
 
@@ -1184,6 +1195,12 @@ function OptionsLiveTest() {
     setCascadeProtection(c.cascadeProtection ?? DEFAULT_CASCADE_PROTECTION);
     setRealTrendConfig({ ...DEFAULT_REAL_TREND_CONFIG, ...(c.realTrendConfig ?? {}) });
     setNoNewTradesAfterTime(c.noNewTradesAfterTime ?? DEFAULT_NO_NEW_TRADES_AFTER_TIME);
+    if (c.aiEnabled                 !== undefined) setAiEnabled(c.aiEnabled);
+    if (c.aiGateEnabled             !== undefined) setAiGateEnabled(c.aiGateEnabled);
+    if (c.aiGateConfidenceThreshold !== undefined) setAiGateConf(c.aiGateConfidenceThreshold);
+    if (c.aiContextIntervalCandles  !== undefined) setAiCtxInterval(c.aiContextIntervalCandles);
+    if (c.aiContextTtlSeconds       !== undefined) setAiCtxTtl(c.aiContextTtlSeconds);
+    if (c.aiTradeAdvisoryEnabled    !== undefined) setAiTradeAdvisory(c.aiTradeAdvisoryEnabled);
   }
 
   function deletePreset(id) {
@@ -1274,6 +1291,12 @@ function OptionsLiveTest() {
   useEffect(() => { try { localStorage.setItem('sma_live_opts_cascade_protection',            JSON.stringify(cascadeProtection));             } catch {} }, [cascadeProtection]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_real_trend_config',             JSON.stringify(realTrendConfig));               } catch {} }, [realTrendConfig]);
   useEffect(() => { try { localStorage.setItem('sma_live_opts_no_new_trades_after_time',      JSON.stringify(noNewTradesAfterTime));          } catch {} }, [noNewTradesAfterTime]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_ai_enabled',        JSON.stringify(aiEnabled));                 } catch {} }, [aiEnabled]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_ai_gate',           JSON.stringify(aiGateEnabled));             } catch {} }, [aiGateEnabled]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_ai_gate_conf',      JSON.stringify(aiGateConfidenceThreshold)); } catch {} }, [aiGateConfidenceThreshold]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_ai_ctx_interval',   JSON.stringify(aiContextIntervalCandles));  } catch {} }, [aiContextIntervalCandles]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_ai_ctx_ttl',        JSON.stringify(aiContextTtlSeconds));       } catch {} }, [aiContextTtlSeconds]);
+  useEffect(() => { try { localStorage.setItem('sma_live_opts_ai_trade_advisory', JSON.stringify(aiTradeAdvisoryEnabled));    } catch {} }, [aiTradeAdvisoryEnabled]);
 
   // ── Session / run state
   const [status,    setStatus]    = useState('idle'); // idle|running|error
@@ -1309,6 +1332,36 @@ function OptionsLiveTest() {
   const [showStopConfirm,  setShowStopConfirm]  = useState(false);
   const [stopConfirmText,  setStopConfirmText]  = useState('');
 
+  // ── AI Insights state
+  const [aiReviews,          setAiReviews]          = useState([]);
+  const [aiAdvisories,       setAiAdvisories]        = useState([]);
+  const [aiMarketContexts,   setAiMarketContexts]    = useState([]);
+  const [aiEngineConfig,     setAiEngineConfig]      = useState(null);
+  const [aiLoading,          setAiLoading]           = useState(false);
+  const [expandedAiRow,      setExpandedAiRow]       = useState(null);
+  // Preserved after session stops (same lifecycle as lastSaveSessionIdRef)
+  const [lastKnownSessionId, setLastKnownSessionId]  = useState(null);
+
+  // Effective session ID for AI tab — persists after stop
+  const aiSessionId = sessionId || lastKnownSessionId;
+
+  // Fetch AI data when AI tab is opened
+  useEffect(() => {
+    if (rightTab !== 'ai' || !aiSessionId) return;
+    setAiLoading(true);
+    Promise.all([
+      getAiReviews(aiSessionId),
+      getAiAdvisories(aiSessionId),
+      getAiMarketContexts(aiSessionId),
+      getAiEngineConfig(),
+    ]).then(([rev, adv, ctx, cfg]) => {
+      setAiReviews(rev?.data ?? []);
+      setAiAdvisories(adv?.data ?? []);
+      setAiMarketContexts(ctx?.data ?? []);
+      if (cfg?.data) setAiEngineConfig(cfg.data);
+    }).catch(() => {}).finally(() => setAiLoading(false));
+  }, [rightTab, aiSessionId]);
+
   // On mount: check if a session is already running for this user and auto-reconnect to it.
   useEffect(() => {
     if (!session?.userId) return;
@@ -1317,6 +1370,7 @@ function OptionsLiveTest() {
         sessionIdRef.current = sid;
         lastSaveSessionIdRef.current = sid;  // preserved past stop for save pipeline
         setSessionId(sid);
+        setLastKnownSessionId(sid);
         setCanSave(true);
         // Auto-attach SSE so the feed starts populating immediately
         const ctrl = new AbortController();
@@ -1666,6 +1720,12 @@ function OptionsLiveTest() {
         enabled: tradingHoursEnabled,
         noNewEntriesMinutesBeforeClose: parseInt(closeoutMins, 10) || 15,
       },
+      aiEnabled,
+      aiGateEnabled,
+      aiGateConfidenceThreshold: parseFloat(aiGateConfidenceThreshold) || 0.65,
+      aiContextIntervalCandles:  parseInt(aiContextIntervalCandles, 10) || 1,
+      aiContextTtlSeconds:       parseInt(aiContextTtlSeconds, 10) || 300,
+      aiTradeAdvisoryEnabled,
     };
     lastPayloadRef.current = payload;
     ticksRef.current = [];
@@ -1680,6 +1740,7 @@ function OptionsLiveTest() {
       sessionIdRef.current = sid;
       lastSaveSessionIdRef.current = sid;  // preserved past stop for save pipeline
       setSessionId(sid);
+      setLastKnownSessionId(sid);
       setCanSave(true); setSyncInfo(null);
 
       // Step 2: attach SSE listener (session already running in backend)
@@ -1994,7 +2055,7 @@ function OptionsLiveTest() {
       {/* ── Results panel ── */}
       <div className="card bt-opts-card" style={{ marginBottom: 16 }}>
         <div className="bt-live-right-tabs" style={{ marginBottom: 14 }}>
-          {[['feed','Feed'],['chart','Chart'],['pnl','P&L'],['portfolio','Portfolio'],['details','Details']].map(([k, l]) => (
+          {[['feed','Feed'],['chart','Chart'],['pnl','P&L'],['portfolio','Portfolio'],['details','Details'],['ai','AI Insights']].map(([k, l]) => (
             <button key={k} className={`bt-live-tab-btn ${rightTab === k ? 'active' : ''}`} onClick={() => setRightTab(k)}>{l}</button>
           ))}
           <div style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
@@ -2095,6 +2156,7 @@ function OptionsLiveTest() {
                   ['Capital', fmt2(lastEvt.capital), undefined],
                   ['Block', lastEvt.blockReason || '—', lastEvt.blockReason ? '#ef4444' : undefined],
                   ['Exec', lastEvt.execWaitReason || '—', lastEvt.execWaitReason ? '#f59e0b' : undefined],
+                  ['AI Gate', lastEvt.aiBlockReason || '—', lastEvt.aiBlockReason ? '#a855f7' : undefined],
                 ].map(([lbl, val, color]) => (
                   <div key={lbl} style={{ fontSize: 11 }}>
                     <div style={{ color: 'var(--text-secondary)' }}>{lbl}</div>
@@ -2176,7 +2238,7 @@ function OptionsLiveTest() {
                         <th title="Consecutive candles seen">Cnf</th><th title="Candles required">Req</th>
                         <th>State</th><th>Bars</th><th>Hold</th><th>Action</th><th>ExitRsn</th>
                         <th>PeakPnL%</th><th>LockFloor%</th><th>Zone</th><th>TrendMode</th>
-                        <th>Option</th><th>Opt Px</th><th>uPnL</th><th>rPnL</th><th>Block</th>
+                        <th>Option</th><th>Opt Px</th><th>uPnL</th><th>rPnL</th><th>Block</th><th style={{ color:'#a855f7' }}>AI Gate</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -2224,6 +2286,9 @@ function OptionsLiveTest() {
                           <td style={pnlStyle(evt.realizedPnl)}>{fmt2(evt.realizedPnl)}</td>
                           <td style={{ color: evt.blockReason ? '#ef4444' : evt.execWaitReason ? '#f59e0b' : undefined, fontSize: 10 }}>
                             {evt.blockReason || (evt.execWaitReason ? '⚠ ' + evt.execWaitReason : '')}
+                          </td>
+                          <td style={{ color: evt.aiBlockReason ? '#a855f7' : undefined, fontSize: 10, fontWeight: evt.aiBlockReason ? 700 : undefined }}>
+                            {evt.aiBlockReason || ''}
                           </td>
                         </tr>
                       ))}
@@ -2349,6 +2414,400 @@ function OptionsLiveTest() {
             }
           </>
         )}
+
+        {/* AI Insights tab */}
+        {rightTab === 'ai' && (() => {
+          if (!aiEnabled) return (
+            <p style={{ fontSize:12, color:'var(--text-muted)', textAlign:'center', padding:'24px 0' }}>
+              AI Engine is OFF for this session. Toggle it ON in session settings and restart.
+            </p>
+          );
+          if (aiLoading) return (
+            <>
+              <style>{`@keyframes sma-ai-spin { to { transform: rotate(360deg); } }`}</style>
+              <div style={{ display:'flex', alignItems:'center', justifyContent:'center', padding:'32px 0', gap:10 }}>
+                <div style={{ width:18, height:18, border:'2px solid rgba(99,102,241,0.25)', borderTopColor:'#818cf8', borderRadius:'50%', animation:'sma-ai-spin 0.75s linear infinite', flexShrink:0 }} />
+                <span style={{ fontSize:12, color:'var(--text-muted)' }}>Loading AI insights…</span>
+              </div>
+            </>
+          );
+          const fmtJson = s => { try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s || '—'; } };
+          const jsonPanel = (label, json) => (
+            <div style={{ flex:1, minWidth:0 }}>
+              <div style={{ fontSize:10, fontWeight:700, color:'var(--text-secondary)', marginBottom:4 }}>{label}</div>
+              <pre style={{ maxHeight:320, overflow:'auto', background:'rgba(0,0,0,0.35)', padding:'8px 10px', borderRadius:4, fontSize:9.5, margin:0, whiteSpace:'pre-wrap', wordBreak:'break-all', color:'#c7d2fe' }}>{fmtJson(json)}</pre>
+            </div>
+          );
+          const qualColor = q => q === 'GOOD' ? '#22c55e' : q === 'BAD' ? '#ef4444' : q === 'AVERAGE' ? '#f59e0b' : '#94a3b8';
+          const actColor  = a => a === 'ALLOW' ? '#22c55e' : a === 'AVOID' ? '#ef4444' : a === 'CAUTION' ? '#f59e0b' : '#94a3b8';
+          const noData = aiMarketContexts.length === 0 && aiReviews.length === 0 && aiAdvisories.length === 0;
+
+          const sessionDateStr = (() => {
+            const ts = aiMarketContexts[0]?.candleTime || aiAdvisories[0]?.candleTime || aiReviews[0]?.entryTime;
+            if (!ts) return new Date().toISOString().slice(0, 10);
+            return new Date(ts).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+          })();
+
+          const downloadAiLiveCsv = () => {
+            const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+            const rows = [];
+            rows.push(`"AI Insights — Live session: ${sessionId || '—'} — date: ${sessionDateStr}"`);
+            if (aiEngineConfig) {
+              rows.push(esc(aiEngineConfig.enabled ? 'OpenAI ON' : 'OpenAI OFF (fallback)'));
+              if (aiEngineConfig.enabled && aiEngineConfig.model) rows.push(esc(aiEngineConfig.model));
+            }
+            rows.push('');
+            if (aiMarketContexts.length > 0) {
+              rows.push(['TYPE','#','CANDLE_TIME','REGIME','TRADABLE','AVOID_CE','AVOID_PE','CONFIDENCE','SOURCE','LATENCY_MS','REASON_CODES','WARNING_CODES','SUMMARY'].join(','));
+              aiMarketContexts.forEach((c, i) => rows.push([
+                'MARKET_CTX', i+1,
+                esc(c.candleTime ? new Date(c.candleTime).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}) : ''),
+                esc(c.regime), c.marketTradable ? 'Yes':'No',
+                c.avoidCe ? 'Yes':'No', c.avoidPe ? 'Yes':'No',
+                c.confidence != null ? Number(c.confidence).toFixed(2) : '',
+                esc(c.source), c.latencyMs ?? '',
+                esc((c.reasonCodes||[]).join(' | ')), esc((c.warningCodes||[]).join(' | ')),
+                esc(c.summary)
+              ].join(',')));
+              rows.push('');
+            }
+            if (aiReviews.length > 0) {
+              rows.push(['TYPE','#','ENTRY_TIME','EXIT_TIME','SYMBOL','OPT_TYPE','PNL','EXIT_REASON','QUALITY','AVOIDABLE','MISTAKE','CONFIDENCE','SUMMARY','SOURCE'].join(','));
+              aiReviews.forEach((r, i) => rows.push([
+                'REVIEW', i+1,
+                esc(r.entryTime ? new Date(r.entryTime).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}) : ''),
+                esc(r.exitTime  ? new Date(r.exitTime ).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}) : ''),
+                esc(r.symbol), esc(r.side), r.pnl ?? '',
+                esc(r.exitReason), esc(r.quality), r.avoidable ? 'Yes':'No',
+                esc(r.mistakeType), r.confidence != null ? Number(r.confidence).toFixed(2) : '',
+                esc(r.summary), esc(r.source)
+              ].join(',')));
+              rows.push('');
+            }
+            if (aiAdvisories.length > 0) {
+              rows.push(['TYPE','#','CANDLE_TIME','SYMBOL','OPT_TYPE','ACTION','RISK','CONFIDENCE','REGIME','WARNING_CODES','SUMMARY','SOURCE'].join(','));
+              aiAdvisories.forEach((a, i) => rows.push([
+                'ADVISORY', i+1,
+                esc(a.candleTime ? new Date(a.candleTime).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata',hour12:false}) : ''),
+                esc(a.symbol), esc(a.currentOptionType || a.side),
+                esc(a.action), esc(a.riskLevel),
+                a.confidence != null ? Number(a.confidence).toFixed(2) : '',
+                esc(a.regime), esc((a.warningCodes||[]).join('; ')),
+                esc(a.summary), esc(a.source)
+              ].join(',')));
+            }
+            const blob = new Blob([rows.join('\n')], { type:'text/csv' });
+            const url  = URL.createObjectURL(blob);
+            const a2   = document.createElement('a'); a2.href = url;
+            a2.download = `ai-insights-live-${sessionDateStr}.csv`;
+            a2.click(); URL.revokeObjectURL(url);
+          };
+
+          const downloadAiLiveText = () => {
+            const sep  = '═'.repeat(80);
+            const sep2 = '─'.repeat(80);
+            const lines = [];
+            lines.push(sep);
+            lines.push(`  AI INSIGHTS — Live session: ${sessionId || '—'} — date: ${sessionDateStr}`);
+            lines.push(sep);
+            if (aiEngineConfig) {
+              lines.push('');
+              lines.push('ENGINE CONFIG');
+              lines.push(`  ${aiEngineConfig.enabled ? 'OpenAI ON' : 'OpenAI OFF (fallback)'}`);
+              if (aiEngineConfig.enabled) {
+                if (aiEngineConfig.model) lines.push(`  ${aiEngineConfig.model}`);
+                if (aiEngineConfig.promptMode) lines.push(`  ${aiEngineConfig.promptMode}`);
+              }
+              lines.push(sep);
+            }
+            if (aiMarketContexts.length > 0) {
+              lines.push(''); lines.push(`MARKET CONTEXT (${aiMarketContexts.length})`); lines.push(sep2);
+              aiMarketContexts.forEach((c, i) => {
+                const t = c.candleTime ? new Date(c.candleTime).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata',hour12:false}) : '—';
+                lines.push('');
+                lines.push(`[CTX ${i+1}]  ${t}  ${c.regime||'—'}  tradable=${c.marketTradable?'YES':'NO'}  avoidCE=${c.avoidCe?'YES':'no'}  avoidPE=${c.avoidPe?'YES':'no'}  conf=${c.confidence!=null?(c.confidence*100).toFixed(0)+'%':'—'}  src=${c.source}  ${c.latencyMs!=null?c.latencyMs+'ms':''}`);
+                if ((c.reasonCodes||[]).length) lines.push(`Reasons : ${c.reasonCodes.join(', ')}`);
+                if ((c.warningCodes||[]).length) lines.push(`Warnings: ${c.warningCodes.join(', ')}`);
+                if (c.summary) lines.push(`Summary : ${c.summary}`);
+                if (c.requestJson || c.responseJson) {
+                  lines.push(sep2);
+                  if (c.requestJson)  { lines.push('REQUEST:');  lines.push(fmtJson(c.requestJson)); }
+                  if (c.responseJson) { lines.push('RESPONSE:'); lines.push(fmtJson(c.responseJson)); }
+                }
+                lines.push(sep2);
+              });
+            }
+            if (aiReviews.length > 0) {
+              lines.push(''); lines.push(`TRADE REVIEWS (${aiReviews.length})`); lines.push(sep2);
+              aiReviews.forEach((r, i) => {
+                lines.push('');
+                lines.push(`[REVIEW ${i+1}]  ${r.symbol}  ${r.quality}${r.avoidable ? '  AVOIDABLE':''}  P&L: ${r.pnl ?? '—'}  Exit: ${r.exitReason||'—'}  Source: ${r.source}`);
+                if (r.summary) lines.push(`Summary : ${r.summary}`);
+                if (r.mistakeType && r.mistakeType !== 'NONE') lines.push(`Mistake : ${r.mistakeType}`);
+                lines.push(sep2);
+                lines.push('REQUEST PAYLOAD:'); lines.push(fmtJson(r.requestJson));
+                lines.push(sep2);
+                lines.push('AI RESPONSE:'); lines.push(fmtJson(r.responseJson));
+                lines.push(sep2);
+              });
+            }
+            if (aiAdvisories.length > 0) {
+              lines.push(''); lines.push(`ENTRY ADVISORIES (${aiAdvisories.length})`); lines.push(sep2);
+              aiAdvisories.forEach((a, i) => {
+                const t = a.candleTime ? new Date(a.candleTime).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata',hour12:false}) : '—';
+                lines.push('');
+                lines.push(`[ADVISORY ${i+1}]  ${t}  ${a.symbol}  ${a.currentOptionType||a.side||''}  ${a.action}  Risk: ${a.riskLevel}  Conf: ${a.confidence!=null?(a.confidence*100).toFixed(0)+'%':'—'}  Source: ${a.source}`);
+                if (a.summary) lines.push(`Summary : ${a.summary}`);
+                if ((a.warningCodes||[]).length) lines.push(`Warnings: ${a.warningCodes.join(', ')}`);
+                lines.push(sep2);
+                lines.push('REQUEST PAYLOAD:'); lines.push(fmtJson(a.requestJson));
+                lines.push(sep2);
+                lines.push('AI RESPONSE:'); lines.push(fmtJson(a.responseJson));
+                lines.push(sep2);
+              });
+            }
+            const blob = new Blob([lines.join('\n')], { type:'text/plain' });
+            const url  = URL.createObjectURL(blob);
+            const a2   = document.createElement('a'); a2.href = url;
+            a2.download = `ai-insights-live-${sessionDateStr}.txt`;
+            a2.click(); URL.revokeObjectURL(url);
+          };
+
+          return (
+            <div>
+              {/* Header row */}
+              <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:10, flexWrap:'wrap' }}>
+                {aiEngineConfig && (
+                  <div style={{ padding:'5px 10px', background:'rgba(99,102,241,0.08)', border:'1px solid rgba(99,102,241,0.2)', borderRadius:4, display:'flex', gap:10, alignItems:'center' }}>
+                    <span style={{ fontSize:10, fontWeight:700, color:'var(--text-secondary)', letterSpacing:'0.05em' }}>ENGINE</span>
+                    <span style={{ fontSize:10, color: aiEngineConfig.enabled ? '#22c55e' : '#ef4444', fontWeight:600 }}>
+                      {aiEngineConfig.enabled ? 'OpenAI ON' : 'OpenAI OFF (fallback)'}
+                    </span>
+                    {aiEngineConfig.enabled && <>
+                      <span style={{ fontSize:10, color:'var(--text-secondary)' }}>{aiEngineConfig.model}</span>
+                      <span style={{ fontSize:10, background:'rgba(99,102,241,0.15)', padding:'1px 6px', borderRadius:3, color:'#818cf8' }}>{aiEngineConfig.promptMode}</span>
+                    </>}
+                  </div>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!aiSessionId) return;
+                    setAiLoading(true);
+                    Promise.all([
+                      getAiReviews(aiSessionId),
+                      getAiAdvisories(aiSessionId),
+                      getAiMarketContexts(aiSessionId),
+                      getAiEngineConfig(),
+                    ]).then(([rev, adv, ctx, cfg]) => {
+                      setAiReviews(rev?.data ?? []);
+                      setAiAdvisories(adv?.data ?? []);
+                      setAiMarketContexts(ctx?.data ?? []);
+                      if (cfg?.data) setAiEngineConfig(cfg.data);
+                    }).catch(() => {}).finally(() => setAiLoading(false));
+                  }}
+                  style={{ fontSize:11, padding:'4px 10px', background:'rgba(99,102,241,0.12)', border:'1px solid rgba(99,102,241,0.3)', borderRadius:4, color:'#818cf8', cursor:'pointer' }}
+                >Refresh</button>
+                {aiSessionId && <span style={{ fontSize:10, color:'var(--text-muted)' }}>sid={aiSessionId.slice(0,8)}</span>}
+                {!noData && (
+                  <>
+                    <button type="button" onClick={downloadAiLiveCsv}
+                      style={{ fontSize:11, padding:'4px 10px', background:'rgba(59,130,246,0.15)', border:'1px solid rgba(59,130,246,0.4)', borderRadius:4, color:'#93c5fd', cursor:'pointer' }}>
+                      Download CSV
+                    </button>
+                    <button type="button" onClick={downloadAiLiveText}
+                      style={{ fontSize:11, padding:'4px 10px', background:'rgba(139,92,246,0.15)', border:'1px solid rgba(139,92,246,0.4)', borderRadius:4, color:'#c4b5fd', cursor:'pointer' }}>
+                      Download Text
+                    </button>
+                  </>
+                )}
+              </div>
+
+              {/* ── Market Context ── */}
+              {aiMarketContexts.length > 0 && (
+                <>
+                  <div style={{ fontSize:11, fontWeight:700, color:'var(--text-secondary)', marginBottom:6 }}>
+                    Market Context ({aiMarketContexts.length}){' '}
+                    <span style={{ fontSize:10, fontWeight:400, color:'var(--text-muted)' }}>— click row to see payload</span>
+                  </div>
+                  {(() => {
+                    const openai   = aiMarketContexts.filter(c => c.source === 'OPENAI').length;
+                    const fallback = aiMarketContexts.filter(c => c.source === 'FALLBACK').length;
+                    const blocked  = aiMarketContexts.filter(c => !c.marketTradable).length;
+                    const avoidCE  = aiMarketContexts.filter(c => c.avoidCe).length;
+                    const avoidPE  = aiMarketContexts.filter(c => c.avoidPe).length;
+                    return (
+                      <div style={{ marginBottom:6, display:'flex', gap:10, fontSize:10, color:'var(--text-muted)' }}>
+                        <span>{aiMarketContexts.length} total</span>
+                        {openai   > 0 && <span style={{ color:'#22c55e' }}>{openai} OpenAI</span>}
+                        {fallback > 0 && <span style={{ color:'#94a3b8' }}>{fallback} fallback</span>}
+                        {blocked  > 0 && <span style={{ color:'#ef4444' }}>{blocked} not-tradable</span>}
+                        {avoidCE  > 0 && <span style={{ color:'#f59e0b' }}>{avoidCE} avoidCE</span>}
+                        {avoidPE  > 0 && <span style={{ color:'#f59e0b' }}>{avoidPE} avoidPE</span>}
+                      </div>
+                    );
+                  })()}
+                  <div style={{ overflowX:'auto', marginBottom:16 }}>
+                    <table className="bt-table">
+                      <thead>
+                        <tr><th>#</th><th>Time</th><th>Regime</th><th>Tradable</th><th>AvoidCE</th><th>AvoidPE</th><th>Confidence</th><th>Source</th><th>Latency</th><th>Reason Codes</th><th>Summary</th></tr>
+                      </thead>
+                      <tbody>
+                        {[...aiMarketContexts].reverse().map((c, i) => {
+                          const rowId = c.id ?? i;
+                          const expanded = expandedAiRow?.type === 'ctx' && expandedAiRow?.id === rowId;
+                          const t = c.candleTime ? new Date(c.candleTime).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata',hour12:false}) : '—';
+                          return (
+                            <Fragment key={rowId}>
+                              <tr onClick={() => setExpandedAiRow(expanded ? null : { type:'ctx', id:rowId })} style={{ cursor:'pointer' }}>
+                                <td style={{ fontSize:10, color:'var(--text-muted)' }}>{expanded ? '▼' : '▶'} {aiMarketContexts.length - i}</td>
+                                <td style={{ fontSize:10, whiteSpace:'nowrap' }}>{t}</td>
+                                <td style={{ fontSize:10 }}>{c.regime || '—'}</td>
+                                <td style={{ fontWeight:700, color: c.marketTradable ? '#22c55e' : '#ef4444' }}>{c.marketTradable ? 'YES' : 'NO'}</td>
+                                <td style={{ fontSize:10, color: c.avoidCe ? '#f59e0b' : 'var(--text-muted)' }}>{c.avoidCe ? 'YES' : '—'}</td>
+                                <td style={{ fontSize:10, color: c.avoidPe ? '#f59e0b' : 'var(--text-muted)' }}>{c.avoidPe ? 'YES' : '—'}</td>
+                                <td style={{ fontSize:11 }}>{c.confidence != null ? `${(c.confidence*100).toFixed(0)}%` : '—'}</td>
+                                <td style={{ fontSize:10, color:'var(--text-muted)' }}>{c.source === 'OPENAI' && c.aiModel ? c.aiModel : c.source}</td>
+                                <td style={{ fontSize:10, color:'var(--text-muted)' }}>{c.latencyMs != null ? `${c.latencyMs}ms` : '—'}</td>
+                                <td style={{ fontSize:9, color:'#a855f7', maxWidth:160, whiteSpace:'normal' }}>{(c.reasonCodes||[]).join(', ') || '—'}</td>
+                                <td style={{ fontSize:10, maxWidth:220, whiteSpace:'normal', color:'var(--text-secondary)' }}>{c.summary || '—'}</td>
+                              </tr>
+                              {expanded && (
+                                <tr>
+                                  <td colSpan={11} style={{ padding:'10px 12px', background:'rgba(168,85,247,0.06)', borderBottom:'1px solid rgba(168,85,247,0.2)' }}>
+                                    {(c.warningCodes||[]).length > 0 && (
+                                      <div style={{ marginBottom:8, display:'flex', gap:6, flexWrap:'wrap' }}>
+                                        {c.warningCodes.map((w,wi) => (
+                                          <span key={wi} style={{ fontSize:10, padding:'1px 6px', background:'rgba(245,158,11,0.15)', border:'1px solid rgba(245,158,11,0.3)', borderRadius:3, color:'#fbbf24' }}>{w}</span>
+                                        ))}
+                                      </div>
+                                    )}
+                                    <div style={{ display:'flex', gap:12 }}>
+                                      {jsonPanel('Request Payload', c.requestJson)}
+                                      {jsonPanel('AI Response', c.responseJson)}
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                            </Fragment>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+
+              {/* ── Trade Reviews ── */}
+              {aiReviews.length > 0 && (
+                <>
+                  <div style={{ fontSize:11, fontWeight:700, color:'var(--text-secondary)', marginBottom:6 }}>
+                    Trade Reviews ({aiReviews.length}){' '}
+                    <span style={{ fontSize:10, fontWeight:400, color:'var(--text-muted)' }}>— click row to see payload</span>
+                  </div>
+                  <div style={{ overflowX:'auto', marginBottom:16 }}>
+                    <table className="bt-table">
+                      <thead>
+                        <tr><th>#</th><th>Symbol</th><th>Quality</th><th>Mistake</th><th>Avoidable</th><th>P&L</th><th>Exit</th><th>Source</th><th>Summary</th></tr>
+                      </thead>
+                      <tbody>
+                        {aiReviews.map((r, i) => {
+                          const rowId = r.id ?? i;
+                          const expanded = expandedAiRow?.type === 'review' && expandedAiRow?.id === rowId;
+                          return (
+                            <Fragment key={rowId}>
+                              <tr onClick={() => setExpandedAiRow(expanded ? null : { type:'review', id:rowId })} style={{ cursor:'pointer' }}>
+                                <td style={{ fontSize:10, color:'var(--text-muted)' }}>{expanded ? '▼' : '▶'} {i+1}</td>
+                                <td style={{ fontSize:10 }}>{r.symbol}</td>
+                                <td style={{ fontWeight:700, color:qualColor(r.quality) }}>{r.quality}</td>
+                                <td style={{ fontSize:10 }}>{r.mistakeType || '—'}</td>
+                                <td style={{ fontSize:11, color: r.avoidable ? '#ef4444' : '#22c55e' }}>{r.avoidable ? 'Yes' : 'No'}</td>
+                                <td style={r.pnl != null ? pnlStyle(r.pnl) : {}}>{r.pnl != null ? fmt2(r.pnl) : '—'}</td>
+                                <td style={{ fontSize:10 }}>{r.exitReason || '—'}</td>
+                                <td style={{ fontSize:10, color:'var(--text-muted)' }}>{r.source === 'OPENAI' && r.aiModel ? r.aiModel : r.source}</td>
+                                <td style={{ fontSize:10, maxWidth:220, whiteSpace:'normal', color:'var(--text-secondary)' }}>{r.summary || '—'}</td>
+                              </tr>
+                              {expanded && (
+                                <tr>
+                                  <td colSpan={9} style={{ padding:'10px 12px', background:'rgba(99,102,241,0.06)', borderBottom:'1px solid rgba(99,102,241,0.2)' }}>
+                                    <div style={{ display:'flex', gap:12 }}>
+                                      {jsonPanel('Request Payload', r.requestJson)}
+                                      {jsonPanel('AI Response', r.responseJson)}
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                            </Fragment>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+
+              {/* ── Trade Advisories ── */}
+              {aiAdvisories.length > 0 && (
+                <>
+                  <div style={{ fontSize:11, fontWeight:700, color:'var(--text-secondary)', marginBottom:6 }}>
+                    Entry Advisories ({aiAdvisories.length}){' '}
+                    <span style={{ fontSize:10, fontWeight:400, color:'var(--text-muted)' }}>— click row to see payload</span>
+                  </div>
+                  <div style={{ overflowX:'auto' }}>
+                    <table className="bt-table">
+                      <thead>
+                        <tr><th>#</th><th>Time</th><th>Symbol</th><th>Side</th><th>Action</th><th>Risk</th><th>Confidence</th><th>Regime</th><th>Source</th><th>Summary</th></tr>
+                      </thead>
+                      <tbody>
+                        {aiAdvisories.map((a, i) => {
+                          const rowId = a.id ?? i;
+                          const expanded = expandedAiRow?.type === 'advisory' && expandedAiRow?.id === rowId;
+                          return (
+                            <Fragment key={rowId}>
+                              <tr onClick={() => setExpandedAiRow(expanded ? null : { type:'advisory', id:rowId })} style={{ cursor:'pointer' }}>
+                                <td style={{ fontSize:10, color:'var(--text-muted)' }}>{expanded ? '▼' : '▶'} {i+1}</td>
+                                <td style={{ fontSize:10, whiteSpace:'nowrap' }}>{a.candleTime ? new Date(a.candleTime).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata',hour12:false}) : '—'}</td>
+                                <td style={{ fontSize:10 }}>{a.symbol}</td>
+                                <td style={{ fontSize:10, fontWeight:600, color: (a.currentOptionType||a.side)==='CE'?'#22c55e':(a.currentOptionType||a.side)==='PE'?'#ef4444':'var(--text-secondary)' }}>{a.currentOptionType||a.side||'—'}</td>
+                                <td style={{ fontWeight:700, color:actColor(a.action) }}>{a.action}</td>
+                                <td style={{ fontSize:10, color: a.riskLevel==='HIGH'?'#ef4444':a.riskLevel==='MEDIUM'?'#f59e0b':'#22c55e' }}>{a.riskLevel}</td>
+                                <td style={{ fontSize:11 }}>{a.confidence != null ? `${(a.confidence*100).toFixed(0)}%` : '—'}</td>
+                                <td style={{ fontSize:10 }}>{a.regime||'—'}</td>
+                                <td style={{ fontSize:10, color:'var(--text-muted)' }}>{a.source === 'OPENAI' && a.aiModel ? a.aiModel : a.source}</td>
+                                <td style={{ fontSize:10, maxWidth:200, whiteSpace:'normal', color:'var(--text-secondary)' }}>{a.summary||'—'}</td>
+                              </tr>
+                              {expanded && (
+                                <tr>
+                                  <td colSpan={10} style={{ padding:'10px 12px', background:'rgba(99,102,241,0.06)', borderBottom:'1px solid rgba(99,102,241,0.2)' }}>
+                                    <div style={{ display:'flex', gap:12 }}>
+                                      {jsonPanel('Request Payload', a.requestJson)}
+                                      {jsonPanel('AI Response', a.responseJson)}
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                            </Fragment>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+
+              {noData && !aiSessionId && (
+                <p style={{ fontSize:12, color:'var(--text-muted)', textAlign:'center', padding:'24px 0' }}>
+                  No session active. Start a live session with AI Engine ON to see insights.
+                </p>
+              )}
+              {noData && aiSessionId && (
+                <p style={{ fontSize:12, color:'var(--text-muted)', textAlign:'center', padding:'24px 0' }}>
+                  No AI records yet. Ensure AI Engine is running on port 9007 and hit Refresh.
+                </p>
+              )}
+            </div>
+          );
+        })()}
       </div>
 
       <form onSubmit={handleStart}>
@@ -2509,6 +2968,53 @@ function OptionsLiveTest() {
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── AI Market Context ── */}
+        <div className="card bt-opts-card">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 6 }}>
+            <span className="bt-section-title" style={{ marginBottom: 0 }}>AI Market Context</span>
+            <button type="button" className={`btn-sm ${aiEnabled ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setAiEnabled(v => !v)} disabled={isRunning}>
+              {aiEnabled ? 'ON' : 'OFF'}
+            </button>
+            <span style={{ fontSize: 11, color: '#a855f7', fontWeight: 600 }}>live ai</span>
+          </div>
+          {aiEnabled && (
+            <div className="bt-form-grid" style={{ marginTop: 4 }}>
+              <div className="form-group">
+                <label>Interval (candles)</label>
+                <input type="number" min="1" max="20" value={aiContextIntervalCandles}
+                  onChange={e => setAiCtxInterval(e.target.value)} disabled={isRunning} />
+              </div>
+              <div className="form-group">
+                <label>Cache TTL (sec)</label>
+                <input type="number" min="60" max="1800" step="60" value={aiContextTtlSeconds}
+                  onChange={e => setAiCtxTtl(e.target.value)} disabled={isRunning} />
+              </div>
+              <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <label style={{ marginBottom: 0 }}>Gate Trades</label>
+                <button type="button" className={`btn-sm ${aiGateEnabled ? 'btn-primary' : 'btn-secondary'}`}
+                  onClick={() => setAiGateEnabled(v => !v)} disabled={isRunning}>
+                  {aiGateEnabled ? 'ON' : 'OFF'}
+                </button>
+              </div>
+              {aiGateEnabled && (
+                <div className="form-group">
+                  <label>Min Confidence</label>
+                  <input type="number" min="0.10" max="1.00" step="0.05" value={aiGateConfidenceThreshold}
+                    onChange={e => setAiGateConf(e.target.value)} disabled={isRunning} />
+                </div>
+              )}
+              <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <label style={{ marginBottom: 0 }}>Risky Advisory</label>
+                <button type="button" className={`btn-sm ${aiTradeAdvisoryEnabled ? 'btn-primary' : 'btn-secondary'}`}
+                  onClick={() => setAiTradeAdvisory(v => !v)} disabled={isRunning}>
+                  {aiTradeAdvisoryEnabled ? 'ON' : 'OFF'}
+                </button>
+              </div>
             </div>
           )}
         </div>
@@ -15901,3 +16407,397 @@ function SessionCompare() {
   );
 }
 
+// ─── AI Insights Dashboard (standalone top-level tab) ──────────────────────
+function AiInsightsDashboard() {
+  const [sessions,         setSessions]         = useState([]);
+  const [selectedSession,  setSelectedSession]  = useState('');
+  const [reviews,          setReviews]          = useState([]);
+  const [advisories,       setAdvisories]       = useState([]);
+  const [marketContexts,   setMarketContexts]   = useState([]);
+  const [loading,          setLoading]          = useState(false);
+  const [expandedRow,      setExpandedRow]      = useState(null);
+
+  // load session list on mount
+  useEffect(() => {
+    getAiSessions().then(r => {
+      const list = r?.data ?? [];
+      setSessions(list);
+      if (list.length > 0 && !selectedSession) setSelectedSession(list[0].sessionId);
+    }).catch(() => {});
+  }, []);
+
+  // load AI data when selected session changes
+  useEffect(() => {
+    if (!selectedSession) return;
+    setLoading(true);
+    setExpandedRow(null);
+    Promise.all([
+      getAiReviews(selectedSession),
+      getAiAdvisories(selectedSession),
+      getAiMarketContexts(selectedSession),
+    ]).then(([rev, adv, ctx]) => {
+      setReviews(rev?.data ?? []);
+      setAdvisories(adv?.data ?? []);
+      setMarketContexts(ctx?.data ?? []);
+    }).catch(() => {}).finally(() => setLoading(false));
+  }, [selectedSession]);
+
+  const refresh = () => {
+    if (!selectedSession) return;
+    setLoading(true);
+    setExpandedRow(null);
+    Promise.all([
+      getAiReviews(selectedSession),
+      getAiAdvisories(selectedSession),
+      getAiMarketContexts(selectedSession),
+    ]).then(([rev, adv, ctx]) => {
+      setReviews(rev?.data ?? []);
+      setAdvisories(adv?.data ?? []);
+      setMarketContexts(ctx?.data ?? []);
+    }).catch(() => {}).finally(() => setLoading(false));
+  };
+
+  const sessionDateStr = (() => {
+    const first = marketContexts[0]?.candleTime || reviews[0]?.entryTime || advisories[0]?.entryTime;
+    if (!first) return selectedSession?.slice(0, 10) || 'unknown';
+    return new Date(first).toISOString().slice(0, 10);
+  })();
+
+  const noData = reviews.length === 0 && advisories.length === 0 && marketContexts.length === 0;
+
+  function downloadAiCsv() {
+    const lines = [];
+    lines.push('=== MARKET CONTEXT ===');
+    lines.push('Time,Tradable,AvoidCE,AvoidPE,Confidence,Source,Summary');
+    marketContexts.forEach(c => lines.push([
+      c.candleTime, c.marketTradable, c.avoidCE, c.avoidPe,
+      c.confidence?.toFixed(2), c.source, (c.summary||'').replace(/,/g,' ')
+    ].join(',')));
+    lines.push('');
+    lines.push('=== TRADE REVIEWS ===');
+    lines.push('Entry,Exit,Symbol,PnL,Verdict,Summary');
+    reviews.forEach(r => lines.push([
+      r.entryTime, r.exitTime, r.symbol, r.pnl?.toFixed(2),
+      r.verdict, (r.summary||'').replace(/,/g,' ')
+    ].join(',')));
+    lines.push('');
+    lines.push('=== ENTRY ADVISORIES ===');
+    lines.push('Time,Symbol,Action,Confidence,Summary');
+    advisories.forEach(a => lines.push([
+      a.entryTime, a.symbol, a.recommendedAction,
+      a.confidence?.toFixed(2), (a.summary||'').replace(/,/g,' ')
+    ].join(',')));
+    const blob = new Blob([lines.join('\n')], { type:'text/csv' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = `ai-insights-${sessionDateStr}.csv`; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function downloadAiText() {
+    const lines = [];
+    lines.push(`AI Insights — Session: ${selectedSession}`);
+    lines.push(`Date: ${sessionDateStr}`);
+    lines.push('');
+    lines.push('=== MARKET CONTEXT ===');
+    marketContexts.forEach(c => {
+      lines.push(`[${c.candleTime}] tradable=${c.marketTradable} avoidCE=${c.avoidCE} avoidPE=${c.avoidPe} conf=${c.confidence?.toFixed(2)} src=${c.source}`);
+      if (c.summary) lines.push(`  → ${c.summary}`);
+      if (c.reasonCodes?.length) lines.push(`  reasons: ${c.reasonCodes.join(', ')}`);
+    });
+    lines.push('');
+    lines.push('=== TRADE REVIEWS ===');
+    reviews.forEach(r => {
+      lines.push(`[${r.entryTime}→${r.exitTime}] ${r.symbol} pnl=${r.pnl?.toFixed(2)} verdict=${r.verdict}`);
+      if (r.summary) lines.push(`  → ${r.summary}`);
+    });
+    lines.push('');
+    lines.push('=== ENTRY ADVISORIES ===');
+    advisories.forEach(a => {
+      lines.push(`[${a.entryTime}] ${a.symbol} action=${a.recommendedAction} conf=${a.confidence?.toFixed(2)}`);
+      if (a.summary) lines.push(`  → ${a.summary}`);
+    });
+    const blob = new Blob([lines.join('\n')], { type:'text/plain' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = `ai-insights-${sessionDateStr}.txt`; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const tblStyle = { width:'100%', borderCollapse:'collapse', fontSize:11 };
+  const thStyle  = { padding:'4px 8px', borderBottom:'1px solid #374151', color:'#9ca3af', textAlign:'left', fontWeight:600 };
+  const tdStyle  = { padding:'3px 8px', borderBottom:'1px solid #1f2937', verticalAlign:'top' };
+
+  return (
+    <div style={{ padding:16, maxWidth:1400, margin:'0 auto' }}>
+      {/* Header row */}
+      <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:16, flexWrap:'wrap' }}>
+        <span style={{ fontSize:16, fontWeight:700, color:'#a855f7' }}>AI Insights</span>
+
+        <select
+          value={selectedSession}
+          onChange={e => setSelectedSession(e.target.value)}
+          style={{ background:'#1f2937', color:'#e5e7eb', border:'1px solid #374151',
+                   borderRadius:4, padding:'4px 8px', fontSize:12, minWidth:240 }}>
+          {sessions.length === 0 && <option value=''>No sessions found</option>}
+          {sessions.map(s => {
+            const dateStr = s.latestActivity
+              ? new Date(s.latestActivity).toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' })
+              : '—';
+            const timeStr = s.latestActivity
+              ? new Date(s.latestActivity).toLocaleTimeString('en-IN', { hour:'2-digit', minute:'2-digit' })
+              : '';
+            const typeLabel = s.sessionId.startsWith('live-') ? '[LIVE]'
+              : s.sessionId.startsWith('replay-') ? '[REPLAY]' : '[?]';
+            const shortId = s.sessionId.startsWith('live-')   ? s.sessionId.slice(5, 13)
+              : s.sessionId.startsWith('replay-') ? s.sessionId.slice(7, 15)
+              : s.sessionId.slice(0, 8);
+            return (
+              <option key={s.sessionId} value={s.sessionId}>
+                {typeLabel} {dateStr} {timeStr} — ctx:{s.marketContextCount} rev:{s.reviewCount} adv:{s.advisoryCount} — {shortId}…
+              </option>
+            );
+          })}
+        </select>
+
+        <button onClick={refresh} disabled={!selectedSession || loading}
+          style={{ background:'#374151', color:'#e5e7eb', border:'none', borderRadius:4,
+                   padding:'4px 10px', fontSize:11, cursor:'pointer' }}>
+          {loading ? 'Loading…' : 'Refresh'}
+        </button>
+
+        {!noData && <>
+          <button onClick={downloadAiCsv}
+            style={{ background:'#065f46', color:'#d1fae5', border:'none', borderRadius:4,
+                     padding:'4px 10px', fontSize:11, cursor:'pointer' }}>
+            Download CSV
+          </button>
+          <button onClick={downloadAiText}
+            style={{ background:'#1e3a5f', color:'#bfdbfe', border:'none', borderRadius:4,
+                     padding:'4px 10px', fontSize:11, cursor:'pointer' }}>
+            Download Text
+          </button>
+        </>}
+      </div>
+
+      {!selectedSession && (
+        <div style={{ color:'#6b7280', fontSize:13 }}>No sessions found. Run a live session with AI Engine ON first.</div>
+      )}
+
+      {selectedSession && !loading && noData && (
+        <div style={{ color:'#6b7280', fontSize:13 }}>No AI data for this session yet.</div>
+      )}
+
+      {/* Market Context Table */}
+      {marketContexts.length > 0 && (
+        <div style={{ marginBottom:24 }}>
+          <div style={{ fontSize:13, fontWeight:700, color:'#a855f7', marginBottom:6 }}>
+            Market Context ({marketContexts.length})
+          </div>
+          <div style={{ overflowX:'auto' }}>
+            <table style={tblStyle}>
+              <thead>
+                <tr>
+                  {['Time','Tradable','AvoidCE','AvoidPE','Conf','Source','Regime','Summary','Reasons'].map(h => (
+                    <th key={h} style={thStyle}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {marketContexts.map((c, i) => {
+                  const rowKey = `ctx-${i}`;
+                  const expanded = expandedRow === rowKey;
+                  return (
+                    <Fragment key={rowKey}>
+                      <tr onClick={() => setExpandedRow(expanded ? null : rowKey)}
+                        style={{ cursor:'pointer', background: expanded ? 'rgba(168,85,247,0.08)' : undefined }}>
+                        <td style={tdStyle}>{c.candleTime ? new Date(c.candleTime).toLocaleTimeString('en-IN') : '—'}</td>
+                        <td style={{ ...tdStyle, color: c.marketTradable ? '#34d399' : '#f87171', fontWeight:700 }}>
+                          {c.marketTradable ? 'YES' : 'NO'}
+                        </td>
+                        <td style={{ ...tdStyle, color: c.avoidCE ? '#f87171' : '#6b7280' }}>{c.avoidCE ? 'YES' : 'no'}</td>
+                        <td style={{ ...tdStyle, color: c.avoidPe ? '#f87171' : '#6b7280' }}>{c.avoidPe ? 'YES' : 'no'}</td>
+                        <td style={tdStyle}>{c.confidence?.toFixed(2) ?? '—'}</td>
+                        <td style={{ ...tdStyle, color: c.source === 'OPENAI' ? '#60a5fa' : '#9ca3af' }}>{c.source}</td>
+                        <td style={tdStyle}>{c.regime ?? '—'}</td>
+                        <td style={{ ...tdStyle, maxWidth:240, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{c.summary}</td>
+                        <td style={{ ...tdStyle, fontSize:10, color:'#9ca3af' }}>{c.reasonCodes?.join(', ')}</td>
+                      </tr>
+                      {expanded && (
+                        <tr style={{ background:'rgba(168,85,247,0.04)' }}>
+                          <td colSpan={9} style={{ padding:'8px 12px' }}>
+                            <div style={{ display:'flex', gap:16, flexWrap:'wrap' }}>
+                              {c.warningCodes?.length > 0 && (
+                                <div style={{ color:'#fbbf24', fontSize:11 }}>Warnings: {c.warningCodes.join(', ')}</div>
+                              )}
+                              {c.requestJson && (
+                                <details style={{ flex:1, minWidth:300 }}>
+                                  <summary style={{ cursor:'pointer', color:'#9ca3af', fontSize:11 }}>Request JSON</summary>
+                                  <pre style={{ fontSize:10, color:'#d1d5db', marginTop:4, maxHeight:200, overflow:'auto',
+                                               background:'#111827', padding:8, borderRadius:4 }}>
+                                    {(() => { try { return JSON.stringify(JSON.parse(c.requestJson), null, 2); } catch { return c.requestJson; } })()}
+                                  </pre>
+                                </details>
+                              )}
+                              {c.responseJson && (
+                                <details style={{ flex:1, minWidth:300 }}>
+                                  <summary style={{ cursor:'pointer', color:'#9ca3af', fontSize:11 }}>Response JSON</summary>
+                                  <pre style={{ fontSize:10, color:'#d1d5db', marginTop:4, maxHeight:200, overflow:'auto',
+                                               background:'#111827', padding:8, borderRadius:4 }}>
+                                    {(() => { try { return JSON.stringify(JSON.parse(c.responseJson), null, 2); } catch { return c.responseJson; } })()}
+                                  </pre>
+                                </details>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Trade Reviews Table */}
+      {reviews.length > 0 && (
+        <div style={{ marginBottom:24 }}>
+          <div style={{ fontSize:13, fontWeight:700, color:'#34d399', marginBottom:6 }}>
+            Trade Reviews ({reviews.length})
+          </div>
+          <div style={{ overflowX:'auto' }}>
+            <table style={tblStyle}>
+              <thead>
+                <tr>
+                  {['Entry','Exit','Symbol','PnL','Verdict','Confidence','Source','Summary'].map(h => (
+                    <th key={h} style={thStyle}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {reviews.map((r, i) => {
+                  const rowKey = `rev-${i}`;
+                  const expanded = expandedRow === rowKey;
+                  const verdictColor = r.verdict === 'GOOD' ? '#34d399' : r.verdict === 'BAD' ? '#f87171' : '#9ca3af';
+                  return (
+                    <Fragment key={rowKey}>
+                      <tr onClick={() => setExpandedRow(expanded ? null : rowKey)}
+                        style={{ cursor:'pointer', background: expanded ? 'rgba(52,211,153,0.06)' : undefined }}>
+                        <td style={tdStyle}>{r.entryTime ? new Date(r.entryTime).toLocaleTimeString('en-IN') : '—'}</td>
+                        <td style={tdStyle}>{r.exitTime  ? new Date(r.exitTime).toLocaleTimeString('en-IN')  : '—'}</td>
+                        <td style={{ ...tdStyle, fontFamily:'monospace' }}>{r.symbol}</td>
+                        <td style={{ ...tdStyle, color: (r.pnl??0) >= 0 ? '#34d399' : '#f87171' }}>
+                          {r.pnl != null ? r.pnl.toFixed(2) : '—'}
+                        </td>
+                        <td style={{ ...tdStyle, color: verdictColor, fontWeight:700 }}>{r.verdict}</td>
+                        <td style={tdStyle}>{r.confidence?.toFixed(2) ?? '—'}</td>
+                        <td style={{ ...tdStyle, color: r.source === 'OPENAI' ? '#60a5fa' : '#9ca3af' }}>{r.source}</td>
+                        <td style={{ ...tdStyle, maxWidth:300, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{r.summary}</td>
+                      </tr>
+                      {expanded && (
+                        <tr style={{ background:'rgba(52,211,153,0.04)' }}>
+                          <td colSpan={8} style={{ padding:'8px 12px' }}>
+                            <div style={{ display:'flex', gap:16, flexWrap:'wrap' }}>
+                              {r.requestJson && (
+                                <details style={{ flex:1, minWidth:300 }}>
+                                  <summary style={{ cursor:'pointer', color:'#9ca3af', fontSize:11 }}>Request JSON</summary>
+                                  <pre style={{ fontSize:10, color:'#d1d5db', marginTop:4, maxHeight:200, overflow:'auto',
+                                               background:'#111827', padding:8, borderRadius:4 }}>
+                                    {(() => { try { return JSON.stringify(JSON.parse(r.requestJson), null, 2); } catch { return r.requestJson; } })()}
+                                  </pre>
+                                </details>
+                              )}
+                              {r.responseJson && (
+                                <details style={{ flex:1, minWidth:300 }}>
+                                  <summary style={{ cursor:'pointer', color:'#9ca3af', fontSize:11 }}>Response JSON</summary>
+                                  <pre style={{ fontSize:10, color:'#d1d5db', marginTop:4, maxHeight:200, overflow:'auto',
+                                               background:'#111827', padding:8, borderRadius:4 }}>
+                                    {(() => { try { return JSON.stringify(JSON.parse(r.responseJson), null, 2); } catch { return r.responseJson; } })()}
+                                  </pre>
+                                </details>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Entry Advisories Table */}
+      {advisories.length > 0 && (
+        <div style={{ marginBottom:24 }}>
+          <div style={{ fontSize:13, fontWeight:700, color:'#60a5fa', marginBottom:6 }}>
+            Entry Advisories ({advisories.length})
+          </div>
+          <div style={{ overflowX:'auto' }}>
+            <table style={tblStyle}>
+              <thead>
+                <tr>
+                  {['Time','Symbol','Action','Confidence','Source','Summary'].map(h => (
+                    <th key={h} style={thStyle}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {advisories.map((a, i) => {
+                  const rowKey = `adv-${i}`;
+                  const expanded = expandedRow === rowKey;
+                  const actionColor = a.recommendedAction === 'ALLOW' ? '#34d399'
+                    : a.recommendedAction === 'AVOID' ? '#f87171'
+                    : a.recommendedAction === 'CAUTION' ? '#fbbf24' : '#9ca3af';
+                  return (
+                    <Fragment key={rowKey}>
+                      <tr onClick={() => setExpandedRow(expanded ? null : rowKey)}
+                        style={{ cursor:'pointer', background: expanded ? 'rgba(96,165,250,0.06)' : undefined }}>
+                        <td style={tdStyle}>{a.entryTime ? new Date(a.entryTime).toLocaleTimeString('en-IN') : '—'}</td>
+                        <td style={{ ...tdStyle, fontFamily:'monospace' }}>{a.symbol}</td>
+                        <td style={{ ...tdStyle, color: actionColor, fontWeight:700 }}>{a.recommendedAction}</td>
+                        <td style={tdStyle}>{a.confidence?.toFixed(2) ?? '—'}</td>
+                        <td style={{ ...tdStyle, color: a.source === 'OPENAI' ? '#60a5fa' : '#9ca3af' }}>{a.source}</td>
+                        <td style={{ ...tdStyle, maxWidth:360, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{a.summary}</td>
+                      </tr>
+                      {expanded && (
+                        <tr style={{ background:'rgba(96,165,250,0.04)' }}>
+                          <td colSpan={6} style={{ padding:'8px 12px' }}>
+                            <div style={{ display:'flex', gap:16, flexWrap:'wrap' }}>
+                              {a.requestJson && (
+                                <details style={{ flex:1, minWidth:300 }}>
+                                  <summary style={{ cursor:'pointer', color:'#9ca3af', fontSize:11 }}>Request JSON</summary>
+                                  <pre style={{ fontSize:10, color:'#d1d5db', marginTop:4, maxHeight:200, overflow:'auto',
+                                               background:'#111827', padding:8, borderRadius:4 }}>
+                                    {(() => { try { return JSON.stringify(JSON.parse(a.requestJson), null, 2); } catch { return a.requestJson; } })()}
+                                  </pre>
+                                </details>
+                              )}
+                              {a.responseJson && (
+                                <details style={{ flex:1, minWidth:300 }}>
+                                  <summary style={{ cursor:'pointer', color:'#9ca3af', fontSize:11 }}>Response JSON</summary>
+                                  <pre style={{ fontSize:10, color:'#d1d5db', marginTop:4, maxHeight:200, overflow:'auto',
+                                               background:'#111827', padding:8, borderRadius:4 }}>
+                                    {(() => { try { return JSON.stringify(JSON.parse(a.responseJson), null, 2); } catch { return a.responseJson; } })()}
+                                  </pre>
+                                </details>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

@@ -3,6 +3,7 @@ package com.sma.strategyengine.model.response;
 import lombok.Builder;
 import lombok.Data;
 import java.util.List;
+import java.util.Map;
 
 @Data
 @Builder
@@ -109,6 +110,13 @@ public class OptionsReplayCandleEvent {
 
     // Closed trades this session
     private List<ClosedTrade> closedTrades;
+
+    // ── AI Market Context (live mode only) ────────────────────────────────────
+    /** Snapshot of the cached AI market context used this candle, or null if none available. */
+    private Map<String, Object> aiMarketContext;
+
+    /** Non-null when the AI gate blocked an entry (e.g. "AI_MARKET_CONTEXT"). */
+    private String aiBlockReason;
 
     // ─────────────────────────────────────────────────────────────────────────
 

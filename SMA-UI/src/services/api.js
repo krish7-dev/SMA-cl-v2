@@ -576,6 +576,10 @@ export async function getAiAdvisories(sessionId) {
   return request(`${AI_ENGINE}/api/v1/ai/advisory?sessionId=${encodeURIComponent(sessionId)}`);
 }
 
+export async function getAiMarketContexts(sessionId) {
+  return request(`${AI_ENGINE}/api/v1/ai/market-context?sessionId=${encodeURIComponent(sessionId)}`);
+}
+
 export async function getAiSessions() {
   return request(`${AI_ENGINE}/api/v1/ai/sessions`);
 }
