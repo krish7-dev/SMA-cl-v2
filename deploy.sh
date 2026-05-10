@@ -19,18 +19,19 @@ declare -A JARS=(
   [execution]="SMA-Execution-Engine/target/sma-execution-engine-0.0.1-SNAPSHOT.jar:app/execution/sma-execution-engine-0.0.1-SNAPSHOT.jar"
   [data]="SMA-Data-Engine/target/sma-data-engine-0.0.1-SNAPSHOT.jar:app/data/sma-data-engine-0.0.1-SNAPSHOT.jar"
   [strategy]="SMA-Strategy-Engine/target/sma-strategy-engine-0.0.1-SNAPSHOT.jar:app/strategy/sma-strategy-engine-0.0.1-SNAPSHOT.jar"
+  [ai]="SMA-AI-Engine/target/sma-ai-engine-0.0.1-SNAPSHOT.jar:app/ai/sma-ai-engine-0.0.1-SNAPSHOT.jar"
 )
 
 # Determine which services to deploy
 if [ $# -eq 0 ]; then
-  SERVICES=("broker" "execution" "data" "strategy")
+  SERVICES=("broker" "execution" "data" "strategy" "ai")
 else
   SERVICES=("$@")
 fi
 
 for svc in "${SERVICES[@]}"; do
   if [ -z "${JARS[$svc]}" ]; then
-    echo "Unknown service: $svc (valid: broker, execution, data, strategy)"
+    echo "Unknown service: $svc (valid: broker, execution, data, strategy, ai)"
     exit 1
   fi
 

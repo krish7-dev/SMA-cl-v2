@@ -13,6 +13,7 @@ declare -A JARS=(
   [execution]="sma-execution-engine-0.0.1-SNAPSHOT.jar"
   [data]="sma-data-engine-0.0.1-SNAPSHOT.jar"
   [strategy]="sma-strategy-engine-0.0.1-SNAPSHOT.jar"
+  [ai]="sma-ai-engine-0.0.1-SNAPSHOT.jar"
 )
 
 declare -A JVMOPTS=(
@@ -20,6 +21,7 @@ declare -A JVMOPTS=(
   [execution]=""
   [data]=""
   [strategy]="-Xmx3g -XX:MaxHeapFreeRatio=30 -XX:MinHeapFreeRatio=10"
+  [ai]=""
 )
 
 declare -A ENVS=(
@@ -27,6 +29,7 @@ declare -A ENVS=(
   [execution]="execution.env"
   [data]="data.env"
   [strategy]="strategy.env"
+  [ai]="ai.env"
 )
 
 declare -A PORTS=(
@@ -34,6 +37,7 @@ declare -A PORTS=(
   [execution]=9004
   [data]=9005
   [strategy]=9006
+  [ai]=9007
 )
 
 restart_service() {
@@ -69,14 +73,14 @@ restart_service() {
 }
 
 if [ $# -eq 0 ]; then
-  SERVICES=("broker" "data" "execution" "strategy")
+  SERVICES=("broker" "data" "execution" "strategy" "ai")
 else
   SERVICES=("$@")
 fi
 
 for svc in "${SERVICES[@]}"; do
   if [ -z "${JARS[$svc]}" ]; then
-    echo "Unknown service: $svc (valid: broker, execution, data, strategy)"
+    echo "Unknown service: $svc (valid: broker, execution, data, strategy, ai)"
     exit 1
   fi
   restart_service "$svc"

@@ -15,6 +15,7 @@ declare -A JARS=(
   [execution]="sma-execution-engine-0.0.1-SNAPSHOT.jar"
   [data]="sma-data-engine-0.0.1-SNAPSHOT.jar"
   [strategy]="sma-strategy-engine-0.0.1-SNAPSHOT.jar"
+  [ai]="sma-ai-engine-0.0.1-SNAPSHOT.jar"
 )
 
 declare -A PORTS=(
@@ -22,9 +23,10 @@ declare -A PORTS=(
   [execution]=9004
   [data]=9005
   [strategy]=9006
+  [ai]=9007
 )
 
-SERVICES=("broker" "execution" "data" "strategy")
+SERVICES=("broker" "execution" "data" "strategy" "ai")
 
 divider() { echo "══════════════════════════════════════"; }
 
