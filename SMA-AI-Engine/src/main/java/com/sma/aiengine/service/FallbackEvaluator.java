@@ -163,6 +163,18 @@ class FallbackEvaluator {
         if (isOppositeWinner) confidence -= 0.05;
         confidence = Math.max(0.40, Math.min(0.80, confidence));
 
+        // ── Triple candle headwind override: CAUTION → AVOID ─────────────────
+        if (action == AdvisoryAction.CAUTION
+                && momentumOpposes
+                && opp >= 4
+                && Boolean.FALSE.equals(req.getLastCandleSupportsTrade())) {
+            action = AdvisoryAction.AVOID;
+            riskLevel = RiskLevel.HIGH;
+            tradeQualityScore = 0.20;
+            reasonCodes.add("STRONG_CANDLE_OPPOSITION");
+            summaryParts.add("triple candle headwind (opposeCount=" + opp + ", lastCandle opposes, momentum OPPOSES_TRADE) — avoid entry");
+        }
+
         // ── Build summary ─────────────────────────────────────────────────────
         String summary;
         if (summaryParts.isEmpty()) {

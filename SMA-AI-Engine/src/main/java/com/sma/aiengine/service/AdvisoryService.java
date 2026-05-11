@@ -588,6 +588,23 @@ public class AdvisoryService {
             }
         }
 
+        // ── CAUTION → AVOID: triple candle headwind (opposeCount>=4 + lastCandle opposes + OPPOSES_TRADE) ─
+        if (action == AdvisoryAction.CAUTION
+                && "OPPOSES_TRADE".equals(req.getRecentMomentumAlignment())
+                && req.getRecentCandlesOpposeTradeCount() != null
+                && req.getRecentCandlesOpposeTradeCount() >= 4
+                && Boolean.FALSE.equals(req.getLastCandleSupportsTrade())) {
+            String msg = "STRONG_CANDLE_OPPOSITION_ESCALATED: CAUTION→AVOID — "
+                    + "opposeCount=" + req.getRecentCandlesOpposeTradeCount()
+                    + " lastCandleSupportsTrade=false recentMomentumAlignment=OPPOSES_TRADE";
+            warnings.add(msg);
+            log.warn("[{}] VALIDATION_WARNING: {}", requestId, msg);
+            action = AdvisoryAction.AVOID;
+            if (!warningCodes.contains("STRONG_CANDLE_OPPOSITION")) {
+                warningCodes.add("STRONG_CANDLE_OPPOSITION");
+            }
+        }
+
         // ── ALLOW + isOppositeSideAfterStrongWinner + candles not confirming → CAUTION ─
         if (action == AdvisoryAction.ALLOW
                 && Boolean.TRUE.equals(req.getIsOppositeSideAfterStrongWinner())

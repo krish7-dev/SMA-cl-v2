@@ -20,5 +20,10 @@ public class MarketContextResponse {
     private String       summary;
     private List<String> reasonCodes;
     private List<String> warningCodes;
-    private String       source;   // "OPENAI" / "FALLBACK"
+    private String       source;       // "OPENAI" / "FALLBACK"
+    private String       regime;
+    private String       candleTime;   // ISO-8601
+    private Long         latencyMs;
+    private String       requestJson;
+    private String       responseJson;
 }

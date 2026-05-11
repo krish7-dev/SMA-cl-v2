@@ -451,6 +451,9 @@ public class OptionsLiveService {
         // Live tick persistence buffer — null when recordTicks=false
         final LiveTickBuffer tickBuffer;
 
+        // Monotonic bucket floor — prevents candle regression during Kite reconnect replay
+        private volatile long latestBucketMs = 0;
+
         // ── AI Market Context ─────────────────────────────────────────────────
         private volatile AiEngineClient.CachedAiMarketContext latestMarketContext = null;
         private int candlesSinceLastContextFire = 0;
@@ -1017,7 +1020,11 @@ public class OptionsLiveService {
 
         void processTick(long token, double ltp, long volumeToday, long epochMs) {
             if (stopped) return;
-            long bucketMs = (epochMs / ivMs) * ivMs;
+            // Monotonic bucket: derive from exchange timestamp but never go backward.
+            // Handles Kite reconnect replay (ticks with old timestamps) without losing any ticks.
+            long rawBucket = (epochMs / ivMs) * ivMs;
+            long bucketMs  = Math.max(rawBucket, latestBucketMs);
+            if (bucketMs > latestBucketMs) latestBucketMs = bucketMs;
 
             if (token == niftyToken) {
                 processNiftyTick(ltp, volumeToday, bucketMs);
@@ -1027,7 +1034,7 @@ public class OptionsLiveService {
 
             emitTickEvent(token, ltp, epochMs);
 
-            // Record raw tick if opted in
+            // Record raw tick with original exchange timestamp (preserves correct order)
             if (tickBuffer != null) {
                 boolean isNifty = (token == niftyToken);
                 String sym  = isNifty ? req.getNiftySymbol()   : resolveOptionSymbol(token);
@@ -1046,7 +1053,7 @@ public class OptionsLiveService {
                 evt.put("token",   token);
                 evt.put("isNifty", isNifty);
                 evt.put("ltp",     ltp);
-                evt.put("timeMs",  epochMs);
+                evt.put("timeMs",  System.currentTimeMillis());
                 if (fc != null) {
                     evt.put("fOpen",  fc.open);
                     evt.put("fHigh",  fc.high);

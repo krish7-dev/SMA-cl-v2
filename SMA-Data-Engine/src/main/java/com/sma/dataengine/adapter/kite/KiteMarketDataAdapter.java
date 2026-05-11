@@ -31,6 +31,8 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 /**
@@ -80,7 +82,9 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
 
     private KiteTicker          ticker;
     private KiteConnect         kiteConnect;
-    private final AtomicBoolean connected = new AtomicBoolean(false);
+    private final AtomicBoolean connected    = new AtomicBoolean(false);
+    private final AtomicInteger reconnectCount = new AtomicInteger(0);
+    private final AtomicLong    disconnectedAt = new AtomicLong(0);
 
     /** Registered by LiveMarketDataService before connect() is called. */
     private Consumer<List<TickData>> tickListener;
@@ -115,12 +119,24 @@ public class KiteMarketDataAdapter implements MarketDataAdapter {
 
             ticker.setOnConnectedListener(() -> {
                 connected.set(true);
-                log.info("KiteTicker connected successfully");
+                long downMs = disconnectedAt.get() > 0
+                        ? System.currentTimeMillis() - disconnectedAt.get() : 0;
+                int count = reconnectCount.get();
+                if (count == 0) {
+                    log.info("KiteTicker connected");
+                } else {
+                    log.warn("KiteTicker reconnected (attempt #{}, down ~{}ms) — " +
+                             "Kite will replay buffered ticks; stale-tick filter active in Strategy Engine",
+                             count, downMs);
+                }
+                reconnectCount.incrementAndGet();
+                disconnectedAt.set(0);
             });
 
             ticker.setOnDisconnectedListener(() -> {
                 connected.set(false);
-                log.warn("KiteTicker disconnected");
+                disconnectedAt.set(System.currentTimeMillis());
+                log.warn("KiteTicker disconnected (total reconnects so far: {})", reconnectCount.get());
             });
 
             // OnError has 3 overloads — not a @FunctionalInterface, requires anonymous class

@@ -1362,6 +1362,23 @@ function OptionsLiveTest() {
     }).catch(() => {}).finally(() => setAiLoading(false));
   }, [rightTab, aiSessionId]);
 
+  // Auto-refresh AI data every 30s while session is running and AI tab is active
+  useEffect(() => {
+    if (rightTab !== 'ai' || !aiSessionId || status !== 'running') return;
+    const id = setInterval(() => {
+      Promise.all([
+        getAiReviews(aiSessionId),
+        getAiAdvisories(aiSessionId),
+        getAiMarketContexts(aiSessionId),
+      ]).then(([rev, adv, ctx]) => {
+        setAiReviews(rev?.data ?? []);
+        setAiAdvisories(adv?.data ?? []);
+        setAiMarketContexts(ctx?.data ?? []);
+      }).catch(() => {});
+    }, 30000);
+    return () => clearInterval(id);
+  }, [rightTab, aiSessionId, status]);
+
   // On mount: check if a session is already running for this user and auto-reconnect to it.
   useEffect(() => {
     if (!session?.userId) return;
@@ -2463,7 +2480,7 @@ function OptionsLiveTest() {
                 'MARKET_CTX', i+1,
                 esc(c.candleTime ? new Date(c.candleTime).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}) : ''),
                 esc(c.regime), c.marketTradable ? 'Yes':'No',
-                c.avoidCe ? 'Yes':'No', c.avoidPe ? 'Yes':'No',
+                c.avoidCE ? 'Yes':'No', c.avoidPE ? 'Yes':'No',
                 c.confidence != null ? Number(c.confidence).toFixed(2) : '',
                 esc(c.source), c.latencyMs ?? '',
                 esc((c.reasonCodes||[]).join(' | ')), esc((c.warningCodes||[]).join(' | ')),
@@ -2525,7 +2542,7 @@ function OptionsLiveTest() {
               aiMarketContexts.forEach((c, i) => {
                 const t = c.candleTime ? new Date(c.candleTime).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata',hour12:false}) : '—';
                 lines.push('');
-                lines.push(`[CTX ${i+1}]  ${t}  ${c.regime||'—'}  tradable=${c.marketTradable?'YES':'NO'}  avoidCE=${c.avoidCe?'YES':'no'}  avoidPE=${c.avoidPe?'YES':'no'}  conf=${c.confidence!=null?(c.confidence*100).toFixed(0)+'%':'—'}  src=${c.source}  ${c.latencyMs!=null?c.latencyMs+'ms':''}`);
+                lines.push(`[CTX ${i+1}]  ${t}  ${c.regime||'—'}  tradable=${c.marketTradable?'YES':'NO'}  avoidCE=${c.avoidCE?'YES':'no'}  avoidPE=${c.avoidPE?'YES':'no'}  conf=${c.confidence!=null?(c.confidence*100).toFixed(0)+'%':'—'}  src=${c.source}  ${c.latencyMs!=null?c.latencyMs+'ms':''}`);
                 if ((c.reasonCodes||[]).length) lines.push(`Reasons : ${c.reasonCodes.join(', ')}`);
                 if ((c.warningCodes||[]).length) lines.push(`Warnings: ${c.warningCodes.join(', ')}`);
                 if (c.summary) lines.push(`Summary : ${c.summary}`);
@@ -2634,8 +2651,8 @@ function OptionsLiveTest() {
                     const openai   = aiMarketContexts.filter(c => c.source === 'OPENAI').length;
                     const fallback = aiMarketContexts.filter(c => c.source === 'FALLBACK').length;
                     const blocked  = aiMarketContexts.filter(c => !c.marketTradable).length;
-                    const avoidCE  = aiMarketContexts.filter(c => c.avoidCe).length;
-                    const avoidPE  = aiMarketContexts.filter(c => c.avoidPe).length;
+                    const avoidCE  = aiMarketContexts.filter(c => c.avoidCE).length;
+                    const avoidPE  = aiMarketContexts.filter(c => c.avoidPE).length;
                     return (
                       <div style={{ marginBottom:6, display:'flex', gap:10, fontSize:10, color:'var(--text-muted)' }}>
                         <span>{aiMarketContexts.length} total</span>
@@ -2664,8 +2681,8 @@ function OptionsLiveTest() {
                                 <td style={{ fontSize:10, whiteSpace:'nowrap' }}>{t}</td>
                                 <td style={{ fontSize:10 }}>{c.regime || '—'}</td>
                                 <td style={{ fontWeight:700, color: c.marketTradable ? '#22c55e' : '#ef4444' }}>{c.marketTradable ? 'YES' : 'NO'}</td>
-                                <td style={{ fontSize:10, color: c.avoidCe ? '#f59e0b' : 'var(--text-muted)' }}>{c.avoidCe ? 'YES' : '—'}</td>
-                                <td style={{ fontSize:10, color: c.avoidPe ? '#f59e0b' : 'var(--text-muted)' }}>{c.avoidPe ? 'YES' : '—'}</td>
+                                <td style={{ fontSize:10, color: c.avoidCE ? '#f59e0b' : 'var(--text-muted)' }}>{c.avoidCE ? 'YES' : '—'}</td>
+                                <td style={{ fontSize:10, color: c.avoidPE ? '#f59e0b' : 'var(--text-muted)' }}>{c.avoidPE ? 'YES' : '—'}</td>
                                 <td style={{ fontSize:11 }}>{c.confidence != null ? `${(c.confidence*100).toFixed(0)}%` : '—'}</td>
                                 <td style={{ fontSize:10, color:'var(--text-muted)' }}>{c.source === 'OPENAI' && c.aiModel ? c.aiModel : c.source}</td>
                                 <td style={{ fontSize:10, color:'var(--text-muted)' }}>{c.latencyMs != null ? `${c.latencyMs}ms` : '—'}</td>
@@ -16470,7 +16487,7 @@ function AiInsightsDashboard() {
     lines.push('=== MARKET CONTEXT ===');
     lines.push('Time,Tradable,AvoidCE,AvoidPE,Confidence,Source,Summary');
     marketContexts.forEach(c => lines.push([
-      c.candleTime, c.marketTradable, c.avoidCE, c.avoidPe,
+      c.candleTime, c.marketTradable, c.avoidCE, c.avoidPE,
       c.confidence?.toFixed(2), c.source, (c.summary||'').replace(/,/g,' ')
     ].join(',')));
     lines.push('');
@@ -16501,7 +16518,7 @@ function AiInsightsDashboard() {
     lines.push('');
     lines.push('=== MARKET CONTEXT ===');
     marketContexts.forEach(c => {
-      lines.push(`[${c.candleTime}] tradable=${c.marketTradable} avoidCE=${c.avoidCE} avoidPE=${c.avoidPe} conf=${c.confidence?.toFixed(2)} src=${c.source}`);
+      lines.push(`[${c.candleTime}] tradable=${c.marketTradable} avoidCE=${c.avoidCE} avoidPE=${c.avoidPE} conf=${c.confidence?.toFixed(2)} src=${c.source}`);
       if (c.summary) lines.push(`  → ${c.summary}`);
       if (c.reasonCodes?.length) lines.push(`  reasons: ${c.reasonCodes.join(', ')}`);
     });
@@ -16616,7 +16633,7 @@ function AiInsightsDashboard() {
                           {c.marketTradable ? 'YES' : 'NO'}
                         </td>
                         <td style={{ ...tdStyle, color: c.avoidCE ? '#f87171' : '#6b7280' }}>{c.avoidCE ? 'YES' : 'no'}</td>
-                        <td style={{ ...tdStyle, color: c.avoidPe ? '#f87171' : '#6b7280' }}>{c.avoidPe ? 'YES' : 'no'}</td>
+                        <td style={{ ...tdStyle, color: c.avoidPE ? '#f87171' : '#6b7280' }}>{c.avoidPE ? 'YES' : 'no'}</td>
                         <td style={tdStyle}>{c.confidence?.toFixed(2) ?? '—'}</td>
                         <td style={{ ...tdStyle, color: c.source === 'OPENAI' ? '#60a5fa' : '#9ca3af' }}>{c.source}</td>
                         <td style={tdStyle}>{c.regime ?? '—'}</td>

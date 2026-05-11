@@ -178,6 +178,11 @@ public class MarketContextService {
                         .reasonCodes(r.getReasonCodes())
                         .warningCodes(r.getWarningCodes())
                         .source(r.getSource() != null ? r.getSource().name() : null)
+                        .regime(r.getRegime())
+                        .candleTime(r.getCandleTime() != null ? r.getCandleTime().toString() : null)
+                        .latencyMs(r.getLatencyMs())
+                        .requestJson(r.getRequestJson())
+                        .responseJson(r.getResponseJson())
                         .build())
                 .toList();
     }
@@ -262,9 +267,7 @@ public class MarketContextService {
         // ── Summary contradiction guard ───────────────────────────────────
         if (res.getSummary() != null) {
             String lc = res.getSummary().toLowerCase();
-            boolean negated = lc.contains("no need to avoid") || lc.contains("no specific need to avoid")
-                    || lc.contains("not necessary to avoid") || lc.contains("not avoid");
-            if (!negated) {
+            if (!hasNeutralAvoidancePhrase(lc)) {
                 if (!res.isAvoidPE()
                         && (lc.contains("avoid pe") || lc.contains("avoid put") || lc.contains("puts should be avoided"))) {
                     res.setAvoidPE(true);
@@ -285,6 +288,18 @@ public class MarketContextService {
         res.setReasonCodes(reasons);
         res.setWarningCodes(warnings);
         return res;
+    }
+
+    private static boolean hasNeutralAvoidancePhrase(String lc) {
+        return lc.contains("no specific bias to avoid")
+                || lc.contains("no need to avoid")
+                || lc.contains("neither calls nor puts")
+                || lc.contains("neither ce nor pe")
+                || lc.contains("not explicitly discouraged")
+                || lc.contains("both calls and puts remain")
+                || lc.contains("both ce and pe remain")
+                || lc.contains("both calls and puts are")
+                || lc.contains("both ce and pe are");
     }
 
     private static void addIfMissing(List<String> list, String code) {
